@@ -1,349 +1,328 @@
-/**
- * LevelUp AI QA Agent — Main Orchestrator
- *
- * End-to-end self-healing test automation:
- *   Run Tests → Analyze Failures → Heal (rule → DB → AI) → Patch → Re-run → PR → Report
- *
- * CLI: ts-node src/index.ts --repo <test-repo-path> [--site-url <url>] [--github-token <token>]
- *                           [--owner <owner>] [--repo-name <name>] [--report-dir <dir>]
- */
-
-import * as path from 'path';
+import 'dotenv/config';
 import * as fs from 'fs';
+import * as path from 'path';
+import { execSync } from 'child_process';
+
 import { logger } from './utils/logger';
-import { runTests } from './core/execution-engine';
-import { analyzeResults, type FailureContext } from './core/failure-analyzer';
-import { ruleBasedHeal, dbPatternHeal, applyFix, storeSuccessfulPattern } from './core/locator-healer';
-import { healWithAI, type AIHealRequest } from './ai/openai-client';
-import { logExecution, logHealing, getHistoricalStats, closePool, updateExecution } from './db/postgres';
-import { createBranch, commitFiles, pushBranch, createPR } from './github/pr-creator';
-import { generateReport, type ReportData, type ReportTest, type ReportHealing } from './reports/html-report';
-import { backupFile, restoreFile, cleanupBackup } from './utils/file-utils';
+import { backupFile, cleanupBackup, restoreFile } from './utils/file-utils';
+import { ExecutionEngine } from './core/execution-engine';
+import { ArtifactCollector } from './core/artifact-collector';
+import { FailureAnalyzer } from './core/failure-analyzer';
+import { HealingOrchestrator } from './core/healing-orchestrator';
+import { RuleEngine } from './engines/rule-engine';
+import { PatternEngine } from './engines/pattern-engine';
+import { AIEngine } from './engines/ai-engine';
+import { ValidationLayer } from './validation/validation-layer';
+import { OpenAIClient } from './ai/openai-client';
+import {
+  getDb,
+  closeDb,
+  logExecution,
+  updateExecution,
+  logHealing,
+  storePattern,
+  getHistoricalStats,
+} from './db/sqlite';
+import { generateReport, type ReportData, type ReportHealing, type ReportTest } from './reports/html-report';
 
-const MOD = 'orchestrator';
-
-// ─── Config ────────────────────────────────────────────────────
+const MOD = 'index';
 
 interface Config {
   testRepoPath: string;
   siteUrl: string;
-  githubToken: string;
   owner: string;
   repoName: string;
   reportDir: string;
+  autoCommit: boolean;
 }
 
 function parseArgs(): Config {
   const args = process.argv.slice(2);
-  const get = (flag: string, def: string = ''): string => {
+  const get = (flag: string, def = ''): string => {
     const idx = args.indexOf(flag);
     return idx >= 0 && args[idx + 1] ? args[idx + 1]! : def;
   };
+  const has = (flag: string): boolean => args.includes(flag);
 
   return {
     testRepoPath: get('--repo', '/home/ubuntu/github_repos/selfhealing_agent_poc'),
     siteUrl: get('--site-url', 'https://opensource-demo.orangehrmlive.com'),
-    githubToken: get('--github-token', process.env['GITHUB_TOKEN'] ?? ''),
     owner: get('--owner', 'PrasanthLevelUp'),
     repoName: get('--repo-name', 'selfhealing_agent_poc'),
     reportDir: get('--report-dir', '/home/ubuntu/healing_reports'),
+    autoCommit: has('--auto-commit'),
   };
 }
 
-// ─── Main Flow ─────────────────────────────────────────────────
+function readTestSummary(resultsFile: string): ReportTest[] {
+  if (!fs.existsSync(resultsFile)) return [];
+  const raw = JSON.parse(fs.readFileSync(resultsFile, 'utf-8')) as {
+    suites?: Array<{
+      specs?: Array<{
+        title?: string;
+        tests?: Array<{ results?: Array<{ status?: string; duration?: number; errors?: Array<{ message?: string }> }> }>;
+      }>;
+    }>;
+  };
+
+  const rows: ReportTest[] = [];
+  for (const suite of raw.suites ?? []) {
+    for (const spec of suite.specs ?? []) {
+      for (const t of spec.tests ?? []) {
+        const result = t.results?.[0];
+        const status = result?.status ?? 'unknown';
+        const err = result?.errors?.map((e) => e.message || '').join('\n') || '';
+        rows.push({
+          testName: spec.title ?? 'unknown',
+          status,
+          durationMs: result?.duration ?? 0,
+          error: err,
+          healed: false,
+        });
+      }
+    }
+  }
+  return rows;
+}
+
+function getCommitSha(repoPath: string): string {
+  try {
+    return execSync('git rev-parse HEAD', { cwd: repoPath, encoding: 'utf-8' }).trim();
+  } catch {
+    return 'unknown';
+  }
+}
+
+function maybeCommitFix(repoPath: string, filePath: string, message: string, autoCommit: boolean): void {
+  if (!autoCommit) return;
+  const relativeFile = path.relative(repoPath, filePath);
+
+  try {
+    execSync(`git add "${relativeFile}"`, { cwd: repoPath, stdio: 'pipe' });
+    execSync(`git commit -m "${message.replace(/"/g, '\\"')}"`, { cwd: repoPath, stdio: 'pipe' });
+    logger.info(MOD, 'Auto-committed healed fix', { relativeFile, message });
+  } catch (error) {
+    logger.warn(MOD, 'Auto-commit skipped or failed', { error: (error as Error).message });
+  }
+}
 
 async function main(): Promise<void> {
   const cfg = parseArgs();
-  const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
-
-  logger.info(MOD, '═══ LevelUp AI QA Agent starting ═══', { timestamp, repo: cfg.testRepoPath });
-
-  // Ensure report dir exists
   fs.mkdirSync(cfg.reportDir, { recursive: true });
 
-  // ── Step 1: Get current commit SHA ──
-  const { execSync } = await import('child_process');
-  let commitSha = 'unknown';
-  try {
-    commitSha = execSync('git rev-parse HEAD', { cwd: cfg.testRepoPath, encoding: 'utf-8' }).trim();
-  } catch { /* ignore */ }
-  logger.info(MOD, `Starting commit: ${commitSha.slice(0, 8)}`);
-
-  // ── Step 2: Run tests ──
-  logger.info(MOD, '── Step 1: Running Playwright tests ──');
-  const runResult = runTests(cfg.testRepoPath);
-
-  // Save run log
-  const logPath = path.join(cfg.reportDir, `run_log_${timestamp}.txt`);
-  fs.writeFileSync(logPath, `STDOUT:\n${runResult.stdout}\n\nSTDERR:\n${runResult.stderr}`, 'utf-8');
-
-  // ── Step 3: Analyze results ──
-  logger.info(MOD, '── Step 2: Analyzing results ──');
-  const analysis = analyzeResults(runResult.resultsFile, cfg.testRepoPath, cfg.siteUrl);
-
-  // ── Step 4: Log initial executions ──
-  const execIds: Map<string, number> = new Map();
-  for (const test of analysis.tests) {
-    const id = await logExecution({
-      test_name: test.testName,
-      status: test.status,
-      error_message: test.errors.join('\n').slice(0, 1000),
-      github_commit_sha: commitSha,
-      duration_ms: test.durationMs,
-    });
-    if (test.status !== 'passed') execIds.set(test.testName, id);
-  }
-
-  // Track results for report
-  const reportTests: ReportTest[] = analysis.tests.map(t => ({
-    testName: t.testName, status: t.status, durationMs: t.durationMs,
-    error: t.errors.join('\n').slice(0, 200), healed: false,
-  }));
-  const reportHealings: ReportHealing[] = [];
-  const commits: Array<{ files: string[]; message: string }> = [];
-  let healedCount = 0;
-
-  // ── Step 5: Healing loop ──
-  if (analysis.failures.length > 0) {
-    logger.info(MOD, `── Step 3: Healing ${analysis.failures.length} failure(s) ──`);
-
-    for (const failure of analysis.failures) {
-      const execId = execIds.get(failure.testName) ?? 0;
-      let healed = false;
-
-      // Backup original file
-      backupFile(failure.testFilePath);
-
-      // ─── Level 1: Rule-based ───
-      logger.info(MOD, `[L1] Rule-based healing for "${failure.testName}"`);
-      const ruleResult = ruleBasedHeal(failure);
-
-      for (const suggestion of ruleResult.alternatives) {
-        if (healed) break;
-        const failedLoc = failure.failedLocator ?? '';
-        const applied = applyFix(failure.testFilePath, failedLoc, suggestion.newLocator, ruleResult.addWait);
-        if (!applied) continue;
-
-        // Re-run just this test
-        const rerun = runTests(cfg.testRepoPath, failure.file);
-        const success = rerun.exitCode === 0;
-
-        await logHealing({
-          test_execution_id: execId,
-          failed_locator: failedLoc,
-          healed_locator: suggestion.newLocator,
-          healing_strategy: 'rule_based',
-          ai_tokens_used: 0,
-          success,
-          confidence: suggestion.confidence,
-          error_context: failure.errorMessage.slice(0, 500),
-        });
-
-        if (success) {
-          healed = true;
-          cleanupBackup(failure.testFilePath);
-          await storeSuccessfulPattern(failedLoc, suggestion.newLocator, 'rule_based', failure.errorMessage, cfg.siteUrl);
-          commits.push({
-            files: [path.relative(cfg.testRepoPath, failure.testFilePath)],
-            message: `🔧 Auto-heal: Fixed ${failure.testName} - ${failedLoc} → ${suggestion.newLocator}`,
-          });
-          reportHealings.push({
-            testName: failure.testName, failedLocator: failedLoc,
-            healedLocator: suggestion.newLocator, strategy: 'rule_based',
-            aiTokensUsed: 0, success: true,
-          });
-          logger.info(MOD, `✅ [L1] Healed with rule-based: "${suggestion.newLocator}"`);
-        } else {
-          restoreFile(failure.testFilePath);
-        }
-      }
-      if (healed) { healedCount++; updateReportTest(reportTests, failure.testName); continue; }
-
-      // ─── Level 2: DB pattern ───
-      logger.info(MOD, `[L2] DB pattern lookup for "${failure.testName}"`);
-      const dbResult = await dbPatternHeal(failure);
-      if (dbResult) {
-        const failedLoc = failure.failedLocator ?? '';
-        const applied = applyFix(failure.testFilePath, failedLoc, dbResult.newLocator);
-        if (applied) {
-          const rerun = runTests(cfg.testRepoPath, failure.file);
-          const success = rerun.exitCode === 0;
-
-          await logHealing({
-            test_execution_id: execId,
-            failed_locator: failedLoc,
-            healed_locator: dbResult.newLocator,
-            healing_strategy: 'database_pattern',
-            success,
-            confidence: dbResult.confidence,
-          });
-
-          if (success) {
-            healed = true;
-            cleanupBackup(failure.testFilePath);
-            await storeSuccessfulPattern(failedLoc, dbResult.newLocator, 'database_pattern', failure.errorMessage, cfg.siteUrl);
-            commits.push({
-              files: [path.relative(cfg.testRepoPath, failure.testFilePath)],
-              message: `🔧 Auto-heal: Fixed ${failure.testName} - ${failedLoc} → ${dbResult.newLocator}`,
-            });
-            reportHealings.push({
-              testName: failure.testName, failedLocator: failedLoc,
-              healedLocator: dbResult.newLocator, strategy: 'database_pattern',
-              aiTokensUsed: 0, success: true,
-            });
-            logger.info(MOD, `✅ [L2] Healed with DB pattern: "${dbResult.newLocator}"`);
-          } else {
-            restoreFile(failure.testFilePath);
-          }
-        }
-      }
-      if (healed) { healedCount++; updateReportTest(reportTests, failure.testName); continue; }
-
-      // ─── Level 3: AI reasoning ───
-      logger.info(MOD, `[L3] AI reasoning for "${failure.testName}"`);
-      try {
-        const aiReq: AIHealRequest = {
-          failedLocator: failure.failedLocator ?? '',
-          errorMessage: failure.errorMessage,
-          failedCodeLine: failure.failedCodeLine,
-          domSnippet: '',  // Will be populated by daemon's browser automation if needed
-          testFileName: failure.file,
-          siteUrl: cfg.siteUrl,
-        };
-        const aiResult = await healWithAI(aiReq);
-
-        if (aiResult.newLocator) {
-          const failedLoc = failure.failedLocator ?? '';
-          const applied = applyFix(failure.testFilePath, failedLoc, aiResult.newLocator);
-          if (applied) {
-            const rerun = runTests(cfg.testRepoPath, failure.file);
-            const success = rerun.exitCode === 0;
-
-            await logHealing({
-              test_execution_id: execId,
-              failed_locator: failedLoc,
-              healed_locator: aiResult.newLocator,
-              healing_strategy: 'ai_reasoning',
-              ai_tokens_used: aiResult.tokensUsed,
-              success,
-              confidence: aiResult.confidence,
-              error_context: failure.errorMessage.slice(0, 500),
-            });
-
-            reportHealings.push({
-              testName: failure.testName, failedLocator: failedLoc,
-              healedLocator: aiResult.newLocator, strategy: 'ai_reasoning',
-              aiTokensUsed: aiResult.tokensUsed, success,
-            });
-
-            if (success) {
-              healed = true;
-              cleanupBackup(failure.testFilePath);
-              await storeSuccessfulPattern(failedLoc, aiResult.newLocator, 'ai_reasoning', failure.errorMessage, cfg.siteUrl, aiResult.tokensUsed);
-              commits.push({
-                files: [path.relative(cfg.testRepoPath, failure.testFilePath)],
-                message: `🔧 Auto-heal: Fixed ${failure.testName} - ${failedLoc} → ${aiResult.newLocator}`,
-              });
-              logger.info(MOD, `✅ [L3] Healed with AI: "${aiResult.newLocator}" (${aiResult.tokensUsed} tokens)`);
-            } else {
-              restoreFile(failure.testFilePath);
-            }
-          }
-        }
-      } catch (e) {
-        logger.warn(MOD, `[L3] AI healing failed: ${(e as Error).message}`);
-      }
-
-      if (healed) { healedCount++; updateReportTest(reportTests, failure.testName); }
-      else {
-        restoreFile(failure.testFilePath);
-        logger.warn(MOD, `❌ Could not heal "${failure.testName}" — all 3 levels failed`);
-      }
-    }
-  }
-
-  // ── Step 6: Commit & PR ──
-  let prUrl: string | null = null;
-  if (commits.length > 0 && cfg.githubToken) {
-    logger.info(MOD, `── Step 4: Creating PR with ${commits.length} commit(s) ──`);
-    const branchName = `auto-heal/${timestamp}`;
-    createBranch(cfg.testRepoPath, branchName, 'main');
-
-    for (const c of commits) {
-      commitFiles(cfg.testRepoPath, c);
-    }
-
-    pushBranch(cfg.testRepoPath, branchName, cfg.githubToken, cfg.owner, cfg.repoName);
-    const pr = await createPR(
-      cfg.githubToken, cfg.owner, cfg.repoName,
-      branchName, 'main',
-      `🔧 Auto-heal: ${commits.length} fix(es) — ${timestamp}`,
-      buildPRBody(commits, reportHealings)
-    );
-    prUrl = pr?.url ?? null;
-  }
-
-  // ── Step 7: Generate report ──
-  logger.info(MOD, '── Step 5: Generating report ──');
-  const histStats = await getHistoricalStats();
-  const reportData: ReportData = {
-    timestamp: new Date().toISOString(),
-    commitSha,
-    prUrl: prUrl ?? undefined,
+  logger.info(MOD, 'Starting refined self-healing orchestrator', {
+    testRepoPath: cfg.testRepoPath,
     siteUrl: cfg.siteUrl,
-    repo: `${cfg.owner}/${cfg.repoName}`,
-    totalTests: analysis.totalTests,
-    passed: analysis.passed,
-    failed: analysis.failed,
-    healed: healedCount,
-    tests: reportTests,
-    healings: reportHealings,
-    historicalStats: histStats,
-  };
-
-  const reportPath = path.join(cfg.reportDir, `report_${timestamp}.html`);
-  generateReport(reportData, reportPath);
-
-  // Also save raw data
-  const dataPath = path.join(cfg.reportDir, `report_data_${timestamp}.json`);
-  fs.writeFileSync(dataPath, JSON.stringify(reportData, null, 2));
-
-  logger.info(MOD, '═══ Agent finished ═══', {
-    totalTests: analysis.totalTests,
-    passed: analysis.passed,
-    failed: analysis.failed,
-    healed: healedCount,
-    report: reportPath,
-    prUrl,
   });
 
-  await closePool();
+  // Initialize DB upfront.
+  getDb();
+
+  const run = ExecutionEngine.run(cfg.testRepoPath);
+  const tests = readTestSummary(run.resultsFile);
+
+  const collector = new ArtifactCollector();
+  const artifacts = collector.collect(run.resultsFile, cfg.testRepoPath);
+
+  const analyzer = new FailureAnalyzer();
+  const orchestrator = new HealingOrchestrator(
+    new RuleEngine(),
+    new PatternEngine(),
+    new AIEngine(new OpenAIClient({
+      model: 'gpt-4o-mini',
+      apiKey: process.env['OPENAI_API_KEY'],
+    })),
+  );
+  const validationLayer = new ValidationLayer(path.join(cfg.reportDir, 'patches'));
+
+  const healings: ReportHealing[] = [];
+  let healedCount = 0;
+  let validationRejected = 0;
+  let patchesGenerated = 0;
+  let totalTokensUsed = 0;
+
+  for (const test of tests) {
+    logExecution({
+      test_name: test.testName,
+      status: test.status,
+      error_message: test.error.slice(0, 1000),
+      github_commit_sha: getCommitSha(cfg.testRepoPath),
+      duration_ms: test.durationMs,
+      healing_attempted: false,
+      healing_succeeded: false,
+    });
+  }
+
+  for (const artifact of artifacts) {
+    const failure = analyzer.analyze(artifact);
+
+    const executionId = logExecution({
+      test_name: failure.testName,
+      status: 'failed',
+      error_message: failure.errorMessage.slice(0, 1000),
+      screenshot_path: failure.screenshotPath ?? undefined,
+      github_commit_sha: getCommitSha(cfg.testRepoPath),
+      healing_attempted: true,
+      healing_succeeded: false,
+    });
+
+    const backupPath = backupFile(failure.filePath);
+
+    try {
+      const outcome = await orchestrator.heal(failure);
+      if (!outcome.suggestion) {
+        logHealing({
+          test_execution_id: executionId,
+          test_name: failure.testName,
+          failed_locator: failure.failedLocator,
+          healing_strategy: 'rule_based',
+          success: false,
+          confidence: 0,
+          error_context: failure.errorMessage.slice(0, 500),
+          validation_status: 'rejected',
+          validation_reason: 'No strategy generated suggestion',
+        });
+        restoreFile(failure.filePath);
+        continue;
+      }
+
+      const validation = validationLayer.validate(outcome.suggestion, failure);
+      if (!validation.approved || !validation.updatedContent) {
+        validationRejected += 1;
+        logHealing({
+          test_execution_id: executionId,
+          test_name: failure.testName,
+          failed_locator: failure.failedLocator,
+          healed_locator: outcome.suggestion.newLocator,
+          healing_strategy: outcome.suggestion.strategy,
+          ai_tokens_used: outcome.suggestion.tokensUsed,
+          success: false,
+          confidence: outcome.suggestion.confidence,
+          error_context: failure.errorMessage.slice(0, 500),
+          validation_status: 'rejected',
+          validation_reason: validation.reason,
+        });
+        restoreFile(failure.filePath);
+        continue;
+      }
+
+      patchesGenerated += 1;
+      totalTokensUsed += outcome.suggestion.tokensUsed;
+      validationLayer.applyValidatedFix(failure.filePath, validation.updatedContent);
+
+      const relativeTestFile = path.relative(path.join(cfg.testRepoPath, 'tests'), failure.filePath);
+      const rerun = ExecutionEngine.run(cfg.testRepoPath, relativeTestFile);
+      const success = rerun.exitCode === 0;
+
+      logHealing({
+        test_execution_id: executionId,
+        test_name: failure.testName,
+        failed_locator: failure.failedLocator,
+        healed_locator: outcome.suggestion.newLocator,
+        healing_strategy: outcome.suggestion.strategy,
+        ai_tokens_used: outcome.suggestion.tokensUsed,
+        success,
+        confidence: outcome.suggestion.confidence,
+        error_context: failure.errorMessage.slice(0, 500),
+        validation_status: 'approved',
+        validation_reason: outcome.suggestion.reasoning,
+        patch_path: validation.patchPath,
+      });
+
+      healings.push({
+        testName: failure.testName,
+        failedLocator: failure.failedLocator,
+        healedLocator: outcome.suggestion.newLocator,
+        strategy: outcome.suggestion.strategy,
+        aiTokensUsed: outcome.suggestion.tokensUsed,
+        success,
+        confidence: outcome.suggestion.confidence,
+        validated: true,
+        validationReason: outcome.suggestion.reasoning,
+        patchPath: validation.patchPath,
+      });
+
+      if (!success) {
+        restoreFile(failure.filePath);
+        continue;
+      }
+
+      healedCount += 1;
+      updateExecution(executionId, { healing_succeeded: true, status: 'healed' });
+      cleanupBackup(failure.filePath);
+      maybeCommitFix(
+        cfg.testRepoPath,
+        failure.filePath,
+        `🔧 Auto-heal: ${failure.testName} (${failure.failedLocator} -> ${outcome.suggestion.newLocator})`,
+        cfg.autoCommit,
+      );
+
+      storePattern({
+        test_name: failure.testName,
+        error_pattern: failure.errorPattern,
+        failed_locator: failure.failedLocator,
+        healed_locator: outcome.suggestion.newLocator,
+        solution_strategy: outcome.suggestion.strategy,
+        confidence: outcome.suggestion.confidence,
+        avg_tokens_saved: outcome.suggestion.tokensUsed,
+      });
+
+      const testRow = tests.find((t) => t.testName === failure.testName);
+      if (testRow) {
+        testRow.healed = true;
+        testRow.status = 'healed';
+      }
+
+      logger.info(MOD, 'Healing success', {
+        testName: failure.testName,
+        strategy: outcome.suggestion.strategy,
+      });
+    } catch (error) {
+      restoreFile(failure.filePath);
+      logger.error(MOD, 'Healing pipeline failed for test', {
+        testName: failure.testName,
+        error: (error as Error).message,
+      });
+    } finally {
+      if (fs.existsSync(backupPath)) cleanupBackup(failure.filePath);
+    }
+  }
+
+  const hist = getHistoricalStats();
+  const now = new Date().toISOString();
+  const reportData: ReportData = {
+    timestamp: now,
+    commitSha: getCommitSha(cfg.testRepoPath),
+    repo: `${cfg.owner}/${cfg.repoName}`,
+    siteUrl: cfg.siteUrl,
+    totalTests: tests.length,
+    passed: tests.filter((t) => t.status === 'passed').length,
+    failed: tests.filter((t) => t.status !== 'passed' && t.status !== 'healed').length,
+    healed: healedCount,
+    validationRejected,
+    patchesGenerated,
+    totalTokensUsed,
+    tests,
+    healings,
+    historicalStats: hist,
+  };
+
+  const reportPath = path.join(cfg.reportDir, `refined-report-${now.replace(/[:.]/g, '-')}.html`);
+  generateReport(reportData, reportPath);
+  fs.writeFileSync(path.join(cfg.reportDir, 'latest-report-data.json'), JSON.stringify(reportData, null, 2));
+
+  logger.info(MOD, 'Refined orchestrator completed', {
+    reportPath,
+    healedCount,
+    validationRejected,
+    patchesGenerated,
+  });
+
+  closeDb();
 }
 
-function updateReportTest(tests: ReportTest[], testName: string): void {
-  const t = tests.find(x => x.testName === testName);
-  if (t) { t.healed = true; t.status = 'healed'; }
-}
-
-function buildPRBody(commits: Array<{ message: string }>, healings: ReportHealing[]): string {
-  const lines = [
-    '## 🔧 Self-Healing Test Fixes\n',
-    'This PR was automatically created by the **LevelUp AI QA Agent**.\n',
-    '### Changes:',
-    ...commits.map(c => `- ${c.message}`),
-    '\n### Strategy Breakdown:',
-    `- Rule-based: ${healings.filter(h => h.strategy === 'rule_based').length}`,
-    `- DB Pattern: ${healings.filter(h => h.strategy === 'database_pattern').length}`,
-    `- AI Reasoning: ${healings.filter(h => h.strategy === 'ai_reasoning').length}`,
-    `- Total AI tokens: ${healings.reduce((s, h) => s + h.aiTokensUsed, 0)}`,
-    '\n---',
-    '*Generated by [LevelUp AI QA Agent](https://github.com/PrasanthLevelUp/levelup-ai-qa-agent)*',
-  ];
-  return lines.join('\n');
-}
-
-// Run
-main().catch(err => {
-  logger.error(MOD, `Fatal: ${(err as Error).message}`, { stack: (err as Error).stack });
+main().catch((error) => {
+  logger.error(MOD, 'Fatal orchestration error', { error: (error as Error).message });
+  closeDb();
   process.exit(1);
 });

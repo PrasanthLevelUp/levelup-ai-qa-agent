@@ -1,30 +1,23 @@
 /**
- * OpenAI Client — Level 3 AI reasoning for locator healing.
- * Only called when rule-based and DB pattern strategies fail.
- * Designed for minimal token usage: sends only the error, failed line, and a small DOM snippet.
- *
- * CLI: ts-node src/ai/openai-client.ts <failure-context.json>
- * Requires: OPENAI_API_KEY env var
+ * OpenAI Platform Client
+ * Provides resilient minimal-context semantic locator suggestions.
  */
 
 import OpenAI from 'openai';
-import * as fs from 'fs';
 import { logger } from '../utils/logger';
 
 const MOD = 'openai-client';
+const DEFAULT_MODEL = 'gpt-4o-mini';
 
-// ─── Types ─────────────────────────────────────────────────────
-
-export interface AIHealRequest {
-  failedLocator: string;
+export interface LocatorSuggestionRequest {
   errorMessage: string;
-  failedCodeLine: string | null;
-  domSnippet: string;        // minimal DOM around failure point
-  testFileName: string;
-  siteUrl: string;
+  failedLine: string;
+  surroundingCode: string;
+  failedLocator: string;
+  testName: string;
 }
 
-export interface AIHealResponse {
+export interface LocatorSuggestionResponse {
   newLocator: string;
   confidence: number;
   reasoning: string;
@@ -32,94 +25,121 @@ export interface AIHealResponse {
   model: string;
 }
 
-// ─── Prompt Construction (token-optimized) ─────────────────────
-
-function buildPrompt(req: AIHealRequest): string {
-  return `You are a Playwright test automation expert. A locator broke. Fix it.
-
-FAILED LOCATOR: ${req.failedLocator}
-ERROR: ${req.errorMessage.slice(0, 300)}
-CODE LINE: ${req.failedCodeLine ?? 'N/A'}
-SITE: ${req.siteUrl}
-
-RELEVANT DOM (near failure):
-${req.domSnippet.slice(0, 1500)}
-
-Reply with ONLY a JSON object (no markdown):
-{"newLocator": "page.xxx(...)", "confidence": 0.0-1.0, "reasoning": "brief explanation"}
-
-Prefer semantic locators: getByRole > getByLabel > getByText > getByTestId > CSS.`;
+interface OpenAIConfig {
+  apiKey: string;
+  model?: string;
+  retries?: number;
 }
 
-// ─── API Call ──────────────────────────────────────────────────
-
-export async function healWithAI(req: AIHealRequest): Promise<AIHealResponse> {
-  const apiKey = process.env['OPENAI_API_KEY'];
-  if (!apiKey) {
-    throw new Error('OPENAI_API_KEY not set — Level 3 healing unavailable');
-  }
-
-  const openai = new OpenAI({ apiKey });
-  const prompt = buildPrompt(req);
-
-  logger.info(MOD, 'Calling OpenAI for locator healing', {
-    failedLocator: req.failedLocator,
-    promptLength: prompt.length,
-  });
-
-  const response = await openai.chat.completions.create({
-    model: 'gpt-4o-mini',   // cost-optimized model
-    messages: [{ role: 'user', content: prompt }],
-    max_tokens: 200,          // strict limit for cost control
-    temperature: 0.1,         // deterministic
-  });
-
-  const content = response.choices[0]?.message?.content ?? '';
-  const tokensUsed =
-    (response.usage?.prompt_tokens ?? 0) + (response.usage?.completion_tokens ?? 0);
-
-  logger.info(MOD, `OpenAI response: ${tokensUsed} tokens used`, { model: response.model });
-
-  // Parse the JSON response
-  try {
-    // Strip markdown code fences if present
-    const cleaned = content.replace(/```json\s*/g, '').replace(/```\s*/g, '').trim();
-    const parsed = JSON.parse(cleaned) as { newLocator: string; confidence: number; reasoning: string };
-
-    return {
-      newLocator: parsed.newLocator,
-      confidence: parsed.confidence,
-      reasoning: parsed.reasoning,
-      tokensUsed,
-      model: response.model,
-    };
-  } catch {
-    logger.error(MOD, 'Failed to parse OpenAI response', { content });
-    return {
-      newLocator: '',
-      confidence: 0,
-      reasoning: `Parse error: ${content.slice(0, 200)}`,
-      tokensUsed,
-      model: response.model,
-    };
-  }
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-// ─── CLI ───────────────────────────────────────────────────────
+export class OpenAIClient {
+  private readonly client: OpenAI;
+  private readonly model: string;
+  private readonly retries: number;
 
-if (require.main === module) {
-  const ctxFile = process.argv[2];
-  if (!ctxFile) {
-    console.error('Usage: openai-client.ts <failure-context.json>');
-    console.error('  Context JSON needs: failedLocator, errorMessage, failedCodeLine, domSnippet, testFileName, siteUrl');
-    process.exit(1);
+  constructor(config?: Partial<OpenAIConfig>) {
+    const apiKey = config?.apiKey || process.env['OPENAI_API_KEY'];
+    if (!apiKey) {
+      throw new Error('OPENAI_API_KEY is missing.');
+    }
+
+    this.client = new OpenAI({ apiKey });
+    this.model = config?.model || DEFAULT_MODEL;
+    this.retries = config?.retries ?? 2;
   }
 
-  (async () => {
-    const ctx = JSON.parse(fs.readFileSync(ctxFile, 'utf-8')) as AIHealRequest;
-    const result = await healWithAI(ctx);
-    const outPath = '/tmp/ai_heal_result.json';
-    fs.writeFileSync(outPath, JSON.stringify(result, null, 2));
-    console.log(JSON.stringify(result, null, 2));
-  })();
+  async suggestSemanticLocator(req: LocatorSuggestionRequest): Promise<LocatorSuggestionResponse> {
+    const prompt = this.buildPrompt(req);
+
+    for (let attempt = 0; attempt <= this.retries; attempt++) {
+      try {
+        logger.info(MOD, 'Calling OpenAI platform API', {
+          model: this.model,
+          attempt: attempt + 1,
+          testName: req.testName,
+        });
+
+        const completion = await this.client.chat.completions.create({
+          model: this.model,
+          temperature: 0.1,
+          max_tokens: 180,
+          messages: [{ role: 'user', content: prompt }],
+        });
+
+        const content = completion.choices[0]?.message?.content || '';
+        const parsed = this.parseResponse(content);
+        const tokensUsed = (completion.usage?.prompt_tokens || 0) + (completion.usage?.completion_tokens || 0);
+
+        return {
+          ...parsed,
+          tokensUsed,
+          model: completion.model,
+        };
+      } catch (error) {
+        const message = (error as Error).message;
+        logger.warn(MOD, 'OpenAI call failed', {
+          attempt: attempt + 1,
+          retries: this.retries + 1,
+          error: message,
+        });
+
+        if (attempt === this.retries) {
+          throw new Error(`OpenAI request failed after retries: ${message}`);
+        }
+
+        await sleep(500 * (attempt + 1));
+      }
+    }
+
+    throw new Error('Unreachable OpenAI fallback path reached.');
+  }
+
+  private buildPrompt(req: LocatorSuggestionRequest): string {
+    return [
+      'Suggest a semantic Playwright locator to replace the broken one.',
+      '',
+      `Test: ${req.testName}`,
+      `Broken locator: ${req.failedLocator}`,
+      `Error: ${req.errorMessage.slice(0, 450)}`,
+      `Failed line: ${req.failedLine || 'N/A'}`,
+      'Surrounding code:',
+      req.surroundingCode.slice(0, 1200),
+      '',
+      'Rules:',
+      '- Return ONLY JSON (no markdown).',
+      '- Prefer getByRole/getByLabel/getByText/getByPlaceholder.',
+      '- Avoid CSS/XPath unless absolutely required.',
+      '- Include confidence between 0 and 1.',
+      '',
+      'JSON schema:',
+      '{"newLocator":"page.getByRole(...)","confidence":0.95,"reasoning":"short reason"}',
+    ].join('\n');
+  }
+
+  private parseResponse(content: string): Omit<LocatorSuggestionResponse, 'tokensUsed' | 'model'> {
+    const cleaned = content.replace(/```json/g, '').replace(/```/g, '').trim();
+    try {
+      const parsed = JSON.parse(cleaned) as {
+        newLocator?: string;
+        confidence?: number;
+        reasoning?: string;
+      };
+
+      return {
+        newLocator: parsed.newLocator || '',
+        confidence: Math.max(0, Math.min(1, parsed.confidence ?? 0)),
+        reasoning: parsed.reasoning || 'No reasoning provided.',
+      };
+    } catch {
+      logger.error(MOD, 'Failed to parse JSON response from OpenAI', { content: cleaned.slice(0, 500) });
+      return {
+        newLocator: '',
+        confidence: 0,
+        reasoning: 'Invalid JSON from model.',
+      };
+    }
+  }
 }

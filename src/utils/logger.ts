@@ -1,6 +1,5 @@
 /**
  * Logger — lightweight structured logging for the healing agent.
- * Writes to stdout (JSON lines) so the daemon can capture output.
  */
 
 export enum LogLevel {
@@ -17,25 +16,31 @@ const LEVEL_PRIORITY: Record<LogLevel, number> = {
   [LogLevel.ERROR]: 3,
 };
 
-const minLevel: LogLevel =
-  (process.env['LOG_LEVEL'] as LogLevel) || LogLevel.INFO;
+function normalizeLogLevel(value: string | undefined): LogLevel {
+  const normalized = (value || 'INFO').toUpperCase();
+  if (normalized === LogLevel.DEBUG) return LogLevel.DEBUG;
+  if (normalized === LogLevel.WARN) return LogLevel.WARN;
+  if (normalized === LogLevel.ERROR) return LogLevel.ERROR;
+  return LogLevel.INFO;
+}
+
+const minLevel: LogLevel = normalizeLogLevel(process.env['LOG_LEVEL']);
 
 function log(level: LogLevel, module: string, message: string, data?: Record<string, unknown>): void {
   if (LEVEL_PRIORITY[level] < LEVEL_PRIORITY[minLevel]) return;
 
-  const entry = {
+  console.log(JSON.stringify({
     ts: new Date().toISOString(),
     level,
     module,
     msg: message,
     ...(data ? { data } : {}),
-  };
-  console.log(JSON.stringify(entry));
+  }));
 }
 
 export const logger = {
-  debug: (mod: string, msg: string, data?: Record<string, unknown>) => log(LogLevel.DEBUG, mod, msg, data),
-  info:  (mod: string, msg: string, data?: Record<string, unknown>) => log(LogLevel.INFO, mod, msg, data),
-  warn:  (mod: string, msg: string, data?: Record<string, unknown>) => log(LogLevel.WARN, mod, msg, data),
-  error: (mod: string, msg: string, data?: Record<string, unknown>) => log(LogLevel.ERROR, mod, msg, data),
+  debug: (module: string, message: string, data?: Record<string, unknown>) => log(LogLevel.DEBUG, module, message, data),
+  info: (module: string, message: string, data?: Record<string, unknown>) => log(LogLevel.INFO, module, message, data),
+  warn: (module: string, message: string, data?: Record<string, unknown>) => log(LogLevel.WARN, module, message, data),
+  error: (module: string, message: string, data?: Record<string, unknown>) => log(LogLevel.ERROR, module, message, data),
 };
