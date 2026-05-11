@@ -1,25 +1,24 @@
 {
   "name": "levelup-ai-qa-agent",
   "version": "1.0.0",
-  "main": "index.js",
-  "directories": {
-    "test": "tests"
-  },
+  "description": "AI-powered self-healing test automation agent",
+  "main": "dist/index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "ts-node src/index.ts",
+    "run-tests": "ts-node src/core/execution-engine.ts",
+    "analyze": "ts-node src/core/failure-analyzer.ts",
+    "heal": "ts-node src/core/locator-healer.ts",
+    "report": "ts-node src/reports/html-report.ts"
   },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/PrasanthLevelUp/levelup-ai-qa-agent.git"
   },
-  "keywords": [],
-  "author": "",
+  "keywords": ["qa", "testing", "self-healing", "playwright", "automation"],
+  "author": "PrasanthLevelUp",
   "license": "ISC",
-  "bugs": {
-    "url": "https://github.com/PrasanthLevelUp/levelup-ai-qa-agent/issues"
-  },
-  "homepage": "https://github.com/PrasanthLevelUp/levelup-ai-qa-agent#readme",
-  "description": "",
   "dependencies": {
     "axios": "^1.16.0",
     "dotenv": "^17.4.2",
@@ -29,6 +28,7 @@
   "devDependencies": {
     "@playwright/test": "^1.59.1",
     "@types/node": "^25.6.2",
+    "@types/pg": "^8.11.0",
     "ts-node": "^10.9.2",
     "typescript": "^6.0.3"
   }
