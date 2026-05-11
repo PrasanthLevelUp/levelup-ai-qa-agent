@@ -1,184 +1,89 @@
 /**
- * PR Creator — commits healed files and creates a GitHub Pull Request.
- * Uses local git CLI for commits/push and GitHub REST API for PR creation.
- *
- * CLI: ts-node src/github/pr-creator.ts <config.json>
- *   config: { repoPath, branch, baseBranch, commitMessages, githubToken, owner, repo }
+ * PR Creator — Git commit/push + GitHub Pull Request creation.
  */
 
 import { execSync } from 'child_process';
-import * as fs from 'fs';
 import axios from 'axios';
 import { logger } from '../utils/logger';
 
 const MOD = 'pr-creator';
 
-// ─── Types ─────────────────────────────────────────────────────
-
 export interface CommitSpec {
-  files: string[];           // paths relative to repo root
-  message: string;           // commit message with emoji
+  files: string[];
+  message: string;
 }
-
-export interface PRConfig {
-  repoPath: string;
-  branch: string;
-  baseBranch: string;
-  commits: CommitSpec[];
-  githubToken: string;
-  owner: string;
-  repo: string;
-  prTitle?: string;
-  prBody?: string;
-}
-
-export interface PRResult {
-  branch: string;
-  commitShas: string[];
-  prUrl: string | null;
-  prNumber: number | null;
-}
-
-// ─── Git Operations ────────────────────────────────────────────
 
 function git(repoPath: string, args: string): string {
   return execSync(`git ${args}`, { cwd: repoPath, encoding: 'utf-8' }).trim();
 }
 
 export function createBranch(repoPath: string, branchName: string, baseBranch: string): void {
-  try {
-    git(repoPath, `checkout ${baseBranch}`);
-    git(repoPath, `pull origin ${baseBranch}`);
-  } catch {
-    // Might already be up to date
-  }
+  git(repoPath, `checkout ${baseBranch}`);
+  git(repoPath, `pull origin ${baseBranch}`);
   try {
     git(repoPath, `checkout -b ${branchName}`);
   } catch {
     git(repoPath, `checkout ${branchName}`);
   }
-  logger.info(MOD, `On branch: ${branchName}`);
+  logger.info(MOD, 'Branch ready', { branchName, baseBranch });
 }
 
-export function commitFiles(repoPath: string, spec: CommitSpec): string {
+export function hasChanges(repoPath: string): boolean {
+  return git(repoPath, 'status --porcelain').length > 0;
+}
+
+export function commitFiles(repoPath: string, spec: CommitSpec): string | null {
   for (const file of spec.files) {
     git(repoPath, `add "${file}"`);
   }
+
+  if (!hasChanges(repoPath)) {
+    logger.warn(MOD, 'No staged changes to commit', { message: spec.message });
+    return null;
+  }
+
   git(repoPath, `commit -m "${spec.message.replace(/"/g, '\\"')}"`);
   const sha = git(repoPath, 'rev-parse HEAD');
-  logger.info(MOD, `Committed: ${sha.slice(0, 8)} — ${spec.message}`);
+  logger.info(MOD, 'Commit created', { sha, message: spec.message });
   return sha;
 }
 
-export function pushBranch(repoPath: string, branch: string, githubToken: string, owner: string, repo: string): void {
-  const remoteUrl = `https://${githubToken}@github.com/${owner}/${repo}.git`;
-  execSync(`git push "${remoteUrl}" ${branch}`, {
-    cwd: repoPath,
-    encoding: 'utf-8',
-    stdio: ['pipe', 'pipe', 'pipe'],
-  });
-  logger.info(MOD, `Pushed branch: ${branch}`);
+export function pushBranch(repoPath: string, branch: string): void {
+  git(repoPath, `push -u origin ${branch}`);
+  logger.info(MOD, 'Branch pushed', { branch });
 }
 
-// ─── GitHub PR ─────────────────────────────────────────────────
-
-export async function createPR(
-  githubToken: string,
-  owner: string,
-  repo: string,
-  head: string,
-  base: string,
-  title: string,
-  body: string
-): Promise<{ url: string; number: number } | null> {
+export async function createPR(params: {
+  githubToken: string;
+  owner: string;
+  repo: string;
+  head: string;
+  base: string;
+  title: string;
+  body: string;
+}): Promise<{ url: string; number: number } | null> {
   try {
     const res = await axios.post(
-      `https://api.github.com/repos/${owner}/${repo}/pulls`,
-      { title, head, base, body },
+      `https://api.github.com/repos/${params.owner}/${params.repo}/pulls`,
+      {
+        title: params.title,
+        head: params.head,
+        base: params.base,
+        body: params.body,
+      },
       {
         headers: {
-          Authorization: `Bearer ${githubToken}`,
-          Accept: 'application/vnd.github.v3+json',
+          Authorization: `Bearer ${params.githubToken}`,
+          Accept: 'application/vnd.github+json',
         },
-      }
+      },
     );
-    const prUrl = res.data.html_url as string;
-    const prNum = res.data.number as number;
-    logger.info(MOD, `PR created: ${prUrl}`);
-    return { url: prUrl, number: prNum };
-  } catch (err: unknown) {
-    const axErr = err as { response?: { data?: unknown; status?: number } };
+
+    return { url: res.data.html_url as string, number: res.data.number as number };
+  } catch (error) {
     logger.error(MOD, 'Failed to create PR', {
-      status: axErr.response?.status,
-      data: axErr.response?.data as Record<string, unknown> | undefined,
+      error: (error as Error).message,
     });
     return null;
   }
-}
-
-// ─── Full Workflow ─────────────────────────────────────────────
-
-export async function commitAndCreatePR(config: PRConfig): Promise<PRResult> {
-  const shas: string[] = [];
-
-  // Commit each set of changes
-  for (const spec of config.commits) {
-    const sha = commitFiles(config.repoPath, spec);
-    shas.push(sha);
-  }
-
-  // Push
-  pushBranch(config.repoPath, config.branch, config.githubToken, config.owner, config.repo);
-
-  // Create PR
-  const prTitle = config.prTitle ?? `🔧 Auto-heal: ${config.commits.length} fix(es)`;
-  const prBody = config.prBody ?? buildPRBody(config.commits);
-  const pr = await createPR(
-    config.githubToken, config.owner, config.repo,
-    config.branch, config.baseBranch, prTitle, prBody
-  );
-
-  return {
-    branch: config.branch,
-    commitShas: shas,
-    prUrl: pr?.url ?? null,
-    prNumber: pr?.number ?? null,
-  };
-}
-
-function buildPRBody(commits: CommitSpec[]): string {
-  const lines = [
-    '## 🔧 Self-Healing Test Fixes',
-    '',
-    'This PR was automatically created by the AI QA Agent.',
-    '',
-    '### Changes:',
-    ...commits.map(c => `- ${c.message}`),
-    '',
-    '### Review Notes:',
-    '- All fixes have been verified by re-running the affected tests',
-    '- Please review the locator changes before merging',
-    '',
-    '---',
-    '*Generated by [LevelUp AI QA Agent](https://github.com/PrasanthLevelUp/levelup-ai-qa-agent)*',
-  ];
-  return lines.join('\n');
-}
-
-// ─── CLI ───────────────────────────────────────────────────────
-
-if (require.main === module) {
-  const configFile = process.argv[2];
-  if (!configFile) {
-    console.error('Usage: pr-creator.ts <config.json>');
-    process.exit(1);
-  }
-
-  (async () => {
-    const config = JSON.parse(fs.readFileSync(configFile, 'utf-8')) as PRConfig;
-    const result = await commitAndCreatePR(config);
-    const outPath = '/tmp/pr_result.json';
-    fs.writeFileSync(outPath, JSON.stringify(result, null, 2));
-    console.log(JSON.stringify(result, null, 2));
-  })();
 }

@@ -1,168 +1,72 @@
 /**
- * Failure Analyzer — parses Playwright JSON results, extracts failure details,
- * identifies the failed locator and surrounding code context.
- *
- * CLI: ts-node src/core/failure-analyzer.ts <test-results.json> <test-repo-path>
- * Output (stdout + /tmp/failures.json): structured failure contexts
+ * Failure Analyzer
+ * Converts raw failure artifacts into healing-ready failure details.
  */
 
-import * as fs from 'fs';
-import * as path from 'path';
 import { logger } from '../utils/logger';
+import type { ArtifactCollection } from './artifact-collector';
 
 const MOD = 'failure-analyzer';
 
-// ─── Types ─────────────────────────────────────────────────────
+export type FailureType = 'locator' | 'timeout' | 'assertion' | 'navigation' | 'unknown';
 
-export interface TestResult {
+export interface FailureDetails {
   testName: string;
-  file: string;
-  line: number;
-  status: 'passed' | 'failed' | 'timedOut' | 'skipped';
-  durationMs: number;
-  errors: string[];
-  attachments: Array<{ name: string; path?: string; contentType?: string }>;
-}
-
-export interface FailureContext {
-  testName: string;
-  file: string;
-  line: number;
+  failureType: FailureType;
+  failedLocator: string;
   errorMessage: string;
-  failedLocator: string | null;
-  failedCodeLine: string | null;
-  testFileContent: string;
-  testFilePath: string;
-  siteUrl: string;
+  errorPattern: string;
+  filePath: string;
+  lineNumber: number;
+  failedLineCode: string;
+  surroundingCode: string;
+  screenshotPath: string | null;
+  url: string | null;
+  timestamp: string;
   isTimingIssue: boolean;
-  attachments: Array<{ name: string; path?: string; contentType?: string }>;
 }
 
-export interface AnalysisResult {
-  totalTests: number;
-  passed: number;
-  failed: number;
-  tests: TestResult[];
-  failures: FailureContext[];
+function detectFailureType(errorMessage: string): FailureType {
+  const text = errorMessage.toLowerCase();
+  if (text.includes('timeout') || text.includes('timed out')) return 'timeout';
+  if (text.includes('locator') || text.includes('selector') || text.includes('element') || text.includes('not found')) return 'locator';
+  if (text.includes('expect(') || text.includes('assert')) return 'assertion';
+  if (text.includes('navigation') || text.includes('net::') || text.includes('http')) return 'navigation';
+  return 'unknown';
 }
 
-// ─── Locator Extraction ────────────────────────────────────────
+function isTimingIssue(errorMessage: string): boolean {
+  const t = errorMessage.toLowerCase();
+  return t.includes('timeout') || t.includes('waiting for') || t.includes('navigation') || t.includes('not visible');
+}
 
-const LOCATOR_PATTERNS = [
-  /locator\('([^']+)'\)/,
-  /page\.(fill|click|locator|getByRole|getByText|getByLabel|getByPlaceholder)\(([^)]+)\)/,
-  /selector[:\s]+['"]([^'"]+)['"]/,
-  /waiting for (?:selector|locator) ['"]([^'"]+)['"]/,
-  /Timeout.*?locator\('([^']+)'\)/,
-  /page\.locator\('([^']+)'\)/,
-  /Error:.*locator\('([^']+)'\)/,
-];
+export class FailureAnalyzer {
+  analyze(artifact: ArtifactCollection): FailureDetails {
+    const failureType = detectFailureType(artifact.error_message);
 
-export function extractFailedLocator(errorText: string): string | null {
-  for (const pat of LOCATOR_PATTERNS) {
-    const m = pat.exec(errorText);
-    if (m) {
-      // Return the last captured group (the actual locator string)
-      return m[m.length - 1] ?? null;
-    }
+    const details: FailureDetails = {
+      testName: artifact.test_name,
+      failureType,
+      failedLocator: artifact.failed_locator ?? '',
+      errorMessage: artifact.error_message,
+      errorPattern: artifact.error_pattern,
+      filePath: artifact.file_path,
+      lineNumber: artifact.line_number,
+      failedLineCode: artifact.failed_line_code ?? '',
+      surroundingCode: artifact.surrounding_code,
+      screenshotPath: artifact.screenshot_path,
+      url: artifact.url,
+      timestamp: artifact.timestamp,
+      isTimingIssue: isTimingIssue(artifact.error_message),
+    };
+
+    logger.info(MOD, 'Failure analyzed', {
+      testName: details.testName,
+      failureType: details.failureType,
+      failedLocator: details.failedLocator,
+      isTimingIssue: details.isTimingIssue,
+    });
+
+    return details;
   }
-  return null;
-}
-
-function extractFailedCodeLine(errorText: string, testContent: string): string | null {
-  // Try to find the line number from the stack trace
-  const lineMatch = /\.spec\.ts:(\d+):(\d+)/.exec(errorText);
-  if (lineMatch) {
-    const lineNum = parseInt(lineMatch[1]!, 10);
-    const lines = testContent.split('\n');
-    if (lineNum > 0 && lineNum <= lines.length) {
-      return lines[lineNum - 1]!.trim();
-    }
-  }
-  return null;
-}
-
-function isTimingRelated(errorText: string): boolean {
-  const keywords = ['timeout', 'waiting for', 'not visible', 'timed out', 'navigation'];
-  return keywords.some(kw => errorText.toLowerCase().includes(kw));
-}
-
-// ─── Main Analysis ─────────────────────────────────────────────
-
-export function analyzeResults(
-  resultsPath: string,
-  testRepoPath: string,
-  siteUrl: string = 'https://opensource-demo.orangehrmlive.com'
-): AnalysisResult {
-  const raw = JSON.parse(fs.readFileSync(resultsPath, 'utf-8'));
-  const tests: TestResult[] = [];
-  const failures: FailureContext[] = [];
-
-  for (const suite of raw.suites ?? []) {
-    for (const spec of suite.specs ?? []) {
-      const testName: string = spec.title ?? 'unknown';
-      const file: string = spec.file ?? '';
-      const line: number = spec.line ?? 0;
-
-      for (const test of spec.tests ?? []) {
-        for (const result of test.results ?? []) {
-          const status = result.status as TestResult['status'];
-          const errors: string[] = (result.errors ?? []).map(
-            (e: { message?: string; stack?: string }) => e.message ?? e.stack ?? ''
-          );
-          const attachments = result.attachments ?? [];
-          const durationMs: number = result.duration ?? 0;
-
-          tests.push({ testName, file, line, status, durationMs, errors, attachments });
-
-          if (status !== 'passed') {
-            const fullError = errors.join('\n');
-            const testFilePath = path.join(testRepoPath, 'tests', file);
-            const testFileContent = fs.existsSync(testFilePath)
-              ? fs.readFileSync(testFilePath, 'utf-8')
-              : '';
-
-            failures.push({
-              testName,
-              file,
-              line,
-              errorMessage: fullError,
-              failedLocator: extractFailedLocator(fullError),
-              failedCodeLine: extractFailedCodeLine(fullError, testFileContent),
-              testFileContent,
-              testFilePath,
-              siteUrl,
-              isTimingIssue: isTimingRelated(fullError),
-              attachments,
-            });
-          }
-        }
-      }
-    }
-  }
-
-  const passed = tests.filter(t => t.status === 'passed').length;
-  logger.info(MOD, `Analyzed: ${tests.length} tests, ${passed} passed, ${failures.length} failures`);
-
-  return {
-    totalTests: tests.length,
-    passed,
-    failed: failures.length,
-    tests,
-    failures,
-  };
-}
-
-// CLI mode
-if (require.main === module) {
-  const resultsFile = process.argv[2];
-  const repoPath = process.argv[3];
-  if (!resultsFile || !repoPath) {
-    console.error('Usage: failure-analyzer.ts <test-results.json> <test-repo-path>');
-    process.exit(1);
-  }
-  const result = analyzeResults(resultsFile, repoPath);
-  const outPath = '/tmp/failures.json';
-  fs.writeFileSync(outPath, JSON.stringify(result, null, 2));
-  console.log(JSON.stringify(result, null, 2));
 }
