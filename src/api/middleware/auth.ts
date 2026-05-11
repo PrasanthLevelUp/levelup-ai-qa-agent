@@ -1,36 +1,32 @@
 /**
  * API Key Authentication Middleware
+ * Reads API keys from environment variables (not from JSON config files).
+ * Supports comma-separated list: API_KEYS="key1,key2,key3"
  */
 
 import type { Request, Response, NextFunction } from 'express';
-import * as fs from 'fs';
-import * as path from 'path';
 import { logger } from '../../utils/logger';
 
 const MOD = 'auth-middleware';
 
-interface ApiKeyEntry {
-  key: string;
-  name: string;
-  active: boolean;
-}
+let cachedKeys: string[] | null = null;
 
-interface ApiKeysConfig {
-  keys: ApiKeyEntry[];
-}
-
-let cachedKeys: ApiKeysConfig | null = null;
-
-function loadApiKeys(): ApiKeysConfig {
+function loadApiKeys(): string[] {
   if (cachedKeys) return cachedKeys;
 
-  const configPath = path.join(__dirname, '../../config/api-keys.json');
-  if (!fs.existsSync(configPath)) {
-    logger.warn(MOD, 'api-keys.json not found, using empty key list');
-    return { keys: [] };
+  const envKeys = process.env['API_KEYS'] || '';
+  if (!envKeys.trim()) {
+    logger.warn(MOD, 'API_KEYS environment variable not set or empty. All API requests will be rejected.');
+    cachedKeys = [];
+    return cachedKeys;
   }
 
-  cachedKeys = JSON.parse(fs.readFileSync(configPath, 'utf-8')) as ApiKeysConfig;
+  cachedKeys = envKeys
+    .split(',')
+    .map((k) => k.trim())
+    .filter((k) => k.length > 0);
+
+  logger.info(MOD, `Loaded ${cachedKeys.length} API key(s) from environment`);
   return cachedKeys;
 }
 
@@ -50,10 +46,18 @@ export function authMiddleware(req: Request, res: Response, next: NextFunction):
   }
 
   const token = authHeader.slice(7).trim();
-  const config = loadApiKeys();
-  const matchedKey = config.keys.find((k) => k.key === token && k.active);
+  const validKeys = loadApiKeys();
 
-  if (!matchedKey) {
+  if (validKeys.length === 0) {
+    logger.error(MOD, 'No API keys configured. Set API_KEYS environment variable.');
+    res.status(500).json({
+      error: 'Server Configuration Error',
+      message: 'API authentication is not configured. Contact administrator.',
+    });
+    return;
+  }
+
+  if (!validKeys.includes(token)) {
     logger.warn(MOD, 'Invalid API key attempt', {
       keyPrefix: token.slice(0, 8) + '...',
     });
@@ -65,7 +69,7 @@ export function authMiddleware(req: Request, res: Response, next: NextFunction):
   }
 
   // Attach key info to request
-  (req as any).apiKeyName = matchedKey.name;
-  logger.debug(MOD, 'Authenticated', { keyName: matchedKey.name });
+  (req as any).apiKeyName = `key_${validKeys.indexOf(token) + 1}`;
+  logger.debug(MOD, 'Authenticated', { keyIndex: validKeys.indexOf(token) + 1 });
   next();
 }

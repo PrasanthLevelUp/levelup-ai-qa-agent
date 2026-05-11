@@ -7,3 +7,9 @@ playwright-report/
 *.bak
 .DS_Store
 /tmp/
+
+# Security: never commit API keys or secrets
+/src/config/api-keys.json
+*.key
+*.pem
+*.secret
