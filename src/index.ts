@@ -24,6 +24,7 @@ import {
   getHistoricalStats,
 } from './db/sqlite';
 import { generateReport, type ReportData, type ReportHealing, type ReportTest } from './reports/html-report';
+import { startAPIServer } from './api/server';
 
 const MOD = 'index';
 
@@ -106,11 +107,11 @@ function maybeCommitFix(repoPath: string, filePath: string, message: string, aut
   }
 }
 
-async function main(): Promise<void> {
+async function runCLI(): Promise<void> {
   const cfg = parseArgs();
   fs.mkdirSync(cfg.reportDir, { recursive: true });
 
-  logger.info(MOD, 'Starting refined self-healing orchestrator', {
+  logger.info(MOD, 'Starting refined self-healing orchestrator (CLI mode)', {
     testRepoPath: cfg.testRepoPath,
     siteUrl: cfg.siteUrl,
   });
@@ -321,8 +322,15 @@ async function main(): Promise<void> {
   closeDb();
 }
 
-main().catch((error) => {
-  logger.error(MOD, 'Fatal orchestration error', { error: (error as Error).message });
-  closeDb();
-  process.exit(1);
-});
+// Entry point — support both CLI and API modes
+const mode = process.env['MODE'] || 'cli';
+
+if (mode === 'api') {
+  startAPIServer();
+} else {
+  runCLI().catch((error) => {
+    logger.error(MOD, 'Fatal orchestration error', { error: (error as Error).message });
+    closeDb();
+    process.exit(1);
+  });
+}

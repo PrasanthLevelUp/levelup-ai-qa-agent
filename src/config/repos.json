@@ -1,0 +1,12 @@
+{
+  "repositories": [
+    {
+      "id": "repo_1",
+      "name": "selfhealing_agent_poc",
+      "url": "https://github.com/PrasanthLevelUp/selfhealing_agent_poc",
+      "branch": "main",
+      "localPath": "/home/ubuntu/github_repos/selfhealing_agent_poc",
+      "enabled": true
+    }
+  ]
+}
