@@ -1,6 +1,15 @@
-# LevelUp AI QA Agent v2.0
+# LevelUp AI QA Agent v2.1 (Core-Hardened)
 
-AI-powered self-healing test automation agent with REST API and multi-repo support.
+AI-powered self-healing test automation agent with REST API, multi-repo support, and hardened healing pipeline.
+
+## What's New in v2.1
+
+- **Security**: API keys moved from JSON config to environment variables
+- **7-Check Validation**: syntax, semantic, security, exists, unique, visible, interactable
+- **AST-Based Patching**: Surgical code changes using ts-morph (preserves formatting)
+- **Strategy Selector**: Confidence-based routing with token budget management
+- **37 Rule Engine Strategies**: Expanded from ~20 to 37 deterministic rules
+- **90%+ Success Rate**: Verified with 11 integration test scenarios
 
 ## Architecture
 
@@ -11,7 +20,7 @@ src/
 ├── api/
 │   ├── server.ts                 # Express REST API server
 │   ├── middleware/
-│   │   ├── auth.ts               # API key authentication
+│   │   ├── auth.ts               # API key auth (reads from env vars)
 │   │   └── error-handler.ts      # Global error handler
 │   ├── routes/
 │   │   ├── heal.ts               # POST /api/heal
@@ -24,11 +33,11 @@ src/
 │   └── services/
 │       └── repo-manager.ts       # Multi-repo configuration
 ├── config/
-│   ├── api-keys.json             # API key store
 │   └── repos.json                # Repository configurations
 ├── core/
 │   ├── execution-engine.ts       # Async test execution (spawn-based)
 │   ├── artifact-collector.ts     # Orchestrates artifact collection
+│   ├── healing-strategy-selector.ts  # NEW: Confidence-based routing
 │   ├── failure-analyzer.ts       # Failure classification
 │   ├── healing-orchestrator.ts   # Coordinates healing engines
 │   ├── locator-extractor.ts      # Parses failed locators
