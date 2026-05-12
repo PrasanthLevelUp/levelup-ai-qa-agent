@@ -29,7 +29,7 @@ src/
 │   │   ├── repos.ts              # CRUD /api/repos
 │   │   └── webhook.ts            # POST /api/webhook/github
 │   ├── queue/
-│   │   └── job-queue.ts          # Job queue with SQLite persistence
+│   │   └── job-queue.ts          # Job queue with PostgreSQL persistence
 │   └── services/
 │       └── repo-manager.ts       # Multi-repo configuration
 ├── config/
@@ -45,13 +45,13 @@ src/
 │   └── code-context-extractor.ts # Extracts code context around failures
 ├── engines/
 │   ├── rule-engine.ts            # Level 1: Deterministic rules
-│   ├── pattern-engine.ts         # Level 2: Learned patterns (SQLite)
+│   ├── pattern-engine.ts         # Level 2: Learned patterns (PostgreSQL)
 │   ├── ai-engine.ts              # Level 3: OpenAI suggestions
 │   ├── validation-engine.ts      # Pre-apply validation checks
 │   ├── patch-engine.ts           # Unified diff patch generation
 │   └── rerun-engine.ts           # Isolated test re-execution
 ├── db/
-│   └── sqlite.ts                 # SQLite database layer
+│   └── postgres.ts               # PostgreSQL database layer
 ├── github/
 │   └── pr-creator.ts             # Git operations & PR creation
 ├── reports/
@@ -97,13 +97,13 @@ All API endpoints (except `/api/health` and `/api/webhook`) require Bearer token
 ```bash
 GET /api/health
 # No auth required
-curl http://localhost:3000/api/health
+curl http://localhost:8080/api/health
 ```
 
 #### Queue Healing Job
 ```bash
 POST /api/heal
-curl -X POST http://localhost:3000/api/heal \
+curl -X POST http://localhost:8080/api/heal \
   -H "Authorization: Bearer levelup_dev_test_key_2026" \
   -H "Content-Type: application/json" \
   -d '{"repository": "repo_1", "branch": "main"}'
@@ -122,34 +122,34 @@ Response:
 ```bash
 GET /api/status/:jobId
 curl -H "Authorization: Bearer levelup_dev_test_key_2026" \
-  http://localhost:3000/api/status/job_abc123
+  http://localhost:8080/api/status/job_abc123
 ```
 
 #### Get Report (JSON)
 ```bash
 GET /api/reports/:jobId
 curl -H "Authorization: Bearer levelup_dev_test_key_2026" \
-  http://localhost:3000/api/reports/job_abc123
+  http://localhost:8080/api/reports/job_abc123
 ```
 
 #### Get Report (HTML)
 ```bash
 GET /api/reports/:jobId/html
 curl -H "Authorization: Bearer levelup_dev_test_key_2026" \
-  http://localhost:3000/api/reports/job_abc123/html
+  http://localhost:8080/api/reports/job_abc123/html
 ```
 
 #### List Repositories
 ```bash
 GET /api/repos
 curl -H "Authorization: Bearer levelup_dev_test_key_2026" \
-  http://localhost:3000/api/repos
+  http://localhost:8080/api/repos
 ```
 
 #### Add Repository
 ```bash
 POST /api/repos
-curl -X POST http://localhost:3000/api/repos \
+curl -X POST http://localhost:8080/api/repos \
   -H "Authorization: Bearer levelup_dev_test_key_2026" \
   -H "Content-Type: application/json" \
   -d '{"name": "my-test-repo", "url": "https://github.com/user/repo", "branch": "main"}'
@@ -159,14 +159,14 @@ curl -X POST http://localhost:3000/api/repos \
 ```bash
 DELETE /api/repos/:id
 curl -X DELETE -H "Authorization: Bearer levelup_dev_test_key_2026" \
-  http://localhost:3000/api/repos/repo_2
+  http://localhost:8080/api/repos/repo_2
 ```
 
 #### List All Jobs
 ```bash
 GET /api/jobs
 curl -H "Authorization: Bearer levelup_dev_test_key_2026" \
-  http://localhost:3000/api/jobs
+  http://localhost:8080/api/jobs
 ```
 
 ### GitHub Webhook Integration
@@ -174,7 +174,7 @@ curl -H "Authorization: Bearer levelup_dev_test_key_2026" \
 ```bash
 POST /api/webhook/github
 # No API key required (uses GitHub signature validation)
-curl -X POST http://localhost:3000/api/webhook/github \
+curl -X POST http://localhost:8080/api/webhook/github \
   -H "Content-Type: application/json" \
   -H "X-GitHub-Event: push" \
   -d '{"ref":"refs/heads/main","repository":{"clone_url":"https://github.com/user/repo"},"after":"abc123"}'
@@ -206,13 +206,13 @@ Edit `src/config/repos.json`:
 
 Or use the API:
 ```bash
-curl -X POST http://localhost:3000/api/repos \
+curl -X POST http://localhost:8080/api/repos \
   -H "Authorization: Bearer levelup_dev_test_key_2026" \
   -H "Content-Type: application/json" \
   -d '{"name":"new-repo","url":"https://github.com/user/repo","branch":"main"}'
 ```
 
-## SQLite Storage
+## PostgreSQL Storage
 
 Database: `/home/ubuntu/healing_data.db`
 
@@ -244,10 +244,10 @@ npm run build
 
 ```env
 MODE=api                           # 'api' or 'cli'
-PORT=3000                          # API server port
+PORT=8080                          # API server port
 OPENAI_API_KEY=sk-proj-...         # OpenAI API key
 GITHUB_TOKEN=ghp_...               # GitHub personal access token
-DATABASE_PATH=/home/ubuntu/healing_data.db
+DATABASE_URL=postgresql://user:password@host:5432/levelup_qa
 REPORT_DIR=/home/ubuntu/healing_reports
 LOG_LEVEL=info                     # debug, info, warn, error
 GITHUB_WEBHOOK_SECRET=             # Optional webhook signature validation
@@ -288,7 +288,7 @@ npx ts-node src/index.ts --repo /path/to/test/repo --auto-commit
 - **Express Server**: CORS-enabled, JSON body parsing, error handling
 - **API Key Auth**: Bearer token authentication
 - **Multi-Repo Support**: Configure and manage multiple test repositories
-- **Job Queue**: SQLite-backed job queue with status tracking
+- **Job Queue**: PostgreSQL-backed job queue with status tracking
 - **Webhook Handler**: GitHub Actions integration for automated healing
 - **Comprehensive Reports**: JSON and HTML report endpoints
 
@@ -297,4 +297,4 @@ npx ts-node src/index.ts --repo /path/to/test/repo --auto-commit
 - `.env` is excluded from version control
 - Reports are generated in `REPORT_DIR` directory
 - API keys are stored in `src/config/api-keys.json`
-- The job queue persists jobs across server restarts via SQLite
+- The job queue persists jobs across server restarts via PostgreSQL

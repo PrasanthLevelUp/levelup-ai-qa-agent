@@ -6,13 +6,13 @@ import { Router, type Request, type Response } from 'express';
 import * as fs from 'fs';
 import * as path from 'path';
 import { JobQueue } from '../queue/job-queue';
-import { getHistoricalStats } from '../../db/sqlite';
+import { getHistoricalStats } from '../../db/postgres';
 
 const router = Router();
 
 export function createReportsRouter(jobQueue: JobQueue): Router {
   // JSON report
-  router.get('/:jobId', (req: Request, res: Response) => {
+  router.get('/:jobId', async (req: Request, res: Response) => {
     const jobId = req.params['jobId'] as string;
     const job = jobQueue.getJob(jobId);
 
@@ -31,7 +31,7 @@ export function createReportsRouter(jobQueue: JobQueue): Router {
       return;
     }
 
-    const stats = getHistoricalStats();
+    const stats = await getHistoricalStats();
 
     res.json({
       jobId: job.id,

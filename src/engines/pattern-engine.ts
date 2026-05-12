@@ -1,11 +1,11 @@
 /**
  * Pattern Engine (Level 2)
- * Looks up previously successful locator fixes from SQLite.
+ * Looks up previously successful locator fixes from PostgreSQL.
  */
 
 import { logger } from '../utils/logger';
 import type { FailureDetails } from '../core/failure-analyzer';
-import { lookupPattern } from '../db/sqlite';
+import { lookupPattern } from '../db/postgres';
 
 const MOD = 'pattern-engine';
 
@@ -17,10 +17,10 @@ export interface PatternEngineResult {
 }
 
 export class PatternEngine {
-  findMatch(failure: FailureDetails): PatternEngineResult | null {
+  async findMatch(failure: FailureDetails): Promise<PatternEngineResult | null> {
     if (!failure.failedLocator) return null;
 
-    const pattern = lookupPattern({
+    const pattern = await lookupPattern({
       failed_locator: failure.failedLocator,
       test_name: failure.testName,
       error_pattern: failure.errorPattern,

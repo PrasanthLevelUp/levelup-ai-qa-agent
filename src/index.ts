@@ -15,14 +15,14 @@ import { AIEngine } from './engines/ai-engine';
 import { ValidationLayer } from './validation/validation-layer';
 import { OpenAIClient } from './ai/openai-client';
 import {
-  getDb,
+  initDb,
   closeDb,
   logExecution,
   updateExecution,
   logHealing,
   storePattern,
   getHistoricalStats,
-} from './db/sqlite';
+} from './db/postgres';
 import { generateReport, type ReportData, type ReportHealing, type ReportTest } from './reports/html-report';
 import { startAPIServer } from './api/server';
 
@@ -117,7 +117,7 @@ async function runCLI(): Promise<void> {
   });
 
   // Initialize DB upfront.
-  getDb();
+  await initDb();
 
   const run = ExecutionEngine.run(cfg.testRepoPath);
   const tests = readTestSummary(run.resultsFile);
@@ -143,7 +143,7 @@ async function runCLI(): Promise<void> {
   let totalTokensUsed = 0;
 
   for (const test of tests) {
-    logExecution({
+    await logExecution({
       test_name: test.testName,
       status: test.status,
       error_message: test.error.slice(0, 1000),
@@ -157,7 +157,7 @@ async function runCLI(): Promise<void> {
   for (const artifact of artifacts) {
     const failure = analyzer.analyze(artifact);
 
-    const executionId = logExecution({
+    const executionId = await logExecution({
       test_name: failure.testName,
       status: 'failed',
       error_message: failure.errorMessage.slice(0, 1000),
@@ -172,7 +172,7 @@ async function runCLI(): Promise<void> {
     try {
       const outcome = await orchestrator.heal(failure);
       if (!outcome.suggestion) {
-        logHealing({
+        await logHealing({
           test_execution_id: executionId,
           test_name: failure.testName,
           failed_locator: failure.failedLocator,
@@ -190,7 +190,7 @@ async function runCLI(): Promise<void> {
       const validation = validationLayer.validate(outcome.suggestion, failure);
       if (!validation.approved || !validation.updatedContent) {
         validationRejected += 1;
-        logHealing({
+        await logHealing({
           test_execution_id: executionId,
           test_name: failure.testName,
           failed_locator: failure.failedLocator,
@@ -215,7 +215,7 @@ async function runCLI(): Promise<void> {
       const rerun = ExecutionEngine.run(cfg.testRepoPath, relativeTestFile);
       const success = rerun.exitCode === 0;
 
-      logHealing({
+      await logHealing({
         test_execution_id: executionId,
         test_name: failure.testName,
         failed_locator: failure.failedLocator,
@@ -249,7 +249,7 @@ async function runCLI(): Promise<void> {
       }
 
       healedCount += 1;
-      updateExecution(executionId, { healing_succeeded: true, status: 'healed' });
+      await updateExecution(executionId, { healing_succeeded: true, status: 'healed' });
       cleanupBackup(failure.filePath);
       maybeCommitFix(
         cfg.testRepoPath,
@@ -258,7 +258,7 @@ async function runCLI(): Promise<void> {
         cfg.autoCommit,
       );
 
-      storePattern({
+      await storePattern({
         test_name: failure.testName,
         error_pattern: failure.errorPattern,
         failed_locator: failure.failedLocator,
@@ -289,7 +289,7 @@ async function runCLI(): Promise<void> {
     }
   }
 
-  const hist = getHistoricalStats();
+  const hist = await getHistoricalStats();
   const now = new Date().toISOString();
   const reportData: ReportData = {
     timestamp: now,
@@ -319,18 +319,21 @@ async function runCLI(): Promise<void> {
     patchesGenerated,
   });
 
-  closeDb();
+  await closeDb();
 }
 
 // Entry point — support both CLI and API modes
 const mode = process.env['MODE'] || 'cli';
 
 if (mode === 'api') {
-  startAPIServer();
+  startAPIServer().catch((error) => {
+    logger.error(MOD, 'Failed to start API server', { error: (error as Error).message });
+    process.exit(1);
+  });
 } else {
-  runCLI().catch((error) => {
+  runCLI().catch(async (error) => {
     logger.error(MOD, 'Fatal orchestration error', { error: (error as Error).message });
-    closeDb();
+    await closeDb();
     process.exit(1);
   });
 }

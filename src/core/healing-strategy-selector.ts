@@ -5,7 +5,7 @@
  */
 
 import { logger } from '../utils/logger';
-import { getDb } from '../db/sqlite';
+import { getPool, logTokenUsage as dbLogTokenUsage, getTokensUsedToday as dbGetTokensUsedToday, getDailyCostUsd as dbGetDailyCostUsd } from '../db/postgres';
 import type { FailureDetails } from './failure-analyzer';
 import type { RuleEngine, RuleEngineResult } from '../engines/rule-engine';
 import type { PatternEngine, PatternEngineResult } from '../engines/pattern-engine';
@@ -55,45 +55,21 @@ const DEFAULT_CONFIG: StrategyConfig = {
 /*  Token Usage DB                                                            */
 /* -------------------------------------------------------------------------- */
 
-export function initTokenUsageTable(): void {
-  const db = getDb();
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS token_usage (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      date TEXT NOT NULL,
-      engine TEXT NOT NULL,
-      tokens_used INTEGER NOT NULL,
-      cost_usd REAL NOT NULL,
-      created_at TEXT DEFAULT CURRENT_TIMESTAMP
-    );
-    CREATE INDEX IF NOT EXISTS idx_token_usage_date ON token_usage(date);
-  `);
+export async function initTokenUsageTable(): Promise<void> {
+  // Token usage table is created in initDb() via postgres.ts schema init
+  // This function is kept for API compatibility
 }
 
-export function logTokenUsage(engine: string, tokensUsed: number, costUsd: number): void {
-  const db = getDb();
-  const today = new Date().toISOString().slice(0, 10);
-  db.prepare(
-    `INSERT INTO token_usage (date, engine, tokens_used, cost_usd) VALUES (?, ?, ?, ?)`,
-  ).run(today, engine, tokensUsed, costUsd);
+export async function logTokenUsage(engine: string, tokensUsed: number, costUsd: number): Promise<void> {
+  await dbLogTokenUsage(engine, tokensUsed, costUsd);
 }
 
-export function getTokensUsedToday(): number {
-  const db = getDb();
-  const today = new Date().toISOString().slice(0, 10);
-  const row = db.prepare(
-    `SELECT COALESCE(SUM(tokens_used), 0) AS total FROM token_usage WHERE date = ?`,
-  ).get(today) as { total: number };
-  return row.total;
+export async function getTokensUsedToday(): Promise<number> {
+  return dbGetTokensUsedToday();
 }
 
-export function getDailyCostUsd(): number {
-  const db = getDb();
-  const today = new Date().toISOString().slice(0, 10);
-  const row = db.prepare(
-    `SELECT COALESCE(SUM(cost_usd), 0) AS total FROM token_usage WHERE date = ?`,
-  ).get(today) as { total: number };
-  return row.total;
+export async function getDailyCostUsd(): Promise<number> {
+  return dbGetDailyCostUsd();
 }
 
 /* -------------------------------------------------------------------------- */
@@ -105,8 +81,7 @@ export class HealingStrategySelector {
 
   constructor(config?: Partial<StrategyConfig>) {
     this.config = { ...DEFAULT_CONFIG, ...config };
-    // Ensure the token_usage table exists
-    try { initTokenUsageTable(); } catch {}
+    // Token usage table is initialized via initDb() in postgres.ts
   }
 
   /**
@@ -137,7 +112,7 @@ export class HealingStrategySelector {
     }
 
     // Priority 2: Pattern Engine (free, learned from history)
-    const patternResult = patternEngine.findMatch(failure);
+    const patternResult = await patternEngine.findMatch(failure);
     if (patternResult && patternResult.confidence >= this.config.confidenceThresholds.pattern) {
       logger.info(MOD, 'Pattern engine selected', {
         confidence: patternResult.confidence,
@@ -153,7 +128,7 @@ export class HealingStrategySelector {
     }
 
     // Priority 3: AI Engine (costs tokens, flexible)
-    const availableBudget = this.getAvailableTokenBudget();
+    const availableBudget = await this.getAvailableTokenBudget();
     const estimatedTokens = 2000; // Estimated tokens per AI call
     const estimatedCost = estimatedTokens * 0.00003; // ~$0.03 per 1K tokens (gpt-4o-mini)
 
@@ -189,9 +164,9 @@ export class HealingStrategySelector {
     };
   }
 
-  getAvailableTokenBudget(): number {
+  async getAvailableTokenBudget(): Promise<number> {
     try {
-      const used = getTokensUsedToday();
+      const used = await getTokensUsedToday();
       const limit = this.config.costLimits.perDay;
       return Math.max(0, limit - used);
     } catch {
@@ -202,10 +177,10 @@ export class HealingStrategySelector {
   /**
    * Record token usage after an AI call completes.
    */
-  recordUsage(engine: string, tokensUsed: number): void {
+  async recordUsage(engine: string, tokensUsed: number): Promise<void> {
     const costUsd = tokensUsed * 0.00003;
     try {
-      logTokenUsage(engine, tokensUsed, costUsd);
+      await logTokenUsage(engine, tokensUsed, costUsd);
       logger.info(MOD, 'Token usage recorded', { engine, tokensUsed, costUsd });
     } catch (err: any) {
       logger.warn(MOD, 'Failed to record token usage', { error: err.message });
@@ -215,10 +190,10 @@ export class HealingStrategySelector {
   /**
    * Get usage statistics for reporting.
    */
-  getUsageStats(): { tokensUsedToday: number; budgetRemaining: number; dailyCost: number } {
+  async getUsageStats(): Promise<{ tokensUsedToday: number; budgetRemaining: number; dailyCost: number }> {
     try {
-      const tokensUsedToday = getTokensUsedToday();
-      const dailyCost = getDailyCostUsd();
+      const tokensUsedToday = await getTokensUsedToday();
+      const dailyCost = await getDailyCostUsd();
       return {
         tokensUsedToday,
         budgetRemaining: Math.max(0, this.config.costLimits.perDay - tokensUsedToday),

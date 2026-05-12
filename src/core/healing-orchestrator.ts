@@ -16,7 +16,7 @@ import { logger } from '../utils/logger';
 import {
   logHealing,
   storePattern,
-} from '../db/sqlite';
+} from '../db/postgres';
 
 const MOD = 'healing-orchestrator';
 
@@ -130,7 +130,7 @@ export class HealingOrchestrator {
 
     // Record token usage for AI calls
     if (suggestion.strategy === 'ai_reasoning' && suggestion.tokensUsed > 0) {
-      this.strategySelector.recordUsage('ai', suggestion.tokensUsed);
+      await this.strategySelector.recordUsage('ai', suggestion.tokensUsed);
     }
 
     return { suggestion, attemptedStrategies, selectedEngine: selected.engine };
@@ -148,7 +148,7 @@ export class HealingOrchestrator {
       const suggestion = await this.tryEngine(eng, failure, attemptedStrategies);
       if (suggestion) {
         if (suggestion.strategy === 'ai_reasoning' && suggestion.tokensUsed > 0) {
-          this.strategySelector.recordUsage('ai', suggestion.tokensUsed);
+          await this.strategySelector.recordUsage('ai', suggestion.tokensUsed);
         }
         return { suggestion, attemptedStrategies };
       }
@@ -205,7 +205,7 @@ export class HealingOrchestrator {
       }
 
       case 'pattern': {
-        const patternResult = this.patternEngine.findMatch(failure);
+        const patternResult = await this.patternEngine.findMatch(failure);
         if (patternResult) {
           const validation = this.validationEngine.validate({
             newLocator: patternResult.newLocator,
@@ -292,7 +292,7 @@ export class HealingOrchestrator {
     );
 
     // Log to database
-    logHealing({
+    await logHealing({
       test_execution_id: executionId,
       test_name: failure.testName,
       failed_locator: failure.failedLocator,
@@ -308,7 +308,7 @@ export class HealingOrchestrator {
     });
 
     // Store learned pattern
-    storePattern({
+    await storePattern({
       test_name: failure.testName,
       error_pattern: failure.errorPattern,
       failed_locator: failure.failedLocator,

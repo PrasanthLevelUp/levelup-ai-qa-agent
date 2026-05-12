@@ -18,7 +18,7 @@ import { createWebhookRouter } from './routes/webhook';
 import { JobQueue } from './queue/job-queue';
 import { RepoManager } from './services/repo-manager';
 import { logger } from '../utils/logger';
-import { getDb, closeDb } from '../db/sqlite';
+import { initDb, closeDb } from '../db/postgres';
 
 // Import healing pipeline components
 import { ExecutionEngine } from '../core/execution-engine';
@@ -38,7 +38,7 @@ import {
   logHealing,
   storePattern,
   getHistoricalStats,
-} from '../db/sqlite';
+} from '../db/postgres';
 import type { HealingJob } from './queue/job-queue';
 
 const MOD = 'api-server';
@@ -59,8 +59,7 @@ export function createServer(): express.Application {
     next();
   });
 
-  // Initialize DB
-  getDb();
+  // Initialize DB (async — called in startAPIServer)
 
   // Initialize services
   const jobQueue = new JobQueue(1);
@@ -101,8 +100,12 @@ export function createServer(): express.Application {
   return app;
 }
 
-export function startAPIServer(): void {
-  const port = parseInt(process.env['PORT'] || '3000', 10);
+export async function startAPIServer(): Promise<void> {
+  const port = parseInt(process.env['PORT'] || '8080', 10);
+
+  // Initialize PostgreSQL schema before starting server
+  await initDb();
+
   const app = createServer();
 
   const server = app.listen(port, () => {
@@ -113,17 +116,17 @@ export function startAPIServer(): void {
   });
 
   // Graceful shutdown
-  const shutdown = () => {
+  const shutdown = async () => {
     logger.info(MOD, 'Shutting down gracefully...');
-    server.close(() => {
-      closeDb();
+    server.close(async () => {
+      await closeDb();
       process.exit(0);
     });
     setTimeout(() => process.exit(1), 10_000);
   };
 
-  process.on('SIGTERM', shutdown);
-  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', () => shutdown());
+  process.on('SIGINT', () => shutdown());
 }
 
 /**
@@ -228,7 +231,7 @@ function createHealingWorker(
         healed: false,
       });
 
-      const executionId = logExecution({
+      const executionId = await logExecution({
         test_name: failure.testName,
         status: 'failed',
         error_message: failure.errorMessage.slice(0, 1000),
@@ -265,7 +268,7 @@ function createHealingWorker(
         const rerun = ExecutionEngine.run(testRepoPath, relativeTestFile);
         const success = rerun.exitCode === 0;
 
-        logHealing({
+        await logHealing({
           test_execution_id: executionId,
           test_name: failure.testName,
           failed_locator: failure.failedLocator,
@@ -294,10 +297,10 @@ function createHealingWorker(
 
         if (success) {
           healedCount++;
-          updateExecution(executionId, { healing_succeeded: true, status: 'healed' });
+          await updateExecution(executionId, { healing_succeeded: true, status: 'healed' });
           cleanupBackup(failure.filePath);
 
-          storePattern({
+          await storePattern({
             test_name: failure.testName,
             error_pattern: failure.errorPattern,
             failed_locator: failure.failedLocator,
@@ -328,7 +331,7 @@ function createHealingWorker(
 
     // Generate report
     const now = new Date().toISOString();
-    const hist = getHistoricalStats();
+    const hist = await getHistoricalStats();
     const reportData: ReportData = {
       timestamp: now,
       commitSha: job.commit || 'unknown',

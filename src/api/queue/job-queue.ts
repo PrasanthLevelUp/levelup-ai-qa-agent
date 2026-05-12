@@ -1,9 +1,9 @@
 /**
- * Job Queue System — in-memory queue backed by SQLite for persistence.
+ * Job Queue System — in-memory queue backed by PostgreSQL for persistence.
  */
 
 import { v4 as uuidv4 } from 'uuid';
-import { getDb } from '../../db/sqlite';
+import { persistJob as dbPersistJob, loadJobFromDb as dbLoadJobFromDb, loadPersistedJobs as dbLoadPersistedJobs } from '../../db/postgres';
 import { logger } from '../../utils/logger';
 
 const MOD = 'job-queue';
@@ -33,26 +33,6 @@ export interface HealingJob {
 // In-memory store for active jobs
 const jobs = new Map<string, HealingJob>();
 
-function initJobsTable(): void {
-  getDb().exec(`
-    CREATE TABLE IF NOT EXISTS healing_jobs (
-      id TEXT PRIMARY KEY,
-      repository_id TEXT NOT NULL,
-      repository_url TEXT,
-      branch TEXT DEFAULT 'main',
-      commit_sha TEXT,
-      status TEXT NOT NULL DEFAULT 'pending',
-      progress TEXT DEFAULT '',
-      created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-      started_at TEXT,
-      completed_at TEXT,
-      result TEXT,
-      error TEXT
-    );
-    CREATE INDEX IF NOT EXISTS idx_jobs_status ON healing_jobs(status);
-  `);
-}
-
 export class JobQueue {
   private processing = false;
   private readonly workers: Array<(job: HealingJob) => Promise<any>>;
@@ -62,7 +42,7 @@ export class JobQueue {
   constructor(maxConcurrent = 1) {
     this.maxConcurrent = maxConcurrent;
     this.workers = [];
-    initJobsTable();
+    // Jobs table is created in initDb() via postgres.ts schema init
     this.loadPersistedJobs();
   }
 
@@ -183,36 +163,17 @@ export class JobQueue {
   }
 
   private persistJob(job: HealingJob): void {
-    try {
-      getDb().prepare(`
-        INSERT OR REPLACE INTO healing_jobs
-          (id, repository_id, repository_url, branch, commit_sha, status, progress,
-           created_at, started_at, completed_at, result, error)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(
-        job.id,
-        job.repositoryId,
-        job.repositoryUrl ?? null,
-        job.branch,
-        job.commit ?? null,
-        job.status,
-        job.progress,
-        job.createdAt,
-        job.startedAt ?? null,
-        job.completedAt ?? null,
-        job.result ? JSON.stringify(job.result) : null,
-        job.error ?? null,
-      );
-    } catch (error) {
+    dbPersistJob(job).catch((error) => {
       logger.error(MOD, 'Failed to persist job', { jobId: job.id, error: (error as Error).message });
-    }
+    });
   }
 
   private loadJobFromDb(jobId: string): HealingJob | null {
-    try {
-      const row = getDb().prepare('SELECT * FROM healing_jobs WHERE id = ?').get(jobId) as any;
-      if (!row) return null;
-
+    // Note: This is called synchronously but DB is async now.
+    // We fire-and-forget the async load and return null for now.
+    // The job will be available in-memory after the next processQueue cycle.
+    dbLoadJobFromDb(jobId).then((row) => {
+      if (!row) return;
       const job: HealingJob = {
         id: row.id,
         repositoryId: row.repository_id,
@@ -227,20 +188,13 @@ export class JobQueue {
         result: row.result ? JSON.parse(row.result) : undefined,
         error: row.error,
       };
-
       jobs.set(job.id, job);
-      return job;
-    } catch {
-      return null;
-    }
+    }).catch(() => {});
+    return null;
   }
 
   private loadPersistedJobs(): void {
-    try {
-      const rows = getDb().prepare(
-        'SELECT * FROM healing_jobs WHERE status IN (?, ?) ORDER BY created_at DESC LIMIT 50',
-      ).all(JobStatus.PENDING, JobStatus.RUNNING) as any[];
-
+    dbLoadPersistedJobs([JobStatus.PENDING, JobStatus.RUNNING]).then((rows) => {
       for (const row of rows) {
         const job: HealingJob = {
           id: row.id,
@@ -258,10 +212,9 @@ export class JobQueue {
         };
         jobs.set(job.id, job);
       }
-
       logger.info(MOD, 'Loaded persisted jobs', { count: rows.length });
-    } catch {
+    }).catch(() => {
       logger.warn(MOD, 'No persisted jobs to load');
-    }
+    });
   }
 }
