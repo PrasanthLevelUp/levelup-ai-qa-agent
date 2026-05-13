@@ -9,6 +9,9 @@ import { HealingStrategySelector, type SelectedStrategy } from './healing-strate
 import { RuleEngine } from '../engines/rule-engine';
 import { PatternEngine } from '../engines/pattern-engine';
 import { AIEngine } from '../engines/ai-engine';
+import { DOMCandidateExtractor, type DOMExtractionResult } from '../engines/dom-candidate-extractor';
+import { SemanticSimilarityEngine } from '../engines/semantic-similarity-engine';
+import { ConfidenceEngine, type ConfidenceResult } from '../engines/confidence-engine';
 import { ValidationEngine, type ValidationResult } from '../engines/validation-engine';
 import { PatchEngine, type PatchResult } from '../engines/patch-engine';
 import { RerunEngine, type RerunResult } from '../engines/rerun-engine';
@@ -40,6 +43,8 @@ export interface HealingOutcome {
   attemptedStrategies: HealingStrategy[];
   validationResult?: ValidationResult;
   selectedEngine?: string;
+  confidenceResult?: ConfidenceResult;
+  domCandidates?: DOMExtractionResult;
 }
 
 export interface FinalizeResult {
@@ -60,6 +65,9 @@ export class HealingOrchestrator {
   private readonly patchEngine: PatchEngine;
   private readonly rerunEngine: RerunEngine;
   private readonly strategySelector: HealingStrategySelector;
+  private readonly domExtractor: DOMCandidateExtractor;
+  private readonly similarityEngine: SemanticSimilarityEngine;
+  private readonly confidenceEngine: ConfidenceEngine;
 
   constructor(
     private readonly ruleEngine: RuleEngine,
@@ -74,13 +82,78 @@ export class HealingOrchestrator {
     this.patchEngine = patchEngine ?? new PatchEngine();
     this.rerunEngine = rerunEngine ?? new RerunEngine();
     this.strategySelector = strategySelector ?? new HealingStrategySelector();
+    this.domExtractor = new DOMCandidateExtractor();
+    this.similarityEngine = new SemanticSimilarityEngine();
+    this.confidenceEngine = new ConfidenceEngine();
   }
 
   /**
-   * Main healing flow — confidence-based routing with strategy selector.
+   * Main healing flow — enhanced with DOM candidate extraction.
+   * Priority: DOM Candidates → Rule Engine → Pattern Engine → AI Engine
+   *
+   * @param failure - Analyzed failure details
+   * @param domHtml - Optional: raw DOM HTML from page.content() for DOM-based healing
    */
-  async heal(failure: FailureDetails): Promise<HealingOutcome> {
+  async heal(failure: FailureDetails, domHtml?: string): Promise<HealingOutcome> {
     const attemptedStrategies: HealingStrategy[] = [];
+    let domCandidates: DOMExtractionResult | undefined;
+
+    // Step 0: DOM Candidate Extraction (if DOM HTML is available)
+    if (domHtml && failure.failedLocator) {
+      logger.info(MOD, 'Running DOM candidate extraction', {
+        testName: failure.testName,
+        failedLocator: failure.failedLocator,
+        domLength: domHtml.length,
+      });
+
+      domCandidates = this.domExtractor.extractFromHTML(
+        domHtml,
+        failure.failedLocator,
+        failure.failedLineCode || '',
+      );
+
+      if (domCandidates.candidates.length > 0) {
+        const topCandidate = domCandidates.candidates[0];
+
+        // Calculate enhanced confidence
+        const confidenceResult = this.confidenceEngine.calculate({
+          strategy: 'dom_candidate',
+          rawConfidence: topCandidate.score,
+          selectorType: topCandidate.matchType === 'semantic' ? 'semantic' : 'css_attribute',
+          similarityScore: topCandidate.score,
+          domValidated: true,
+          matchType: topCandidate.matchType,
+          sameTag: true,
+        });
+
+        if (confidenceResult.finalScore >= 0.70) {
+          logger.info(MOD, 'DOM candidate accepted', {
+            selector: topCandidate.selector,
+            score: topCandidate.score,
+            confidence: confidenceResult.finalScore,
+            grade: confidenceResult.grade,
+            reasoning: topCandidate.reasoning,
+          });
+
+          const suggestion: HealingSuggestion = {
+            newLocator: topCandidate.selector,
+            strategy: 'rule_based', // DOM extraction is deterministic, 0 tokens
+            confidence: confidenceResult.finalScore,
+            tokensUsed: 0,
+            reasoning: `[DOM Candidate] ${topCandidate.reasoning}`,
+            addExplicitWait: false,
+          };
+
+          return {
+            suggestion,
+            attemptedStrategies: ['rule_based'],
+            selectedEngine: 'dom_candidate',
+            confidenceResult,
+            domCandidates,
+          };
+        }
+      }
+    }
 
     // Step 1: Use strategy selector to determine best approach
     const selected = await this.strategySelector.selectStrategy(
@@ -125,15 +198,28 @@ export class HealingOrchestrator {
         testName: failure.testName,
         attemptedStrategies,
       });
-      return { suggestion: null, attemptedStrategies, selectedEngine: selected.engine };
+      return { suggestion: null, attemptedStrategies, selectedEngine: selected.engine, domCandidates };
     }
+
+    // Calculate enhanced confidence for the chosen suggestion
+    const confidenceResult = this.confidenceEngine.calculate({
+      strategy: suggestion.strategy === 'rule_based' ? 'rule_based'
+        : suggestion.strategy === 'database_pattern' ? 'database_pattern'
+        : 'ai_reasoning',
+      rawConfidence: suggestion.confidence,
+      selectorType: suggestion.newLocator.includes('getBy') ? 'semantic' : 'css_attribute',
+      similarityScore: suggestion.confidence,
+    });
+
+    // Update confidence with enhanced score
+    suggestion.confidence = confidenceResult.finalScore;
 
     // Record token usage for AI calls
     if (suggestion.strategy === 'ai_reasoning' && suggestion.tokensUsed > 0) {
       await this.strategySelector.recordUsage('ai', suggestion.tokensUsed);
     }
 
-    return { suggestion, attemptedStrategies, selectedEngine: selected.engine };
+    return { suggestion, attemptedStrategies, selectedEngine: selected.engine, confidenceResult, domCandidates };
   }
 
   /**

@@ -300,25 +300,84 @@ export class RuleEngine {
     // Rule 15: Input by name attribute
     if (/input\s*\[\s*name\s*=/.test(locator)) {
       const nameValueMatch = /name\s*=\s*['"]?([^'")\]]+)['"]?/.exec(locator);
-      const fieldName = humanize(nameValueMatch?.[1] ?? 'input');
+      const nameValue = nameValueMatch?.[1] ?? '';
+      const fieldName = humanize(nameValue);
       rulesApplied.push('R15_input_name');
 
+      // R15_attr: Attribute-based fuzzy candidates (HIGHEST PRIORITY)
+      // When input[name="user"] fails, try common extensions like "username"
+      const commonMappings: Array<{ suffix: string; confidence: number }> = [
+        { suffix: 'name', confidence: 0.95 },      // user → username
+        { suffix: '_name', confidence: 0.94 },      // user → user_name
+        { suffix: 'Name', confidence: 0.94 },       // user → userName
+        { suffix: '_id', confidence: 0.90 },         // user → user_id
+        { suffix: 'Id', confidence: 0.90 },          // user → userId
+        { suffix: '_input', confidence: 0.88 },      // user → user_input
+        { suffix: 'Input', confidence: 0.88 },       // user → userInput
+        { suffix: '_field', confidence: 0.86 },      // user → user_field
+      ];
+
+      // Also try known semantic equivalences
+      const semanticMappings: Record<string, string[]> = {
+        'user': ['username', 'userName', 'user_name', 'login', 'loginName', 'uname'],
+        'pass': ['password', 'passwd', 'passWord', 'pass_word', 'pwd'],
+        'pwd': ['password', 'passwd'],
+        'email': ['emailAddress', 'email_address', 'mail', 'userEmail'],
+        'mail': ['email', 'emailAddress'],
+        'phone': ['phoneNumber', 'phone_number', 'tel', 'telephone', 'mobile'],
+        'tel': ['phone', 'phoneNumber', 'telephone'],
+        'addr': ['address', 'streetAddress', 'street_address'],
+        'fname': ['firstName', 'first_name', 'givenName'],
+        'lname': ['lastName', 'last_name', 'surname'],
+        'first': ['firstName', 'first_name'],
+        'last': ['lastName', 'last_name'],
+        'name': ['fullName', 'full_name', 'displayName'],
+        'msg': ['message', 'comment', 'body'],
+        'search': ['query', 'searchQuery', 'keyword', 'q'],
+        'zip': ['zipcode', 'zipCode', 'postalCode', 'postal_code'],
+      };
+
+      // Add semantic mappings first (highest confidence for known equivalences)
+      const knownAlternatives = semanticMappings[nameValue.toLowerCase()] || [];
+      for (const alt of knownAlternatives) {
+        suggestions.push({
+          newLocator: `input[name="${alt}"]`,
+          confidence: 0.96,
+          reasoning: `Semantic mapping: input[name="${nameValue}"] → input[name="${alt}"] (known equivalent).`,
+          ruleId: 'R15_semantic',
+        });
+      }
+
+      // Add suffix-based candidates
+      for (const { suffix, confidence } of commonMappings) {
+        const candidate = nameValue + suffix;
+        // Skip if already covered by semantic mappings
+        if (knownAlternatives.some(a => a.toLowerCase() === candidate.toLowerCase())) continue;
+        suggestions.push({
+          newLocator: `input[name="${candidate}"]`,
+          confidence,
+          reasoning: `Attribute fuzzy: input[name="${nameValue}"] → input[name="${candidate}"] (common naming pattern).`,
+          ruleId: 'R15_attr',
+        });
+      }
+
+      // Then add semantic locator fallbacks (lower priority than attribute fixes)
       suggestions.push({
         newLocator: `page.getByLabel(/${fieldName}/i)`,
-        confidence: 0.93,
-        reasoning: 'Input[name] → label-first locator (best for inputs).',
+        confidence: 0.82,
+        reasoning: 'Input[name] → label-first locator (fallback if no label exists, will fail).',
         ruleId: 'R15',
       });
       suggestions.push({
         newLocator: `page.getByPlaceholder(/${fieldName}/i)`,
-        confidence: 0.88,
-        reasoning: 'Input[name] → placeholder locator.',
+        confidence: 0.78,
+        reasoning: 'Input[name] → placeholder locator (fallback).',
         ruleId: 'R15b',
       });
       suggestions.push({
         newLocator: `page.getByRole('textbox', { name: /${fieldName}/i })`,
-        confidence: 0.86,
-        reasoning: 'Input[name] → textbox role locator.',
+        confidence: 0.76,
+        reasoning: 'Input[name] → textbox role locator (fallback).',
         ruleId: 'R15c',
       });
     }

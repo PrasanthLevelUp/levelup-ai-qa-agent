@@ -268,6 +268,13 @@ export class ValidationEngine {
   /* ---- Individual check methods ---- */
 
   validateSyntaxCheck(locator: string, fileName: string): ValidationCheckDetail {
+    // CSS/attribute selectors are valid locators but not valid TS expressions
+    // Accept them directly without TS validation
+    const isCSSSelector = /^[a-z#.\[*][\w\-\[\]="'#.\s:,>+~()]*$/i.test(locator);
+    if (isCSSSelector) {
+      return { name: 'syntax', passed: true, detail: 'Valid CSS/attribute selector' };
+    }
+
     // Check if the locator string itself is syntactically valid as a TS expression
     const code = `const _test = ${locator};`;
     const result = ts.transpileModule(code, {
@@ -324,12 +331,20 @@ export class ValidationEngine {
 
   validateSemanticCheck(locator: string): ValidationCheckDetail {
     const isSemantic = SEMANTIC_LOCATORS.some((s) => locator.includes(s));
+    // Also accept stable CSS attribute selectors like input[name="username"], #id
+    const isStableCSS = /^[a-z]+\[[a-z-]+="[^"]+"\]$/i.test(locator)
+      || /^#[\w-]+$/.test(locator)
+      || /^\[data-testid="[^"]+"\]$/.test(locator);
+
+    const passed = isSemantic || isStableCSS;
     return {
       name: 'semantic',
-      passed: isSemantic,
+      passed,
       detail: isSemantic
         ? 'Uses semantic locator'
-        : 'Non-semantic locator (CSS/XPath) — prefer getByRole/getByLabel/getByText',
+        : isStableCSS
+          ? 'Uses stable CSS attribute selector (acceptable for attribute healing)'
+          : 'Non-semantic locator (CSS/XPath) — prefer getByRole/getByLabel/getByText',
     };
   }
 
