@@ -119,6 +119,7 @@ async function runCLI(): Promise<void> {
   // Initialize DB upfront.
   await initDb();
 
+  await ExecutionEngine.installDependencies(cfg.testRepoPath);
   const run = ExecutionEngine.run(cfg.testRepoPath);
   const tests = readTestSummary(run.resultsFile);
 
