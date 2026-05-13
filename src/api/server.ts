@@ -282,12 +282,33 @@ function createHealingWorker(
         totalTokensUsed += outcome.suggestion.tokensUsed;
         validationLayer.applyValidatedFix(failure.filePath, validation.updatedContent);
 
+        // Log the transformed file content for debugging
+        const transformedContent = fs.readFileSync(failure.filePath, 'utf-8');
+        logger.info(MOD, 'Transformed test file content', {
+          testName: failure.testName,
+          filePath: failure.filePath,
+          contentPreview: transformedContent.substring(0, 500),
+        });
+
         const relativeTestFile = path.relative(
           path.join(testRepoPath, 'tests'),
           failure.filePath,
         );
+        logger.info(MOD, 'Running healed test rerun', {
+          testRepoPath,
+          relativeTestFile,
+          cmd: `npx playwright test "${relativeTestFile}" --reporter=json --output=test-results`,
+        });
+
         const rerun = ExecutionEngine.run(testRepoPath, relativeTestFile);
         const success = rerun.exitCode === 0;
+
+        logger.info(MOD, 'Rerun result', {
+          exitCode: rerun.exitCode,
+          success,
+          stdout: rerun.stdout?.substring(0, 300),
+          stderr: rerun.stderr?.substring(0, 300),
+        });
 
         await logHealing({
           test_execution_id: executionId,
