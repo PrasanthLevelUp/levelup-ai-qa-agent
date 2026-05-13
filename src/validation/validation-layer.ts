@@ -134,29 +134,78 @@ export class ValidationLayer {
     return input.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   }
 
+  /**
+   * Checks if the locator expression is a bare CSS/attribute selector
+   * (not a Playwright API call). E.g. input[name="username"], #login-btn
+   */
+  private isBareSelector(expr: string): boolean {
+    // Already a Playwright API call like page.getByRole(...) or page.locator(...)
+    if (/^page\./.test(expr)) return false;
+    // CSS attribute selector: tag[attr="value"]
+    if (/^[a-z]+\[.+\]$/i.test(expr)) return true;
+    // ID selector: #some-id
+    if (/^#[\w-]+$/.test(expr)) return true;
+    // Data attribute selector: [data-testid="x"]
+    if (/^\[[\w-]+="[^"]+"\]$/.test(expr)) return true;
+    // Class selector: .some-class
+    if (/^\.[\w-]+$/.test(expr)) return true;
+    return false;
+  }
+
+  /**
+   * Wraps a bare CSS selector in page.locator('...') if needed.
+   * Playwright API calls like page.getByRole(...) are returned as-is.
+   */
+  private toPlaywrightLocator(expr: string): string {
+    if (this.isBareSelector(expr)) {
+      return `page.locator('${expr}')`;
+    }
+    return expr;
+  }
+
   private applyLocatorReplacement(content: string, failedLocator: string, newLocatorExpr: string): string {
     const escapedLocator = this.escapeRegex(failedLocator);
+    const pwLocator = this.toPlaywrightLocator(newLocatorExpr);
 
+    logger.info(MOD, 'applyLocatorReplacement', {
+      failedLocator,
+      newLocatorExpr,
+      wrappedLocator: pwLocator,
+    });
+
+    let result = content;
+
+    // page.click('selector') → pwLocator.click()
+    // Note: NOT adding 'await' since original `await page.click(...)` already has it
     const clickPattern = new RegExp(`page\\.click\\((['\"])${escapedLocator}\\1\\)`, 'g');
     if (clickPattern.test(content)) {
-      return content.replace(clickPattern, `${newLocatorExpr}.click()`);
+      result = content.replace(new RegExp(`page\\.click\\((['\"])${escapedLocator}\\1\\)`, 'g'), `${pwLocator}.click()`);
+      if (result !== content) return result;
     }
 
+    // page.fill('selector', value) → pwLocator.fill(value)
+    // Note: NOT adding 'await' since original `await page.fill(...)` already has it
     const fillPattern = new RegExp(`page\\.fill\\((['\"])${escapedLocator}\\1\\s*,`, 'g');
     if (fillPattern.test(content)) {
-      return content.replace(fillPattern, `${newLocatorExpr}.fill(`);
+      result = content.replace(new RegExp(`page\\.fill\\((['\"])${escapedLocator}\\1\\s*,`, 'g'), `${pwLocator}.fill(`);
+      if (result !== content) return result;
     }
 
+    // page.locator('selector') → pwLocator
     const locatorPattern = new RegExp(`page\\.locator\\((['\"])${escapedLocator}\\1\\)`, 'g');
     if (locatorPattern.test(content)) {
-      return content.replace(locatorPattern, `${newLocatorExpr}`);
+      result = content.replace(new RegExp(`page\\.locator\\((['\"])${escapedLocator}\\1\\)`, 'g'), pwLocator);
+      if (result !== content) return result;
     }
 
+    // expect(page.locator('selector')) → expect(pwLocator)
     const expectPattern = new RegExp(`expect\\(page\\.locator\\((['\"])${escapedLocator}\\1\\)\\)`, 'g');
     if (expectPattern.test(content)) {
-      return content.replace(expectPattern, `expect(${newLocatorExpr})`);
+      result = content.replace(new RegExp(`expect\\(page\\.locator\\((['\"])${escapedLocator}\\1\\)\\)`, 'g'), `expect(${pwLocator})`);
+      if (result !== content) return result;
     }
 
+    // Fallback: simple string replacement
     return content.replace(failedLocator, newLocatorExpr);
   }
 
