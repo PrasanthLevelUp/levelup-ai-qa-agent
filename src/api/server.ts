@@ -174,7 +174,6 @@ function createHealingWorker(
 
     // Step 3: Run tests
     jobQueue.updateJob(job.id, { progress: 'Running tests...' });
-    await ExecutionEngine.installDependencies(testRepoPath);
     const run = ExecutionEngine.run(testRepoPath);
 
     // Step 4: Collect artifacts

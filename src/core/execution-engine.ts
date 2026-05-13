@@ -26,8 +26,11 @@ export class ExecutionEngine {
    */
   static async cloneRepository(repoUrl: string, targetDir: string, branch = 'main'): Promise<void> {
     if (fs.existsSync(path.join(targetDir, '.git'))) {
-      logger.info(MOD, 'Repository exists, pulling latest', { targetDir, branch });
+      logger.info(MOD, 'Repository exists, resetting and pulling latest', { targetDir, branch });
+      // Always reset to clean state to discard any leftover healing patches
       await ExecutionEngine.spawnAsync('git', ['checkout', branch], { cwd: targetDir });
+      await ExecutionEngine.spawnAsync('git', ['reset', '--hard', `origin/${branch}`], { cwd: targetDir });
+      await ExecutionEngine.spawnAsync('git', ['clean', '-fd'], { cwd: targetDir });
       await ExecutionEngine.spawnAsync('git', ['pull', 'origin', branch], { cwd: targetDir });
     } else {
       logger.info(MOD, 'Cloning repository', { repoUrl, targetDir, branch });
