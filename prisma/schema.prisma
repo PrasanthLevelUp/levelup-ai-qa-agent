@@ -1,0 +1,94 @@
+generator client {
+    provider = "prisma-client-js"
+    binaryTargets = ["native", "linux-musl-arm64-openssl-3.0.x"]
+}
+
+datasource db {
+    provider = "postgresql"
+    url      = env("DATABASE_URL")
+}
+
+model TestExecution {
+  id               Int       @id @default(autoincrement())
+  testName         String    @map("test_name")
+  status           String
+  errorMessage     String?   @map("error_message")
+  healingAttempted Boolean?  @default(false) @map("healing_attempted")
+  healingSucceeded Boolean?  @default(false) @map("healing_succeeded")
+  durationMs       Int?      @default(0) @map("duration_ms")
+  createdAt        DateTime? @default(now()) @map("created_at")
+  healingActions   HealingAction[]
+
+  @@index([status])
+  @@map("test_executions")
+}
+
+model HealingAction {
+  id                 Int       @id @default(autoincrement())
+  testExecutionId    Int       @map("test_execution_id")
+  testName           String    @map("test_name")
+  failedLocator      String    @map("failed_locator")
+  healedLocator      String?   @map("healed_locator")
+  healingStrategy    String    @map("healing_strategy")
+  aiTokensUsed       Int?      @default(0) @map("ai_tokens_used")
+  success            Boolean?  @default(false)
+  confidence         Float?    @default(0)
+  errorContext       String?   @map("error_context")
+  validationStatus   String?   @map("validation_status")
+  validationReason   String?   @map("validation_reason")
+  patchPath          String?   @map("patch_path")
+  createdAt          DateTime? @default(now()) @map("created_at")
+  execution          TestExecution @relation(fields: [testExecutionId], references: [id])
+
+  @@index([testExecutionId])
+  @@map("healing_actions")
+}
+
+model LearnedPattern {
+  id               Int       @id @default(autoincrement())
+  testName         String    @map("test_name")
+  errorPattern     String    @map("error_pattern")
+  failedLocator    String    @map("failed_locator")
+  healedLocator    String    @map("healed_locator")
+  solutionStrategy String    @map("solution_strategy")
+  confidence       Float?    @default(0)
+  successCount     Int?      @default(1) @map("success_count")
+  failureCount     Int?      @default(0) @map("failure_count")
+  usageCount       Int?      @default(0) @map("usage_count")
+  avgTokensSaved   Int?      @default(0) @map("avg_tokens_saved")
+  lastUsed         DateTime? @default(now()) @map("last_used")
+  createdAt        DateTime? @default(now()) @map("created_at")
+
+  @@unique([testName, errorPattern, failedLocator])
+  @@map("learned_patterns")
+}
+
+model TokenUsage {
+  id         Int       @id @default(autoincrement())
+  date       String
+  engine     String
+  tokensUsed Int       @map("tokens_used")
+  costUsd    Float     @default(0) @map("cost_usd")
+  createdAt  DateTime? @default(now()) @map("created_at")
+
+  @@index([date])
+  @@map("token_usage")
+}
+
+model HealingJob {
+  id             String    @id
+  repositoryId   String    @map("repository_id")
+  repositoryUrl  String?   @map("repository_url")
+  branch         String?
+  commitSha      String?   @map("commit_sha")
+  status         String    @default("queued")
+  progress       String?
+  createdAt      DateTime? @map("created_at") @db.Timestamptz(6)
+  startedAt      DateTime? @map("started_at") @db.Timestamptz(6)
+  completedAt    DateTime? @map("completed_at") @db.Timestamptz(6)
+  result         String?
+  error          String?
+
+  @@index([status], map: "idx_jobs_status")
+  @@map("healing_jobs")
+}

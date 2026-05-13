@@ -29,6 +29,7 @@
   "author": "PrasanthLevelUp",
   "license": "ISC",
   "dependencies": {
+    "@prisma/client": "^6.7.0",
     "axios": "^1.16.0",
     "cors": "^2.8.5",
     "diff": "^8.0.2",
@@ -37,6 +38,7 @@
     "openai": "^6.37.0",
     "pg": "^8.20.0",
     "playwright": "^1.59.1",
+    "prisma": "^6.7.0",
     "ts-morph": "^21.0.1",
     "uuid": "^9.0.0"
   },
@@ -48,6 +50,7 @@
     "@types/pg": "^8.20.0",
     "@types/uuid": "^10.0.0",
     "ts-node": "^10.9.2",
-    "typescript": "^6.0.3"
+    "typescript": "^6.0.3",
+    "prisma": "^6.7.0"
   }
 }
