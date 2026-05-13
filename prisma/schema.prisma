@@ -13,10 +13,16 @@ model TestExecution {
   testName         String    @map("test_name")
   status           String
   errorMessage     String?   @map("error_message")
+
+  screenshotPath   String?   @map("screenshot_path")
+  videoPath        String?   @map("video_path")
+  tracePath        String?   @map("trace_path")
+
   healingAttempted Boolean?  @default(false) @map("healing_attempted")
   healingSucceeded Boolean?  @default(false) @map("healing_succeeded")
   durationMs       Int?      @default(0) @map("duration_ms")
   createdAt        DateTime? @default(now()) @map("created_at")
+
   healingActions   HealingAction[]
 
   @@index([status])
