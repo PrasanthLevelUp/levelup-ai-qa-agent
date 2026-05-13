@@ -18,8 +18,13 @@ model TestExecution {
   videoPath        String?   @map("video_path")
   tracePath        String?   @map("trace_path")
 
+  githubCommitSha  String?   @map("github_commit_sha")
+  githubBranch     String?   @map("github_branch")
+  repositoryName   String?   @map("repository_name")
+
   healingAttempted Boolean?  @default(false) @map("healing_attempted")
   healingSucceeded Boolean?  @default(false) @map("healing_succeeded")
+
   durationMs       Int?      @default(0) @map("duration_ms")
   createdAt        DateTime? @default(now()) @map("created_at")
 
