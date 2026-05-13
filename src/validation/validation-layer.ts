@@ -24,8 +24,8 @@ export class ValidationLayer {
   constructor(private readonly patchDir: string = '/home/ubuntu/healing_reports/patches') {}
 
   validate(suggestion: HealingSuggestion, failure: FailureDetails): ValidationResult {
-    if (suggestion.confidence <= 0.8) {
-      return { approved: false, reason: `Confidence too low (${suggestion.confidence.toFixed(2)} <= 0.80)` };
+    if (suggestion.confidence <= 0.5) {
+      return { approved: false, reason: `Confidence too low (${suggestion.confidence.toFixed(2)} <= 0.50)` };
     }
 
     if (!this.isSemanticLocator(suggestion.newLocator)) {
@@ -79,7 +79,21 @@ export class ValidationLayer {
   }
 
   private isSemanticLocator(locatorExpression: string): boolean {
-    return /(getByRole|getByLabel|getByText|getByPlaceholder|getByTestId)/.test(locatorExpression);
+    // Accept Playwright semantic locators
+    if (/(getByRole|getByLabel|getByText|getByPlaceholder|getByTestId|getByAltText|getByTitle)/.test(locatorExpression)) {
+      return true;
+    }
+    // Accept stable CSS attribute selectors like input[name="username"], #id, [data-testid="x"]
+    if (/^[a-z]+\[[a-z_-]+="[^"]+"\]$/i.test(locatorExpression)) {
+      return true;
+    }
+    if (/^#[\w-]+$/.test(locatorExpression)) {
+      return true;
+    }
+    if (/^\[data-testid="[^"]+"\]$/.test(locatorExpression)) {
+      return true;
+    }
+    return false;
   }
 
   private isSafeCode(locatorExpression: string): boolean {

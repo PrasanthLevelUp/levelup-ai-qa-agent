@@ -248,12 +248,32 @@ function createHealingWorker(
 
       try {
         const outcome = await orchestrator.heal(failure);
+        logger.info(MOD, 'Orchestrator result', {
+          testName: failure.testName,
+          failedLocator: failure.failedLocator,
+          hasSuggestion: !!outcome.suggestion,
+          suggestion: outcome.suggestion ? {
+            newLocator: outcome.suggestion.newLocator,
+            strategy: outcome.suggestion.strategy,
+            confidence: outcome.suggestion.confidence,
+          } : null,
+          attemptedStrategies: outcome.attemptedStrategies,
+          selectedEngine: outcome.selectedEngine,
+        });
+
         if (!outcome.suggestion) {
           restoreFile(failure.filePath);
           continue;
         }
 
         const validation = validationLayer.validate(outcome.suggestion, failure);
+        logger.info(MOD, 'Validation result', {
+          testName: failure.testName,
+          approved: validation.approved,
+          reason: validation.reason,
+          newLocator: outcome.suggestion.newLocator,
+        });
+
         if (!validation.approved || !validation.updatedContent) {
           restoreFile(failure.filePath);
           continue;
