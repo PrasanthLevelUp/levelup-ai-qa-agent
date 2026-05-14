@@ -35,6 +35,8 @@ import { RCAEngine, type RCAResult } from '../engines/rca-engine';
 import { createRCARouter } from './routes/rca';
 import { createPRRouter } from './routes/pr';
 import { createScriptGenRouter } from './routes/script-gen';
+import { createAuthRouter } from './routes/auth';
+import cookieParser from 'cookie-parser';
 import { createHealingPR, parseRepoUrl, type HealingSummary, type PRResult } from '../github/pr-creator';
 import { backupFile, restoreFile, cleanupBackup } from '../utils/file-utils';
 import {
@@ -54,8 +56,12 @@ export function createServer(): express.Application {
   const app = express();
 
   // Middleware
-  app.use(cors());
+  app.use(cors({
+    origin: process.env.DASHBOARD_URL || true,
+    credentials: true,
+  }));
   app.use(express.json({ limit: '10mb' }));
+  app.use(cookieParser());
 
   // Request logging
   app.use((req, _res, next) => {
@@ -89,7 +95,10 @@ export function createServer(): express.Application {
   // Webhook — no auth (uses its own signature validation)
   app.use('/api/webhook', createWebhookRouter(jobQueue, repoManager));
 
-  // Authenticated routes
+  // Auth routes — no API key required (uses cookie-based JWT)
+  app.use('/api/auth', createAuthRouter());
+
+  // Authenticated routes (API key)
   app.use('/api/heal', authMiddleware, createHealRouter(jobQueue, repoManager));
   app.use('/api/status', authMiddleware, createStatusRouter(jobQueue));
   app.use('/api/reports', authMiddleware, createReportsRouter(jobQueue));

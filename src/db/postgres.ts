@@ -295,6 +295,49 @@ async function initSchema(client: PoolClient): Promise<void> {
       created_at TIMESTAMPTZ DEFAULT NOW()
     );
     CREATE INDEX IF NOT EXISTS idx_gp_script ON generated_projects(script_id);
+
+    -- Authentication tables
+    CREATE TABLE IF NOT EXISTS users (
+      id SERIAL PRIMARY KEY,
+      username VARCHAR(100) UNIQUE NOT NULL,
+      password_hash TEXT NOT NULL,
+      role VARCHAR(50) DEFAULT 'client',
+      company_name VARCHAR(255),
+      is_active BOOLEAN DEFAULT true,
+      last_login TIMESTAMPTZ,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      updated_at TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_users_username ON users(username);
+    CREATE INDEX IF NOT EXISTS idx_users_active ON users(is_active);
+
+    CREATE TABLE IF NOT EXISTS audit_logs (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER REFERENCES users(id),
+      username VARCHAR(100),
+      action TEXT NOT NULL,
+      resource TEXT,
+      resource_id TEXT,
+      ip_address VARCHAR(45),
+      user_agent TEXT,
+      details JSONB,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_audit_user ON audit_logs(user_id);
+    CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_logs(action);
+    CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_logs(created_at DESC);
+
+    CREATE TABLE IF NOT EXISTS sessions (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+      token_hash TEXT NOT NULL,
+      ip_address VARCHAR(45),
+      user_agent TEXT,
+      expires_at TIMESTAMPTZ NOT NULL,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
+    CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);
   `);
 }
 
@@ -950,4 +993,151 @@ export async function logProjectExport(data: {
     [data.script_id, data.project_dir, data.file_count, data.total_size, data.structure ? JSON.stringify(data.structure) : null],
   );
   return result.rows[0].id;
+}
+
+/* -------------------------------------------------------------------------- */
+/*  User Management                                                          */
+/* -------------------------------------------------------------------------- */
+
+export interface UserRecord {
+  id: number;
+  username: string;
+  password_hash: string;
+  role: string;
+  company_name: string | null;
+  is_active: boolean;
+  last_login: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export async function createUser(data: {
+  username: string;
+  password_hash: string;
+  role?: string;
+  company_name?: string;
+}): Promise<UserRecord> {
+  const result = await getPool().query(
+    `INSERT INTO users (username, password_hash, role, company_name)
+    VALUES ($1, $2, $3, $4)
+    RETURNING *`,
+    [data.username, data.password_hash, data.role || 'client', data.company_name || null],
+  );
+  return result.rows[0];
+}
+
+export async function getUserByUsername(username: string): Promise<UserRecord | null> {
+  const result = await getPool().query(
+    `SELECT * FROM users WHERE username = $1 AND is_active = true`,
+    [username],
+  );
+  return result.rows[0] ?? null;
+}
+
+export async function getUserById(id: number): Promise<UserRecord | null> {
+  const result = await getPool().query(
+    `SELECT * FROM users WHERE id = $1`,
+    [id],
+  );
+  return result.rows[0] ?? null;
+}
+
+export async function updateLastLogin(userId: number): Promise<void> {
+  await getPool().query(
+    `UPDATE users SET last_login = NOW(), updated_at = NOW() WHERE id = $1`,
+    [userId],
+  );
+}
+
+export async function listUsers(): Promise<UserRecord[]> {
+  const result = await getPool().query(
+    `SELECT id, username, role, company_name, is_active, last_login, created_at, updated_at
+     FROM users ORDER BY created_at ASC`,
+  );
+  return result.rows;
+}
+
+export async function deactivateUser(userId: number): Promise<void> {
+  await getPool().query(
+    `UPDATE users SET is_active = false, updated_at = NOW() WHERE id = $1`,
+    [userId],
+  );
+}
+
+/* -------------------------------------------------------------------------- */
+/*  Audit Logging                                                            */
+/* -------------------------------------------------------------------------- */
+
+export interface AuditLogRecord {
+  id?: number;
+  user_id: number | null;
+  username: string;
+  action: string;
+  resource?: string;
+  resource_id?: string;
+  ip_address?: string;
+  user_agent?: string;
+  details?: any;
+  created_at?: string;
+}
+
+export async function logAudit(data: AuditLogRecord): Promise<number> {
+  const result = await getPool().query(
+    `INSERT INTO audit_logs (user_id, username, action, resource, resource_id, ip_address, user_agent, details)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+    RETURNING id`,
+    [
+      data.user_id,
+      data.username,
+      data.action,
+      data.resource ?? null,
+      data.resource_id ?? null,
+      data.ip_address ?? null,
+      data.user_agent ?? null,
+      data.details ? JSON.stringify(data.details) : null,
+    ],
+  );
+  return result.rows[0].id;
+}
+
+export async function getAuditLogs(limit = 50, offset = 0): Promise<AuditLogRecord[]> {
+  const result = await getPool().query(
+    `SELECT * FROM audit_logs ORDER BY created_at DESC LIMIT $1 OFFSET $2`,
+    [limit, offset],
+  );
+  return result.rows;
+}
+
+/* -------------------------------------------------------------------------- */
+/*  Session Management                                                       */
+/* -------------------------------------------------------------------------- */
+
+export async function createSession(data: {
+  user_id: number;
+  token_hash: string;
+  ip_address?: string;
+  user_agent?: string;
+  expires_at: Date;
+}): Promise<number> {
+  const result = await getPool().query(
+    `INSERT INTO sessions (user_id, token_hash, ip_address, user_agent, expires_at)
+    VALUES ($1, $2, $3, $4, $5)
+    RETURNING id`,
+    [data.user_id, data.token_hash, data.ip_address ?? null, data.user_agent ?? null, data.expires_at],
+  );
+  return result.rows[0].id;
+}
+
+export async function invalidateUserSessions(userId: number): Promise<void> {
+  await getPool().query(
+    `DELETE FROM sessions WHERE user_id = $1`,
+    [userId],
+  );
+}
+
+export async function cleanExpiredSessions(): Promise<number> {
+  const result = await getPool().query(
+    `DELETE FROM sessions WHERE expires_at < NOW()`,
+  );
+  return result.rowCount ?? 0;
 }
