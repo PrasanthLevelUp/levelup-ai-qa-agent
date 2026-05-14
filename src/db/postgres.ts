@@ -208,6 +208,25 @@ async function initSchema(client: PoolClient): Promise<void> {
     CREATE INDEX IF NOT EXISTS idx_rca_classification ON rca_analyses(classification);
     CREATE INDEX IF NOT EXISTS idx_rca_job_id ON rca_analyses(job_id);
     CREATE INDEX IF NOT EXISTS idx_rca_exec_id ON rca_analyses(test_execution_id);
+
+    CREATE TABLE IF NOT EXISTS pr_automations (
+      id SERIAL PRIMARY KEY,
+      job_id TEXT NOT NULL,
+      pr_url TEXT NOT NULL,
+      pr_number INTEGER NOT NULL,
+      branch_name TEXT NOT NULL,
+      commit_sha TEXT,
+      repo_owner TEXT NOT NULL,
+      repo_name TEXT NOT NULL,
+      base_branch TEXT NOT NULL,
+      files_changed TEXT[],
+      healing_count INTEGER DEFAULT 0,
+      status TEXT DEFAULT 'open',
+      merged_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_pr_job_id ON pr_automations(job_id);
+    CREATE INDEX IF NOT EXISTS idx_pr_status ON pr_automations(status);
   `);
 }
 
@@ -643,4 +662,72 @@ export async function getRCAStats(): Promise<{
   const healingSuccessRate = attempted > 0 ? succeeded / attempted : 0;
 
   return { total, byClassification, bySeverity, avgConfidence, flakyCount, healingSuccessRate };
+}
+
+/* -------------------------------------------------------------------------- */
+/*  PR Automation Persistence                                                 */
+/* -------------------------------------------------------------------------- */
+
+export interface PRRecord {
+  id?: number;
+  job_id: string;
+  pr_url: string;
+  pr_number: number;
+  branch_name: string;
+  commit_sha?: string;
+  repo_owner: string;
+  repo_name: string;
+  base_branch: string;
+  files_changed?: string[];
+  healing_count: number;
+  status?: string;
+  merged_at?: string;
+  created_at?: string;
+}
+
+export async function logPR(data: PRRecord): Promise<number> {
+  const result = await getPool().query(
+    `INSERT INTO pr_automations
+      (job_id, pr_url, pr_number, branch_name, commit_sha,
+       repo_owner, repo_name, base_branch, files_changed, healing_count, status)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+    RETURNING id`,
+    [
+      data.job_id,
+      data.pr_url,
+      data.pr_number,
+      data.branch_name,
+      data.commit_sha ?? null,
+      data.repo_owner,
+      data.repo_name,
+      data.base_branch,
+      data.files_changed ?? [],
+      data.healing_count,
+      data.status ?? 'open',
+    ],
+  );
+  return result.rows[0].id;
+}
+
+export async function getPRForJob(jobId: string): Promise<PRRecord | null> {
+  const result = await getPool().query(
+    `SELECT * FROM pr_automations WHERE job_id = $1 ORDER BY created_at DESC LIMIT 1`,
+    [jobId],
+  );
+  return result.rows[0] ?? null;
+}
+
+export async function getRecentPRs(limit = 20): Promise<PRRecord[]> {
+  const result = await getPool().query(
+    `SELECT * FROM pr_automations ORDER BY created_at DESC LIMIT $1`,
+    [limit],
+  );
+  return result.rows;
+}
+
+export async function updatePRStatus(prId: number, status: string, mergedAt?: string): Promise<void> {
+  await getPool().query(
+    `UPDATE pr_automations SET status = $1, merged_at = $2 WHERE id = $3`,
+    [status, mergedAt ?? null, prId],
+  );
 }

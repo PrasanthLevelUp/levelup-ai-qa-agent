@@ -42,6 +42,12 @@ export interface ReportData {
   totalTokensUsed: number;
   tests: ReportTest[];
   healings: ReportHealing[];
+  prInfo?: {
+    prUrl: string;
+    prNumber: number;
+    branchName: string;
+    filesChanged: number;
+  } | null;
   rcaAnalyses?: {
     testName: string;
     classification: string;
@@ -169,6 +175,18 @@ code { background: #f9fafb; padding: 2px 4px; border-radius: 4px; }
     <tr><th>Test</th><th>Failed Locator</th><th>Healed Locator</th><th>Strategy</th><th>Tokens</th><th>Confidence</th><th>Validated</th><th>Success</th><th>Patch</th></tr>
     ${healRows || '<tr><td colspan="9">No healing actions</td></tr>'}
   </table>
+
+  ${data.prInfo ? `
+  <h2>🔀 Pull Request</h2>
+  <div class="card" style="max-width:600px">
+    <h3 style="margin:0">PR #${data.prInfo.prNumber}</h3>
+    <div style="margin-top:8px">
+      <strong>Branch:</strong> <code>${esc(data.prInfo.branchName)}</code><br/>
+      <strong>Files Changed:</strong> ${data.prInfo.filesChanged}<br/>
+      <strong>Link:</strong> <a href="${esc(data.prInfo.prUrl)}" target="_blank">${esc(data.prInfo.prUrl)}</a>
+    </div>
+  </div>
+  ` : ''}
 
   <h2>🔍 Root Cause Analysis</h2>
   <table>

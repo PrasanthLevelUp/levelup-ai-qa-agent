@@ -33,6 +33,8 @@ import { ValidationLayer } from '../validation/validation-layer';
 import { generateReport, type ReportData, type ReportTest, type ReportHealing } from '../reports/html-report';
 import { RCAEngine, type RCAResult } from '../engines/rca-engine';
 import { createRCARouter } from './routes/rca';
+import { createPRRouter } from './routes/pr';
+import { createHealingPR, parseRepoUrl, type HealingSummary, type PRResult } from '../github/pr-creator';
 import { backupFile, restoreFile, cleanupBackup } from '../utils/file-utils';
 import {
   logExecution,
@@ -41,6 +43,7 @@ import {
   storePattern,
   getHistoricalStats,
   logRCA,
+  logPR,
 } from '../db/postgres';
 import type { HealingJob } from './queue/job-queue';
 
@@ -91,6 +94,7 @@ export function createServer(): express.Application {
   app.use('/api/reports', authMiddleware, createReportsRouter(jobQueue));
   app.use('/api/repos', authMiddleware, createReposRouter(repoManager));
   app.use('/api/rca', authMiddleware, createRCARouter());
+  app.use('/api/pr', authMiddleware, createPRRouter());
 
   // List all jobs
   app.get('/api/jobs', authMiddleware, (_req, res) => {
@@ -433,6 +437,66 @@ function createHealingWorker(
       }
     }
 
+    // --- GitHub PR Automation ---
+    let prResult: PRResult | null = null;
+    const githubToken = process.env['GITHUB_TOKEN'];
+    if (githubToken && healedCount > 0) {
+      try {
+        jobQueue.updateJob(job.id, { progress: 'Creating GitHub PR...' });
+
+        const healingSummaries: HealingSummary[] = healings
+          .filter((h) => h.success)
+          .map((h) => ({
+            testName: h.testName,
+            failedLocator: h.failedLocator,
+            healedLocator: h.healedLocator,
+            strategy: h.strategy,
+            confidence: h.confidence,
+            filePath: '', // relative path captured in PR diff
+          }));
+
+        prResult = await createHealingPR({
+          repoPath: testRepoPath,
+          repoUrl,
+          branch,
+          jobId: job.id,
+          healings: healingSummaries,
+          totalTests: tests.length,
+          failedTests: tests.filter((t) => t.status !== 'passed' && t.status !== 'healed').length,
+          healedTests: healedCount,
+          githubToken,
+        });
+
+        if (prResult) {
+          const parsed = parseRepoUrl(repoUrl);
+          await logPR({
+            job_id: job.id,
+            pr_url: prResult.prUrl,
+            pr_number: prResult.prNumber,
+            branch_name: prResult.branchName,
+            commit_sha: prResult.commitSha,
+            repo_owner: parsed?.owner ?? 'unknown',
+            repo_name: parsed?.repo ?? 'unknown',
+            base_branch: branch,
+            files_changed: prResult.filesChanged,
+            healing_count: prResult.healingCount,
+            status: 'open',
+          });
+
+          logger.info(MOD, 'PR created and logged', {
+            prUrl: prResult.prUrl,
+            prNumber: prResult.prNumber,
+          });
+        }
+      } catch (prError) {
+        logger.error(MOD, 'GitHub PR automation failed (non-blocking)', {
+          error: (prError as Error).message,
+        });
+      }
+    } else if (!githubToken && healedCount > 0) {
+      logger.info(MOD, 'Skipping PR creation — GITHUB_TOKEN not configured');
+    }
+
     // Generate report
     const now = new Date().toISOString();
     const hist = await getHistoricalStats();
@@ -460,6 +524,12 @@ function createHealingWorker(
         isFlaky: r.isFlaky,
         affectedComponent: r.affectedComponent,
       })),
+      prInfo: prResult ? {
+        prUrl: prResult.prUrl,
+        prNumber: prResult.prNumber,
+        branchName: prResult.branchName,
+        filesChanged: prResult.filesChanged.length,
+      } : null,
       historicalStats: hist,
     };
 
@@ -483,6 +553,12 @@ function createHealingWorker(
         suggestedFix: r.suggestedFix,
         isFlaky: r.isFlaky,
       })),
+      pullRequest: prResult ? {
+        prUrl: prResult.prUrl,
+        prNumber: prResult.prNumber,
+        branchName: prResult.branchName,
+        filesChanged: prResult.filesChanged,
+      } : null,
       reportPath,
     };
   };
