@@ -31,6 +31,8 @@ import { AIEngine } from '../engines/ai-engine';
 import { OpenAIClient } from '../ai/openai-client';
 import { ValidationLayer } from '../validation/validation-layer';
 import { generateReport, type ReportData, type ReportTest, type ReportHealing } from '../reports/html-report';
+import { RCAEngine, type RCAResult } from '../engines/rca-engine';
+import { createRCARouter } from './routes/rca';
 import { backupFile, restoreFile, cleanupBackup } from '../utils/file-utils';
 import {
   logExecution,
@@ -38,6 +40,7 @@ import {
   logHealing,
   storePattern,
   getHistoricalStats,
+  logRCA,
 } from '../db/postgres';
 import type { HealingJob } from './queue/job-queue';
 
@@ -87,6 +90,7 @@ export function createServer(): express.Application {
   app.use('/api/status', authMiddleware, createStatusRouter(jobQueue));
   app.use('/api/reports', authMiddleware, createReportsRouter(jobQueue));
   app.use('/api/repos', authMiddleware, createReposRouter(repoManager));
+  app.use('/api/rca', authMiddleware, createRCARouter());
 
   // List all jobs
   app.get('/api/jobs', authMiddleware, (_req, res) => {
@@ -218,8 +222,14 @@ function createHealingWorker(
 
     const healings: ReportHealing[] = [];
     const tests: ReportTest[] = [];
+    const rcaResults: RCAResult[] = [];
     let healedCount = 0;
     let totalTokensUsed = 0;
+
+    // RCA engine (instantiate once per job)
+    const rcaEngine = process.env['OPENAI_API_KEY']
+      ? new RCAEngine({ apiKey: process.env['OPENAI_API_KEY'] })
+      : null;
 
     for (const artifact of artifacts) {
       const failure = analyzer.analyze(artifact);
@@ -368,6 +378,59 @@ function createHealingWorker(
       } finally {
         if (fs.existsSync(backupPath)) cleanupBackup(failure.filePath);
       }
+
+      // --- RCA Analysis for this failure ---
+      if (rcaEngine) {
+        try {
+          const healingForTest = healings.find((h) => h.testName === failure.testName);
+          const rcaResult = await rcaEngine.analyze({
+            failure,
+            jobId: job.id,
+            healingAttempted: !!healingForTest,
+            healingSucceeded: healingForTest?.success ?? false,
+            healedLocator: healingForTest?.healedLocator,
+            healingStrategy: healingForTest?.strategy,
+          });
+
+          rcaResults.push(rcaResult);
+
+          await logRCA({
+            test_execution_id: String(executionId),
+            job_id: job.id,
+            test_name: failure.testName,
+            root_cause: rcaResult.rootCause,
+            classification: rcaResult.classification,
+            severity: rcaResult.severity,
+            confidence: rcaResult.confidence,
+            suggested_fix: rcaResult.suggestedFix,
+            affected_component: rcaResult.affectedComponent,
+            is_flaky: rcaResult.isFlaky,
+            flaky_reason: rcaResult.flakyReason ?? undefined,
+            summary: rcaResult.summary,
+            technical_details: rcaResult.technicalDetails,
+            tokens_used: rcaResult.tokensUsed,
+            model: rcaResult.model,
+            analysis_time_ms: rcaResult.analysisTimeMs,
+            healing_attempted: !!healingForTest,
+            healing_succeeded: healingForTest?.success ?? false,
+            healed_locator: healingForTest?.healedLocator,
+            healing_strategy: healingForTest?.strategy,
+            error_message: failure.errorMessage?.slice(0, 1000),
+          });
+
+          logger.info(MOD, 'RCA analysis complete', {
+            testName: failure.testName,
+            classification: rcaResult.classification,
+            severity: rcaResult.severity,
+            confidence: rcaResult.confidence,
+          });
+        } catch (rcaError) {
+          logger.error(MOD, 'RCA analysis failed', {
+            testName: failure.testName,
+            error: (rcaError as Error).message,
+          });
+        }
+      }
     }
 
     // Generate report
@@ -387,6 +450,16 @@ function createHealingWorker(
       totalTokensUsed,
       tests,
       healings,
+      rcaAnalyses: rcaResults.map((r) => ({
+        testName: r.affectedComponent || 'unknown',
+        classification: r.classification,
+        severity: r.severity,
+        confidence: r.confidence,
+        rootCause: r.rootCause,
+        suggestedFix: r.suggestedFix,
+        isFlaky: r.isFlaky,
+        affectedComponent: r.affectedComponent,
+      })),
       historicalStats: hist,
     };
 
@@ -401,6 +474,15 @@ function createHealingWorker(
       tokensUsed: totalTokensUsed,
       testResults: tests,
       healingActions: healings,
+      rcaAnalyses: rcaResults.map((r) => ({
+        testName: r.summary.split(':')[0] || 'unknown',
+        classification: r.classification,
+        severity: r.severity,
+        confidence: r.confidence,
+        rootCause: r.rootCause,
+        suggestedFix: r.suggestedFix,
+        isFlaky: r.isFlaky,
+      })),
       reportPath,
     };
   };

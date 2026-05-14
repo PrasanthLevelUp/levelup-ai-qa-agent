@@ -169,6 +169,32 @@ async function initSchema(client: PoolClient): Promise<void> {
       created_at TIMESTAMPTZ DEFAULT NOW()
     );
 
+    CREATE TABLE IF NOT EXISTS rca_analyses (
+      id SERIAL PRIMARY KEY,
+      test_execution_id INTEGER REFERENCES test_executions(id),
+      job_id TEXT,
+      test_name TEXT NOT NULL,
+      root_cause TEXT NOT NULL,
+      classification TEXT NOT NULL,
+      severity TEXT NOT NULL DEFAULT 'medium',
+      confidence REAL DEFAULT 0,
+      suggested_fix TEXT,
+      affected_component TEXT,
+      is_flaky BOOLEAN DEFAULT FALSE,
+      flaky_reason TEXT,
+      summary TEXT,
+      technical_details TEXT,
+      tokens_used INTEGER DEFAULT 0,
+      model TEXT DEFAULT 'gpt-4o-mini',
+      analysis_time_ms INTEGER DEFAULT 0,
+      healing_attempted BOOLEAN DEFAULT FALSE,
+      healing_succeeded BOOLEAN DEFAULT FALSE,
+      healed_locator TEXT,
+      healing_strategy TEXT,
+      error_message TEXT,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+
     CREATE INDEX IF NOT EXISTS idx_exec_status ON test_executions(status);
     CREATE INDEX IF NOT EXISTS idx_exec_test_name ON test_executions(test_name);
     CREATE INDEX IF NOT EXISTS idx_heal_exec_id ON healing_actions(test_execution_id);
@@ -178,6 +204,10 @@ async function initSchema(client: PoolClient): Promise<void> {
     CREATE INDEX IF NOT EXISTS idx_pattern_error ON learned_patterns(error_pattern);
     CREATE INDEX IF NOT EXISTS idx_jobs_status ON healing_jobs(status);
     CREATE INDEX IF NOT EXISTS idx_token_usage_date ON token_usage(date);
+    CREATE INDEX IF NOT EXISTS idx_rca_test_name ON rca_analyses(test_name);
+    CREATE INDEX IF NOT EXISTS idx_rca_classification ON rca_analyses(classification);
+    CREATE INDEX IF NOT EXISTS idx_rca_job_id ON rca_analyses(job_id);
+    CREATE INDEX IF NOT EXISTS idx_rca_exec_id ON rca_analyses(test_execution_id);
   `);
 }
 
@@ -479,4 +509,138 @@ export async function loadPersistedJobs(statuses: string[]): Promise<any[]> {
     [statuses],
   );
   return result.rows;
+}
+
+/* -------------------------------------------------------------------------- */
+/*  RCA Analysis Persistence                                                  */
+/* -------------------------------------------------------------------------- */
+
+export interface RCARecord {
+  id?: number;
+  test_execution_id: string;
+  job_id: string;
+  test_name: string;
+  root_cause: string;
+  classification: string;
+  severity: string;
+  confidence: number;
+  suggested_fix: string;
+  affected_component: string;
+  is_flaky: boolean;
+  flaky_reason?: string;
+  summary: string;
+  technical_details?: string;
+  tokens_used: number;
+  model: string;
+  analysis_time_ms: number;
+  healing_attempted: boolean;
+  healing_succeeded: boolean;
+  healed_locator?: string;
+  healing_strategy?: string;
+  error_message?: string;
+  created_at?: string;
+}
+
+export async function logRCA(data: RCARecord): Promise<number> {
+  const result = await getPool().query(
+    `INSERT INTO rca_analyses
+      (test_execution_id, job_id, test_name, root_cause, classification, severity,
+       confidence, suggested_fix, affected_component, is_flaky, flaky_reason,
+       summary, technical_details, tokens_used, model, analysis_time_ms,
+       healing_attempted, healing_succeeded, healed_locator, healing_strategy, error_message)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
+    RETURNING id`,
+    [
+      data.test_execution_id,
+      data.job_id,
+      data.test_name,
+      data.root_cause,
+      data.classification,
+      data.severity,
+      data.confidence,
+      data.suggested_fix,
+      data.affected_component,
+      data.is_flaky,
+      data.flaky_reason ?? null,
+      data.summary,
+      data.technical_details ?? null,
+      data.tokens_used,
+      data.model,
+      data.analysis_time_ms,
+      data.healing_attempted,
+      data.healing_succeeded,
+      data.healed_locator ?? null,
+      data.healing_strategy ?? null,
+      data.error_message ?? null,
+    ],
+  );
+  return result.rows[0].id;
+}
+
+export async function getRCA(executionId: string): Promise<RCARecord | null> {
+  const result = await getPool().query(
+    `SELECT * FROM rca_analyses WHERE test_execution_id = $1 ORDER BY created_at DESC LIMIT 1`,
+    [executionId],
+  );
+  return result.rows[0] ?? null;
+}
+
+export async function getRCAsForJob(jobId: string): Promise<RCARecord[]> {
+  const result = await getPool().query(
+    `SELECT * FROM rca_analyses WHERE job_id = $1 ORDER BY created_at ASC`,
+    [jobId],
+  );
+  return result.rows;
+}
+
+export async function getRCAStats(): Promise<{
+  total: number;
+  byClassification: Record<string, number>;
+  bySeverity: Record<string, number>;
+  avgConfidence: number;
+  flakyCount: number;
+  healingSuccessRate: number;
+}> {
+  const pool = getPool();
+
+  const totalRes = await pool.query(`SELECT COUNT(*) AS count FROM rca_analyses`);
+  const total = parseInt(totalRes.rows[0].count, 10);
+
+  const classRes = await pool.query(
+    `SELECT classification, COUNT(*) AS count FROM rca_analyses GROUP BY classification ORDER BY count DESC`,
+  );
+  const byClassification: Record<string, number> = {};
+  for (const row of classRes.rows) {
+    byClassification[row.classification] = parseInt(row.count, 10);
+  }
+
+  const sevRes = await pool.query(
+    `SELECT severity, COUNT(*) AS count FROM rca_analyses GROUP BY severity ORDER BY count DESC`,
+  );
+  const bySeverity: Record<string, number> = {};
+  for (const row of sevRes.rows) {
+    bySeverity[row.severity] = parseInt(row.count, 10);
+  }
+
+  const avgRes = await pool.query(
+    `SELECT COALESCE(AVG(confidence), 0) AS avg FROM rca_analyses`,
+  );
+  const avgConfidence = parseFloat(avgRes.rows[0].avg);
+
+  const flakyRes = await pool.query(
+    `SELECT COUNT(*) AS count FROM rca_analyses WHERE is_flaky = true`,
+  );
+  const flakyCount = parseInt(flakyRes.rows[0].count, 10);
+
+  const healRes = await pool.query(
+    `SELECT
+       COUNT(*) FILTER (WHERE healing_attempted = true) AS attempted,
+       COUNT(*) FILTER (WHERE healing_succeeded = true) AS succeeded
+     FROM rca_analyses`,
+  );
+  const attempted = parseInt(healRes.rows[0].attempted, 10);
+  const succeeded = parseInt(healRes.rows[0].succeeded, 10);
+  const healingSuccessRate = attempted > 0 ? succeeded / attempted : 0;
+
+  return { total, byClassification, bySeverity, avgConfidence, flakyCount, healingSuccessRate };
 }

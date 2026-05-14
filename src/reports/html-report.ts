@@ -42,6 +42,16 @@ export interface ReportData {
   totalTokensUsed: number;
   tests: ReportTest[];
   healings: ReportHealing[];
+  rcaAnalyses?: {
+    testName: string;
+    classification: string;
+    severity: string;
+    confidence: number;
+    rootCause: string;
+    suggestedFix: string;
+    isFlaky: boolean;
+    affectedComponent: string;
+  }[];
   historicalStats: {
     total_executions: number;
     total_healings: number;
@@ -61,7 +71,25 @@ function esc(s: string): string {
     .replace(/\"/g, '&quot;');
 }
 
+function severityBadge(s: string): string {
+  const colors: Record<string, string> = { critical: '#dc2626', high: '#ea580c', medium: '#ca8a04', low: '#16a34a' };
+  return `<span style="background:${colors[s] || '#6b7280'};color:#fff;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600;text-transform:uppercase">${esc(s)}</span>`;
+}
+
 export function generateReport(data: ReportData, outputPath: string): void {
+  const rcaRows = (data.rcaAnalyses || []).map((r) => `
+    <tr>
+      <td>${esc(r.testName)}</td>
+      <td><code>${esc(r.classification)}</code></td>
+      <td>${severityBadge(r.severity)}</td>
+      <td>${(r.confidence * 100).toFixed(0)}%</td>
+      <td>${esc(r.rootCause.slice(0, 200))}</td>
+      <td>${esc(r.suggestedFix.slice(0, 200))}</td>
+      <td>${r.isFlaky ? '⚠️ Yes' : 'No'}</td>
+      <td>${esc(r.affectedComponent)}</td>
+    </tr>
+  `).join('');
+
   const healRows = data.healings.map((h) => `
     <tr>
       <td>${esc(h.testName)}</td>
@@ -140,6 +168,12 @@ code { background: #f9fafb; padding: 2px 4px; border-radius: 4px; }
   <table>
     <tr><th>Test</th><th>Failed Locator</th><th>Healed Locator</th><th>Strategy</th><th>Tokens</th><th>Confidence</th><th>Validated</th><th>Success</th><th>Patch</th></tr>
     ${healRows || '<tr><td colspan="9">No healing actions</td></tr>'}
+  </table>
+
+  <h2>🔍 Root Cause Analysis</h2>
+  <table>
+    <tr><th>Test</th><th>Classification</th><th>Severity</th><th>Confidence</th><th>Root Cause</th><th>Suggested Fix</th><th>Flaky?</th><th>Component</th></tr>
+    ${rcaRows || '<tr><td colspan="8">No RCA data</td></tr>'}
   </table>
 </body>
 </html>`;
