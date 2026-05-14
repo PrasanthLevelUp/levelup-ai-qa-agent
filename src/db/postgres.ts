@@ -227,6 +227,74 @@ async function initSchema(client: PoolClient): Promise<void> {
     );
     CREATE INDEX IF NOT EXISTS idx_pr_job_id ON pr_automations(job_id);
     CREATE INDEX IF NOT EXISTS idx_pr_status ON pr_automations(status);
+
+    -- Script Generation tables
+    CREATE TABLE IF NOT EXISTS generated_scripts (
+      id SERIAL PRIMARY KEY,
+      url TEXT NOT NULL,
+      page_type TEXT,
+      workflow_graph JSONB,
+      instructions TEXT,
+      script_content TEXT,
+      test_plan JSONB,
+      validation_status TEXT DEFAULT 'pending',
+      reliability_score REAL DEFAULT 0,
+      review_score REAL,
+      review_issues JSONB,
+      tokens_used INTEGER DEFAULT 0,
+      model TEXT,
+      generation_time_ms INTEGER,
+      files_generated JSONB,
+      negative_tests_included BOOLEAN DEFAULT false,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_gs_url ON generated_scripts(url);
+    CREATE INDEX IF NOT EXISTS idx_gs_created ON generated_scripts(created_at DESC);
+
+    CREATE TABLE IF NOT EXISTS dom_snapshots (
+      id SERIAL PRIMARY KEY,
+      script_id INTEGER REFERENCES generated_scripts(id) ON DELETE CASCADE,
+      page_url TEXT NOT NULL,
+      html_snapshot TEXT,
+      elements_count INTEGER DEFAULT 0,
+      page_type TEXT,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_dom_script ON dom_snapshots(script_id);
+
+    CREATE TABLE IF NOT EXISTS selector_scores (
+      id SERIAL PRIMARY KEY,
+      script_id INTEGER REFERENCES generated_scripts(id) ON DELETE CASCADE,
+      selector TEXT NOT NULL,
+      score REAL DEFAULT 0,
+      strategy TEXT,
+      element_type TEXT,
+      reason TEXT,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_sel_script ON selector_scores(script_id);
+
+    CREATE TABLE IF NOT EXISTS workflow_maps (
+      id SERIAL PRIMARY KEY,
+      script_id INTEGER REFERENCES generated_scripts(id) ON DELETE CASCADE,
+      source_page TEXT,
+      target_page TEXT,
+      action TEXT,
+      link_text TEXT,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_wf_script ON workflow_maps(script_id);
+
+    CREATE TABLE IF NOT EXISTS generated_projects (
+      id SERIAL PRIMARY KEY,
+      script_id INTEGER REFERENCES generated_scripts(id) ON DELETE CASCADE,
+      project_dir TEXT,
+      file_count INTEGER DEFAULT 0,
+      total_size INTEGER DEFAULT 0,
+      structure JSONB,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_gp_script ON generated_projects(script_id);
   `);
 }
 
@@ -730,4 +798,156 @@ export async function updatePRStatus(prId: number, status: string, mergedAt?: st
     `UPDATE pr_automations SET status = $1, merged_at = $2 WHERE id = $3`,
     [status, mergedAt ?? null, prId],
   );
+}
+
+/* -------------------------------------------------------------------------- */
+/*  Script Generation Persistence                                            */
+/* -------------------------------------------------------------------------- */
+
+export interface GeneratedScriptRecord {
+  id?: number;
+  url: string;
+  page_type?: string;
+  workflow_graph?: any;
+  instructions?: string;
+  script_content?: string;
+  test_plan?: any;
+  validation_status?: string;
+  reliability_score?: number;
+  review_score?: number;
+  review_issues?: any;
+  tokens_used?: number;
+  model?: string;
+  generation_time_ms?: number;
+  files_generated?: any;
+  negative_tests_included?: boolean;
+  created_at?: string;
+}
+
+export async function logGeneratedScript(data: GeneratedScriptRecord): Promise<number> {
+  const result = await getPool().query(
+    `INSERT INTO generated_scripts
+      (url, page_type, workflow_graph, instructions, script_content, test_plan,
+       validation_status, reliability_score, review_score, review_issues,
+       tokens_used, model, generation_time_ms, files_generated, negative_tests_included)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+    RETURNING id`,
+    [
+      data.url,
+      data.page_type ?? null,
+      data.workflow_graph ? JSON.stringify(data.workflow_graph) : null,
+      data.instructions ?? null,
+      data.script_content ?? null,
+      data.test_plan ? JSON.stringify(data.test_plan) : null,
+      data.validation_status ?? 'pending',
+      data.reliability_score ?? 0,
+      data.review_score ?? null,
+      data.review_issues ? JSON.stringify(data.review_issues) : null,
+      data.tokens_used ?? 0,
+      data.model ?? null,
+      data.generation_time_ms ?? null,
+      data.files_generated ? JSON.stringify(data.files_generated) : null,
+      data.negative_tests_included ?? false,
+    ],
+  );
+  return result.rows[0].id;
+}
+
+export async function getGeneratedScript(id: number): Promise<GeneratedScriptRecord | null> {
+  const result = await getPool().query(
+    `SELECT * FROM generated_scripts WHERE id = $1`,
+    [id],
+  );
+  return result.rows[0] ?? null;
+}
+
+export async function getRecentScripts(limit = 20): Promise<GeneratedScriptRecord[]> {
+  const result = await getPool().query(
+    `SELECT * FROM generated_scripts ORDER BY created_at DESC LIMIT $1`,
+    [limit],
+  );
+  return result.rows;
+}
+
+export async function updateScriptReview(
+  scriptId: number,
+  reviewScore: number,
+  reviewIssues: any[],
+): Promise<void> {
+  await getPool().query(
+    `UPDATE generated_scripts SET review_score = $1, review_issues = $2 WHERE id = $3`,
+    [reviewScore, JSON.stringify(reviewIssues), scriptId],
+  );
+}
+
+export async function logDomSnapshot(data: {
+  script_id: number;
+  page_url: string;
+  html_snapshot?: string;
+  elements_count: number;
+  page_type?: string;
+}): Promise<number> {
+  const result = await getPool().query(
+    `INSERT INTO dom_snapshots (script_id, page_url, html_snapshot, elements_count, page_type)
+    VALUES ($1,$2,$3,$4,$5)
+    RETURNING id`,
+    [data.script_id, data.page_url, data.html_snapshot ?? null, data.elements_count, data.page_type ?? null],
+  );
+  return result.rows[0].id;
+}
+
+export async function logSelectorScores(
+  scriptId: number,
+  scores: Array<{ selector: string; score: number; strategy: string; element_type?: string; reason?: string }>,
+): Promise<void> {
+  if (scores.length === 0) return;
+  const values: any[] = [];
+  const placeholders: string[] = [];
+  let idx = 1;
+  for (const s of scores) {
+    placeholders.push(`($${idx},$${idx + 1},$${idx + 2},$${idx + 3},$${idx + 4},$${idx + 5})`);
+    values.push(scriptId, s.selector, s.score, s.strategy, s.element_type ?? null, s.reason ?? null);
+    idx += 6;
+  }
+  await getPool().query(
+    `INSERT INTO selector_scores (script_id, selector, score, strategy, element_type, reason)
+    VALUES ${placeholders.join(',')}`,
+    values,
+  );
+}
+
+export async function logWorkflowMaps(
+  scriptId: number,
+  maps: Array<{ source_page: string; target_page: string; action: string; link_text?: string }>,
+): Promise<void> {
+  if (maps.length === 0) return;
+  const values: any[] = [];
+  const placeholders: string[] = [];
+  let idx = 1;
+  for (const m of maps) {
+    placeholders.push(`($${idx},$${idx + 1},$${idx + 2},$${idx + 3},$${idx + 4})`);
+    values.push(scriptId, m.source_page, m.target_page, m.action, m.link_text ?? null);
+    idx += 5;
+  }
+  await getPool().query(
+    `INSERT INTO workflow_maps (script_id, source_page, target_page, action, link_text)
+    VALUES ${placeholders.join(',')}`,
+    values,
+  );
+}
+
+export async function logProjectExport(data: {
+  script_id: number;
+  project_dir: string;
+  file_count: number;
+  total_size: number;
+  structure?: any;
+}): Promise<number> {
+  const result = await getPool().query(
+    `INSERT INTO generated_projects (script_id, project_dir, file_count, total_size, structure)
+    VALUES ($1,$2,$3,$4,$5)
+    RETURNING id`,
+    [data.script_id, data.project_dir, data.file_count, data.total_size, data.structure ? JSON.stringify(data.structure) : null],
+  );
+  return result.rows[0].id;
 }

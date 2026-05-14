@@ -34,6 +34,7 @@ import { generateReport, type ReportData, type ReportTest, type ReportHealing } 
 import { RCAEngine, type RCAResult } from '../engines/rca-engine';
 import { createRCARouter } from './routes/rca';
 import { createPRRouter } from './routes/pr';
+import { createScriptGenRouter } from './routes/script-gen';
 import { createHealingPR, parseRepoUrl, type HealingSummary, type PRResult } from '../github/pr-creator';
 import { backupFile, restoreFile, cleanupBackup } from '../utils/file-utils';
 import {
@@ -95,6 +96,7 @@ export function createServer(): express.Application {
   app.use('/api/repos', authMiddleware, createReposRouter(repoManager));
   app.use('/api/rca', authMiddleware, createRCARouter());
   app.use('/api/pr', authMiddleware, createPRRouter());
+  app.use('/api/scripts', authMiddleware, createScriptGenRouter());
 
   // List all jobs
   app.get('/api/jobs', authMiddleware, (_req, res) => {
