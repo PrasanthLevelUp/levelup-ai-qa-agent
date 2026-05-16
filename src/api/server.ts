@@ -37,6 +37,8 @@ import { createPRRouter } from './routes/pr';
 import { createScriptGenRouter } from './routes/script-gen';
 import { createAuthRouter } from './routes/auth';
 import { createNotificationsRouter } from './routes/notifications';
+import { notifyRca } from '../integrations/slack';
+import { createRcaTicket } from '../integrations/jira';
 import cookieParser from 'cookie-parser';
 import { createHealingPR, parseRepoUrl, type HealingSummary, type PRResult } from '../github/pr-creator';
 import { backupFile, restoreFile, cleanupBackup } from '../utils/file-utils';
@@ -441,6 +443,31 @@ function createHealingWorker(
             severity: rcaResult.severity,
             confidence: rcaResult.confidence,
           });
+
+          // Fire-and-forget: Slack RCA notification + Jira ticket
+          notifyRca({
+            testName: failure.testName,
+            classification: rcaResult.classification,
+            severity: rcaResult.severity,
+            rootCause: rcaResult.rootCause,
+            suggestedFix: rcaResult.suggestedFix,
+            isFlaky: rcaResult.isFlaky,
+          }).catch((err) => logger.error(MOD, 'Slack RCA notify failed', { error: (err as Error).message }));
+
+          createRcaTicket({
+            testName: failure.testName,
+            classification: rcaResult.classification,
+            severity: rcaResult.severity,
+            rootCause: rcaResult.rootCause,
+            suggestedFix: rcaResult.suggestedFix,
+            affectedComponent: rcaResult.affectedComponent,
+            isFlaky: rcaResult.isFlaky,
+            jobId: job.id,
+            repoName: repo?.name,
+            branch: job.branch,
+            healingAttempted: !!healingForTest,
+            healingSucceeded: healingForTest?.success ?? false,
+          }).catch((err) => logger.error(MOD, 'Jira ticket creation failed', { error: (err as Error).message }));
         } catch (rcaError) {
           logger.error(MOD, 'RCA analysis failed', {
             testName: failure.testName,

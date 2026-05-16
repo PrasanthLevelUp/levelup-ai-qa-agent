@@ -16,6 +16,7 @@ import {
 } from '../../db/postgres';
 import { sendTestMessage as sendSlackTest } from '../../integrations/slack';
 import { sendTeamsTestMessage } from '../../integrations/teams';
+import { fetchProjects, fetchIssueTypes, type JiraConfig } from '../../integrations/jira';
 import { logger } from '../../utils/logger';
 
 const MOD = 'notifications-api';
@@ -274,6 +275,44 @@ router.get('/logs', async (req: Request, res: Response) => {
   } catch (error) {
     logger.error(MOD, 'GET /logs error', { error: (error as Error).message });
     res.status(500).json({ success: false, error: 'Failed to fetch logs' });
+  }
+});
+
+/* ------------------------------------------------------------------ */
+/*  GET /api/notifications/jira/projects                               */
+/* ------------------------------------------------------------------ */
+
+router.get('/jira/projects', async (req: Request, res: Response) => {
+  try {
+    const { instanceUrl, email, apiToken } = req.query as Record<string, string>;
+    if (!instanceUrl || !email || !apiToken) {
+      res.status(400).json({ success: false, error: 'instanceUrl, email, apiToken required' });
+      return;
+    }
+    const projects = await fetchProjects({ instanceUrl, email, apiToken });
+    res.json({ success: true, data: projects });
+  } catch (error) {
+    logger.error(MOD, 'GET /jira/projects error', { error: (error as Error).message });
+    res.status(500).json({ success: false, error: 'Failed to fetch projects' });
+  }
+});
+
+/* ------------------------------------------------------------------ */
+/*  GET /api/notifications/jira/issue-types                            */
+/* ------------------------------------------------------------------ */
+
+router.get('/jira/issue-types', async (req: Request, res: Response) => {
+  try {
+    const { instanceUrl, email, apiToken, projectKey } = req.query as Record<string, string>;
+    if (!instanceUrl || !email || !apiToken || !projectKey) {
+      res.status(400).json({ success: false, error: 'instanceUrl, email, apiToken, projectKey required' });
+      return;
+    }
+    const types = await fetchIssueTypes({ instanceUrl, email, apiToken }, projectKey);
+    res.json({ success: true, data: types });
+  } catch (error) {
+    logger.error(MOD, 'GET /jira/issue-types error', { error: (error as Error).message });
+    res.status(500).json({ success: false, error: 'Failed to fetch issue types' });
   }
 });
 
