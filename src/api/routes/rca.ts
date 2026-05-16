@@ -8,7 +8,7 @@
  */
 
 import { Router, type Request, type Response } from 'express';
-import { getRCA, getRCAsForJob, getRCAStats } from '../../db/postgres';
+import { getRCA, getRCAsForJob, getRCAStats, getFlakyTests, getFlakyTrend, getFlakyHistory } from '../../db/postgres';
 import { RCAEngine } from '../../engines/rca-engine';
 import type { FailureDetails } from '../../core/failure-analyzer';
 
@@ -50,6 +50,52 @@ export function createRCARouter(): Router {
       res.json({ success: true, data: rca });
     } catch (err: any) {
       console.error('[RCA] get error:', err);
+      res.status(500).json({ success: false, error: err.message });
+    }
+  });
+
+  /* ── Flaky tests — summary list ──────────────────────────────── */
+  router.get('/flaky', async (_req: Request, res: Response) => {
+    try {
+      const tests = await getFlakyTests();
+      const stats = await getRCAStats();
+      res.json({
+        success: true,
+        data: {
+          tests,
+          summary: {
+            totalFlaky: stats.flakyCount,
+            totalAnalyses: stats.total,
+            flakyRate: stats.total > 0 ? Math.round((stats.flakyCount / stats.total) * 1000) / 10 : 0,
+          },
+        },
+      });
+    } catch (err: any) {
+      console.error('[RCA] flaky tests error:', err);
+      res.status(500).json({ success: false, error: err.message });
+    }
+  });
+
+  /* ── Flaky trend over time ──────────────────────────────────── */
+  router.get('/flaky/trend', async (req: Request, res: Response) => {
+    try {
+      const days = parseInt(String(req.query.days || '30')) || 30;
+      const trend = await getFlakyTrend(days);
+      res.json({ success: true, data: trend });
+    } catch (err: any) {
+      console.error('[RCA] flaky trend error:', err);
+      res.status(500).json({ success: false, error: err.message });
+    }
+  });
+
+  /* ── Flaky history for a specific test ─────────────────────── */
+  router.get('/flaky/history/:testName', async (req: Request, res: Response) => {
+    try {
+      const testName = decodeURIComponent(req.params.testName as string);
+      const history = await getFlakyHistory(testName);
+      res.json({ success: true, data: history, count: history.length });
+    } catch (err: any) {
+      console.error('[RCA] flaky history error:', err);
       res.status(500).json({ success: false, error: err.message });
     }
   });

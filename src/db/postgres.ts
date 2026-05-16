@@ -804,6 +804,92 @@ export async function getRCAStats(): Promise<{
 }
 
 /* -------------------------------------------------------------------------- */
+/*  Flaky Test Analytics                                                      */
+/* -------------------------------------------------------------------------- */
+
+export interface FlakyTestSummary {
+  test_name: string;
+  flaky_count: number;
+  total_analyses: number;
+  flaky_rate: number;
+  latest_reason: string | null;
+  latest_severity: string;
+  classifications: string[];
+  first_seen: string;
+  last_seen: string;
+  affected_components: string[];
+}
+
+export async function getFlakyTests(): Promise<FlakyTestSummary[]> {
+  const pool = getPool();
+  const result = await pool.query(`
+    WITH flaky_agg AS (
+      SELECT
+        test_name,
+        COUNT(*) FILTER (WHERE is_flaky = true) AS flaky_count,
+        COUNT(*) AS total_analyses,
+        ARRAY_AGG(DISTINCT classification) FILTER (WHERE classification IS NOT NULL) AS classifications,
+        ARRAY_AGG(DISTINCT affected_component) FILTER (WHERE affected_component IS NOT NULL) AS affected_components,
+        MIN(created_at) AS first_seen,
+        MAX(created_at) AS last_seen
+      FROM rca_analyses
+      GROUP BY test_name
+      HAVING COUNT(*) FILTER (WHERE is_flaky = true) > 0
+    ),
+    latest_flaky AS (
+      SELECT DISTINCT ON (test_name)
+        test_name, flaky_reason, severity
+      FROM rca_analyses
+      WHERE is_flaky = true
+      ORDER BY test_name, created_at DESC
+    )
+    SELECT
+      f.test_name,
+      f.flaky_count,
+      f.total_analyses,
+      ROUND((f.flaky_count::numeric / NULLIF(f.total_analyses, 0)) * 100, 1) AS flaky_rate,
+      l.flaky_reason AS latest_reason,
+      COALESCE(l.severity, 'medium') AS latest_severity,
+      f.classifications,
+      f.first_seen,
+      f.last_seen,
+      f.affected_components
+    FROM flaky_agg f
+    LEFT JOIN latest_flaky l ON l.test_name = f.test_name
+    ORDER BY f.flaky_count DESC, f.last_seen DESC
+  `);
+  return result.rows;
+}
+
+export async function getFlakyTrend(days: number = 30): Promise<Array<{ date: string; flaky: number; total: number }>> {
+  const pool = getPool();
+  const result = await pool.query(`
+    SELECT
+      DATE(created_at) AS date,
+      COUNT(*) FILTER (WHERE is_flaky = true) AS flaky,
+      COUNT(*) AS total
+    FROM rca_analyses
+    WHERE created_at >= NOW() - INTERVAL '${days} days'
+    GROUP BY DATE(created_at)
+    ORDER BY date ASC
+  `);
+  return result.rows.map(r => ({
+    date: r.date instanceof Date ? r.date.toISOString().split('T')[0] : String(r.date),
+    flaky: parseInt(r.flaky, 10),
+    total: parseInt(r.total, 10),
+  }));
+}
+
+export async function getFlakyHistory(testName: string): Promise<RCARecord[]> {
+  const pool = getPool();
+  const result = await pool.query(
+    `SELECT * FROM rca_analyses WHERE test_name = $1 ORDER BY created_at DESC LIMIT 50`,
+    [testName],
+  );
+  return result.rows;
+}
+
+/* -------------------------------------------------------------------------- */
 /*  PR Automation Persistence                                                 */
 /* -------------------------------------------------------------------------- */
 
