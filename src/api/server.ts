@@ -36,6 +36,7 @@ import { createRCARouter } from './routes/rca';
 import { createPRRouter } from './routes/pr';
 import { createScriptGenRouter } from './routes/script-gen';
 import { createAuthRouter } from './routes/auth';
+import { createNotificationsRouter } from './routes/notifications';
 import cookieParser from 'cookie-parser';
 import { createHealingPR, parseRepoUrl, type HealingSummary, type PRResult } from '../github/pr-creator';
 import { backupFile, restoreFile, cleanupBackup } from '../utils/file-utils';
@@ -106,6 +107,7 @@ export function createServer(): express.Application {
   app.use('/api/rca', authMiddleware, createRCARouter());
   app.use('/api/pr', authMiddleware, createPRRouter());
   app.use('/api/scripts', authMiddleware, createScriptGenRouter());
+  app.use('/api/notifications', authMiddleware, createNotificationsRouter());
 
   // List all jobs
   app.get('/api/jobs', authMiddleware, (_req, res) => {

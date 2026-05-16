@@ -5,6 +5,7 @@
 import { v4 as uuidv4 } from 'uuid';
 import { persistJob as dbPersistJob, loadJobFromDb as dbLoadJobFromDb, loadPersistedJobs as dbLoadPersistedJobs } from '../../db/postgres';
 import { logger } from '../../utils/logger';
+import { notifyHealResult } from '../../integrations/slack';
 
 const MOD = 'job-queue';
 
@@ -160,6 +161,11 @@ export class JobQueue {
     }
 
     this.persistJob(job);
+
+    // Fire-and-forget Slack notification
+    this.sendJobNotification(job).catch((err) => {
+      logger.error(MOD, 'Notification send failed', { error: (err as Error).message });
+    });
   }
 
   private persistJob(job: HealingJob): void {
@@ -215,6 +221,35 @@ export class JobQueue {
       logger.info(MOD, 'Loaded persisted jobs', { count: rows.length });
     }).catch(() => {
       logger.warn(MOD, 'No persisted jobs to load');
+    });
+  }
+
+  private async sendJobNotification(job: HealingJob): Promise<void> {
+    const repoName = job.repositoryUrl
+      ? job.repositoryUrl.replace(/.*github\.com\//, '').replace(/\.git$/, '')
+      : job.repositoryId;
+
+    const durationMs = job.startedAt && job.completedAt
+      ? new Date(job.completedAt).getTime() - new Date(job.startedAt).getTime()
+      : undefined;
+
+    // Extract stats from result if available
+    const result = job.result || {};
+    const healingSummary = result.summary || result;
+
+    await notifyHealResult({
+      jobId: job.id,
+      repoName,
+      branch: job.branch,
+      status: job.status === JobStatus.COMPLETED ? 'completed' : 'failed',
+      testsHealed: healingSummary.healed ?? healingSummary.testsHealed,
+      testsFailed: healingSummary.failed ?? healingSummary.testsFailed,
+      totalTests: healingSummary.total ?? healingSummary.totalTests,
+      strategies: healingSummary.strategies,
+      commitSha: job.commit,
+      prUrl: healingSummary.prUrl ?? result.prUrl,
+      errorMessage: job.error,
+      durationMs,
     });
   }
 }

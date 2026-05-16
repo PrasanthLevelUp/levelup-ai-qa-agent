@@ -338,6 +338,34 @@ async function initSchema(client: PoolClient): Promise<void> {
     );
     CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
     CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);
+
+    CREATE TABLE IF NOT EXISTS notification_configs (
+      id SERIAL PRIMARY KEY,
+      tool_type TEXT NOT NULL UNIQUE,
+      display_name TEXT NOT NULL,
+      status TEXT DEFAULT 'connected',
+      config JSONB DEFAULT '{}',
+      connected_at TIMESTAMPTZ,
+      last_tested_at TIMESTAMPTZ,
+      last_test_result TEXT,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      updated_at TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_notif_tool ON notification_configs(tool_type);
+
+    CREATE TABLE IF NOT EXISTS notification_logs (
+      id SERIAL PRIMARY KEY,
+      tool_type TEXT NOT NULL,
+      event_type TEXT NOT NULL,
+      channel TEXT,
+      message_preview TEXT,
+      status TEXT DEFAULT 'sent',
+      error TEXT,
+      metadata JSONB DEFAULT '{}',
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_notif_log_type ON notification_logs(tool_type);
+    CREATE INDEX IF NOT EXISTS idx_notif_log_created ON notification_logs(created_at DESC);
   `);
 }
 
@@ -1140,4 +1168,120 @@ export async function cleanExpiredSessions(): Promise<number> {
     `DELETE FROM sessions WHERE expires_at < NOW()`,
   );
   return result.rowCount ?? 0;
+}
+
+
+/* -------------------------------------------------------------------------- */
+/*  Notification Configs                                                       */
+/* -------------------------------------------------------------------------- */
+
+export interface NotificationConfig {
+  id: number;
+  tool_type: string;
+  display_name: string;
+  status: string;
+  config: Record<string, any>;
+  connected_at: string | null;
+  last_tested_at: string | null;
+  last_test_result: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export async function getNotificationConfigs(): Promise<NotificationConfig[]> {
+  const result = await getPool().query(
+    `SELECT * FROM notification_configs ORDER BY created_at ASC`,
+  );
+  return result.rows;
+}
+
+export async function getNotificationConfigByType(toolType: string): Promise<NotificationConfig | null> {
+  const result = await getPool().query(
+    `SELECT * FROM notification_configs WHERE tool_type = $1`,
+    [toolType],
+  );
+  return result.rows[0] || null;
+}
+
+export async function upsertNotificationConfig(data: {
+  tool_type: string;
+  display_name: string;
+  config: Record<string, any>;
+}): Promise<NotificationConfig> {
+  const result = await getPool().query(
+    `INSERT INTO notification_configs (tool_type, display_name, status, config, connected_at, updated_at)
+     VALUES ($1, $2, 'connected', $3, NOW(), NOW())
+     ON CONFLICT (tool_type)
+     DO UPDATE SET
+       display_name = EXCLUDED.display_name,
+       config = EXCLUDED.config,
+       status = 'connected',
+       connected_at = NOW(),
+       updated_at = NOW(),
+       last_test_result = NULL
+     RETURNING *`,
+    [data.tool_type, data.display_name, JSON.stringify(data.config)],
+  );
+  return result.rows[0];
+}
+
+export async function deleteNotificationConfig(id: number): Promise<boolean> {
+  const result = await getPool().query(
+    `DELETE FROM notification_configs WHERE id = $1`,
+    [id],
+  );
+  return (result.rowCount ?? 0) > 0;
+}
+
+export async function updateNotificationTestResult(
+  id: number,
+  success: boolean,
+): Promise<void> {
+  await getPool().query(
+    `UPDATE notification_configs
+     SET last_tested_at = NOW(),
+         last_test_result = $2,
+         status = CASE WHEN $2 = 'success' THEN 'connected' ELSE 'error' END,
+         updated_at = NOW()
+     WHERE id = $1`,
+    [id, success ? 'success' : 'failed'],
+  );
+}
+
+/* -------------------------------------------------------------------------- */
+/*  Notification Logs                                                          */
+/* -------------------------------------------------------------------------- */
+
+export async function insertNotificationLog(data: {
+  tool_type: string;
+  event_type: string;
+  channel?: string;
+  message_preview?: string;
+  status: string;
+  error?: string;
+  metadata?: Record<string, any>;
+}): Promise<number> {
+  const result = await getPool().query(
+    `INSERT INTO notification_logs (tool_type, event_type, channel, message_preview, status, error, metadata)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)
+     RETURNING id`,
+    [
+      data.tool_type,
+      data.event_type,
+      data.channel ?? null,
+      data.message_preview ?? null,
+      data.status,
+      data.error ?? null,
+      JSON.stringify(data.metadata ?? {}),
+    ],
+  );
+  return result.rows[0].id;
+}
+
+export async function getNotificationLogs(limit = 50): Promise<any[]> {
+  const result = await getPool().query(
+    `SELECT * FROM notification_logs ORDER BY created_at DESC LIMIT $1`,
+    [limit],
+  );
+  return result.rows;
 }
