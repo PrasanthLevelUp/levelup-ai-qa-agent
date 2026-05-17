@@ -20,9 +20,10 @@ import {
 export function createLearningRouter(): Router {
   const router = Router();
 
-  router.get('/stats', async (_req: Request, res: Response) => {
+  router.get('/stats', async (req: Request, res: Response) => {
     try {
-      const stats = await getLearningStats();
+      const cid = (req as any).companyId;
+      const stats = await getLearningStats(cid);
       res.json({ success: true, data: stats });
     } catch (err: any) {
       console.error('[Learning] stats error:', err);
@@ -32,8 +33,9 @@ export function createLearningRouter(): Router {
 
   router.get('/patterns', async (req: Request, res: Response) => {
     try {
+      const cid = (req as any).companyId;
       const limit = parseInt(String(req.query.limit || '100')) || 100;
-      const patterns = await getPatternsList(limit);
+      const patterns = await getPatternsList(limit, cid);
       res.json({ success: true, data: patterns, count: patterns.length });
     } catch (err: any) {
       console.error('[Learning] patterns error:', err);
@@ -43,8 +45,9 @@ export function createLearningRouter(): Router {
 
   router.get('/top', async (req: Request, res: Response) => {
     try {
+      const cid = (req as any).companyId;
       const limit = parseInt(String(req.query.limit || '10')) || 10;
-      const top = await getTopPatterns(limit);
+      const top = await getTopPatterns(limit, cid);
       res.json({ success: true, data: top });
     } catch (err: any) {
       console.error('[Learning] top patterns error:', err);
@@ -52,9 +55,10 @@ export function createLearningRouter(): Router {
     }
   });
 
-  router.get('/strategies', async (_req: Request, res: Response) => {
+  router.get('/strategies', async (req: Request, res: Response) => {
     try {
-      const strategies = await getStrategyEffectiveness();
+      const cid = (req as any).companyId;
+      const strategies = await getStrategyEffectiveness(cid);
       res.json({ success: true, data: strategies });
     } catch (err: any) {
       console.error('[Learning] strategies error:', err);
@@ -64,8 +68,9 @@ export function createLearningRouter(): Router {
 
   router.get('/velocity', async (req: Request, res: Response) => {
     try {
+      const cid = (req as any).companyId;
       const days = parseInt(String(req.query.days || '30')) || 30;
-      const velocity = await getLearningVelocity(days);
+      const velocity = await getLearningVelocity(days, cid);
       res.json({ success: true, data: velocity });
     } catch (err: any) {
       console.error('[Learning] velocity error:', err);

@@ -22,6 +22,7 @@ export interface HealingJob {
   repositoryUrl?: string;
   branch: string;
   commit?: string;
+  companyId?: number;
   status: JobStatus;
   progress: string;
   createdAt: string;
@@ -57,12 +58,13 @@ export class JobQueue {
   /**
    * Create a new healing job and add to queue.
    */
-  createJob(repositoryId: string, branch = 'main', commit?: string, repositoryUrl?: string): HealingJob {
+  createJob(repositoryId: string, branch = 'main', commit?: string, repositoryUrl?: string, companyId?: number): HealingJob {
     const job: HealingJob = {
       id: `job_${uuidv4().slice(0, 12)}`,
       repositoryId,
       repositoryUrl,
       branch,
+      companyId,
       commit,
       status: JobStatus.PENDING,
       progress: 'Queued for processing',

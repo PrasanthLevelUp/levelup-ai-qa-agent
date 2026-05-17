@@ -366,18 +366,176 @@ async function initSchema(client: PoolClient): Promise<void> {
     );
     CREATE INDEX IF NOT EXISTS idx_notif_log_type ON notification_logs(tool_type);
     CREATE INDEX IF NOT EXISTS idx_notif_log_created ON notification_logs(created_at DESC);
+
+    -- Multi-tenant: Companies
+    CREATE TABLE IF NOT EXISTS companies (
+      id SERIAL PRIMARY KEY,
+      name VARCHAR(255) NOT NULL UNIQUE,
+      slug VARCHAR(100) NOT NULL UNIQUE,
+      is_active BOOLEAN DEFAULT true,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      updated_at TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_companies_slug ON companies(slug);
+
+    -- Add company_id columns (safe idempotent ALTER)
+    DO $$ BEGIN
+      -- test_executions
+      IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='test_executions' AND column_name='company_id') THEN
+        ALTER TABLE test_executions ADD COLUMN company_id INTEGER REFERENCES companies(id);
+      END IF;
+      -- healing_actions
+      IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='healing_actions' AND column_name='company_id') THEN
+        ALTER TABLE healing_actions ADD COLUMN company_id INTEGER REFERENCES companies(id);
+      END IF;
+      -- learned_patterns
+      IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='learned_patterns' AND column_name='company_id') THEN
+        ALTER TABLE learned_patterns ADD COLUMN company_id INTEGER REFERENCES companies(id);
+      END IF;
+      -- healing_jobs
+      IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='healing_jobs' AND column_name='company_id') THEN
+        ALTER TABLE healing_jobs ADD COLUMN company_id INTEGER REFERENCES companies(id);
+      END IF;
+      -- token_usage
+      IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='token_usage' AND column_name='company_id') THEN
+        ALTER TABLE token_usage ADD COLUMN company_id INTEGER REFERENCES companies(id);
+      END IF;
+      -- rca_analyses
+      IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='rca_analyses' AND column_name='company_id') THEN
+        ALTER TABLE rca_analyses ADD COLUMN company_id INTEGER REFERENCES companies(id);
+      END IF;
+      -- pr_automations
+      IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='pr_automations' AND column_name='company_id') THEN
+        ALTER TABLE pr_automations ADD COLUMN company_id INTEGER REFERENCES companies(id);
+      END IF;
+      -- generated_scripts
+      IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='generated_scripts' AND column_name='company_id') THEN
+        ALTER TABLE generated_scripts ADD COLUMN company_id INTEGER REFERENCES companies(id);
+      END IF;
+      -- notification_configs
+      IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='notification_configs' AND column_name='company_id') THEN
+        ALTER TABLE notification_configs ADD COLUMN company_id INTEGER REFERENCES companies(id);
+      END IF;
+      -- notification_logs
+      IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='notification_logs' AND column_name='company_id') THEN
+        ALTER TABLE notification_logs ADD COLUMN company_id INTEGER REFERENCES companies(id);
+      END IF;
+      -- users
+      IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='company_id') THEN
+        ALTER TABLE users ADD COLUMN company_id INTEGER REFERENCES companies(id);
+      END IF;
+    END $$;
+
+    -- Indexes for company_id columns
+    CREATE INDEX IF NOT EXISTS idx_exec_company ON test_executions(company_id);
+    CREATE INDEX IF NOT EXISTS idx_heal_company ON healing_actions(company_id);
+    CREATE INDEX IF NOT EXISTS idx_pattern_company ON learned_patterns(company_id);
+    CREATE INDEX IF NOT EXISTS idx_jobs_company ON healing_jobs(company_id);
+    CREATE INDEX IF NOT EXISTS idx_token_company ON token_usage(company_id);
+    CREATE INDEX IF NOT EXISTS idx_rca_company ON rca_analyses(company_id);
+    CREATE INDEX IF NOT EXISTS idx_pr_company ON pr_automations(company_id);
+    CREATE INDEX IF NOT EXISTS idx_gs_company ON generated_scripts(company_id);
+    CREATE INDEX IF NOT EXISTS idx_notif_config_company ON notification_configs(company_id);
+    CREATE INDEX IF NOT EXISTS idx_notif_log_company ON notification_logs(company_id);
+    CREATE INDEX IF NOT EXISTS idx_users_company ON users(company_id);
   `);
+
+  // Ensure default company exists and backfill orphaned data
+  await migrateDefaultCompany(client);
+}
+
+/* -------------------------------------------------------------------------- */
+/*  Multi-tenant Migration Helper                                             */
+/* -------------------------------------------------------------------------- */
+
+async function migrateDefaultCompany(client: PoolClient): Promise<void> {
+  // Ensure "Default" company exists
+  const { rows } = await client.query(
+    `INSERT INTO companies (name, slug) VALUES ('Default', 'default')
+     ON CONFLICT (slug) DO UPDATE SET updated_at = NOW()
+     RETURNING id`
+  );
+  const defaultId = rows[0].id;
+
+  // Backfill any rows without company_id
+  const tables = [
+    'test_executions', 'healing_actions', 'learned_patterns',
+    'healing_jobs', 'token_usage', 'rca_analyses', 'pr_automations',
+    'generated_scripts', 'notification_configs', 'notification_logs', 'users',
+  ];
+  for (const t of tables) {
+    await client.query(`UPDATE ${t} SET company_id = $1 WHERE company_id IS NULL`, [defaultId]);
+  }
+
+  // Migrate notification_configs unique constraint: tool_type → (tool_type, company_id)
+  await client.query(`
+    DO $$ BEGIN
+      IF EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'notification_configs_tool_type_key'
+          AND conrelid = 'notification_configs'::regclass
+      ) THEN
+        ALTER TABLE notification_configs DROP CONSTRAINT notification_configs_tool_type_key;
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_notif_tool_company
+          ON notification_configs (tool_type, COALESCE(company_id, 0));
+      END IF;
+    END $$;
+  `);
+}
+
+/* -------------------------------------------------------------------------- */
+/*  Company CRUD                                                              */
+/* -------------------------------------------------------------------------- */
+
+export async function createCompany(name: string, slug: string): Promise<number> {
+  const pool = getPool();
+  const { rows } = await pool.query(
+    `INSERT INTO companies (name, slug) VALUES ($1, $2) RETURNING id`,
+    [name, slug],
+  );
+  return rows[0].id;
+}
+
+export async function getCompanies(): Promise<Array<{ id: number; name: string; slug: string; is_active: boolean; created_at: string }>> {
+  const pool = getPool();
+  const { rows } = await pool.query(
+    `SELECT id, name, slug, is_active, created_at FROM companies ORDER BY name`
+  );
+  return rows;
+}
+
+export async function getCompanyById(id: number): Promise<{ id: number; name: string; slug: string; is_active: boolean } | null> {
+  const pool = getPool();
+  const { rows } = await pool.query(`SELECT id, name, slug, is_active FROM companies WHERE id = $1`, [id]);
+  return rows[0] || null;
+}
+
+export async function getCompanyBySlug(slug: string): Promise<{ id: number; name: string; slug: string; is_active: boolean } | null> {
+  const pool = getPool();
+  const { rows } = await pool.query(`SELECT id, name, slug, is_active FROM companies WHERE slug = $1`, [slug]);
+  return rows[0] || null;
+}
+
+export async function updateCompany(id: number, data: { name?: string; is_active?: boolean }): Promise<void> {
+  const pool = getPool();
+  const sets: string[] = ['updated_at = NOW()'];
+  const vals: any[] = [];
+  let idx = 1;
+  if (data.name !== undefined) { sets.push(`name = $${idx++}`); vals.push(data.name); }
+  if (data.is_active !== undefined) { sets.push(`is_active = $${idx++}`); vals.push(data.is_active); }
+  vals.push(id);
+  await pool.query(`UPDATE companies SET ${sets.join(', ')} WHERE id = $${idx}`, vals);
 }
 
 /* -------------------------------------------------------------------------- */
 /*  Test Executions                                                           */
 /* -------------------------------------------------------------------------- */
 
-export async function logExecution(data: TestExecution): Promise<number> {
+export async function logExecution(data: TestExecution, companyId?: number): Promise<number> {
   const result = await getPool().query(
     `INSERT INTO test_executions
-      (test_name, status, error_message, screenshot_path, github_commit_sha, duration_ms, healing_attempted, healing_succeeded)
-    VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+      (test_name, status, error_message, screenshot_path, github_commit_sha, duration_ms, healing_attempted, healing_succeeded, company_id)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
     RETURNING id`,
     [
       data.test_name,
@@ -388,6 +546,7 @@ export async function logExecution(data: TestExecution): Promise<number> {
       data.duration_ms ?? 0,
       data.healing_attempted ?? false,
       data.healing_succeeded ?? false,
+      companyId ?? null,
     ],
   );
   return result.rows[0].id;
@@ -423,12 +582,12 @@ export async function updateExecution(id: number, fields: Partial<TestExecution>
 /*  Healing Actions                                                           */
 /* -------------------------------------------------------------------------- */
 
-export async function logHealing(data: HealingAction): Promise<number> {
+export async function logHealing(data: HealingAction, companyId?: number): Promise<number> {
   const result = await getPool().query(
     `INSERT INTO healing_actions
       (test_execution_id, test_name, failed_locator, healed_locator, healing_strategy, ai_tokens_used,
-       success, confidence, error_context, validation_status, validation_reason, patch_path)
-    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+       success, confidence, error_context, validation_status, validation_reason, patch_path, company_id)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
     RETURNING id`,
     [
       data.test_execution_id,
@@ -443,6 +602,7 @@ export async function logHealing(data: HealingAction): Promise<number> {
       data.validation_status ?? null,
       data.validation_reason ?? null,
       data.patch_path ?? null,
+      companyId ?? null,
     ],
   );
   return result.rows[0].id;
@@ -505,11 +665,11 @@ export async function lookupPattern(input: {
   };
 }
 
-export async function storePattern(data: LearnedPattern): Promise<number> {
+export async function storePattern(data: LearnedPattern, companyId?: number): Promise<number> {
   const result = await getPool().query(
     `INSERT INTO learned_patterns
-      (test_name, error_pattern, failed_locator, healed_locator, solution_strategy, confidence, avg_tokens_saved)
-    VALUES ($1, $2, $3, $4, $5, $6, $7)
+      (test_name, error_pattern, failed_locator, healed_locator, solution_strategy, confidence, avg_tokens_saved, company_id)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
     ON CONFLICT(test_name, error_pattern, failed_locator)
     DO UPDATE SET
       healed_locator = EXCLUDED.healed_locator,
@@ -528,6 +688,7 @@ export async function storePattern(data: LearnedPattern): Promise<number> {
       data.solution_strategy,
       data.confidence ?? 0,
       data.avg_tokens_saved ?? 0,
+      companyId ?? null,
     ],
   );
   return result.rows[0].id;
@@ -537,16 +698,18 @@ export async function storePattern(data: LearnedPattern): Promise<number> {
 /*  Historical Stats                                                          */
 /* -------------------------------------------------------------------------- */
 
-export async function getHistoricalStats(): Promise<HistoricalStats> {
+export async function getHistoricalStats(companyId?: number): Promise<HistoricalStats> {
   const p = getPool();
+  const cf = companyId ? `WHERE company_id = ${companyId}` : '';
+  const cfAnd = companyId ? `AND company_id = ${companyId}` : '';
 
   const [execRes, healRes, successRes, tokenRes, patternRes, strategyRes] = await Promise.all([
-    p.query('SELECT COUNT(*) as c FROM test_executions'),
-    p.query('SELECT COUNT(*) as c FROM healing_actions'),
-    p.query('SELECT COUNT(*) as c FROM healing_actions WHERE success = true'),
-    p.query('SELECT COALESCE(SUM(ai_tokens_used), 0) as t FROM healing_actions'),
-    p.query('SELECT COUNT(*) as c FROM learned_patterns'),
-    p.query(`SELECT healing_strategy, COUNT(*) as c FROM healing_actions GROUP BY healing_strategy`),
+    p.query(`SELECT COUNT(*) as c FROM test_executions ${cf}`),
+    p.query(`SELECT COUNT(*) as c FROM healing_actions ${cf}`),
+    p.query(`SELECT COUNT(*) as c FROM healing_actions WHERE success = true ${cfAnd}`),
+    p.query(`SELECT COALESCE(SUM(ai_tokens_used), 0) as t FROM healing_actions ${cf}`),
+    p.query(`SELECT COUNT(*) as c FROM learned_patterns ${cf}`),
+    p.query(`SELECT healing_strategy, COUNT(*) as c FROM healing_actions ${cf} GROUP BY healing_strategy`),
   ]);
 
   const totalExecutions = parseInt(execRes.rows[0].c, 10);
@@ -583,11 +746,11 @@ export async function getHistoricalStats(): Promise<HistoricalStats> {
 /*  Token Usage                                                               */
 /* -------------------------------------------------------------------------- */
 
-export async function logTokenUsage(engine: string, tokensUsed: number, costUsd: number): Promise<void> {
+export async function logTokenUsage(engine: string, tokensUsed: number, costUsd: number, companyId?: number): Promise<void> {
   const today = new Date().toISOString().slice(0, 10);
   await getPool().query(
-    `INSERT INTO token_usage (date, engine, tokens_used, cost_usd) VALUES ($1, $2, $3, $4)`,
-    [today, engine, tokensUsed, costUsd],
+    `INSERT INTO token_usage (date, engine, tokens_used, cost_usd, company_id) VALUES ($1, $2, $3, $4, $5)`,
+    [today, engine, tokensUsed, costUsd, companyId ?? null],
   );
 }
 
@@ -626,12 +789,13 @@ export async function persistJob(job: {
   completedAt?: string;
   result?: any;
   error?: string;
+  companyId?: number;
 }): Promise<void> {
   await getPool().query(
     `INSERT INTO healing_jobs
       (id, repository_id, repository_url, branch, commit_sha, status, progress,
-       created_at, started_at, completed_at, result, error)
-    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+       created_at, started_at, completed_at, result, error, company_id)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
     ON CONFLICT(id) DO UPDATE SET
       status = EXCLUDED.status,
       progress = EXCLUDED.progress,
@@ -652,6 +816,7 @@ export async function persistJob(job: {
       job.completedAt ?? null,
       job.result ? JSON.stringify(job.result) : null,
       job.error ?? null,
+      job.companyId ?? null,
     ],
   );
 }
@@ -699,14 +864,14 @@ export interface RCARecord {
   created_at?: string;
 }
 
-export async function logRCA(data: RCARecord): Promise<number> {
+export async function logRCA(data: RCARecord, companyId?: number): Promise<number> {
   const result = await getPool().query(
     `INSERT INTO rca_analyses
       (test_execution_id, job_id, test_name, root_cause, classification, severity,
        confidence, suggested_fix, affected_component, is_flaky, flaky_reason,
        summary, technical_details, tokens_used, model, analysis_time_ms,
-       healing_attempted, healing_succeeded, healed_locator, healing_strategy, error_message)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
+       healing_attempted, healing_succeeded, healed_locator, healing_strategy, error_message, company_id)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
     RETURNING id`,
     [
       data.test_execution_id,
@@ -730,28 +895,31 @@ export async function logRCA(data: RCARecord): Promise<number> {
       data.healed_locator ?? null,
       data.healing_strategy ?? null,
       data.error_message ?? null,
+      companyId ?? null,
     ],
   );
   return result.rows[0].id;
 }
 
-export async function getRCA(executionId: string): Promise<RCARecord | null> {
+export async function getRCA(executionId: string, companyId?: number): Promise<RCARecord | null> {
+  const cfAnd = companyId ? `AND company_id = ${companyId}` : '';
   const result = await getPool().query(
-    `SELECT * FROM rca_analyses WHERE test_execution_id = $1 ORDER BY created_at DESC LIMIT 1`,
+    `SELECT * FROM rca_analyses WHERE test_execution_id = $1 ${cfAnd} ORDER BY created_at DESC LIMIT 1`,
     [executionId],
   );
   return result.rows[0] ?? null;
 }
 
-export async function getRCAsForJob(jobId: string): Promise<RCARecord[]> {
+export async function getRCAsForJob(jobId: string, companyId?: number): Promise<RCARecord[]> {
+  const cfAnd = companyId ? `AND company_id = ${companyId}` : '';
   const result = await getPool().query(
-    `SELECT * FROM rca_analyses WHERE job_id = $1 ORDER BY created_at ASC`,
+    `SELECT * FROM rca_analyses WHERE job_id = $1 ${cfAnd} ORDER BY created_at ASC`,
     [jobId],
   );
   return result.rows;
 }
 
-export async function getRCAStats(): Promise<{
+export async function getRCAStats(companyId?: number): Promise<{
   total: number;
   byClassification: Record<string, number>;
   bySeverity: Record<string, number>;
@@ -760,12 +928,14 @@ export async function getRCAStats(): Promise<{
   healingSuccessRate: number;
 }> {
   const pool = getPool();
+  const cf = companyId ? `WHERE company_id = ${companyId}` : '';
+  const cfAnd = companyId ? `AND company_id = ${companyId}` : '';
 
-  const totalRes = await pool.query(`SELECT COUNT(*) AS count FROM rca_analyses`);
+  const totalRes = await pool.query(`SELECT COUNT(*) AS count FROM rca_analyses ${cf}`);
   const total = parseInt(totalRes.rows[0].count, 10);
 
   const classRes = await pool.query(
-    `SELECT classification, COUNT(*) AS count FROM rca_analyses GROUP BY classification ORDER BY count DESC`,
+    `SELECT classification, COUNT(*) AS count FROM rca_analyses ${cf} GROUP BY classification ORDER BY count DESC`,
   );
   const byClassification: Record<string, number> = {};
   for (const row of classRes.rows) {
@@ -773,7 +943,7 @@ export async function getRCAStats(): Promise<{
   }
 
   const sevRes = await pool.query(
-    `SELECT severity, COUNT(*) AS count FROM rca_analyses GROUP BY severity ORDER BY count DESC`,
+    `SELECT severity, COUNT(*) AS count FROM rca_analyses ${cf} GROUP BY severity ORDER BY count DESC`,
   );
   const bySeverity: Record<string, number> = {};
   for (const row of sevRes.rows) {
@@ -781,12 +951,12 @@ export async function getRCAStats(): Promise<{
   }
 
   const avgRes = await pool.query(
-    `SELECT COALESCE(AVG(confidence), 0) AS avg FROM rca_analyses`,
+    `SELECT COALESCE(AVG(confidence), 0) AS avg FROM rca_analyses ${cf}`,
   );
   const avgConfidence = parseFloat(avgRes.rows[0].avg);
 
   const flakyRes = await pool.query(
-    `SELECT COUNT(*) AS count FROM rca_analyses WHERE is_flaky = true`,
+    `SELECT COUNT(*) AS count FROM rca_analyses WHERE is_flaky = true ${cfAnd}`,
   );
   const flakyCount = parseInt(flakyRes.rows[0].count, 10);
 
@@ -794,7 +964,7 @@ export async function getRCAStats(): Promise<{
     `SELECT
        COUNT(*) FILTER (WHERE healing_attempted = true) AS attempted,
        COUNT(*) FILTER (WHERE healing_succeeded = true) AS succeeded
-     FROM rca_analyses`,
+     FROM rca_analyses ${cf}`,
   );
   const attempted = parseInt(healRes.rows[0].attempted, 10);
   const succeeded = parseInt(healRes.rows[0].succeeded, 10);
@@ -820,8 +990,10 @@ export interface FlakyTestSummary {
   affected_components: string[];
 }
 
-export async function getFlakyTests(): Promise<FlakyTestSummary[]> {
+export async function getFlakyTests(companyId?: number): Promise<FlakyTestSummary[]> {
   const pool = getPool();
+  const cf = companyId ? `WHERE company_id = ${companyId}` : '';
+  const cfAnd = companyId ? `AND company_id = ${companyId}` : '';
   const result = await pool.query(`
     WITH flaky_agg AS (
       SELECT
@@ -833,6 +1005,7 @@ export async function getFlakyTests(): Promise<FlakyTestSummary[]> {
         MIN(created_at) AS first_seen,
         MAX(created_at) AS last_seen
       FROM rca_analyses
+      ${cf}
       GROUP BY test_name
       HAVING COUNT(*) FILTER (WHERE is_flaky = true) > 0
     ),
@@ -840,7 +1013,7 @@ export async function getFlakyTests(): Promise<FlakyTestSummary[]> {
       SELECT DISTINCT ON (test_name)
         test_name, flaky_reason, severity
       FROM rca_analyses
-      WHERE is_flaky = true
+      WHERE is_flaky = true ${cfAnd}
       ORDER BY test_name, created_at DESC
     )
     SELECT
@@ -861,15 +1034,16 @@ export async function getFlakyTests(): Promise<FlakyTestSummary[]> {
   return result.rows;
 }
 
-export async function getFlakyTrend(days: number = 30): Promise<Array<{ date: string; flaky: number; total: number }>> {
+export async function getFlakyTrend(days: number = 30, companyId?: number): Promise<Array<{ date: string; flaky: number; total: number }>> {
   const pool = getPool();
+  const cfAnd = companyId ? `AND company_id = ${companyId}` : '';
   const result = await pool.query(`
     SELECT
       DATE(created_at) AS date,
       COUNT(*) FILTER (WHERE is_flaky = true) AS flaky,
       COUNT(*) AS total
     FROM rca_analyses
-    WHERE created_at >= NOW() - INTERVAL '${days} days'
+    WHERE created_at >= NOW() - INTERVAL '${days} days' ${cfAnd}
     GROUP BY DATE(created_at)
     ORDER BY date ASC
   `);
@@ -880,10 +1054,11 @@ export async function getFlakyTrend(days: number = 30): Promise<Array<{ date: st
   }));
 }
 
-export async function getFlakyHistory(testName: string): Promise<RCARecord[]> {
+export async function getFlakyHistory(testName: string, companyId?: number): Promise<RCARecord[]> {
   const pool = getPool();
+  const cfAnd = companyId ? `AND company_id = ${companyId}` : '';
   const result = await pool.query(
-    `SELECT * FROM rca_analyses WHERE test_name = $1 ORDER BY created_at DESC LIMIT 50`,
+    `SELECT * FROM rca_analyses WHERE test_name = $1 ${cfAnd} ORDER BY created_at DESC LIMIT 50`,
     [testName],
   );
   return result.rows;
@@ -893,7 +1068,7 @@ export async function getFlakyHistory(testName: string): Promise<RCARecord[]> {
 /*  DOM Memory Analytics                                                      */
 /* -------------------------------------------------------------------------- */
 
-export async function getDomMemoryStats(): Promise<{
+export async function getDomMemoryStats(companyId?: number): Promise<{
   totalSnapshots: number;
   totalSelectors: number;
   uniquePages: number;
@@ -902,13 +1077,17 @@ export async function getDomMemoryStats(): Promise<{
   uniqueHealedLocators: number;
 }> {
   const pool = getPool();
+  // DOM snapshots/selectors join through generated_scripts for company scope
+  const snapCf = companyId ? `WHERE ds.script_id IN (SELECT id FROM generated_scripts WHERE company_id = ${companyId})` : '';
+  const selCf = companyId ? `WHERE ss.script_id IN (SELECT id FROM generated_scripts WHERE company_id = ${companyId})` : '';
+  const haCf = companyId ? `AND company_id = ${companyId}` : '';
   const [snapRes, selRes, pagesRes, avgRes, changesRes, uniqueHealedRes] = await Promise.all([
-    pool.query(`SELECT COUNT(*) AS c FROM dom_snapshots`),
-    pool.query(`SELECT COUNT(*) AS c FROM selector_scores`),
-    pool.query(`SELECT COUNT(DISTINCT page_url) AS c FROM dom_snapshots`),
-    pool.query(`SELECT COALESCE(AVG(score), 0) AS avg FROM selector_scores`),
-    pool.query(`SELECT COUNT(*) AS c FROM healing_actions WHERE healed_locator IS NOT NULL AND healed_locator != failed_locator`),
-    pool.query(`SELECT COUNT(DISTINCT healed_locator) AS c FROM healing_actions WHERE healed_locator IS NOT NULL`),
+    pool.query(`SELECT COUNT(*) AS c FROM dom_snapshots ds ${snapCf}`),
+    pool.query(`SELECT COUNT(*) AS c FROM selector_scores ss ${selCf}`),
+    pool.query(`SELECT COUNT(DISTINCT ds.page_url) AS c FROM dom_snapshots ds ${snapCf}`),
+    pool.query(`SELECT COALESCE(AVG(ss.score), 0) AS avg FROM selector_scores ss ${selCf}`),
+    pool.query(`SELECT COUNT(*) AS c FROM healing_actions WHERE healed_locator IS NOT NULL AND healed_locator != failed_locator ${haCf}`),
+    pool.query(`SELECT COUNT(DISTINCT healed_locator) AS c FROM healing_actions WHERE healed_locator IS NOT NULL ${haCf}`),
   ]);
   return {
     totalSnapshots: parseInt(snapRes.rows[0].c, 10),
@@ -920,11 +1099,13 @@ export async function getDomMemoryStats(): Promise<{
   };
 }
 
-export async function getDomSnapshots(limit = 50): Promise<any[]> {
+export async function getDomSnapshots(limit = 50, companyId?: number): Promise<any[]> {
+  const cf = companyId ? `WHERE gs.company_id = ${companyId}` : '';
   const result = await getPool().query(
     `SELECT ds.*, gs.url AS script_url, gs.test_count
      FROM dom_snapshots ds
      LEFT JOIN generated_scripts gs ON gs.id = ds.script_id
+     ${cf}
      ORDER BY ds.created_at DESC
      LIMIT $1`,
     [limit],
@@ -932,27 +1113,30 @@ export async function getDomSnapshots(limit = 50): Promise<any[]> {
   return result.rows;
 }
 
-export async function getSelectorHealth(limit = 100): Promise<any[]> {
+export async function getSelectorHealth(limit = 100, companyId?: number): Promise<any[]> {
+  const cfJoin = companyId ? `JOIN generated_scripts gs ON gs.id = ss.script_id AND gs.company_id = ${companyId}` : '';
   const result = await getPool().query(
     `SELECT
-       selector,
-       ROUND(AVG(score)::numeric, 2) AS avg_score,
+       ss.selector,
+       ROUND(AVG(ss.score)::numeric, 2) AS avg_score,
        COUNT(*) AS usage_count,
-       MAX(strategy) AS strategy,
-       MAX(element_type) AS element_type,
-       ARRAY_AGG(DISTINCT reason) FILTER (WHERE reason IS NOT NULL) AS reasons,
-       MIN(created_at) AS first_seen,
-       MAX(created_at) AS last_seen
-     FROM selector_scores
-     GROUP BY selector
-     ORDER BY AVG(score) ASC, COUNT(*) DESC
+       MAX(ss.strategy) AS strategy,
+       MAX(ss.element_type) AS element_type,
+       ARRAY_AGG(DISTINCT ss.reason) FILTER (WHERE ss.reason IS NOT NULL) AS reasons,
+       MIN(ss.created_at) AS first_seen,
+       MAX(ss.created_at) AS last_seen
+     FROM selector_scores ss
+     ${cfJoin}
+     GROUP BY ss.selector
+     ORDER BY AVG(ss.score) ASC, COUNT(*) DESC
      LIMIT $1`,
     [limit],
   );
   return result.rows;
 }
 
-export async function getLocatorEvolution(limit = 50): Promise<any[]> {
+export async function getLocatorEvolution(limit = 50, companyId?: number): Promise<any[]> {
+  const cfAnd = companyId ? `AND company_id = ${companyId}` : '';
   const result = await getPool().query(
     `SELECT
        failed_locator,
@@ -965,7 +1149,7 @@ export async function getLocatorEvolution(limit = 50): Promise<any[]> {
        MIN(created_at) AS first_seen,
        MAX(created_at) AS last_seen
      FROM healing_actions
-     WHERE healed_locator IS NOT NULL
+     WHERE healed_locator IS NOT NULL ${cfAnd}
      GROUP BY failed_locator, healed_locator, healing_strategy, test_name, success, confidence
      ORDER BY COUNT(*) DESC, MAX(created_at) DESC
      LIMIT $1`,
@@ -974,16 +1158,18 @@ export async function getLocatorEvolution(limit = 50): Promise<any[]> {
   return result.rows;
 }
 
-export async function getPageElementTrend(days = 30): Promise<Array<{ date: string; pages: number; elements: number; snapshots: number }>> {
+export async function getPageElementTrend(days = 30, companyId?: number): Promise<Array<{ date: string; pages: number; elements: number; snapshots: number }>> {
+  const cfJoin = companyId ? `JOIN generated_scripts gs ON gs.id = ds.script_id AND gs.company_id = ${companyId}` : '';
   const result = await getPool().query(`
     SELECT
-      DATE(created_at) AS date,
-      COUNT(DISTINCT page_url) AS pages,
-      COALESCE(SUM(elements_count), 0) AS elements,
+      DATE(ds.created_at) AS date,
+      COUNT(DISTINCT ds.page_url) AS pages,
+      COALESCE(SUM(ds.elements_count), 0) AS elements,
       COUNT(*) AS snapshots
-    FROM dom_snapshots
-    WHERE created_at >= NOW() - INTERVAL '${days} days'
-    GROUP BY DATE(created_at)
+    FROM dom_snapshots ds
+    ${cfJoin}
+    WHERE ds.created_at >= NOW() - INTERVAL '${days} days'
+    GROUP BY DATE(ds.created_at)
     ORDER BY date ASC
   `);
   return result.rows.map(r => ({
@@ -994,20 +1180,22 @@ export async function getPageElementTrend(days = 30): Promise<Array<{ date: stri
   }));
 }
 
-export async function getSelectorScoreDistribution(): Promise<Array<{ range: string; count: number }>> {
+export async function getSelectorScoreDistribution(companyId?: number): Promise<Array<{ range: string; count: number }>> {
+  const cfJoin = companyId ? `JOIN generated_scripts gs ON gs.id = ss.script_id AND gs.company_id = ${companyId}` : '';
   const result = await getPool().query(`
     SELECT
       CASE
-        WHEN score >= 0.8 THEN 'Excellent (0.8-1.0)'
-        WHEN score >= 0.6 THEN 'Good (0.6-0.8)'
-        WHEN score >= 0.4 THEN 'Fair (0.4-0.6)'
-        WHEN score >= 0.2 THEN 'Poor (0.2-0.4)'
+        WHEN ss.score >= 0.8 THEN 'Excellent (0.8-1.0)'
+        WHEN ss.score >= 0.6 THEN 'Good (0.6-0.8)'
+        WHEN ss.score >= 0.4 THEN 'Fair (0.4-0.6)'
+        WHEN ss.score >= 0.2 THEN 'Poor (0.2-0.4)'
         ELSE 'Critical (0-0.2)'
       END AS range,
       COUNT(*) AS count
-    FROM selector_scores
+    FROM selector_scores ss
+    ${cfJoin}
     GROUP BY range
-    ORDER BY MIN(score) DESC
+    ORDER BY MIN(ss.score) DESC
   `);
   return result.rows.map(r => ({ range: r.range, count: parseInt(r.count, 10) }));
 }
@@ -1016,7 +1204,7 @@ export async function getSelectorScoreDistribution(): Promise<Array<{ range: str
 /*  Learning Engine Analytics                                                 */
 /* -------------------------------------------------------------------------- */
 
-export async function getLearningStats(): Promise<{
+export async function getLearningStats(companyId?: number): Promise<{
   totalPatterns: number;
   totalUsages: number;
   avgConfidence: number;
@@ -1027,14 +1215,16 @@ export async function getLearningStats(): Promise<{
   stalePatterns: number;
 }> {
   const pool = getPool();
+  const cf = companyId ? `WHERE company_id = ${companyId}` : '';
+  const cfAnd = companyId ? `AND company_id = ${companyId}` : '';
   const [totalRes, usageRes, avgRes, tokenRes, stratRes, activeRes, staleRes] = await Promise.all([
-    pool.query(`SELECT COUNT(*) AS c FROM learned_patterns`),
-    pool.query(`SELECT COALESCE(SUM(usage_count), 0) AS c FROM learned_patterns`),
-    pool.query(`SELECT COALESCE(AVG(confidence), 0) AS avg FROM learned_patterns`),
-    pool.query(`SELECT COALESCE(SUM(avg_tokens_saved * usage_count), 0) AS total, COALESCE(AVG(avg_tokens_saved), 0) AS avg FROM learned_patterns`),
-    pool.query(`SELECT solution_strategy, COUNT(*) AS c FROM learned_patterns GROUP BY solution_strategy ORDER BY c DESC LIMIT 1`),
-    pool.query(`SELECT COUNT(*) AS c FROM learned_patterns WHERE last_used >= NOW() - INTERVAL '30 days'`),
-    pool.query(`SELECT COUNT(*) AS c FROM learned_patterns WHERE last_used < NOW() - INTERVAL '90 days'`),
+    pool.query(`SELECT COUNT(*) AS c FROM learned_patterns ${cf}`),
+    pool.query(`SELECT COALESCE(SUM(usage_count), 0) AS c FROM learned_patterns ${cf}`),
+    pool.query(`SELECT COALESCE(AVG(confidence), 0) AS avg FROM learned_patterns ${cf}`),
+    pool.query(`SELECT COALESCE(SUM(avg_tokens_saved * usage_count), 0) AS total, COALESCE(AVG(avg_tokens_saved), 0) AS avg FROM learned_patterns ${cf}`),
+    pool.query(`SELECT solution_strategy, COUNT(*) AS c FROM learned_patterns ${cf} GROUP BY solution_strategy ORDER BY c DESC LIMIT 1`),
+    pool.query(`SELECT COUNT(*) AS c FROM learned_patterns WHERE last_used >= NOW() - INTERVAL '30 days' ${cfAnd}`),
+    pool.query(`SELECT COUNT(*) AS c FROM learned_patterns WHERE last_used < NOW() - INTERVAL '90 days' ${cfAnd}`),
   ]);
   return {
     totalPatterns: parseInt(totalRes.rows[0].c, 10),
@@ -1048,15 +1238,16 @@ export async function getLearningStats(): Promise<{
   };
 }
 
-export async function getPatternsList(limit = 100): Promise<any[]> {
+export async function getPatternsList(limit = 100, companyId?: number): Promise<any[]> {
+  const cf = companyId ? `WHERE company_id = ${companyId}` : '';
   const result = await getPool().query(
-    `SELECT * FROM learned_patterns ORDER BY usage_count DESC, success_count DESC, last_used DESC LIMIT $1`,
+    `SELECT * FROM learned_patterns ${cf} ORDER BY usage_count DESC, success_count DESC, last_used DESC LIMIT $1`,
     [limit],
   );
   return result.rows;
 }
 
-export async function getStrategyEffectiveness(): Promise<Array<{
+export async function getStrategyEffectiveness(companyId?: number): Promise<Array<{
   strategy: string;
   pattern_count: number;
   total_usages: number;
@@ -1066,6 +1257,7 @@ export async function getStrategyEffectiveness(): Promise<Array<{
   success_rate: number;
   avg_tokens_saved: number;
 }>> {
+  const cf = companyId ? `WHERE company_id = ${companyId}` : '';
   const result = await getPool().query(`
     SELECT
       solution_strategy AS strategy,
@@ -1080,6 +1272,7 @@ export async function getStrategyEffectiveness(): Promise<Array<{
       END AS success_rate,
       ROUND(AVG(avg_tokens_saved)::numeric, 0) AS avg_tokens_saved
     FROM learned_patterns
+    ${cf}
     GROUP BY solution_strategy
     ORDER BY total_usages DESC
   `);
@@ -1095,14 +1288,15 @@ export async function getStrategyEffectiveness(): Promise<Array<{
   }));
 }
 
-export async function getLearningVelocity(days = 30): Promise<Array<{ date: string; new_patterns: number; usages: number }>> {
+export async function getLearningVelocity(days = 30, companyId?: number): Promise<Array<{ date: string; new_patterns: number; usages: number }>> {
   const pool = getPool();
+  const cfAnd = companyId ? `AND company_id = ${companyId}` : '';
   const result = await pool.query(`
     SELECT
       DATE(created_at) AS date,
       COUNT(*) AS new_patterns
     FROM learned_patterns
-    WHERE created_at >= NOW() - INTERVAL '${days} days'
+    WHERE created_at >= NOW() - INTERVAL '${days} days' ${cfAnd}
     GROUP BY DATE(created_at)
     ORDER BY date ASC
   `);
@@ -1113,7 +1307,7 @@ export async function getLearningVelocity(days = 30): Promise<Array<{ date: stri
       COUNT(*) AS usages
     FROM healing_actions
     WHERE healing_strategy = 'pattern_match'
-      AND created_at >= NOW() - INTERVAL '${days} days'
+      AND created_at >= NOW() - INTERVAL '${days} days' ${cfAnd}
     GROUP BY DATE(created_at)
     ORDER BY date ASC
   `);
@@ -1133,13 +1327,15 @@ export async function getLearningVelocity(days = 30): Promise<Array<{ date: stri
   });
 }
 
-export async function getTopPatterns(limit = 10): Promise<any[]> {
+export async function getTopPatterns(limit = 10, companyId?: number): Promise<any[]> {
+  const cf = companyId ? `WHERE company_id = ${companyId}` : '';
   const result = await getPool().query(
     `SELECT
        test_name, failed_locator, healed_locator, solution_strategy,
        confidence, success_count, failure_count, usage_count,
        avg_tokens_saved, last_used, created_at
      FROM learned_patterns
+     ${cf}
      ORDER BY usage_count DESC, success_count DESC
      LIMIT $1`,
     [limit],
@@ -1168,12 +1364,12 @@ export interface PRRecord {
   created_at?: string;
 }
 
-export async function logPR(data: PRRecord): Promise<number> {
+export async function logPR(data: PRRecord, companyId?: number): Promise<number> {
   const result = await getPool().query(
     `INSERT INTO pr_automations
       (job_id, pr_url, pr_number, branch_name, commit_sha,
-       repo_owner, repo_name, base_branch, files_changed, healing_count, status)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+       repo_owner, repo_name, base_branch, files_changed, healing_count, status, company_id)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
     RETURNING id`,
     [
       data.job_id,
@@ -1187,6 +1383,7 @@ export async function logPR(data: PRRecord): Promise<number> {
       data.files_changed ?? [],
       data.healing_count,
       data.status ?? 'open',
+      companyId ?? null,
     ],
   );
   return result.rows[0].id;
@@ -1239,13 +1436,13 @@ export interface GeneratedScriptRecord {
   created_at?: string;
 }
 
-export async function logGeneratedScript(data: GeneratedScriptRecord): Promise<number> {
+export async function logGeneratedScript(data: GeneratedScriptRecord, companyId?: number): Promise<number> {
   const result = await getPool().query(
     `INSERT INTO generated_scripts
       (url, page_type, workflow_graph, instructions, script_content, test_plan,
        validation_status, reliability_score, review_score, review_issues,
-       tokens_used, model, generation_time_ms, files_generated, negative_tests_included)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+       tokens_used, model, generation_time_ms, files_generated, negative_tests_included, company_id)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
     RETURNING id`,
     [
       data.url,
@@ -1263,22 +1460,25 @@ export async function logGeneratedScript(data: GeneratedScriptRecord): Promise<n
       data.generation_time_ms ?? null,
       data.files_generated ? JSON.stringify(data.files_generated) : null,
       data.negative_tests_included ?? false,
+      companyId ?? null,
     ],
   );
   return result.rows[0].id;
 }
 
-export async function getGeneratedScript(id: number): Promise<GeneratedScriptRecord | null> {
+export async function getGeneratedScript(id: number, companyId?: number): Promise<GeneratedScriptRecord | null> {
+  const cfAnd = companyId ? `AND company_id = ${companyId}` : '';
   const result = await getPool().query(
-    `SELECT * FROM generated_scripts WHERE id = $1`,
+    `SELECT * FROM generated_scripts WHERE id = $1 ${cfAnd}`,
     [id],
   );
   return result.rows[0] ?? null;
 }
 
-export async function getRecentScripts(limit = 20): Promise<GeneratedScriptRecord[]> {
+export async function getRecentScripts(limit = 20, companyId?: number): Promise<GeneratedScriptRecord[]> {
+  const cf = companyId ? `WHERE company_id = ${companyId}` : '';
   const result = await getPool().query(
-    `SELECT * FROM generated_scripts ORDER BY created_at DESC LIMIT $1`,
+    `SELECT * FROM generated_scripts ${cf} ORDER BY created_at DESC LIMIT $1`,
     [limit],
   );
   return result.rows;
@@ -1377,6 +1577,7 @@ export interface UserRecord {
   password_hash: string;
   role: string;
   company_name: string | null;
+  company_id: number | null;
   is_active: boolean;
   last_login: string | null;
   created_at: string;
@@ -1388,19 +1589,22 @@ export async function createUser(data: {
   password_hash: string;
   role?: string;
   company_name?: string;
+  company_id?: number;
 }): Promise<UserRecord> {
   const result = await getPool().query(
-    `INSERT INTO users (username, password_hash, role, company_name)
-    VALUES ($1, $2, $3, $4)
+    `INSERT INTO users (username, password_hash, role, company_name, company_id)
+    VALUES ($1, $2, $3, $4, $5)
     RETURNING *`,
-    [data.username, data.password_hash, data.role || 'client', data.company_name || null],
+    [data.username, data.password_hash, data.role || 'client', data.company_name || null, data.company_id || null],
   );
   return result.rows[0];
 }
 
 export async function getUserByUsername(username: string): Promise<UserRecord | null> {
   const result = await getPool().query(
-    `SELECT * FROM users WHERE username = $1 AND is_active = true`,
+    `SELECT u.*, c.name AS company_display_name, c.slug AS company_slug
+     FROM users u LEFT JOIN companies c ON c.id = u.company_id
+     WHERE u.username = $1 AND u.is_active = true`,
     [username],
   );
   return result.rows[0] ?? null;
@@ -1408,7 +1612,9 @@ export async function getUserByUsername(username: string): Promise<UserRecord | 
 
 export async function getUserById(id: number): Promise<UserRecord | null> {
   const result = await getPool().query(
-    `SELECT * FROM users WHERE id = $1`,
+    `SELECT u.*, c.name AS company_display_name, c.slug AS company_slug
+     FROM users u LEFT JOIN companies c ON c.id = u.company_id
+     WHERE u.id = $1`,
     [id],
   );
   return result.rows[0] ?? null;
@@ -1421,10 +1627,11 @@ export async function updateLastLogin(userId: number): Promise<void> {
   );
 }
 
-export async function listUsers(): Promise<UserRecord[]> {
+export async function listUsers(companyId?: number): Promise<UserRecord[]> {
+  const cf = companyId ? `WHERE company_id = ${companyId}` : '';
   const result = await getPool().query(
-    `SELECT id, username, role, company_name, is_active, last_login, created_at, updated_at
-     FROM users ORDER BY created_at ASC`,
+    `SELECT id, username, role, company_name, company_id, is_active, last_login, created_at, updated_at
+     FROM users ${cf} ORDER BY created_at ASC`,
   );
   return result.rows;
 }
@@ -1532,16 +1739,18 @@ export interface NotificationConfig {
   updated_at: string;
 }
 
-export async function getNotificationConfigs(): Promise<NotificationConfig[]> {
+export async function getNotificationConfigs(companyId?: number): Promise<NotificationConfig[]> {
+  const cf = companyId ? `WHERE company_id = ${companyId}` : '';
   const result = await getPool().query(
-    `SELECT * FROM notification_configs ORDER BY created_at ASC`,
+    `SELECT * FROM notification_configs ${cf} ORDER BY created_at ASC`,
   );
   return result.rows;
 }
 
-export async function getNotificationConfigByType(toolType: string): Promise<NotificationConfig | null> {
+export async function getNotificationConfigByType(toolType: string, companyId?: number): Promise<NotificationConfig | null> {
+  const cfAnd = companyId ? `AND company_id = ${companyId}` : '';
   const result = await getPool().query(
-    `SELECT * FROM notification_configs WHERE tool_type = $1`,
+    `SELECT * FROM notification_configs WHERE tool_type = $1 ${cfAnd}`,
     [toolType],
   );
   return result.rows[0] || null;
@@ -1551,11 +1760,12 @@ export async function upsertNotificationConfig(data: {
   tool_type: string;
   display_name: string;
   config: Record<string, any>;
-}): Promise<NotificationConfig> {
+}, companyId?: number): Promise<NotificationConfig> {
+  const cid = companyId ?? null;
   const result = await getPool().query(
-    `INSERT INTO notification_configs (tool_type, display_name, status, config, connected_at, updated_at)
-     VALUES ($1, $2, 'connected', $3, NOW(), NOW())
-     ON CONFLICT (tool_type)
+    `INSERT INTO notification_configs (tool_type, display_name, status, config, connected_at, updated_at, company_id)
+     VALUES ($1, $2, 'connected', $3, NOW(), NOW(), $4)
+     ON CONFLICT (tool_type, COALESCE(company_id, 0))
      DO UPDATE SET
        display_name = EXCLUDED.display_name,
        config = EXCLUDED.config,
@@ -1564,7 +1774,7 @@ export async function upsertNotificationConfig(data: {
        updated_at = NOW(),
        last_test_result = NULL
      RETURNING *`,
-    [data.tool_type, data.display_name, JSON.stringify(data.config)],
+    [data.tool_type, data.display_name, JSON.stringify(data.config), cid],
   );
   return result.rows[0];
 }
@@ -1604,10 +1814,10 @@ export async function insertNotificationLog(data: {
   status: string;
   error?: string;
   metadata?: Record<string, any>;
-}): Promise<number> {
+}, companyId?: number): Promise<number> {
   const result = await getPool().query(
-    `INSERT INTO notification_logs (tool_type, event_type, channel, message_preview, status, error, metadata)
-     VALUES ($1, $2, $3, $4, $5, $6, $7)
+    `INSERT INTO notification_logs (tool_type, event_type, channel, message_preview, status, error, metadata, company_id)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
      RETURNING id`,
     [
       data.tool_type,
@@ -1617,14 +1827,16 @@ export async function insertNotificationLog(data: {
       data.status,
       data.error ?? null,
       JSON.stringify(data.metadata ?? {}),
+      companyId ?? null,
     ],
   );
   return result.rows[0].id;
 }
 
-export async function getNotificationLogs(limit = 50): Promise<any[]> {
+export async function getNotificationLogs(limit = 50, companyId?: number): Promise<any[]> {
+  const cf = companyId ? `WHERE company_id = ${companyId}` : '';
   const result = await getPool().query(
-    `SELECT * FROM notification_logs ORDER BY created_at DESC LIMIT $1`,
+    `SELECT * FROM notification_logs ${cf} ORDER BY created_at DESC LIMIT $1`,
     [limit],
   );
   return result.rows;

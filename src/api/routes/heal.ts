@@ -50,7 +50,8 @@ export function createHealRouter(jobQueue: JobQueue, repoManager: RepoManager): 
       repoUrl = repo.url;
     }
 
-    const job = jobQueue.createJob(repoId, branch ?? 'main', commit, repoUrl);
+    const cid = (req as any).companyId;
+    const job = jobQueue.createJob(repoId, branch ?? 'main', commit, repoUrl, cid);
 
     res.status(202).json({
       jobId: job.id,

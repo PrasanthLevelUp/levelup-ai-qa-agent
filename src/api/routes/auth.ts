@@ -166,6 +166,7 @@ export function createAuthRouter(): Router {
         username: user.username,
         role: user.role,
         company: user.company_name,
+        companyId: user.company_id,
       };
       const token = jwt.sign(tokenPayload, JWT_SECRET, { expiresIn: JWT_EXPIRY });
 

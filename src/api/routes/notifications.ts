@@ -51,9 +51,10 @@ function sanitizeConfig(toolType: string, config: Record<string, any>): Record<s
 /*  GET /api/notifications/config                                      */
 /* ------------------------------------------------------------------ */
 
-router.get('/config', async (_req: Request, res: Response) => {
+router.get('/config', async (req: Request, res: Response) => {
   try {
-    const configs = await getNotificationConfigs();
+    const cid = (req as any).companyId;
+    const configs = await getNotificationConfigs(cid);
     const sanitized = configs.map((c) => ({
       ...c,
       config: sanitizeConfig(c.tool_type, c.config),
@@ -79,6 +80,7 @@ router.get('/config', async (_req: Request, res: Response) => {
 
 router.post('/config', async (req: Request, res: Response) => {
   try {
+    const cid = (req as any).companyId;
     const { toolType, displayName, config } = req.body;
     if (!toolType || !displayName) {
       res.status(400).json({ success: false, error: 'toolType and displayName are required' });
@@ -89,7 +91,7 @@ router.post('/config', async (req: Request, res: Response) => {
       tool_type: toolType,
       display_name: displayName,
       config: config || {},
-    });
+    }, cid);
 
     res.json({
       success: true,
@@ -269,8 +271,9 @@ router.post('/test', async (req: Request, res: Response) => {
 
 router.get('/logs', async (req: Request, res: Response) => {
   try {
+    const cid = (req as any).companyId;
     const limit = parseInt(String(req.query.limit || "50")) || 50;
-    const logs = await getNotificationLogs(limit);
+    const logs = await getNotificationLogs(limit, cid);
     res.json({ success: true, data: logs });
   } catch (error) {
     logger.error(MOD, 'GET /logs error', { error: (error as Error).message });

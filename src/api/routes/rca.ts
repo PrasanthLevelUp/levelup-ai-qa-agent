@@ -16,9 +16,10 @@ export function createRCARouter(): Router {
   const router = Router();
 
   /* ── Stats ──────────────────────────────────────────────────── */
-  router.get('/stats', async (_req: Request, res: Response) => {
+  router.get('/stats', async (req: Request, res: Response) => {
     try {
-      const stats = await getRCAStats();
+      const cid = (req as any).companyId;
+      const stats = await getRCAStats(cid);
       res.json({ success: true, data: stats });
     } catch (err: any) {
       console.error('[RCA] stats error:', err);
@@ -29,8 +30,9 @@ export function createRCARouter(): Router {
   /* ── All RCAs for a job ─────────────────────────────────────── */
   router.get('/job/:jobId', async (req: Request, res: Response) => {
     try {
+      const cid = (req as any).companyId;
       const jobId = req.params.jobId as string;
-      const rcas = await getRCAsForJob(jobId);
+      const rcas = await getRCAsForJob(jobId, cid);
       res.json({ success: true, data: rcas, count: rcas.length });
     } catch (err: any) {
       console.error('[RCA] job RCAs error:', err);
@@ -41,8 +43,9 @@ export function createRCARouter(): Router {
   /* ── Single RCA by execution ID ────────────────────────────── */
   router.get('/:executionId', async (req: Request, res: Response) => {
     try {
+      const cid = (req as any).companyId;
       const executionId = req.params.executionId as string;
-      const rca = await getRCA(executionId);
+      const rca = await getRCA(executionId, cid);
       if (!rca) {
         res.status(404).json({ success: false, error: 'RCA not found' });
         return;
@@ -55,10 +58,11 @@ export function createRCARouter(): Router {
   });
 
   /* ── Flaky tests — summary list ──────────────────────────────── */
-  router.get('/flaky', async (_req: Request, res: Response) => {
+  router.get('/flaky', async (req: Request, res: Response) => {
     try {
-      const tests = await getFlakyTests();
-      const stats = await getRCAStats();
+      const cid = (req as any).companyId;
+      const tests = await getFlakyTests(cid);
+      const stats = await getRCAStats(cid);
       res.json({
         success: true,
         data: {
@@ -79,8 +83,9 @@ export function createRCARouter(): Router {
   /* ── Flaky trend over time ──────────────────────────────────── */
   router.get('/flaky/trend', async (req: Request, res: Response) => {
     try {
+      const cid = (req as any).companyId;
       const days = parseInt(String(req.query.days || '30')) || 30;
-      const trend = await getFlakyTrend(days);
+      const trend = await getFlakyTrend(days, cid);
       res.json({ success: true, data: trend });
     } catch (err: any) {
       console.error('[RCA] flaky trend error:', err);
@@ -91,8 +96,9 @@ export function createRCARouter(): Router {
   /* ── Flaky history for a specific test ─────────────────────── */
   router.get('/flaky/history/:testName', async (req: Request, res: Response) => {
     try {
+      const cid = (req as any).companyId;
       const testName = decodeURIComponent(req.params.testName as string);
-      const history = await getFlakyHistory(testName);
+      const history = await getFlakyHistory(testName, cid);
       res.json({ success: true, data: history, count: history.length });
     } catch (err: any) {
       console.error('[RCA] flaky history error:', err);

@@ -9,6 +9,7 @@ import * as path from 'path';
 import * as fs from 'fs';
 
 import { authMiddleware } from './middleware/auth';
+import { companyMiddleware } from './middleware/company';
 import { errorHandler } from './middleware/error-handler';
 import { createHealRouter } from './routes/heal';
 import { createStatusRouter } from './routes/status';
@@ -39,6 +40,7 @@ import { createAuthRouter } from './routes/auth';
 import { createNotificationsRouter } from './routes/notifications';
 import { createDomMemoryRouter } from './routes/dom-memory';
 import { createLearningRouter } from './routes/learning';
+import { createCompaniesRouter } from './routes/companies';
 import { notifyRca } from '../integrations/slack';
 import { createRcaTicket } from '../integrations/jira';
 import cookieParser from 'cookie-parser';
@@ -104,16 +106,17 @@ export function createServer(): express.Application {
   app.use('/api/auth', createAuthRouter());
 
   // Authenticated routes (API key)
-  app.use('/api/heal', authMiddleware, createHealRouter(jobQueue, repoManager));
-  app.use('/api/status', authMiddleware, createStatusRouter(jobQueue));
-  app.use('/api/reports', authMiddleware, createReportsRouter(jobQueue));
-  app.use('/api/repos', authMiddleware, createReposRouter(repoManager));
-  app.use('/api/rca', authMiddleware, createRCARouter());
-  app.use('/api/pr', authMiddleware, createPRRouter());
-  app.use('/api/scripts', authMiddleware, createScriptGenRouter());
-  app.use('/api/notifications', authMiddleware, createNotificationsRouter());
-  app.use('/api/dom', authMiddleware, createDomMemoryRouter());
-  app.use('/api/learning', authMiddleware, createLearningRouter());
+  app.use('/api/heal', authMiddleware, companyMiddleware, createHealRouter(jobQueue, repoManager));
+  app.use('/api/status', authMiddleware, companyMiddleware, createStatusRouter(jobQueue));
+  app.use('/api/reports', authMiddleware, companyMiddleware, createReportsRouter(jobQueue));
+  app.use('/api/repos', authMiddleware, companyMiddleware, createReposRouter(repoManager));
+  app.use('/api/rca', authMiddleware, companyMiddleware, createRCARouter());
+  app.use('/api/pr', authMiddleware, companyMiddleware, createPRRouter());
+  app.use('/api/scripts', authMiddleware, companyMiddleware, createScriptGenRouter());
+  app.use('/api/notifications', authMiddleware, companyMiddleware, createNotificationsRouter());
+  app.use('/api/dom', authMiddleware, companyMiddleware, createDomMemoryRouter());
+  app.use('/api/learning', authMiddleware, companyMiddleware, createLearningRouter());
+  app.use('/api/companies', authMiddleware, createCompaniesRouter());
 
   // List all jobs
   app.get('/api/jobs', authMiddleware, (_req, res) => {
@@ -270,7 +273,7 @@ function createHealingWorker(
         error_message: failure.errorMessage.slice(0, 1000),
         healing_attempted: true,
         healing_succeeded: false,
-      });
+      }, job.companyId);
 
       jobQueue.updateJob(job.id, {
         progress: `Healing: ${failure.testName}...`,
@@ -354,7 +357,7 @@ function createHealingWorker(
           validation_status: 'approved',
           validation_reason: outcome.suggestion.reasoning,
           patch_path: validation.patchPath,
-        });
+        }, job.companyId);
 
         healings.push({
           testName: failure.testName,
@@ -382,7 +385,7 @@ function createHealingWorker(
             solution_strategy: outcome.suggestion.strategy,
             confidence: outcome.suggestion.confidence,
             avg_tokens_saved: outcome.suggestion.tokensUsed,
-          });
+          }, job.companyId);
 
           const testRow = tests.find((t) => t.testName === failure.testName);
           if (testRow) {
@@ -439,7 +442,7 @@ function createHealingWorker(
             healed_locator: healingForTest?.healedLocator,
             healing_strategy: healingForTest?.strategy,
             error_message: failure.errorMessage?.slice(0, 1000),
-          });
+          }, job.companyId);
 
           logger.info(MOD, 'RCA analysis complete', {
             testName: failure.testName,
@@ -525,7 +528,7 @@ function createHealingWorker(
             files_changed: prResult.filesChanged,
             healing_count: prResult.healingCount,
             status: 'open',
-          });
+          }, job.companyId);
 
           logger.info(MOD, 'PR created and logged', {
             prUrl: prResult.prUrl,

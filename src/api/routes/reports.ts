@@ -31,7 +31,8 @@ export function createReportsRouter(jobQueue: JobQueue): Router {
       return;
     }
 
-    const stats = await getHistoricalStats();
+    const cid = (req as any).companyId;
+    const stats = await getHistoricalStats(cid);
 
     res.json({
       jobId: job.id,

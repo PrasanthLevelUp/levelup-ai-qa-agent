@@ -80,6 +80,7 @@ export function createScriptGenRouter(): Router {
       const validationStatus = validationReport.overallScore >= 80 ? 'passed' : 'needs_review';
 
       // Persist to DB
+      const cid = (req as any).companyId;
       const scriptId = await logGeneratedScript({
         url: config.url,
         page_type: result.testPlan?.pageType || 'unknown',
@@ -94,7 +95,7 @@ export function createScriptGenRouter(): Router {
         generation_time_ms: generationTimeMs,
         files_generated: result.generatedFiles.map((f: GeneratedFile) => ({ path: f.path, size: f.content.length, type: f.type })),
         negative_tests_included: config.includeNegativeTests,
-      });
+      }, cid);
 
       console.log(`[ScriptGen] ✅ Generation complete — ID ${scriptId}, ${result.generatedFiles.length} files, ${generationTimeMs}ms`);
 
@@ -121,8 +122,9 @@ export function createScriptGenRouter(): Router {
   /* ── Recent Generations ─────────────────────────────────── */
   router.get('/recent', async (req: Request, res: Response) => {
     try {
+      const cid = (req as any).companyId;
       const limit = Math.min(parseInt(req.query.limit as string) || 20, 100);
-      const scripts = await getRecentScripts(limit);
+      const scripts = await getRecentScripts(limit, cid);
       res.json({ success: true, data: scripts, count: scripts.length });
     } catch (err: any) {
       console.error('[ScriptGen] recent error:', err);
@@ -133,11 +135,12 @@ export function createScriptGenRouter(): Router {
   /* ── Get Specific Script ────────────────────────────────── */
   router.get('/:id', async (req: Request, res: Response) => {
     try {
+      const cid = (req as any).companyId;
       const id = parseInt(req.params.id as string);
       if (isNaN(id)) {
         return res.status(400).json({ success: false, error: 'Invalid script ID' });
       }
-      const script = await getGeneratedScript(id);
+      const script = await getGeneratedScript(id, cid);
       if (!script) {
         return res.status(404).json({ success: false, error: 'Script not found' });
       }
