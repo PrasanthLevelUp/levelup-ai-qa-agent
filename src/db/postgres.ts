@@ -890,6 +890,129 @@ export async function getFlakyHistory(testName: string): Promise<RCARecord[]> {
 }
 
 /* -------------------------------------------------------------------------- */
+/*  DOM Memory Analytics                                                      */
+/* -------------------------------------------------------------------------- */
+
+export async function getDomMemoryStats(): Promise<{
+  totalSnapshots: number;
+  totalSelectors: number;
+  uniquePages: number;
+  avgSelectorScore: number;
+  totalLocatorChanges: number;
+  uniqueHealedLocators: number;
+}> {
+  const pool = getPool();
+  const [snapRes, selRes, pagesRes, avgRes, changesRes, uniqueHealedRes] = await Promise.all([
+    pool.query(`SELECT COUNT(*) AS c FROM dom_snapshots`),
+    pool.query(`SELECT COUNT(*) AS c FROM selector_scores`),
+    pool.query(`SELECT COUNT(DISTINCT page_url) AS c FROM dom_snapshots`),
+    pool.query(`SELECT COALESCE(AVG(score), 0) AS avg FROM selector_scores`),
+    pool.query(`SELECT COUNT(*) AS c FROM healing_actions WHERE healed_locator IS NOT NULL AND healed_locator != failed_locator`),
+    pool.query(`SELECT COUNT(DISTINCT healed_locator) AS c FROM healing_actions WHERE healed_locator IS NOT NULL`),
+  ]);
+  return {
+    totalSnapshots: parseInt(snapRes.rows[0].c, 10),
+    totalSelectors: parseInt(selRes.rows[0].c, 10),
+    uniquePages: parseInt(pagesRes.rows[0].c, 10),
+    avgSelectorScore: parseFloat(parseFloat(avgRes.rows[0].avg).toFixed(2)),
+    totalLocatorChanges: parseInt(changesRes.rows[0].c, 10),
+    uniqueHealedLocators: parseInt(uniqueHealedRes.rows[0].c, 10),
+  };
+}
+
+export async function getDomSnapshots(limit = 50): Promise<any[]> {
+  const result = await getPool().query(
+    `SELECT ds.*, gs.url AS script_url, gs.test_count
+     FROM dom_snapshots ds
+     LEFT JOIN generated_scripts gs ON gs.id = ds.script_id
+     ORDER BY ds.created_at DESC
+     LIMIT $1`,
+    [limit],
+  );
+  return result.rows;
+}
+
+export async function getSelectorHealth(limit = 100): Promise<any[]> {
+  const result = await getPool().query(
+    `SELECT
+       selector,
+       ROUND(AVG(score)::numeric, 2) AS avg_score,
+       COUNT(*) AS usage_count,
+       MAX(strategy) AS strategy,
+       MAX(element_type) AS element_type,
+       ARRAY_AGG(DISTINCT reason) FILTER (WHERE reason IS NOT NULL) AS reasons,
+       MIN(created_at) AS first_seen,
+       MAX(created_at) AS last_seen
+     FROM selector_scores
+     GROUP BY selector
+     ORDER BY AVG(score) ASC, COUNT(*) DESC
+     LIMIT $1`,
+    [limit],
+  );
+  return result.rows;
+}
+
+export async function getLocatorEvolution(limit = 50): Promise<any[]> {
+  const result = await getPool().query(
+    `SELECT
+       failed_locator,
+       healed_locator,
+       healing_strategy,
+       test_name,
+       success,
+       confidence,
+       COUNT(*) AS occurrence_count,
+       MIN(created_at) AS first_seen,
+       MAX(created_at) AS last_seen
+     FROM healing_actions
+     WHERE healed_locator IS NOT NULL
+     GROUP BY failed_locator, healed_locator, healing_strategy, test_name, success, confidence
+     ORDER BY COUNT(*) DESC, MAX(created_at) DESC
+     LIMIT $1`,
+    [limit],
+  );
+  return result.rows;
+}
+
+export async function getPageElementTrend(days = 30): Promise<Array<{ date: string; pages: number; elements: number; snapshots: number }>> {
+  const result = await getPool().query(`
+    SELECT
+      DATE(created_at) AS date,
+      COUNT(DISTINCT page_url) AS pages,
+      COALESCE(SUM(elements_count), 0) AS elements,
+      COUNT(*) AS snapshots
+    FROM dom_snapshots
+    WHERE created_at >= NOW() - INTERVAL '${days} days'
+    GROUP BY DATE(created_at)
+    ORDER BY date ASC
+  `);
+  return result.rows.map(r => ({
+    date: r.date instanceof Date ? r.date.toISOString().split('T')[0] : String(r.date),
+    pages: parseInt(r.pages, 10),
+    elements: parseInt(r.elements, 10),
+    snapshots: parseInt(r.snapshots, 10),
+  }));
+}
+
+export async function getSelectorScoreDistribution(): Promise<Array<{ range: string; count: number }>> {
+  const result = await getPool().query(`
+    SELECT
+      CASE
+        WHEN score >= 0.8 THEN 'Excellent (0.8-1.0)'
+        WHEN score >= 0.6 THEN 'Good (0.6-0.8)'
+        WHEN score >= 0.4 THEN 'Fair (0.4-0.6)'
+        WHEN score >= 0.2 THEN 'Poor (0.2-0.4)'
+        ELSE 'Critical (0-0.2)'
+      END AS range,
+      COUNT(*) AS count
+    FROM selector_scores
+    GROUP BY range
+    ORDER BY MIN(score) DESC
+  `);
+  return result.rows.map(r => ({ range: r.range, count: parseInt(r.count, 10) }));
+}
+
+/* -------------------------------------------------------------------------- */
 /*  PR Automation Persistence                                                 */
 /* -------------------------------------------------------------------------- */
 
