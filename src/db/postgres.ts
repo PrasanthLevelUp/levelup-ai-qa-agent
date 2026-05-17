@@ -1013,6 +1013,141 @@ export async function getSelectorScoreDistribution(): Promise<Array<{ range: str
 }
 
 /* -------------------------------------------------------------------------- */
+/*  Learning Engine Analytics                                                 */
+/* -------------------------------------------------------------------------- */
+
+export async function getLearningStats(): Promise<{
+  totalPatterns: number;
+  totalUsages: number;
+  avgConfidence: number;
+  avgTokensSaved: number;
+  totalTokensSaved: number;
+  topStrategy: string;
+  activePatterns: number;
+  stalePatterns: number;
+}> {
+  const pool = getPool();
+  const [totalRes, usageRes, avgRes, tokenRes, stratRes, activeRes, staleRes] = await Promise.all([
+    pool.query(`SELECT COUNT(*) AS c FROM learned_patterns`),
+    pool.query(`SELECT COALESCE(SUM(usage_count), 0) AS c FROM learned_patterns`),
+    pool.query(`SELECT COALESCE(AVG(confidence), 0) AS avg FROM learned_patterns`),
+    pool.query(`SELECT COALESCE(SUM(avg_tokens_saved * usage_count), 0) AS total, COALESCE(AVG(avg_tokens_saved), 0) AS avg FROM learned_patterns`),
+    pool.query(`SELECT solution_strategy, COUNT(*) AS c FROM learned_patterns GROUP BY solution_strategy ORDER BY c DESC LIMIT 1`),
+    pool.query(`SELECT COUNT(*) AS c FROM learned_patterns WHERE last_used >= NOW() - INTERVAL '30 days'`),
+    pool.query(`SELECT COUNT(*) AS c FROM learned_patterns WHERE last_used < NOW() - INTERVAL '90 days'`),
+  ]);
+  return {
+    totalPatterns: parseInt(totalRes.rows[0].c, 10),
+    totalUsages: parseInt(usageRes.rows[0].c, 10),
+    avgConfidence: parseFloat(parseFloat(avgRes.rows[0].avg).toFixed(3)),
+    avgTokensSaved: parseFloat(parseFloat(tokenRes.rows[0].avg).toFixed(0)),
+    totalTokensSaved: parseInt(tokenRes.rows[0].total, 10),
+    topStrategy: stratRes.rows[0]?.solution_strategy || 'N/A',
+    activePatterns: parseInt(activeRes.rows[0].c, 10),
+    stalePatterns: parseInt(staleRes.rows[0].c, 10),
+  };
+}
+
+export async function getPatternsList(limit = 100): Promise<any[]> {
+  const result = await getPool().query(
+    `SELECT * FROM learned_patterns ORDER BY usage_count DESC, success_count DESC, last_used DESC LIMIT $1`,
+    [limit],
+  );
+  return result.rows;
+}
+
+export async function getStrategyEffectiveness(): Promise<Array<{
+  strategy: string;
+  pattern_count: number;
+  total_usages: number;
+  avg_confidence: number;
+  total_successes: number;
+  total_failures: number;
+  success_rate: number;
+  avg_tokens_saved: number;
+}>> {
+  const result = await getPool().query(`
+    SELECT
+      solution_strategy AS strategy,
+      COUNT(*) AS pattern_count,
+      COALESCE(SUM(usage_count), 0) AS total_usages,
+      ROUND(AVG(confidence)::numeric, 3) AS avg_confidence,
+      COALESCE(SUM(success_count), 0) AS total_successes,
+      COALESCE(SUM(failure_count), 0) AS total_failures,
+      CASE WHEN SUM(success_count) + SUM(failure_count) > 0
+        THEN ROUND((SUM(success_count)::numeric / (SUM(success_count) + SUM(failure_count))) * 100, 1)
+        ELSE 0
+      END AS success_rate,
+      ROUND(AVG(avg_tokens_saved)::numeric, 0) AS avg_tokens_saved
+    FROM learned_patterns
+    GROUP BY solution_strategy
+    ORDER BY total_usages DESC
+  `);
+  return result.rows.map(r => ({
+    strategy: r.strategy,
+    pattern_count: parseInt(r.pattern_count, 10),
+    total_usages: parseInt(r.total_usages, 10),
+    avg_confidence: parseFloat(r.avg_confidence),
+    total_successes: parseInt(r.total_successes, 10),
+    total_failures: parseInt(r.total_failures, 10),
+    success_rate: parseFloat(r.success_rate),
+    avg_tokens_saved: parseInt(r.avg_tokens_saved, 10),
+  }));
+}
+
+export async function getLearningVelocity(days = 30): Promise<Array<{ date: string; new_patterns: number; usages: number }>> {
+  const pool = getPool();
+  const result = await pool.query(`
+    SELECT
+      DATE(created_at) AS date,
+      COUNT(*) AS new_patterns
+    FROM learned_patterns
+    WHERE created_at >= NOW() - INTERVAL '${days} days'
+    GROUP BY DATE(created_at)
+    ORDER BY date ASC
+  `);
+  // Also get usage trend from healing_actions using pattern_match strategy
+  const usageResult = await pool.query(`
+    SELECT
+      DATE(created_at) AS date,
+      COUNT(*) AS usages
+    FROM healing_actions
+    WHERE healing_strategy = 'pattern_match'
+      AND created_at >= NOW() - INTERVAL '${days} days'
+    GROUP BY DATE(created_at)
+    ORDER BY date ASC
+  `);
+  const usageMap: Record<string, number> = {};
+  usageResult.rows.forEach(r => {
+    const d = r.date instanceof Date ? r.date.toISOString().split('T')[0] : String(r.date);
+    usageMap[d] = parseInt(r.usages, 10);
+  });
+
+  return result.rows.map(r => {
+    const d = r.date instanceof Date ? r.date.toISOString().split('T')[0] : String(r.date);
+    return {
+      date: d,
+      new_patterns: parseInt(r.new_patterns, 10),
+      usages: usageMap[d] || 0,
+    };
+  });
+}
+
+export async function getTopPatterns(limit = 10): Promise<any[]> {
+  const result = await getPool().query(
+    `SELECT
+       test_name, failed_locator, healed_locator, solution_strategy,
+       confidence, success_count, failure_count, usage_count,
+       avg_tokens_saved, last_used, created_at
+     FROM learned_patterns
+     ORDER BY usage_count DESC, success_count DESC
+     LIMIT $1`,
+    [limit],
+  );
+  return result.rows;
+}
+
+/* -------------------------------------------------------------------------- */
 /*  PR Automation Persistence                                                 */
 /* -------------------------------------------------------------------------- */
 

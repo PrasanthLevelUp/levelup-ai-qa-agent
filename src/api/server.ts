@@ -38,6 +38,7 @@ import { createScriptGenRouter } from './routes/script-gen';
 import { createAuthRouter } from './routes/auth';
 import { createNotificationsRouter } from './routes/notifications';
 import { createDomMemoryRouter } from './routes/dom-memory';
+import { createLearningRouter } from './routes/learning';
 import { notifyRca } from '../integrations/slack';
 import { createRcaTicket } from '../integrations/jira';
 import cookieParser from 'cookie-parser';
@@ -112,6 +113,7 @@ export function createServer(): express.Application {
   app.use('/api/scripts', authMiddleware, createScriptGenRouter());
   app.use('/api/notifications', authMiddleware, createNotificationsRouter());
   app.use('/api/dom', authMiddleware, createDomMemoryRouter());
+  app.use('/api/learning', authMiddleware, createLearningRouter());
 
   // List all jobs
   app.get('/api/jobs', authMiddleware, (_req, res) => {
