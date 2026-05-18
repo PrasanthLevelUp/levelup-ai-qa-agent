@@ -2103,3 +2103,178 @@ export async function getSemanticGroupStats(companyId?: number): Promise<Array<{
     successRate: parseFloat(r.success_rate) || 0,
   }));
 }
+
+/* -------------------------------------------------------------------------- */
+/*  Release Risk Data Gathering                                               */
+/* -------------------------------------------------------------------------- */
+
+export interface ReleaseRiskInputData {
+  totalHealings: number;
+  failedHealings: number;
+  lowConfidenceHealings: number;
+  avgConfidence: number;
+  totalExecutions: number;
+  failedExecutions: number;
+  unhealedFailures: number;
+  flakyCount: number;
+  totalRCAs: number;
+  criticalRCAs: number;
+  highRCAs: number;
+  mediumRCAs: number;
+  recentFailureRate: number;
+  previousFailureRate: number;
+  moduleStats: Array<{
+    module: string;
+    failures: number;
+    flakyCount: number;
+    healingFailures: number;
+    criticalRCAs: number;
+  }>;
+}
+
+export async function getReleaseRiskData(days: number = 30, companyId?: number): Promise<ReleaseRiskInputData> {
+  const p = getPool();
+  const cfAnd = companyId ? `AND company_id = ${companyId}` : '';
+
+  const interval = `${days} days`;
+
+  // Healing metrics (within time window)
+  const [healTotal, healFailed, healLowConf, healAvgConf] = await Promise.all([
+    p.query(`SELECT COUNT(*) AS c FROM healing_actions WHERE created_at >= NOW() - INTERVAL '${interval}' ${cfAnd}`),
+    p.query(`SELECT COUNT(*) AS c FROM healing_actions WHERE success = false AND created_at >= NOW() - INTERVAL '${interval}' ${cfAnd}`),
+    p.query(`SELECT COUNT(*) AS c FROM healing_actions WHERE confidence < 0.5 AND confidence > 0 AND created_at >= NOW() - INTERVAL '${interval}' ${cfAnd}`),
+    p.query(`SELECT COALESCE(AVG(confidence), 0) AS avg FROM healing_actions WHERE created_at >= NOW() - INTERVAL '${interval}' ${cfAnd}`),
+  ]);
+
+  // Execution metrics
+  const [execTotal, execFailed, execUnhealed] = await Promise.all([
+    p.query(`SELECT COUNT(*) AS c FROM test_executions WHERE created_at >= NOW() - INTERVAL '${interval}' ${cfAnd}`),
+    p.query(`SELECT COUNT(*) AS c FROM test_executions WHERE status IN ('failed', 'timedOut') AND created_at >= NOW() - INTERVAL '${interval}' ${cfAnd}`),
+    p.query(`SELECT COUNT(*) AS c FROM test_executions WHERE healing_attempted = true AND healing_succeeded = false AND created_at >= NOW() - INTERVAL '${interval}' ${cfAnd}`),
+  ]);
+
+  // RCA severity distribution
+  const [rcaTotal, rcaFlaky, rcaCritical, rcaHigh, rcaMedium] = await Promise.all([
+    p.query(`SELECT COUNT(*) AS c FROM rca_analyses WHERE created_at >= NOW() - INTERVAL '${interval}' ${cfAnd}`),
+    p.query(`SELECT COUNT(*) AS c FROM rca_analyses WHERE is_flaky = true AND created_at >= NOW() - INTERVAL '${interval}' ${cfAnd}`),
+    p.query(`SELECT COUNT(*) AS c FROM rca_analyses WHERE severity = 'critical' AND created_at >= NOW() - INTERVAL '${interval}' ${cfAnd}`),
+    p.query(`SELECT COUNT(*) AS c FROM rca_analyses WHERE severity = 'high' AND created_at >= NOW() - INTERVAL '${interval}' ${cfAnd}`),
+    p.query(`SELECT COUNT(*) AS c FROM rca_analyses WHERE severity = 'medium' AND created_at >= NOW() - INTERVAL '${interval}' ${cfAnd}`),
+  ]);
+
+  // Trend: recent 7 days vs previous 7 days
+  const [recentExec, recentFail, prevExec, prevFail] = await Promise.all([
+    p.query(`SELECT COUNT(*) AS c FROM test_executions WHERE created_at >= NOW() - INTERVAL '7 days' ${cfAnd}`),
+    p.query(`SELECT COUNT(*) AS c FROM test_executions WHERE status IN ('failed', 'timedOut') AND created_at >= NOW() - INTERVAL '7 days' ${cfAnd}`),
+    p.query(`SELECT COUNT(*) AS c FROM test_executions WHERE created_at >= NOW() - INTERVAL '14 days' AND created_at < NOW() - INTERVAL '7 days' ${cfAnd}`),
+    p.query(`SELECT COUNT(*) AS c FROM test_executions WHERE status IN ('failed', 'timedOut') AND created_at >= NOW() - INTERVAL '14 days' AND created_at < NOW() - INTERVAL '7 days' ${cfAnd}`),
+  ]);
+
+  const recentTotal = parseInt(recentExec.rows[0].c, 10);
+  const recentFails = parseInt(recentFail.rows[0].c, 10);
+  const prevTotal = parseInt(prevExec.rows[0].c, 10);
+  const prevFails = parseInt(prevFail.rows[0].c, 10);
+
+  // Module breakdown from RCA affected_component
+  const moduleRes = await p.query(`
+    SELECT
+      COALESCE(r.affected_component, 'unknown') AS module,
+      COUNT(CASE WHEN te.status IN ('failed', 'timedOut') THEN 1 END) AS failures,
+      COUNT(CASE WHEN r.is_flaky = true THEN 1 END) AS flaky_count,
+      COUNT(CASE WHEN r.healing_attempted = true AND r.healing_succeeded = false THEN 1 END) AS healing_failures,
+      COUNT(CASE WHEN r.severity = 'critical' THEN 1 END) AS critical_rcas
+    FROM rca_analyses r
+    LEFT JOIN test_executions te ON r.test_execution_id = te.id
+    WHERE r.created_at >= NOW() - INTERVAL '${interval}' ${cfAnd.replace('company_id', 'r.company_id')}
+    GROUP BY r.affected_component
+    ORDER BY failures DESC
+    LIMIT 20
+  `);
+
+  return {
+    totalHealings: parseInt(healTotal.rows[0].c, 10),
+    failedHealings: parseInt(healFailed.rows[0].c, 10),
+    lowConfidenceHealings: parseInt(healLowConf.rows[0].c, 10),
+    avgConfidence: parseFloat(healAvgConf.rows[0].avg) || 0,
+    totalExecutions: parseInt(execTotal.rows[0].c, 10),
+    failedExecutions: parseInt(execFailed.rows[0].c, 10),
+    unhealedFailures: parseInt(execUnhealed.rows[0].c, 10),
+    flakyCount: parseInt(rcaFlaky.rows[0].c, 10),
+    totalRCAs: parseInt(rcaTotal.rows[0].c, 10),
+    criticalRCAs: parseInt(rcaCritical.rows[0].c, 10),
+    highRCAs: parseInt(rcaHigh.rows[0].c, 10),
+    mediumRCAs: parseInt(rcaMedium.rows[0].c, 10),
+    recentFailureRate: recentTotal > 0 ? recentFails / recentTotal : 0,
+    previousFailureRate: prevTotal > 0 ? prevFails / prevTotal : 0,
+    moduleStats: moduleRes.rows.map((r: any) => ({
+      module: r.module,
+      failures: parseInt(r.failures, 10),
+      flakyCount: parseInt(r.flaky_count, 10),
+      healingFailures: parseInt(r.healing_failures, 10),
+      criticalRCAs: parseInt(r.critical_rcas, 10),
+    })),
+  };
+}
+
+export async function getRiskTrend(days: number = 30, companyId?: number): Promise<Array<{
+  date: string;
+  riskScore: number;
+  failureRate: number;
+  flakyRate: number;
+  healingFailureRate: number;
+}>> {
+  const p = getPool();
+  const cfAnd = companyId ? `AND company_id = ${companyId}` : '';
+
+  const result = await p.query(`
+    SELECT
+      DATE(te.created_at) AS date,
+      COUNT(*) AS total,
+      COUNT(CASE WHEN te.status IN ('failed', 'timedOut') THEN 1 END) AS failures,
+      COUNT(CASE WHEN te.healing_attempted = true AND te.healing_succeeded = false THEN 1 END) AS unhealed
+    FROM test_executions te
+    WHERE te.created_at >= NOW() - INTERVAL '${days} days' ${cfAnd.replace('company_id', 'te.company_id')}
+    GROUP BY DATE(te.created_at)
+    ORDER BY date ASC
+  `);
+
+  // Also get flaky counts per day
+  const flakyRes = await p.query(`
+    SELECT DATE(created_at) AS date, COUNT(*) AS flaky
+    FROM rca_analyses
+    WHERE is_flaky = true AND created_at >= NOW() - INTERVAL '${days} days' ${cfAnd}
+    GROUP BY DATE(created_at)
+  `);
+  const flakyMap = new Map<string, number>();
+  for (const r of flakyRes.rows) {
+    const d = r.date instanceof Date ? r.date.toISOString().slice(0, 10) : String(r.date).slice(0, 10);
+    flakyMap.set(d, parseInt(r.flaky, 10));
+  }
+
+  return result.rows.map((r: any) => {
+    const dateStr = r.date instanceof Date ? r.date.toISOString().slice(0, 10) : String(r.date).slice(0, 10);
+    const total = parseInt(r.total, 10);
+    const failures = parseInt(r.failures, 10);
+    const unhealed = parseInt(r.unhealed, 10);
+    const flaky = flakyMap.get(dateStr) || 0;
+
+    const failureRate = total > 0 ? failures / total : 0;
+    const healingFailureRate = total > 0 ? unhealed / total : 0;
+    const flakyRate = total > 0 ? flaky / total : 0;
+
+    // Simple daily risk = weighted average
+    const dailyRisk = Math.round(
+      failureRate * 40 +
+      healingFailureRate * 30 +
+      flakyRate * 30
+    ) * 100 / 100;
+
+    return {
+      date: dateStr,
+      riskScore: Math.min(100, Math.round(dailyRisk * 100)),
+      failureRate: Math.round(failureRate * 1000) / 10,
+      flakyRate: Math.round(flakyRate * 1000) / 10,
+      healingFailureRate: Math.round(healingFailureRate * 1000) / 10,
+    };
+  });
+}
