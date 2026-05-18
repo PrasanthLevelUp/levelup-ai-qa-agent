@@ -45,6 +45,7 @@ import { createSimilarityRouter } from './routes/similarity';
 import { createReleaseRiskRouter } from './routes/release-risk';
 import { createReleaseSignoffRouter } from './routes/release-signoff';
 import { createRCAIntelligenceRouter } from './routes/rca-intelligence';
+import { createROIRouter } from './routes/roi';
 import { notifyRca } from '../integrations/slack';
 import { createRcaTicket } from '../integrations/jira';
 import cookieParser from 'cookie-parser';
@@ -125,6 +126,7 @@ export function createServer(): express.Application {
   app.use('/api/release-risk', authMiddleware, companyMiddleware, createReleaseRiskRouter());
   app.use('/api/release-signoff', authMiddleware, companyMiddleware, createReleaseSignoffRouter());
   app.use('/api/rca-intelligence', authMiddleware, companyMiddleware, createRCAIntelligenceRouter());
+  app.use('/api/roi', authMiddleware, companyMiddleware, createROIRouter());
 
   // List all jobs
   app.get('/api/jobs', authMiddleware, (_req, res) => {

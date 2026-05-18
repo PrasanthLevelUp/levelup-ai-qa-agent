@@ -2463,3 +2463,137 @@ export async function getRecentRCAAnalyses(limit: number, companyId?: number) {
 
   return res.rows;
 }
+
+/* -------------------------------------------------------------------------- */
+/*  ROI / Maintenance Cost Analytics                                          */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Gather all data needed for ROI calculation.
+ */
+export async function getROIData(days: number, companyId?: number) {
+  const p = getPool();
+  const interval = `${days} days`;
+  const cf = companyId ? `WHERE company_id = ${companyId}` : '';
+  const cfAnd = companyId ? `AND company_id = ${companyId}` : '';
+  const cfWhere = companyId ? `WHERE company_id = ${companyId} AND` : 'WHERE';
+
+  const [
+    healingTotals,
+    strategyRes,
+    prRes,
+    patternRes,
+    flakyRes,
+    tokenCostRes,
+  ] = await Promise.all([
+    // Healing totals for the window
+    p.query(`
+      SELECT
+        COUNT(*) AS total,
+        COUNT(*) FILTER (WHERE success = true) AS successful
+      FROM healing_actions
+      ${cfWhere} created_at >= NOW() - INTERVAL '${interval}'
+    `),
+    // Strategy breakdown
+    p.query(`
+      SELECT healing_strategy, COUNT(*) AS count
+      FROM healing_actions
+      ${cfWhere} created_at >= NOW() - INTERVAL '${interval}'
+      GROUP BY healing_strategy
+    `),
+    // PR stats
+    p.query(`
+      SELECT
+        COUNT(*) AS total,
+        COUNT(*) FILTER (WHERE status = 'merged') AS merged
+      FROM pr_automations
+      ${cfWhere} created_at >= NOW() - INTERVAL '${interval}'
+    `),
+    // Pattern stats
+    p.query(`
+      SELECT
+        COUNT(*) AS total_patterns,
+        COALESCE(SUM(usage_count), 0) AS total_usages
+      FROM learned_patterns ${cf}
+    `),
+    // Flaky count
+    p.query(`
+      SELECT COUNT(DISTINCT test_name) AS count
+      FROM rca_analyses
+      ${cfWhere} is_flaky = true AND created_at >= NOW() - INTERVAL '${interval}'
+    `),
+    // Token cost
+    p.query(`
+      SELECT
+        COALESCE(SUM(tokens_used), 0) AS total_tokens,
+        COALESCE(SUM(cost_usd), 0) AS total_cost
+      FROM token_usage
+      ${cfWhere} date >= TO_CHAR(NOW() - INTERVAL '${interval}', 'YYYY-MM-DD')
+    `),
+  ]);
+
+  // Strategy breakdown
+  const strategyBreakdown: Record<string, number> = {};
+  for (const row of strategyRes.rows) {
+    strategyBreakdown[row.healing_strategy] = parseInt(row.count, 10);
+  }
+
+  return {
+    totalHealings: parseInt(healingTotals.rows[0].total, 10),
+    successfulHealings: parseInt(healingTotals.rows[0].successful, 10),
+    totalTokensUsed: parseInt(tokenCostRes.rows[0].total_tokens, 10),
+    strategyBreakdown,
+    prsGenerated: parseInt(prRes.rows[0].total, 10),
+    prsMerged: parseInt(prRes.rows[0].merged, 10),
+    patternsLearned: parseInt(patternRes.rows[0].total_patterns, 10),
+    totalPatternUsages: parseInt(patternRes.rows[0].total_usages, 10),
+    flakyTestCount: parseInt(flakyRes.rows[0].count, 10),
+    totalTokenCostUsd: parseFloat(tokenCostRes.rows[0].total_cost),
+  };
+}
+
+/**
+ * Daily trend for ROI chart — healings + token cost per day.
+ */
+export async function getROIDailyTrend(days: number, companyId?: number) {
+  const p = getPool();
+  const interval = `${days} days`;
+  const cfAnd = companyId ? `AND company_id = ${companyId}` : '';
+
+  const res = await p.query(`
+    SELECT
+      d.date,
+      COALESCE(h.healings, 0) AS healings,
+      COALESCE(h.tokens_used, 0) AS tokens_used,
+      COALESCE(t.token_cost, 0) AS token_cost
+    FROM (
+      SELECT generate_series(
+        (NOW() - INTERVAL '${interval}')::date,
+        NOW()::date,
+        '1 day'
+      )::date AS date
+    ) d
+    LEFT JOIN (
+      SELECT DATE(created_at) AS date,
+        COUNT(*) AS healings,
+        COALESCE(SUM(ai_tokens_used), 0) AS tokens_used
+      FROM healing_actions
+      WHERE created_at >= NOW() - INTERVAL '${interval}' ${cfAnd}
+      GROUP BY DATE(created_at)
+    ) h ON d.date = h.date
+    LEFT JOIN (
+      SELECT date::date AS date, COALESCE(SUM(cost_usd), 0) AS token_cost
+      FROM token_usage
+      WHERE date >= TO_CHAR(NOW() - INTERVAL '${interval}', 'YYYY-MM-DD') ${cfAnd}
+      GROUP BY date::date
+    ) t ON d.date = t.date
+    ORDER BY d.date ASC
+  `);
+
+  return res.rows.map(r => ({
+    date: r.date.toISOString().split('T')[0],
+    healings: parseInt(r.healings, 10),
+    tokens_used: parseInt(r.tokens_used, 10),
+    token_cost: parseFloat(r.token_cost),
+  }));
+}
