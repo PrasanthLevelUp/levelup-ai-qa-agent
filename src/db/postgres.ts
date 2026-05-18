@@ -480,6 +480,72 @@ async function migrateDefaultCompany(client: PoolClient): Promise<void> {
           ON notification_configs (tool_type, COALESCE(company_id, 0));
       END IF;
     END $$;
+
+    -- Test Coverage Intelligence tables
+    CREATE TABLE IF NOT EXISTS test_requirements (
+      id SERIAL PRIMARY KEY,
+      title VARCHAR(500) NOT NULL,
+      description TEXT NOT NULL,
+      jira_id VARCHAR(100),
+      business_flow TEXT,
+      acceptance_criteria TEXT,
+      api_docs TEXT,
+      release_notes TEXT,
+      module VARCHAR(200),
+      feature_type VARCHAR(100),
+      risk_level VARCHAR(20) DEFAULT 'medium',
+      analysis JSONB,
+      company_id INTEGER REFERENCES companies(id),
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      updated_at TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_test_requirements_company ON test_requirements(company_id);
+
+    CREATE TABLE IF NOT EXISTS generated_test_scenarios (
+      id SERIAL PRIMARY KEY,
+      requirement_id INTEGER NOT NULL REFERENCES test_requirements(id) ON DELETE CASCADE,
+      scenario TEXT NOT NULL,
+      coverage_type VARCHAR(50) NOT NULL,
+      priority VARCHAR(10) DEFAULT 'P1',
+      risk_area VARCHAR(200),
+      company_id INTEGER REFERENCES companies(id),
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_gen_scenarios_req ON generated_test_scenarios(requirement_id);
+
+    CREATE TABLE IF NOT EXISTS generated_test_cases (
+      id SERIAL PRIMARY KEY,
+      scenario_id INTEGER NOT NULL REFERENCES generated_test_scenarios(id) ON DELETE CASCADE,
+      title VARCHAR(500) NOT NULL,
+      preconditions TEXT,
+      steps JSONB NOT NULL DEFAULT '[]',
+      expected_result TEXT NOT NULL,
+      test_data TEXT,
+      priority VARCHAR(10) DEFAULT 'P1',
+      severity VARCHAR(20) DEFAULT 'major',
+      tags JSONB DEFAULT '[]',
+      automation_ready BOOLEAN DEFAULT false,
+      automation_complexity VARCHAR(20) DEFAULT 'medium',
+      selector_availability VARCHAR(20) DEFAULT 'unknown',
+      company_id INTEGER REFERENCES companies(id),
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_gen_cases_scenario ON generated_test_cases(scenario_id);
+
+    CREATE TABLE IF NOT EXISTS application_knowledge (
+      id SERIAL PRIMARY KEY,
+      module VARCHAR(200) NOT NULL,
+      workflow TEXT,
+      business_rules TEXT,
+      dependencies TEXT,
+      apis TEXT,
+      historical_bugs TEXT,
+      company_id INTEGER REFERENCES companies(id),
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      updated_at TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_app_knowledge_company ON application_knowledge(company_id);
+    CREATE INDEX IF NOT EXISTS idx_app_knowledge_module ON application_knowledge(module);
   `);
 }
 
@@ -2596,4 +2662,221 @@ export async function getROIDailyTrend(days: number, companyId?: number) {
     tokens_used: parseInt(r.tokens_used, 10),
     token_cost: parseFloat(r.token_cost),
   }));
+}
+
+/* -------------------------------------------------------------------------- */
+/*  Test Coverage Intelligence — DB Functions                                  */
+/* -------------------------------------------------------------------------- */
+
+// ---- Test Requirements ----
+export async function createTestRequirement(data: {
+  title: string; description: string; jiraId?: string; businessFlow?: string;
+  acceptanceCriteria?: string; apiDocs?: string; releaseNotes?: string;
+  module?: string; featureType?: string; riskLevel?: string; analysis?: any;
+  companyId?: number;
+}): Promise<number> {
+  const pool = getPool();
+  const r = await pool.query(
+    `INSERT INTO test_requirements
+       (title, description, jira_id, business_flow, acceptance_criteria, api_docs,
+        release_notes, module, feature_type, risk_level, analysis, company_id)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING id`,
+    [data.title, data.description, data.jiraId || null, data.businessFlow || null,
+     data.acceptanceCriteria || null, data.apiDocs || null, data.releaseNotes || null,
+     data.module || null, data.featureType || null, data.riskLevel || 'medium',
+     data.analysis ? JSON.stringify(data.analysis) : null, data.companyId || null]
+  );
+  return r.rows[0].id;
+}
+
+export async function getTestRequirements(companyId?: number): Promise<any[]> {
+  const pool = getPool();
+  const where = companyId ? 'WHERE company_id = $1' : '';
+  const params = companyId ? [companyId] : [];
+  const r = await pool.query(
+    `SELECT tr.*, 
+       (SELECT COUNT(*) FROM generated_test_scenarios WHERE requirement_id = tr.id) as scenario_count,
+       (SELECT COUNT(*) FROM generated_test_cases tc 
+        JOIN generated_test_scenarios ts ON tc.scenario_id = ts.id 
+        WHERE ts.requirement_id = tr.id) as test_case_count
+     FROM test_requirements tr ${where}
+     ORDER BY tr.created_at DESC LIMIT 100`, params
+  );
+  return r.rows;
+}
+
+export async function getTestRequirement(id: number, companyId?: number): Promise<any | null> {
+  const pool = getPool();
+  const where = companyId ? 'AND company_id = $2' : '';
+  const params: any[] = [id];
+  if (companyId) params.push(companyId);
+  const r = await pool.query(
+    `SELECT * FROM test_requirements WHERE id = $1 ${where}`, params
+  );
+  return r.rows[0] || null;
+}
+
+export async function deleteTestRequirement(id: number): Promise<boolean> {
+  const pool = getPool();
+  const r = await pool.query('DELETE FROM test_requirements WHERE id = $1', [id]);
+  return (r.rowCount ?? 0) > 0;
+}
+
+// ---- Generated Test Scenarios ----
+export async function insertTestScenarios(requirementId: number, scenarios: Array<{
+  scenario: string; coverageType: string; priority: string; riskArea: string;
+}>, companyId?: number): Promise<number[]> {
+  const pool = getPool();
+  const ids: number[] = [];
+  for (const s of scenarios) {
+    const r = await pool.query(
+      `INSERT INTO generated_test_scenarios (requirement_id, scenario, coverage_type, priority, risk_area, company_id)
+       VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
+      [requirementId, s.scenario, s.coverageType, s.priority, s.riskArea || '', companyId || null]
+    );
+    ids.push(r.rows[0].id);
+  }
+  return ids;
+}
+
+export async function getTestScenarios(requirementId: number): Promise<any[]> {
+  const pool = getPool();
+  const r = await pool.query(
+    `SELECT s.*, 
+       (SELECT COUNT(*) FROM generated_test_cases WHERE scenario_id = s.id) as case_count
+     FROM generated_test_scenarios s 
+     WHERE s.requirement_id = $1 ORDER BY s.priority, s.id`, [requirementId]
+  );
+  return r.rows;
+}
+
+// ---- Generated Test Cases ----
+export async function insertTestCases(scenarioId: number, cases: Array<{
+  title: string; preconditions: string; steps: string[]; expectedResult: string;
+  testData: string; priority: string; severity: string; tags: string[];
+  automationReady: boolean; automationComplexity: string; selectorAvailability: string;
+}>, companyId?: number): Promise<number[]> {
+  const pool = getPool();
+  const ids: number[] = [];
+  for (const c of cases) {
+    const r = await pool.query(
+      `INSERT INTO generated_test_cases
+         (scenario_id, title, preconditions, steps, expected_result, test_data,
+          priority, severity, tags, automation_ready, automation_complexity,
+          selector_availability, company_id)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING id`,
+      [scenarioId, c.title, c.preconditions, JSON.stringify(c.steps),
+       c.expectedResult, c.testData, c.priority, c.severity,
+       JSON.stringify(c.tags), c.automationReady, c.automationComplexity,
+       c.selectorAvailability, companyId || null]
+    );
+    ids.push(r.rows[0].id);
+  }
+  return ids;
+}
+
+export async function getTestCases(scenarioId: number): Promise<any[]> {
+  const pool = getPool();
+  const r = await pool.query(
+    `SELECT * FROM generated_test_cases WHERE scenario_id = $1 ORDER BY priority, id`,
+    [scenarioId]
+  );
+  return r.rows;
+}
+
+export async function getTestCasesByRequirement(requirementId: number): Promise<any[]> {
+  const pool = getPool();
+  const r = await pool.query(
+    `SELECT tc.*, ts.scenario, ts.coverage_type
+     FROM generated_test_cases tc
+     JOIN generated_test_scenarios ts ON tc.scenario_id = ts.id
+     WHERE ts.requirement_id = $1
+     ORDER BY tc.priority, tc.id`, [requirementId]
+  );
+  return r.rows;
+}
+
+// ---- Application Knowledge ----
+export async function upsertApplicationKnowledge(data: {
+  module: string; workflow?: string; businessRules?: string;
+  dependencies?: string; apis?: string; historicalBugs?: string;
+  companyId?: number;
+}): Promise<number> {
+  const pool = getPool();
+  const existing = await pool.query(
+    `SELECT id FROM application_knowledge WHERE module = $1 AND COALESCE(company_id, 0) = $2`,
+    [data.module, data.companyId || 0]
+  );
+  if (existing.rows.length > 0) {
+    await pool.query(
+      `UPDATE application_knowledge SET workflow=$1, business_rules=$2, dependencies=$3,
+         apis=$4, historical_bugs=$5, updated_at=NOW() WHERE id=$6`,
+      [data.workflow || null, data.businessRules || null, data.dependencies || null,
+       data.apis || null, data.historicalBugs || null, existing.rows[0].id]
+    );
+    return existing.rows[0].id;
+  }
+  const r = await pool.query(
+    `INSERT INTO application_knowledge (module, workflow, business_rules, dependencies, apis, historical_bugs, company_id)
+     VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id`,
+    [data.module, data.workflow || null, data.businessRules || null,
+     data.dependencies || null, data.apis || null, data.historicalBugs || null,
+     data.companyId || null]
+  );
+  return r.rows[0].id;
+}
+
+export async function getApplicationKnowledge(companyId?: number): Promise<any[]> {
+  const pool = getPool();
+  const where = companyId ? 'WHERE company_id = $1' : '';
+  const params = companyId ? [companyId] : [];
+  const r = await pool.query(
+    `SELECT * FROM application_knowledge ${where} ORDER BY module`, params
+  );
+  return r.rows;
+}
+
+export async function deleteApplicationKnowledge(id: number): Promise<boolean> {
+  const pool = getPool();
+  const r = await pool.query('DELETE FROM application_knowledge WHERE id = $1', [id]);
+  return (r.rowCount ?? 0) > 0;
+}
+
+// ---- Coverage Stats ----
+export async function getTestCoverageStats(companyId?: number): Promise<{
+  totalRequirements: number; totalScenarios: number; totalTestCases: number;
+  automationReadyCount: number; coverageTypeBreakdown: Record<string, number>;
+  priorityBreakdown: Record<string, number>;
+}> {
+  const pool = getPool();
+  const cond = companyId ? 'AND company_id = $1' : '';
+  const params = companyId ? [companyId] : [];
+
+  const reqR = await pool.query(`SELECT COUNT(*) as c FROM test_requirements WHERE 1=1 ${cond}`, params);
+  const scenR = await pool.query(`SELECT COUNT(*) as c FROM generated_test_scenarios WHERE 1=1 ${cond}`, params);
+  const caseR = await pool.query(
+    `SELECT COUNT(*) as c, COUNT(*) FILTER (WHERE automation_ready = true) as auto_ready
+     FROM generated_test_cases WHERE 1=1 ${cond}`, params
+  );
+
+  const coverageR = await pool.query(
+    `SELECT coverage_type, COUNT(*) as c FROM generated_test_scenarios WHERE 1=1 ${cond} GROUP BY coverage_type`, params
+  );
+  const priorityR = await pool.query(
+    `SELECT priority, COUNT(*) as c FROM generated_test_cases WHERE 1=1 ${cond} GROUP BY priority`, params
+  );
+
+  const coverageTypeBreakdown: Record<string, number> = {};
+  coverageR.rows.forEach((r: any) => { coverageTypeBreakdown[r.coverage_type] = parseInt(r.c, 10); });
+  const priorityBreakdown: Record<string, number> = {};
+  priorityR.rows.forEach((r: any) => { priorityBreakdown[r.priority] = parseInt(r.c, 10); });
+
+  return {
+    totalRequirements: parseInt(reqR.rows[0].c, 10),
+    totalScenarios: parseInt(scenR.rows[0].c, 10),
+    totalTestCases: parseInt(caseR.rows[0].c, 10),
+    automationReadyCount: parseInt(caseR.rows[0].auto_ready, 10),
+    coverageTypeBreakdown,
+    priorityBreakdown,
+  };
 }
