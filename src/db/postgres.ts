@@ -2278,3 +2278,188 @@ export async function getRiskTrend(days: number = 30, companyId?: number): Promi
     };
   });
 }
+
+/* -------------------------------------------------------------------------- */
+/*  Environment Intelligence Analytics                                        */
+/* -------------------------------------------------------------------------- */
+
+const SEVERITY_MAP: Record<string, number> = { critical: 4, high: 3, medium: 2, low: 1 };
+
+/**
+ * Classification stats with healing rates and severity for the env intelligence engine.
+ */
+export async function getClassificationStats(days: number, companyId?: number) {
+  const p = getPool();
+  const interval = `${days} days`;
+  const cf = companyId ? `AND company_id = ${companyId}` : '';
+
+  const res = await p.query(`
+    SELECT
+      classification,
+      COUNT(*) AS count,
+      COALESCE(AVG(confidence), 0) AS avg_confidence,
+      COUNT(*) FILTER (WHERE healing_attempted = true) AS healing_attempted,
+      COUNT(*) FILTER (WHERE healing_succeeded = true) AS healing_succeeded,
+      COALESCE(AVG(
+        CASE severity
+          WHEN 'critical' THEN 4
+          WHEN 'high' THEN 3
+          WHEN 'medium' THEN 2
+          WHEN 'low' THEN 1
+          ELSE 2
+        END
+      ), 2) AS avg_severity
+    FROM rca_analyses
+    WHERE created_at >= NOW() - INTERVAL '${interval}' ${cf}
+    GROUP BY classification
+    ORDER BY count DESC
+  `);
+
+  return res.rows.map(r => ({
+    classification: r.classification,
+    count: parseInt(r.count, 10),
+    avg_confidence: parseFloat(r.avg_confidence),
+    healing_attempted: parseInt(r.healing_attempted, 10),
+    healing_succeeded: parseInt(r.healing_succeeded, 10),
+    avg_severity: parseFloat(r.avg_severity),
+  }));
+}
+
+/**
+ * Component × classification cross-tab for heatmap.
+ */
+export async function getComponentClassificationStats(days: number, companyId?: number) {
+  const p = getPool();
+  const interval = `${days} days`;
+  const cf = companyId ? `AND company_id = ${companyId}` : '';
+
+  const res = await p.query(`
+    SELECT
+      COALESCE(NULLIF(affected_component, ''), 'Unknown') AS component,
+      classification,
+      COUNT(*) AS count,
+      COALESCE(AVG(
+        CASE severity
+          WHEN 'critical' THEN 4
+          WHEN 'high' THEN 3
+          WHEN 'medium' THEN 2
+          WHEN 'low' THEN 1
+          ELSE 2
+        END
+      ), 2) AS avg_severity
+    FROM rca_analyses
+    WHERE created_at >= NOW() - INTERVAL '${interval}' ${cf}
+    GROUP BY component, classification
+    ORDER BY count DESC
+  `);
+
+  return res.rows.map(r => ({
+    component: r.component,
+    classification: r.classification,
+    count: parseInt(r.count, 10),
+    avg_severity: parseFloat(r.avg_severity),
+  }));
+}
+
+/**
+ * Classification trend — daily counts by classification type.
+ */
+export async function getClassificationTrend(days: number, companyId?: number) {
+  const p = getPool();
+  const interval = `${days} days`;
+  const cf = companyId ? `AND company_id = ${companyId}` : '';
+
+  const res = await p.query(`
+    SELECT
+      DATE(created_at) AS date,
+      COUNT(*) FILTER (WHERE classification = 'app_bug') AS app_bug,
+      COUNT(*) FILTER (WHERE classification = 'infra_issue') AS infra_issue,
+      COUNT(*) FILTER (WHERE classification = 'flaky_test') AS flaky_test,
+      COUNT(*) FILTER (WHERE classification = 'env_config') AS env_config,
+      COUNT(*) FILTER (WHERE classification = 'data_issue') AS data_issue,
+      COUNT(*) FILTER (WHERE classification = 'selector_drift') AS selector_drift,
+      COUNT(*) FILTER (WHERE classification = 'unknown') AS unknown
+    FROM rca_analyses
+    WHERE created_at >= NOW() - INTERVAL '${interval}' ${cf}
+    GROUP BY DATE(created_at)
+    ORDER BY date ASC
+  `);
+
+  return res.rows.map(r => ({
+    date: r.date.toISOString().split('T')[0],
+    app_bug: parseInt(r.app_bug, 10),
+    infra_issue: parseInt(r.infra_issue, 10),
+    flaky_test: parseInt(r.flaky_test, 10),
+    env_config: parseInt(r.env_config, 10),
+    data_issue: parseInt(r.data_issue, 10),
+    selector_drift: parseInt(r.selector_drift, 10),
+    unknown: parseInt(r.unknown, 10),
+  }));
+}
+
+/**
+ * Domain trend comparison — recent half vs older half of the window.
+ */
+export async function getDomainTrendComparison(days: number, companyId?: number) {
+  const p = getPool();
+  const halfDays = Math.floor(days / 2);
+  const interval = `${days} days`;
+  const halfInterval = `${halfDays} days`;
+  const cf = companyId ? `AND company_id = ${companyId}` : '';
+
+  // Map classification → domain in SQL
+  const domainCase = `
+    CASE
+      WHEN classification IN ('app_bug', 'selector_drift') THEN 'application'
+      WHEN classification IN ('infra_issue', 'env_config', 'data_issue') THEN 'environment'
+      WHEN classification = 'flaky_test' THEN 'test_quality'
+      ELSE 'unknown'
+    END
+  `;
+
+  const res = await p.query(`
+    SELECT
+      domain,
+      SUM(CASE WHEN created_at >= NOW() - INTERVAL '${halfInterval}' THEN 1 ELSE 0 END) AS recent_count,
+      SUM(CASE WHEN created_at < NOW() - INTERVAL '${halfInterval}' AND created_at >= NOW() - INTERVAL '${interval}' THEN 1 ELSE 0 END) AS older_count,
+      COALESCE(AVG(confidence), 0) AS avg_confidence,
+      MODE() WITHIN GROUP (ORDER BY COALESCE(NULLIF(affected_component, ''), 'Unknown')) AS top_component
+    FROM (
+      SELECT *, ${domainCase} AS domain
+      FROM rca_analyses
+      WHERE created_at >= NOW() - INTERVAL '${interval}' ${cf}
+    ) sub
+    GROUP BY domain
+    ORDER BY recent_count DESC
+  `);
+
+  return res.rows.map(r => ({
+    domain: r.domain as 'application' | 'environment' | 'test_quality' | 'unknown',
+    recent_count: parseInt(r.recent_count, 10),
+    older_count: parseInt(r.older_count, 10),
+    top_component: r.top_component || 'N/A',
+    avg_confidence: parseFloat(r.avg_confidence),
+  }));
+}
+
+/**
+ * Recent RCA analyses with full detail for the intelligence dashboard.
+ */
+export async function getRecentRCAAnalyses(limit: number, companyId?: number) {
+  const p = getPool();
+  const cf = companyId ? `WHERE company_id = ${companyId}` : '';
+
+  const res = await p.query(`
+    SELECT
+      id, test_name, classification, severity, confidence,
+      root_cause, suggested_fix, affected_component,
+      is_flaky, healing_attempted, healing_succeeded,
+      healing_strategy, summary, created_at
+    FROM rca_analyses
+    ${cf}
+    ORDER BY created_at DESC
+    LIMIT ${limit}
+  `);
+
+  return res.rows;
+}
