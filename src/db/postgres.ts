@@ -1841,3 +1841,265 @@ export async function getNotificationLogs(limit = 50, companyId?: number): Promi
   );
   return result.rows;
 }
+/* -------------------------------------------------------------------------- */
+/*  Vector Similarity Analytics                                               */
+/* -------------------------------------------------------------------------- */
+
+export interface SimilarityStats {
+  totalComparisons: number;
+  avgConfidence: number;
+  highConfidenceCount: number;    // >= 0.8
+  mediumConfidenceCount: number;  // 0.5 - 0.79
+  lowConfidenceCount: number;     // < 0.5
+  domCandidateHealings: number;
+  semanticMatchRate: number;
+  strategyEffectiveness: Array<{
+    strategy: string;
+    count: number;
+    avgConfidence: number;
+    successRate: number;
+  }>;
+}
+
+export async function getSimilarityStats(companyId?: number): Promise<SimilarityStats> {
+  const p = getPool();
+  const cf = companyId ? `WHERE company_id = ${companyId}` : '';
+  const cfAnd = companyId ? `AND company_id = ${companyId}` : '';
+
+  const [totalRes, confRes, highRes, medRes, lowRes, domRes, stratRes] = await Promise.all([
+    p.query(`SELECT COUNT(*) as c FROM healing_actions WHERE healed_locator IS NOT NULL ${cfAnd}`),
+    p.query(`SELECT COALESCE(AVG(confidence), 0) as avg FROM healing_actions WHERE healed_locator IS NOT NULL ${cfAnd}`),
+    p.query(`SELECT COUNT(*) as c FROM healing_actions WHERE confidence >= 0.8 ${cfAnd}`),
+    p.query(`SELECT COUNT(*) as c FROM healing_actions WHERE confidence >= 0.5 AND confidence < 0.8 ${cfAnd}`),
+    p.query(`SELECT COUNT(*) as c FROM healing_actions WHERE confidence < 0.5 AND confidence > 0 ${cfAnd}`),
+    p.query(`SELECT COUNT(*) as c FROM healing_actions WHERE healing_strategy = 'rule_based' AND ai_tokens_used = 0 AND success = true ${cfAnd}`),
+    p.query(`
+      SELECT healing_strategy,
+             COUNT(*) as count,
+             ROUND(AVG(confidence)::numeric, 3) as avg_confidence,
+             ROUND(SUM(CASE WHEN success THEN 1 ELSE 0 END)::numeric / NULLIF(COUNT(*), 0), 3) as success_rate
+      FROM healing_actions ${cf}
+      GROUP BY healing_strategy
+      ORDER BY count DESC
+    `),
+  ]);
+
+  const total = parseInt(totalRes.rows[0].c, 10);
+  const domCandidates = parseInt(domRes.rows[0].c, 10);
+
+  return {
+    totalComparisons: total,
+    avgConfidence: parseFloat(confRes.rows[0].avg) || 0,
+    highConfidenceCount: parseInt(highRes.rows[0].c, 10),
+    mediumConfidenceCount: parseInt(medRes.rows[0].c, 10),
+    lowConfidenceCount: parseInt(lowRes.rows[0].c, 10),
+    domCandidateHealings: domCandidates,
+    semanticMatchRate: total > 0 ? domCandidates / total : 0,
+    strategyEffectiveness: stratRes.rows.map((r: any) => ({
+      strategy: r.healing_strategy,
+      count: parseInt(r.count, 10),
+      avgConfidence: parseFloat(r.avg_confidence) || 0,
+      successRate: parseFloat(r.success_rate) || 0,
+    })),
+  };
+}
+
+export interface SimilarityDistribution {
+  bucket: string;
+  range: string;
+  count: number;
+  percentage: number;
+}
+
+export async function getConfidenceDistribution(companyId?: number): Promise<SimilarityDistribution[]> {
+  const p = getPool();
+  const cf = companyId ? `WHERE company_id = ${companyId}` : '';
+  const cfAnd = companyId ? `AND company_id = ${companyId}` : '';
+
+  const result = await p.query(`
+    SELECT
+      CASE
+        WHEN confidence >= 0.9 THEN '0.9-1.0'
+        WHEN confidence >= 0.8 THEN '0.8-0.9'
+        WHEN confidence >= 0.7 THEN '0.7-0.8'
+        WHEN confidence >= 0.6 THEN '0.6-0.7'
+        WHEN confidence >= 0.5 THEN '0.5-0.6'
+        WHEN confidence >= 0.4 THEN '0.4-0.5'
+        WHEN confidence >= 0.3 THEN '0.3-0.4'
+        ELSE '0.0-0.3'
+      END as bucket,
+      COUNT(*) as count
+    FROM healing_actions
+    WHERE confidence > 0 ${cfAnd}
+    GROUP BY bucket
+    ORDER BY bucket DESC
+  `);
+
+  const total = result.rows.reduce((s: number, r: any) => s + parseInt(r.count, 10), 0);
+
+  const bucketLabels: Record<string, string> = {
+    '0.9-1.0': 'Excellent',
+    '0.8-0.9': 'High',
+    '0.7-0.8': 'Good',
+    '0.6-0.7': 'Moderate',
+    '0.5-0.6': 'Fair',
+    '0.4-0.5': 'Low',
+    '0.3-0.4': 'Poor',
+    '0.0-0.3': 'Very Low',
+  };
+
+  return result.rows.map((r: any) => ({
+    bucket: bucketLabels[r.bucket] || r.bucket,
+    range: r.bucket,
+    count: parseInt(r.count, 10),
+    percentage: total > 0 ? Math.round((parseInt(r.count, 10) / total) * 10000) / 100 : 0,
+  }));
+}
+
+export interface SimilarityTrend {
+  date: string;
+  avgConfidence: number;
+  totalHealings: number;
+  successCount: number;
+  domCandidateCount: number;
+}
+
+export async function getSimilarityTrend(days: number = 30, companyId?: number): Promise<SimilarityTrend[]> {
+  const p = getPool();
+  const cfAnd = companyId ? `AND company_id = ${companyId}` : '';
+
+  const result = await p.query(`
+    SELECT
+      DATE(created_at) as date,
+      ROUND(AVG(confidence)::numeric, 3) as avg_confidence,
+      COUNT(*) as total,
+      SUM(CASE WHEN success THEN 1 ELSE 0 END) as success_count,
+      SUM(CASE WHEN healing_strategy = 'rule_based' AND ai_tokens_used = 0 AND success THEN 1 ELSE 0 END) as dom_count
+    FROM healing_actions
+    WHERE created_at >= NOW() - INTERVAL '${days} days' ${cfAnd}
+    GROUP BY DATE(created_at)
+    ORDER BY date ASC
+  `);
+
+  return result.rows.map((r: any) => ({
+    date: r.date instanceof Date ? r.date.toISOString().slice(0, 10) : String(r.date).slice(0, 10),
+    avgConfidence: parseFloat(r.avg_confidence) || 0,
+    totalHealings: parseInt(r.total, 10),
+    successCount: parseInt(r.success_count, 10),
+    domCandidateCount: parseInt(r.dom_count, 10),
+  }));
+}
+
+export interface TopSimilarityMatch {
+  failedLocator: string;
+  healedLocator: string;
+  confidence: number;
+  strategy: string;
+  testName: string;
+  success: boolean;
+  createdAt: string;
+}
+
+export async function getTopSimilarityMatches(limit: number = 20, companyId?: number): Promise<TopSimilarityMatch[]> {
+  const p = getPool();
+  const cf = companyId ? `WHERE company_id = ${companyId}` : '';
+
+  const result = await p.query(`
+    SELECT failed_locator, healed_locator, confidence, healing_strategy,
+           test_name, success, created_at
+    FROM healing_actions
+    ${cf}
+    ORDER BY confidence DESC, created_at DESC
+    LIMIT $1
+  `, [limit]);
+
+  return result.rows.map((r: any) => ({
+    failedLocator: r.failed_locator,
+    healedLocator: r.healed_locator,
+    confidence: parseFloat(r.confidence) || 0,
+    strategy: r.healing_strategy,
+    testName: r.test_name,
+    success: r.success,
+    createdAt: r.created_at instanceof Date ? r.created_at.toISOString() : String(r.created_at),
+  }));
+}
+
+export interface LocatorPairAnalysis {
+  failedLocator: string;
+  healedLocator: string;
+  occurrences: number;
+  avgConfidence: number;
+  successRate: number;
+  strategies: string[];
+  lastSeen: string;
+}
+
+export async function getLocatorPairAnalysis(limit: number = 20, companyId?: number): Promise<LocatorPairAnalysis[]> {
+  const p = getPool();
+  const cf = companyId ? `WHERE healed_locator IS NOT NULL ${companyId ? `AND company_id = ${companyId}` : ''}` : 'WHERE healed_locator IS NOT NULL';
+
+  const result = await p.query(`
+    SELECT failed_locator, healed_locator,
+           COUNT(*) as occurrences,
+           ROUND(AVG(confidence)::numeric, 3) as avg_confidence,
+           ROUND(SUM(CASE WHEN success THEN 1 ELSE 0 END)::numeric / NULLIF(COUNT(*), 0), 3) as success_rate,
+           ARRAY_AGG(DISTINCT healing_strategy) as strategies,
+           MAX(created_at) as last_seen
+    FROM healing_actions
+    ${cf}
+    GROUP BY failed_locator, healed_locator
+    ORDER BY occurrences DESC, avg_confidence DESC
+    LIMIT $1
+  `, [limit]);
+
+  return result.rows.map((r: any) => ({
+    failedLocator: r.failed_locator,
+    healedLocator: r.healed_locator,
+    occurrences: parseInt(r.occurrences, 10),
+    avgConfidence: parseFloat(r.avg_confidence) || 0,
+    successRate: parseFloat(r.success_rate) || 0,
+    strategies: r.strategies || [],
+    lastSeen: r.last_seen instanceof Date ? r.last_seen.toISOString() : String(r.last_seen),
+  }));
+}
+
+export async function getSemanticGroupStats(companyId?: number): Promise<Array<{
+  locatorType: string;
+  count: number;
+  avgConfidence: number;
+  successRate: number;
+}>> {
+  const p = getPool();
+  const cf = companyId ? `WHERE company_id = ${companyId}` : '';
+  const cfAnd = companyId ? `AND company_id = ${companyId}` : '';
+
+  const result = await p.query(`
+    SELECT
+      CASE
+        WHEN failed_locator LIKE '%[data-testid%' THEN 'data-testid'
+        WHEN failed_locator LIKE '%[name=%' THEN 'name attribute'
+        WHEN failed_locator LIKE '%[id=%' OR failed_locator LIKE '%#%' THEN 'id selector'
+        WHEN failed_locator LIKE '%[class=%' OR failed_locator LIKE '%.%' THEN 'class selector'
+        WHEN failed_locator LIKE '%text=%' OR failed_locator LIKE '%getByText%' THEN 'text content'
+        WHEN failed_locator LIKE '%getByRole%' THEN 'ARIA role'
+        WHEN failed_locator LIKE '%getByLabel%' THEN 'label'
+        WHEN failed_locator LIKE '%getByPlaceholder%' THEN 'placeholder'
+        WHEN failed_locator LIKE '%xpath%' OR failed_locator LIKE '%//%' THEN 'XPath'
+        ELSE 'other'
+      END as locator_type,
+      COUNT(*) as count,
+      ROUND(AVG(confidence)::numeric, 3) as avg_confidence,
+      ROUND(SUM(CASE WHEN success THEN 1 ELSE 0 END)::numeric / NULLIF(COUNT(*), 0), 3) as success_rate
+    FROM healing_actions
+    ${cf}
+    GROUP BY locator_type
+    ORDER BY count DESC
+  `);
+
+  return result.rows.map((r: any) => ({
+    locatorType: r.locator_type,
+    count: parseInt(r.count, 10),
+    avgConfidence: parseFloat(r.avg_confidence) || 0,
+    successRate: parseFloat(r.success_rate) || 0,
+  }));
+}

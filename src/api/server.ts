@@ -41,6 +41,7 @@ import { createNotificationsRouter } from './routes/notifications';
 import { createDomMemoryRouter } from './routes/dom-memory';
 import { createLearningRouter } from './routes/learning';
 import { createCompaniesRouter } from './routes/companies';
+import { createSimilarityRouter } from './routes/similarity';
 import { notifyRca } from '../integrations/slack';
 import { createRcaTicket } from '../integrations/jira';
 import cookieParser from 'cookie-parser';
@@ -117,6 +118,7 @@ export function createServer(): express.Application {
   app.use('/api/dom', authMiddleware, companyMiddleware, createDomMemoryRouter());
   app.use('/api/learning', authMiddleware, companyMiddleware, createLearningRouter());
   app.use('/api/companies', authMiddleware, createCompaniesRouter());
+  app.use('/api/similarity', authMiddleware, companyMiddleware, createSimilarityRouter());
 
   // List all jobs
   app.get('/api/jobs', authMiddleware, (_req, res) => {
