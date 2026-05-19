@@ -47,6 +47,7 @@ import { createReleaseSignoffRouter } from './routes/release-signoff';
 import { createRCAIntelligenceRouter } from './routes/rca-intelligence';
 import { createTestCoverageRouter } from './routes/test-coverage';
 import { createROIRouter } from './routes/roi';
+import { createBillingRouter } from './routes/billing';
 import { notifyRca } from '../integrations/slack';
 import { createRcaTicket } from '../integrations/jira';
 import cookieParser from 'cookie-parser';
@@ -129,6 +130,7 @@ export function createServer(): express.Application {
   app.use('/api/rca-intelligence', authMiddleware, companyMiddleware, createRCAIntelligenceRouter());
   app.use('/api/roi', authMiddleware, companyMiddleware, createROIRouter());
   app.use('/api/test-coverage', authMiddleware, companyMiddleware, createTestCoverageRouter());
+  app.use('/api/billing', authMiddleware, companyMiddleware, createBillingRouter());
 
   // List all jobs
   app.get('/api/jobs', authMiddleware, (_req, res) => {

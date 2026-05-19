@@ -438,7 +438,115 @@ async function initSchema(client: PoolClient): Promise<void> {
     CREATE INDEX IF NOT EXISTS idx_notif_config_company ON notification_configs(company_id);
     CREATE INDEX IF NOT EXISTS idx_notif_log_company ON notification_logs(company_id);
     CREATE INDEX IF NOT EXISTS idx_users_company ON users(company_id);
+
+    -- ==================== BILLING & LICENSING TABLES ====================
+
+    CREATE TABLE IF NOT EXISTS plans (
+      id            SERIAL PRIMARY KEY,
+      name          VARCHAR(100) NOT NULL,
+      slug          VARCHAR(50) UNIQUE NOT NULL,
+      price_usd_monthly    NUMERIC(10,2) DEFAULT 0,
+      price_usd_annually   NUMERIC(10,2) DEFAULT 0,
+      price_inr_monthly    NUMERIC(10,2) DEFAULT 0,
+      price_inr_annually   NUMERIC(10,2) DEFAULT 0,
+      credits_monthly      INTEGER NOT NULL DEFAULT 0,
+      max_users            INTEGER NOT NULL DEFAULT 1,
+      max_repos            INTEGER NOT NULL DEFAULT 1,
+      max_jobs_per_month   INTEGER NOT NULL DEFAULT 25,
+      retention_days       INTEGER NOT NULL DEFAULT 7,
+      features             JSONB DEFAULT '{}',
+      is_active            BOOLEAN DEFAULT TRUE,
+      created_at           TIMESTAMPTZ DEFAULT NOW(),
+      updated_at           TIMESTAMPTZ DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS subscriptions (
+      id                     SERIAL PRIMARY KEY,
+      company_id             INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+      plan_id                INTEGER NOT NULL REFERENCES plans(id),
+      status                 VARCHAR(20) NOT NULL DEFAULT 'active'
+                             CHECK (status IN ('active','trialing','past_due','cancelled','expired')),
+      billing_cycle          VARCHAR(10) NOT NULL DEFAULT 'monthly'
+                             CHECK (billing_cycle IN ('monthly','annually')),
+      currency               VARCHAR(3) NOT NULL DEFAULT 'USD',
+      current_period_start   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      current_period_end     TIMESTAMPTZ NOT NULL DEFAULT (NOW() + INTERVAL '30 days'),
+      cancelled_at           TIMESTAMPTZ,
+      payment_gateway        VARCHAR(20) DEFAULT 'stripe',
+      gateway_subscription_id VARCHAR(255),
+      gateway_customer_id    VARCHAR(255),
+      created_at             TIMESTAMPTZ DEFAULT NOW(),
+      updated_at             TIMESTAMPTZ DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS subscription_usage (
+      id              SERIAL PRIMARY KEY,
+      subscription_id INTEGER REFERENCES subscriptions(id) ON DELETE CASCADE,
+      company_id      INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+      operation       VARCHAR(50) NOT NULL,
+      credits_used    INTEGER NOT NULL DEFAULT 0,
+      metadata        JSONB DEFAULT '{}',
+      period_start    TIMESTAMPTZ NOT NULL,
+      period_end      TIMESTAMPTZ NOT NULL,
+      created_at      TIMESTAMPTZ DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS billing_events (
+      id                  SERIAL PRIMARY KEY,
+      company_id          INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+      subscription_id     INTEGER REFERENCES subscriptions(id) ON DELETE SET NULL,
+      event_type          VARCHAR(50) NOT NULL,
+      amount              NUMERIC(10,2) DEFAULT 0,
+      currency            VARCHAR(3) DEFAULT 'USD',
+      gateway             VARCHAR(20),
+      gateway_event_id    VARCHAR(255),
+      invoice_number      VARCHAR(50),
+      status              VARCHAR(20) DEFAULT 'completed',
+      description         TEXT,
+      metadata            JSONB DEFAULT '{}',
+      created_at          TIMESTAMPTZ DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS payment_methods (
+      id              SERIAL PRIMARY KEY,
+      company_id      INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+      type            VARCHAR(20) NOT NULL DEFAULT 'card',
+      last_four       VARCHAR(4),
+      brand           VARCHAR(20),
+      exp_month       INTEGER,
+      exp_year        INTEGER,
+      is_default      BOOLEAN DEFAULT FALSE,
+      gateway         VARCHAR(20) DEFAULT 'stripe',
+      gateway_pm_id   VARCHAR(255),
+      created_at      TIMESTAMPTZ DEFAULT NOW()
+    );
+
+    -- Billing indexes
+    CREATE INDEX IF NOT EXISTS idx_subscriptions_company ON subscriptions(company_id);
+    CREATE INDEX IF NOT EXISTS idx_subscriptions_status ON subscriptions(status);
+    CREATE INDEX IF NOT EXISTS idx_sub_usage_company ON subscription_usage(company_id);
+    CREATE INDEX IF NOT EXISTS idx_sub_usage_period ON subscription_usage(period_start, period_end);
+    CREATE INDEX IF NOT EXISTS idx_sub_usage_operation ON subscription_usage(operation);
+    CREATE INDEX IF NOT EXISTS idx_billing_events_company ON billing_events(company_id);
+    CREATE INDEX IF NOT EXISTS idx_billing_events_type ON billing_events(event_type);
+    CREATE INDEX IF NOT EXISTS idx_payment_methods_company ON payment_methods(company_id);
+
+    -- ==================== ROLES TABLE ====================
+
+    CREATE TABLE IF NOT EXISTS roles (
+      id            SERIAL PRIMARY KEY,
+      name          VARCHAR(50) NOT NULL,
+      slug          VARCHAR(50) UNIQUE NOT NULL,
+      description   TEXT,
+      permissions   JSONB DEFAULT '{}',
+      is_system     BOOLEAN DEFAULT FALSE,
+      created_at    TIMESTAMPTZ DEFAULT NOW()
+    );
   `);
+
+  // Seed default plans & roles
+  await seedDefaultPlans(client);
+  await seedDefaultRoles(client);
 
   // Ensure default company exists and backfill orphaned data
   await migrateDefaultCompany(client);
@@ -547,6 +655,389 @@ async function migrateDefaultCompany(client: PoolClient): Promise<void> {
     CREATE INDEX IF NOT EXISTS idx_app_knowledge_company ON application_knowledge(company_id);
     CREATE INDEX IF NOT EXISTS idx_app_knowledge_module ON application_knowledge(module);
   `);
+}
+
+/* -------------------------------------------------------------------------- */
+/*  Billing – Seed Default Plans                                              */
+/* -------------------------------------------------------------------------- */
+
+async function seedDefaultPlans(client: PoolClient): Promise<void> {
+  const plans = [
+    {
+      name: 'Free POC', slug: 'free',
+      price_usd_monthly: 0, price_usd_annually: 0,
+      price_inr_monthly: 0, price_inr_annually: 0,
+      credits_monthly: 50, max_users: 1, max_repos: 1,
+      max_jobs_per_month: 25, retention_days: 7,
+      features: { healing_types: ['rule_based'], basic_reports: true, community_support: true },
+    },
+    {
+      name: 'Starter', slug: 'starter',
+      price_usd_monthly: 149, price_usd_annually: 1490,
+      price_inr_monthly: 12499, price_inr_annually: 124990,
+      credits_monthly: 500, max_users: 5, max_repos: 5,
+      max_jobs_per_month: 200, retention_days: 30,
+      features: { healing_types: ['rule_based', 'database_pattern', 'ai_reasoning'], rca: true, pr_automation: true, email_support: true },
+    },
+    {
+      name: 'Growth', slug: 'growth',
+      price_usd_monthly: 999, price_usd_annually: 9990,
+      price_inr_monthly: 83499, price_inr_annually: 834990,
+      credits_monthly: 5000, max_users: 25, max_repos: -1,
+      max_jobs_per_month: -1, retention_days: 90,
+      features: { healing_types: ['rule_based', 'database_pattern', 'ai_reasoning'], rca: true, pr_automation: true, script_generation: true, coverage_generation: true, release_signoff: true, priority_support: true, sso: true },
+    },
+    {
+      name: 'Enterprise', slug: 'enterprise',
+      price_usd_monthly: 0, price_usd_annually: 0,
+      price_inr_monthly: 0, price_inr_annually: 0,
+      credits_monthly: -1, max_users: -1, max_repos: -1,
+      max_jobs_per_month: -1, retention_days: 365,
+      features: { healing_types: ['rule_based', 'database_pattern', 'ai_reasoning'], rca: true, pr_automation: true, script_generation: true, coverage_generation: true, release_signoff: true, dedicated_support: true, sso: true, custom_sla: true, on_premise: true },
+    },
+  ];
+
+  for (const p of plans) {
+    await client.query(
+      `INSERT INTO plans (name, slug, price_usd_monthly, price_usd_annually, price_inr_monthly, price_inr_annually, credits_monthly, max_users, max_repos, max_jobs_per_month, retention_days, features)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+       ON CONFLICT (slug) DO UPDATE SET
+         name=$1, price_usd_monthly=$3, price_usd_annually=$4, price_inr_monthly=$5, price_inr_annually=$6,
+         credits_monthly=$7, max_users=$8, max_repos=$9, max_jobs_per_month=$10, retention_days=$11,
+         features=$12, updated_at=NOW()`,
+      [p.name, p.slug, p.price_usd_monthly, p.price_usd_annually, p.price_inr_monthly, p.price_inr_annually,
+       p.credits_monthly, p.max_users, p.max_repos, p.max_jobs_per_month, p.retention_days, JSON.stringify(p.features)]
+    );
+  }
+  logger.info(MOD, 'Default plans seeded/updated');
+}
+
+async function seedDefaultRoles(client: PoolClient): Promise<void> {
+  const roles = [
+    {
+      name: 'Owner', slug: 'owner',
+      description: 'Full platform access with billing and team management',
+      permissions: {
+        platform: ['view_dashboard','manage_repos','configure_settings','manage_integrations'],
+        testing: ['run_tests','view_results','manage_healing','approve_fixes'],
+        billing: ['view_billing','manage_subscription','manage_payment_methods','view_invoices'],
+        team: ['invite_members','remove_members','assign_roles','view_audit_logs'],
+        intelligence: ['view_rca','generate_scripts','manage_coverage','release_signoff','view_learning'],
+      },
+      is_system: true,
+    },
+    {
+      name: 'QA Manager', slug: 'qa_manager',
+      description: 'Test management and team oversight',
+      permissions: {
+        platform: ['view_dashboard','manage_repos','configure_settings'],
+        testing: ['run_tests','view_results','manage_healing','approve_fixes'],
+        billing: ['view_billing','view_invoices'],
+        team: ['invite_members','assign_roles','view_audit_logs'],
+        intelligence: ['view_rca','generate_scripts','manage_coverage','release_signoff','view_learning'],
+      },
+      is_system: true,
+    },
+    {
+      name: 'QA Engineer', slug: 'qa_engineer',
+      description: 'Day-to-day testing and healing operations',
+      permissions: {
+        platform: ['view_dashboard','manage_repos'],
+        testing: ['run_tests','view_results','manage_healing'],
+        billing: ['view_billing'],
+        team: [],
+        intelligence: ['view_rca','generate_scripts','manage_coverage','view_learning'],
+      },
+      is_system: true,
+    },
+    {
+      name: 'Viewer', slug: 'viewer',
+      description: 'Read-only access to dashboards and reports',
+      permissions: {
+        platform: ['view_dashboard'],
+        testing: ['view_results'],
+        billing: ['view_billing'],
+        team: [],
+        intelligence: ['view_rca','view_learning'],
+      },
+      is_system: true,
+    },
+  ];
+
+  for (const r of roles) {
+    await client.query(
+      `INSERT INTO roles (name, slug, description, permissions, is_system)
+       VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT (slug) DO UPDATE SET
+         name=$1, description=$3, permissions=$4, is_system=$5`,
+      [r.name, r.slug, r.description, JSON.stringify(r.permissions), r.is_system]
+    );
+  }
+  logger.info(MOD, 'Default roles seeded/updated');
+}
+
+/* -------------------------------------------------------------------------- */
+/*  Billing – Plans CRUD                                                      */
+/* -------------------------------------------------------------------------- */
+
+export async function getPlans(): Promise<any[]> {
+  const { rows } = await getPool().query(
+    `SELECT * FROM plans WHERE is_active = TRUE ORDER BY price_usd_monthly ASC`
+  );
+  return rows;
+}
+
+export async function getPlanById(id: number): Promise<any | null> {
+  const { rows } = await getPool().query(`SELECT * FROM plans WHERE id = $1`, [id]);
+  return rows[0] || null;
+}
+
+export async function getPlanBySlug(slug: string): Promise<any | null> {
+  const { rows } = await getPool().query(`SELECT * FROM plans WHERE slug = $1`, [slug]);
+  return rows[0] || null;
+}
+
+/* -------------------------------------------------------------------------- */
+/*  Billing – Subscriptions CRUD                                              */
+/* -------------------------------------------------------------------------- */
+
+export async function getSubscription(companyId: number): Promise<any | null> {
+  const { rows } = await getPool().query(
+    `SELECT s.*, p.name as plan_name, p.slug as plan_slug, p.credits_monthly, p.max_users, p.max_repos,
+            p.max_jobs_per_month, p.retention_days, p.features as plan_features
+     FROM subscriptions s
+     JOIN plans p ON s.plan_id = p.id
+     WHERE s.company_id = $1 AND s.status IN ('active','trialing')
+     ORDER BY s.created_at DESC LIMIT 1`,
+    [companyId]
+  );
+  return rows[0] || null;
+}
+
+export async function createSubscription(data: {
+  companyId: number; planId: number; billingCycle?: string; currency?: string;
+  gateway?: string; gatewaySubId?: string; gatewayCustomerId?: string;
+}): Promise<number> {
+  const cycle = data.billingCycle || 'monthly';
+  const interval = cycle === 'annually' ? '365 days' : '30 days';
+  const { rows } = await getPool().query(
+    `INSERT INTO subscriptions (company_id, plan_id, billing_cycle, currency, payment_gateway, gateway_subscription_id, gateway_customer_id, current_period_end)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, NOW() + $8::interval)
+     RETURNING id`,
+    [data.companyId, data.planId, cycle, data.currency || 'USD', data.gateway || 'stripe',
+     data.gatewaySubId || null, data.gatewayCustomerId || null, interval]
+  );
+  return rows[0].id;
+}
+
+export async function updateSubscription(subId: number, updates: {
+  planId?: number; status?: string; billingCycle?: string; cancelledAt?: string;
+}): Promise<void> {
+  const sets: string[] = ['updated_at = NOW()'];
+  const vals: any[] = [];
+  let i = 1;
+  if (updates.planId !== undefined) { sets.push(`plan_id = $${i++}`); vals.push(updates.planId); }
+  if (updates.status !== undefined) { sets.push(`status = $${i++}`); vals.push(updates.status); }
+  if (updates.billingCycle !== undefined) { sets.push(`billing_cycle = $${i++}`); vals.push(updates.billingCycle); }
+  if (updates.cancelledAt !== undefined) { sets.push(`cancelled_at = $${i++}`); vals.push(updates.cancelledAt); }
+  vals.push(subId);
+  await getPool().query(`UPDATE subscriptions SET ${sets.join(', ')} WHERE id = $${i}`, vals);
+}
+
+export async function cancelSubscription(companyId: number): Promise<boolean> {
+  const { rowCount } = await getPool().query(
+    `UPDATE subscriptions SET status = 'cancelled', cancelled_at = NOW(), updated_at = NOW()
+     WHERE company_id = $1 AND status IN ('active','trialing')`,
+    [companyId]
+  );
+  return (rowCount ?? 0) > 0;
+}
+
+/* -------------------------------------------------------------------------- */
+/*  Billing – Usage Tracking                                                  */
+/* -------------------------------------------------------------------------- */
+
+/** Credit cost map for each operation type */
+export const CREDIT_COSTS: Record<string, number> = {
+  rule_based: 0,
+  database_pattern: 1,
+  ai_reasoning: 5,
+  rca_analysis: 3,
+  script_generation: 10,
+  coverage_generation: 8,
+  release_signoff: 5,
+  pr_automation: 3,
+};
+
+export async function trackUsage(companyId: number, operation: string, creditsUsed: number, metadata?: Record<string, any>): Promise<number> {
+  const sub = await getSubscription(companyId);
+  const subId = sub?.id || null;
+  const periodStart = sub?.current_period_start || new Date().toISOString();
+  const periodEnd = sub?.current_period_end || new Date(Date.now() + 30 * 86400000).toISOString();
+
+  const { rows } = await getPool().query(
+    `INSERT INTO subscription_usage (subscription_id, company_id, operation, credits_used, metadata, period_start, period_end)
+     VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
+    [subId, companyId, operation, creditsUsed, JSON.stringify(metadata || {}), periodStart, periodEnd]
+  );
+  return rows[0].id;
+}
+
+export async function getUsageSummary(companyId: number): Promise<{
+  totalCreditsUsed: number; creditsAllowed: number; creditsRemaining: number;
+  totalOperations: number; periodStart: string; periodEnd: string;
+}> {
+  const sub = await getSubscription(companyId);
+  const creditsAllowed = sub?.credits_monthly ?? 50;
+  const periodStart = sub?.current_period_start || new Date(new Date().getFullYear(), new Date().getMonth(), 1).toISOString();
+  const periodEnd = sub?.current_period_end || new Date(new Date().getFullYear(), new Date().getMonth() + 1, 0).toISOString();
+
+  const { rows } = await getPool().query(
+    `SELECT COALESCE(SUM(credits_used), 0) as total_credits, COUNT(*) as total_ops
+     FROM subscription_usage
+     WHERE company_id = $1 AND created_at >= $2 AND created_at <= $3`,
+    [companyId, periodStart, periodEnd]
+  );
+  const totalCreditsUsed = parseInt(rows[0].total_credits);
+  return {
+    totalCreditsUsed,
+    creditsAllowed: creditsAllowed === -1 ? 999999 : creditsAllowed,
+    creditsRemaining: creditsAllowed === -1 ? 999999 : Math.max(0, creditsAllowed - totalCreditsUsed),
+    totalOperations: parseInt(rows[0].total_ops),
+    periodStart, periodEnd,
+  };
+}
+
+export async function getUsageBreakdown(companyId: number): Promise<Array<{
+  operation: string; count: number; credits: number;
+}>> {
+  const sub = await getSubscription(companyId);
+  const periodStart = sub?.current_period_start || new Date(new Date().getFullYear(), new Date().getMonth(), 1).toISOString();
+
+  const { rows } = await getPool().query(
+    `SELECT operation, COUNT(*)::int as count, COALESCE(SUM(credits_used), 0)::int as credits
+     FROM subscription_usage
+     WHERE company_id = $1 AND created_at >= $2
+     GROUP BY operation ORDER BY credits DESC`,
+    [companyId, periodStart]
+  );
+  return rows;
+}
+
+export async function getUsageTrend(companyId: number, days: number = 30): Promise<Array<{
+  date: string; operations: number; credits: number;
+}>> {
+  const { rows } = await getPool().query(
+    `SELECT DATE(created_at) as date, COUNT(*)::int as operations, COALESCE(SUM(credits_used), 0)::int as credits
+     FROM subscription_usage
+     WHERE company_id = $1 AND created_at >= NOW() - $2::int * INTERVAL '1 day'
+     GROUP BY DATE(created_at) ORDER BY date ASC`,
+    [companyId, days]
+  );
+  return rows;
+}
+
+export async function checkCredits(companyId: number, requiredCredits: number = 0): Promise<{
+  allowed: boolean; remaining: number; total: number; used: number;
+}> {
+  const usage = await getUsageSummary(companyId);
+  return {
+    allowed: usage.creditsRemaining >= requiredCredits,
+    remaining: usage.creditsRemaining,
+    total: usage.creditsAllowed,
+    used: usage.totalCreditsUsed,
+  };
+}
+
+/* -------------------------------------------------------------------------- */
+/*  Billing – Billing Events / Invoices                                       */
+/* -------------------------------------------------------------------------- */
+
+export async function logBillingEvent(data: {
+  companyId: number; subscriptionId?: number; eventType: string; amount?: number;
+  currency?: string; gateway?: string; gatewayEventId?: string; invoiceNumber?: string;
+  status?: string; description?: string; metadata?: Record<string, any>;
+}): Promise<number> {
+  const { rows } = await getPool().query(
+    `INSERT INTO billing_events (company_id, subscription_id, event_type, amount, currency, gateway, gateway_event_id, invoice_number, status, description, metadata)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING id`,
+    [data.companyId, data.subscriptionId || null, data.eventType, data.amount || 0,
+     data.currency || 'USD', data.gateway || null, data.gatewayEventId || null,
+     data.invoiceNumber || null, data.status || 'completed', data.description || null,
+     JSON.stringify(data.metadata || {})]
+  );
+  return rows[0].id;
+}
+
+export async function getBillingEvents(companyId: number, limit: number = 50): Promise<any[]> {
+  const { rows } = await getPool().query(
+    `SELECT * FROM billing_events WHERE company_id = $1 ORDER BY created_at DESC LIMIT $2`,
+    [companyId, limit]
+  );
+  return rows;
+}
+
+export async function getInvoices(companyId: number): Promise<any[]> {
+  const { rows } = await getPool().query(
+    `SELECT be.*, p.name as plan_name, s.billing_cycle
+     FROM billing_events be
+     LEFT JOIN subscriptions s ON be.subscription_id = s.id
+     LEFT JOIN plans p ON s.plan_id = p.id
+     WHERE be.company_id = $1 AND be.event_type IN ('invoice','payment','charge')
+     ORDER BY be.created_at DESC`,
+    [companyId]
+  );
+  return rows;
+}
+
+/* -------------------------------------------------------------------------- */
+/*  Billing – Payment Methods                                                 */
+/* -------------------------------------------------------------------------- */
+
+export async function getPaymentMethods(companyId: number): Promise<any[]> {
+  const { rows } = await getPool().query(
+    `SELECT * FROM payment_methods WHERE company_id = $1 ORDER BY is_default DESC, created_at DESC`,
+    [companyId]
+  );
+  return rows;
+}
+
+export async function addPaymentMethod(data: {
+  companyId: number; type?: string; lastFour?: string; brand?: string;
+  expMonth?: number; expYear?: number; isDefault?: boolean; gateway?: string; gatewayPmId?: string;
+}): Promise<number> {
+  // If this is default, un-default others
+  if (data.isDefault) {
+    await getPool().query(`UPDATE payment_methods SET is_default = FALSE WHERE company_id = $1`, [data.companyId]);
+  }
+  const { rows } = await getPool().query(
+    `INSERT INTO payment_methods (company_id, type, last_four, brand, exp_month, exp_year, is_default, gateway, gateway_pm_id)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id`,
+    [data.companyId, data.type || 'card', data.lastFour || null, data.brand || null,
+     data.expMonth || null, data.expYear || null, data.isDefault || false,
+     data.gateway || 'stripe', data.gatewayPmId || null]
+  );
+  return rows[0].id;
+}
+
+export async function removePaymentMethod(id: number, companyId: number): Promise<boolean> {
+  const { rowCount } = await getPool().query(
+    `DELETE FROM payment_methods WHERE id = $1 AND company_id = $2`, [id, companyId]
+  );
+  return (rowCount ?? 0) > 0;
+}
+
+/* -------------------------------------------------------------------------- */
+/*  Billing – Ensure Free Plan on New Company                                 */
+/* -------------------------------------------------------------------------- */
+
+export async function ensureFreePlan(companyId: number): Promise<void> {
+  const existing = await getSubscription(companyId);
+  if (existing) return;
+  const freePlan = await getPlanBySlug('free');
+  if (!freePlan) return;
+  await createSubscription({ companyId, planId: freePlan.id, billingCycle: 'monthly', currency: 'USD' });
+  logger.info(MOD, `Auto-assigned Free plan to company ${companyId}`);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -2878,5 +3369,140 @@ export async function getTestCoverageStats(companyId?: number): Promise<{
     automationReadyCount: parseInt(caseR.rows[0].auto_ready, 10),
     coverageTypeBreakdown,
     priorityBreakdown,
+
+/* ========================================================================== */
+/*  ROLES & TEAM MANAGEMENT                                                    */
+/* ========================================================================== */
+
+export async function getRoles(): Promise<any[]> {
+  const { rows } = await getPool().query(`SELECT * FROM roles ORDER BY id ASC`);
+  return rows;
+}
+
+export async function getRoleBySlug(slug: string): Promise<any | null> {
+  const { rows } = await getPool().query(`SELECT * FROM roles WHERE slug = $1`, [slug]);
+  return rows[0] || null;
+}
+
+export async function getTeamMembers(companyId: number): Promise<any[]> {
+  const { rows } = await getPool().query(
+    `SELECT u.id, u.username, u.role, u.is_active, u.last_login, u.created_at,
+            r.name as role_name, r.permissions
+     FROM users u
+     LEFT JOIN roles r ON u.role = r.slug
+     WHERE u.company_id = $1
+     ORDER BY u.created_at ASC`,
+    [companyId]
+  );
+  return rows;
+}
+
+export async function updateUserRole(userId: number, roleSlug: string): Promise<any> {
+  const { rows } = await getPool().query(
+    `UPDATE users SET role = $1, updated_at = NOW() WHERE id = $2 RETURNING id, username, role`,
+    [roleSlug, userId]
+  );
+  return rows[0] || null;
+}
+
+/* ========================================================================== */
+/*  BILLING AUDIT LOGS                                                         */
+/* ========================================================================== */
+
+export async function createBillingAuditLog(data: {
+  companyId: number; userId?: number; action: string; category?: string;
+  severity?: string; target?: string; details?: Record<string, any>;
+  ipAddress?: string; userAgent?: string;
+}): Promise<number> {
+  const { rows } = await getPool().query(
+    `INSERT INTO audit_logs (user_id, action, entity_type, entity_id, details, ip_address, company_id)
+     VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
+    [data.userId || null, data.action, data.category || 'billing', data.target || null,
+     JSON.stringify({ ...(data.details || {}), severity: data.severity || 'info', userAgent: data.userAgent }),
+     data.ipAddress || null, data.companyId]
+  );
+  return rows[0].id;
+}
+
+export async function getBillingAuditLogs(options: {
+  companyId?: number; category?: string; severity?: string;
+  search?: string; limit?: number; offset?: number;
+}): Promise<{ logs: any[]; total: number }> {
+  const conditions: string[] = [];
+  const params: any[] = [];
+  let idx = 1;
+
+  if (options.companyId) { conditions.push(`company_id = $${idx++}`); params.push(options.companyId); }
+  if (options.category) { conditions.push(`entity_type = $${idx++}`); params.push(options.category); }
+  if (options.severity) { conditions.push(`details->>'severity' = $${idx++}`); params.push(options.severity); }
+  if (options.search) { conditions.push(`(action ILIKE $${idx} OR details::text ILIKE $${idx})`); params.push(`%${options.search}%`); idx++; }
+
+  const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+  const limit = options.limit || 50;
+  const offset = options.offset || 0;
+
+  const countResult = await getPool().query(`SELECT COUNT(*)::int as total FROM audit_logs ${where}`, params);
+  const total = countResult.rows[0].total;
+
+  const dataParams = [...params, limit, offset];
+  const { rows } = await getPool().query(
+    `SELECT al.*, u.username
+     FROM audit_logs al
+     LEFT JOIN users u ON al.user_id = u.id
+     ${where}
+     ORDER BY al.created_at DESC
+     LIMIT $${idx} OFFSET $${idx + 1}`,
+    dataParams
+  );
+
+  return { logs: rows, total };
+}
+
+/* ========================================================================== */
+/*  LICENSE CHECK                                                              */
+/* ========================================================================== */
+
+interface LicenseCheckResult {
+  allowed: boolean;
+  reason?: string;
+  subscription: any;
+  usage: { creditsUsed: number; creditsAllowed: number; creditsRemaining: number };
+}
+
+export async function checkLicense(companyId: number, operation: string): Promise<LicenseCheckResult> {
+  const sub = await getSubscription(companyId);
+  if (!sub) {
+    return { allowed: false, reason: 'No active subscription', subscription: null, usage: { creditsUsed: 0, creditsAllowed: 0, creditsRemaining: 0 } };
+  }
+
+  const usageSummary = await getUsageSummary(companyId);
+  const creditCost = CREDIT_COSTS[operation] ?? 0;
+
+  // Check feature access
+  const features = sub.plan_features || {};
+  const healingTypes = features.healing_types || ['rule_based'];
+  if (['rule_based', 'database_pattern', 'ai_reasoning'].includes(operation) && !healingTypes.includes(operation)) {
+    return {
+      allowed: false,
+      reason: `${operation} not available on ${sub.plan_name} plan`,
+      subscription: sub,
+      usage: { creditsUsed: usageSummary.totalCreditsUsed, creditsAllowed: usageSummary.creditsAllowed, creditsRemaining: usageSummary.creditsRemaining },
+    };
+  }
+
+  // Check credits
+  if (creditCost > 0 && usageSummary.creditsRemaining < creditCost) {
+    return {
+      allowed: false,
+      reason: `Insufficient credits: need ${creditCost}, have ${usageSummary.creditsRemaining}`,
+      subscription: sub,
+      usage: { creditsUsed: usageSummary.totalCreditsUsed, creditsAllowed: usageSummary.creditsAllowed, creditsRemaining: usageSummary.creditsRemaining },
+    };
+  }
+
+  return {
+    allowed: true,
+    subscription: sub,
+    usage: { creditsUsed: usageSummary.totalCreditsUsed, creditsAllowed: usageSummary.creditsAllowed, creditsRemaining: usageSummary.creditsRemaining },
   };
 }
