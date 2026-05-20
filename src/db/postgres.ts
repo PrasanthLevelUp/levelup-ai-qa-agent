@@ -439,6 +439,47 @@ async function initSchema(client: PoolClient): Promise<void> {
     CREATE INDEX IF NOT EXISTS idx_notif_log_company ON notification_logs(company_id);
     CREATE INDEX IF NOT EXISTS idx_users_company ON users(company_id);
 
+    -- ==================== API KEYS (Enterprise Machine Auth) ====================
+    CREATE TABLE IF NOT EXISTS api_keys (
+      id            SERIAL PRIMARY KEY,
+      company_id    INTEGER NOT NULL REFERENCES companies(id),
+      name          VARCHAR(255) NOT NULL,
+      prefix        VARCHAR(20) NOT NULL,
+      key_hash      VARCHAR(64) NOT NULL UNIQUE,
+      scopes        JSONB DEFAULT '["ingest:write"]',
+      rate_limit    INTEGER DEFAULT 1000,
+      is_active     BOOLEAN DEFAULT TRUE,
+      last_used_at  TIMESTAMPTZ,
+      expires_at    TIMESTAMPTZ,
+      created_at    TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_api_keys_hash ON api_keys(key_hash);
+    CREATE INDEX IF NOT EXISTS idx_api_keys_company ON api_keys(company_id);
+
+    -- ==================== INGESTION LOGS ====================
+    CREATE TABLE IF NOT EXISTS ingestion_logs (
+      id            SERIAL PRIMARY KEY,
+      company_id    INTEGER NOT NULL REFERENCES companies(id),
+      provider      VARCHAR(50) NOT NULL,
+      build_id      VARCHAR(255),
+      repo_url      TEXT,
+      branch        VARCHAR(255),
+      commit_sha    VARCHAR(64),
+      total_tests   INTEGER DEFAULT 0,
+      passed_tests  INTEGER DEFAULT 0,
+      failed_tests  INTEGER DEFAULT 0,
+      skipped_tests INTEGER DEFAULT 0,
+      status        VARCHAR(20) DEFAULT 'received',
+      healing_job_id VARCHAR(255),
+      error_message TEXT,
+      metadata      JSONB DEFAULT '{}',
+      created_at    TIMESTAMPTZ DEFAULT NOW(),
+      completed_at  TIMESTAMPTZ
+    );
+    CREATE INDEX IF NOT EXISTS idx_ingest_company ON ingestion_logs(company_id);
+    CREATE INDEX IF NOT EXISTS idx_ingest_status ON ingestion_logs(status);
+    CREATE INDEX IF NOT EXISTS idx_ingest_created ON ingestion_logs(created_at DESC);
+
     -- ==================== BILLING & LICENSING TABLES ====================
 
     CREATE TABLE IF NOT EXISTS plans (

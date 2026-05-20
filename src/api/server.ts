@@ -48,6 +48,9 @@ import { createRCAIntelligenceRouter } from './routes/rca-intelligence';
 import { createTestCoverageRouter } from './routes/test-coverage';
 import { createROIRouter } from './routes/roi';
 import { createBillingRouter } from './routes/billing';
+import { createIngestRouter } from './routes/ingest';
+import { apiKeysRouter } from './routes/api-keys';
+import { hooksRouter } from './routes/hooks';
 import { notifyRca } from '../integrations/slack';
 import { createRcaTicket } from '../integrations/jira';
 import cookieParser from 'cookie-parser';
@@ -109,6 +112,13 @@ export function createServer(): express.Application {
   // Webhook — no auth (uses its own signature validation)
   app.use('/api/webhook', createWebhookRouter(jobQueue, repoManager));
 
+  // Ingest API — uses its own API key auth (Bearer lvlp_live_xxx)
+  // Must support both JSON and raw text/xml bodies
+  app.use('/api/ingest', express.text({ type: ['text/xml', 'application/xml'], limit: '50mb' }), createIngestRouter(jobQueue));
+
+  // Cloud platform webhook receivers — use API key via ?token= param
+  app.use('/api/hooks', hooksRouter);
+
   // Auth routes — no API key required (uses cookie-based JWT)
   app.use('/api/auth', createAuthRouter());
 
@@ -131,6 +141,7 @@ export function createServer(): express.Application {
   app.use('/api/roi', authMiddleware, companyMiddleware, createROIRouter());
   app.use('/api/test-coverage', authMiddleware, companyMiddleware, createTestCoverageRouter());
   app.use('/api/billing', authMiddleware, companyMiddleware, createBillingRouter());
+  app.use('/api/keys', authMiddleware, companyMiddleware, apiKeysRouter);
 
   // List all jobs
   app.get('/api/jobs', authMiddleware, (_req, res) => {
