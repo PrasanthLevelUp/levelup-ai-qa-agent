@@ -33,6 +33,26 @@ export function createStatusRouter(jobQueue: JobQueue): Router {
     });
   });
 
+  // Cancel a running/pending job
+  router.post('/:jobId/cancel', (req: Request, res: Response) => {
+    const jobId = req.params['jobId'] as string;
+    const cancelled = jobQueue.cancelJob(jobId);
+
+    if (!cancelled) {
+      res.status(404).json({
+        error: 'Not Found or Not Cancellable',
+        message: `Job ${jobId} not found or already completed`,
+      });
+      return;
+    }
+
+    res.json({
+      jobId,
+      status: 'cancelled',
+      message: 'Job cancelled successfully',
+    });
+  });
+
   // List all jobs
   router.get('/', (_req: Request, res: Response) => {
     const allJobs = jobQueue.listJobs();

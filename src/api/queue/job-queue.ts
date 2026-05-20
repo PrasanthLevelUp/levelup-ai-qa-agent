@@ -101,6 +101,24 @@ export class JobQueue {
   }
 
   /**
+   * Cancel a pending or running job.
+   */
+  cancelJob(jobId: string): boolean {
+    const job = jobs.get(jobId);
+    if (!job) return false;
+    if (job.status !== JobStatus.PENDING && job.status !== JobStatus.RUNNING) return false;
+
+    job.status = JobStatus.FAILED;
+    job.completedAt = new Date().toISOString();
+    job.error = 'Job cancelled by user';
+    job.progress = 'Cancelled';
+    this.persistJob(job);
+
+    logger.info(MOD, 'Job cancelled', { jobId });
+    return true;
+  }
+
+  /**
    * Update job status and progress.
    */
   updateJob(jobId: string, updates: Partial<HealingJob>): void {
