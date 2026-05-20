@@ -162,6 +162,11 @@ export class ExecutionEngine {
   /**
    * Synchronous run method (backward compatible for orchestrator).
    * Always uses `npx playwright test` to resolve both local and global playwright.
+   *
+   * IMPORTANT: We do NOT pass --reporter=json on the CLI because that overrides
+   * the playwright.config's reporters and sends JSON to stdout instead of a file.
+   * Instead, we rely on the config's ['json', { outputFile: 'test-results.json' }].
+   * If the config doesn't produce the file, we write stdout as a fallback.
    */
   static run(repoPath: string, testFile?: string): RunResult {
     const { execSync } = require('child_process');
@@ -169,10 +174,11 @@ export class ExecutionEngine {
     const startTime = new Date().toISOString();
     const start = Date.now();
 
-    // Always use npx to resolve playwright from local node_modules OR global install
+    // Do NOT pass --reporter — let playwright.config.ts handle it
+    // The config should have: reporter: [['json', { outputFile: 'test-results.json' }]]
     const cmd = testFile
-      ? `npx playwright test "${testFile}" --reporter=json --output=test-results`
-      : `npx playwright test --reporter=json --output=test-results`;
+      ? `npx playwright test "${testFile}"`
+      : `npx playwright test`;
 
     logger.info(MOD, 'Executing Playwright tests (sync)', { repoPath, cmd });
 
@@ -199,18 +205,65 @@ export class ExecutionEngine {
     const endTime = new Date().toISOString();
     const durationMs = Date.now() - start;
 
-    // Exit code 127 = command not found — likely playwright binary missing
+    // If the config's JSON reporter didn't create the file, try writing stdout
+    if (!fs.existsSync(resultsFile)) {
+      logger.warn(MOD, 'test-results.json not found from config reporter, attempting to write from stdout');
+      // Check if stdout contains valid JSON (Playwright JSON output starts with {)
+      const trimmed = stdout.trim();
+      if (trimmed.startsWith('{')) {
+        try {
+          JSON.parse(trimmed); // validate it's valid JSON
+          fs.writeFileSync(resultsFile, trimmed, 'utf-8');
+          logger.info(MOD, 'Wrote test-results.json from stdout');
+        } catch {
+          logger.warn(MOD, 'stdout is not valid JSON, cannot create results file');
+        }
+      } else {
+        // Last resort: run again with --reporter=json to get JSON output
+        logger.info(MOD, 'Re-running with --reporter=json to capture results file');
+        try {
+          const jsonCmd = testFile
+            ? `npx playwright test "${testFile}" --reporter=json`
+            : `npx playwright test --reporter=json`;
+          let jsonOut = '';
+          try {
+            jsonOut = execSync(jsonCmd, {
+              cwd: repoPath,
+              encoding: 'utf-8',
+              env: process.env,
+              timeout: 180_000,
+              maxBuffer: 10_000_000,
+              stdio: ['pipe', 'pipe', 'pipe'],
+            });
+          } catch (e2) {
+            jsonOut = (e2 as any).stdout ?? '';
+          }
+          if (jsonOut.trim().startsWith('{')) {
+            fs.writeFileSync(resultsFile, jsonOut.trim(), 'utf-8');
+            logger.info(MOD, 'Wrote test-results.json from --reporter=json re-run');
+          }
+        } catch (rerunErr) {
+          logger.warn(MOD, 'Re-run with --reporter=json also failed', {
+            error: (rerunErr as Error).message,
+          });
+        }
+      }
+    }
+
+    // Exit code 127 = command not found
     if (exitCode === 127) {
-      logger.error(MOD, 'EXIT CODE 127: Command not found — playwright binary may be missing from node_modules/.bin', {
-        repoPath,
-        cmd,
+      logger.error(MOD, 'EXIT CODE 127: Command not found', {
+        repoPath, cmd,
         nodeModulesExists: fs.existsSync(path.join(repoPath, 'node_modules')),
         playwrightBinExists: fs.existsSync(path.join(repoPath, 'node_modules', '.bin', 'playwright')),
         stderr: stderr.slice(0, 500),
       });
     }
 
-    logger.info(MOD, 'Playwright execution complete', { exitCode, durationMs, resultsFile });
+    logger.info(MOD, 'Playwright execution complete', {
+      exitCode, durationMs, resultsFile,
+      resultsFileExists: fs.existsSync(resultsFile),
+    });
 
     return { exitCode, stdout, stderr, resultsFile, startTime, endTime, durationMs };
   }
