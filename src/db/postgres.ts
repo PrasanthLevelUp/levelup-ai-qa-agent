@@ -3369,6 +3369,8 @@ export async function getTestCoverageStats(companyId?: number): Promise<{
     automationReadyCount: parseInt(caseR.rows[0].auto_ready, 10),
     coverageTypeBreakdown,
     priorityBreakdown,
+  };
+}
 
 /* ========================================================================== */
 /*  ROLES & TEAM MANAGEMENT                                                    */
