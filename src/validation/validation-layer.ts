@@ -50,7 +50,15 @@ export class ValidationLayer {
     }
 
     let updatedContent = this.applyLocatorReplacement(originalContent, failure.failedLocator, suggestion.newLocator);
-    if (suggestion.addExplicitWait) {
+
+    // Always add explicit waits for locator_timeout and timeout failures.
+    // In Playwright, broken locators usually manifest as timeouts, so we need
+    // both a locator fix AND increased wait times for reliable healing.
+    const needsWait = suggestion.addExplicitWait
+      || failure.failureType === 'locator_timeout'
+      || failure.failureType === 'timeout'
+      || failure.isTimingIssue;
+    if (needsWait) {
       updatedContent = this.insertExplicitWait(updatedContent);
     }
 
@@ -223,8 +231,45 @@ export class ValidationLayer {
   }
 
   private insertExplicitWait(content: string): string {
-    if (content.includes("waitForLoadState('networkidle')")) return content;
-    return content.replace(/(await page\.goto\([^;]+;)/, "$1\n  await page.waitForLoadState('networkidle');");
+    let result = content;
+
+    // 1. Add networkidle wait after page.goto()
+    if (!result.includes("waitForLoadState('networkidle')")) {
+      result = result.replace(/(await page\.goto\([^;]+;)/, "$1\n  await page.waitForLoadState('networkidle');");
+    }
+
+    // 2. Add explicit timeout to locator actions that don't already have one.
+    // This handles locator_timeout failures where the element exists but takes
+    // time to appear (e.g., after SPA navigation, lazy loading).
+    // Match .click(), .fill(...), .waitFor(), .toBeVisible(), .toContainText(...), etc.
+    // without existing { timeout: ... } options.
+    result = result.replace(
+      /\.(click|fill|waitFor|check|uncheck|selectOption|press|type)\(\s*\)/g,
+      '.$1({ timeout: 30000 })'
+    );
+
+    // For .click() etc. that have no args, the above handles it.
+    // For .toBeVisible() and .toContainText() in expect, add timeout option:
+    result = result.replace(
+      /\.toBeVisible\(\s*\)/g,
+      '.toBeVisible({ timeout: 30000 })'
+    );
+    result = result.replace(
+      /\.toContainText\(([^,)]+)\)/g,
+      (match, textArg) => {
+        if (match.includes('timeout')) return match;
+        return `.toContainText(${textArg}, { timeout: 30000 })`;
+      }
+    );
+    result = result.replace(
+      /\.toHaveURL\(([^,)]+)\)/g,
+      (match, urlArg) => {
+        if (match.includes('timeout')) return match;
+        return `.toHaveURL(${urlArg}, { timeout: 30000 })`;
+      }
+    );
+
+    return result;
   }
 
   private generatePatch(filePath: string, originalContent: string, updatedContent: string): string {

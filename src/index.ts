@@ -175,13 +175,65 @@ async function runCLI(): Promise<void> {
     let iterFixCount = 0;
 
     try {
-      // Skip locator healing for assertion failures
-      if (failure.failureType === 'assertion') {
-        logger.info(MOD, 'Skipping locator healing — assertion failure', {
+      // Decide healing strategy based on failure type:
+      // - assertion: Element found but assertion failed → add waits only, no locator change
+      // - locator / locator_timeout: Element NOT found → change locator + add waits
+      // - timeout (pure): Generic timeout → add waits only
+      // - navigation: Network issue → skip healing
+      if (failure.failureType === 'navigation') {
+        logger.info(MOD, 'Skipping healing — navigation/network error', {
           testName: failure.testName,
-          failureType: failure.failureType,
         });
         restoreFile(failure.filePath);
+      } else if (failure.failureType === 'assertion' || failure.failureType === 'timeout') {
+        logger.info(MOD, 'Skipping locator healing — assertion/timeout failure', {
+          testName: failure.testName,
+          failureType: failure.failureType,
+          failedLocator: failure.failedLocator,
+          errorMessage: failure.errorMessage.slice(0, 200),
+        });
+
+        // For timing-related failures, try adding explicit wait
+        if (failure.isTimingIssue || failure.errorMessage.includes('Received ""') || failure.errorMessage.includes('Received: ""')) {
+          logger.info(MOD, 'Failure may be timing-related — attempting wait injection');
+          const originalContent = fs.readFileSync(failure.filePath, 'utf-8');
+          if (!originalContent.includes("waitForLoadState('networkidle')")) {
+            const updatedContent = originalContent.replace(
+              /(await page\.goto\([^;]+;)/g,
+              "$1\n    await page.waitForLoadState('networkidle');"
+            );
+            if (updatedContent !== originalContent) {
+              fs.writeFileSync(failure.filePath, updatedContent, 'utf-8');
+              const relativeTestFile = path.relative(path.join(cfg.testRepoPath, 'tests'), failure.filePath);
+              const rerun = ExecutionEngine.run(cfg.testRepoPath, relativeTestFile);
+              if (rerun.exitCode === 0) {
+                iterationSuccess = true;
+                healedCount++;
+                iterFixCount = 1;
+                healings.push({
+                  testName: failure.testName,
+                  failedLocator: failure.failedLocator || 'assertion',
+                  healedLocator: 'Added waitForLoadState(networkidle)',
+                  strategy: 'rule_based',
+                  aiTokensUsed: 0,
+                  success: true,
+                  confidence: 0.85,
+                  validated: true,
+                  validationReason: 'Timing fix — added explicit wait',
+                });
+                const testRow = tests.find((t) => t.testName === failure.testName);
+                if (testRow) {
+                  testRow.healed = true;
+                  testRow.status = 'healed';
+                }
+              } else {
+                restoreFile(failure.filePath);
+              }
+            }
+          }
+        } else {
+          restoreFile(failure.filePath);
+        }
       } else {
 
       // Iterative healing loop: fix one locator → rerun → fix next → repeat
@@ -342,7 +394,7 @@ async function runCLI(): Promise<void> {
         restoreFile(failure.filePath);
       }
 
-      } // end else (locator healing branch)
+      } // end else (locator/locator_timeout healing branch)
     } catch (error) {
       restoreFile(failure.filePath);
       logger.error(MOD, 'Healing pipeline failed for test', {

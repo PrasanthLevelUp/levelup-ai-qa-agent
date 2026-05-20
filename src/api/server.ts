@@ -367,9 +367,17 @@ function createHealingWorker(
       let iterFixCount = 0;
 
       try {
-        // Skip locator healing for assertion failures — the locator found the element,
-        // the assertion (toContainText, toHaveText, etc.) failed.
-        if (failure.failureType === 'assertion') {
+        // Decide healing strategy based on failure type:
+        // - assertion: Element found but assertion failed → add waits only, no locator change
+        // - locator / locator_timeout: Element NOT found → change locator + add waits
+        // - timeout (pure): Generic timeout → add waits only
+        // - navigation: Network issue → skip healing
+        if (failure.failureType === 'navigation') {
+          logger.info(MOD, 'Skipping healing — navigation/network error', {
+            testName: failure.testName,
+          });
+          restoreFile(failure.filePath);
+        } else if (failure.failureType === 'assertion' || failure.failureType === 'timeout') {
           logger.info(MOD, 'Skipping locator healing — assertion failure (element found, assertion failed)', {
             testName: failure.testName,
             failureType: failure.failureType,

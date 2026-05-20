@@ -8,7 +8,7 @@ import type { ArtifactCollection } from './artifact-collector';
 
 const MOD = 'failure-analyzer';
 
-export type FailureType = 'locator' | 'timeout' | 'assertion' | 'navigation' | 'unknown';
+export type FailureType = 'locator' | 'locator_timeout' | 'timeout' | 'assertion' | 'navigation' | 'unknown';
 
 export interface FailureDetails {
   testName: string;
@@ -26,38 +26,71 @@ export interface FailureDetails {
   isTimingIssue: boolean;
 }
 
+/**
+ * Classify failures into precise categories:
+ *
+ * 1. 'assertion'        — Element WAS found, but assertion failed (toContainText, toHaveURL, etc.)
+ *                         Action: Add waits (timing fix), do NOT change locator.
+ *
+ * 2. 'locator_timeout'  — Timeout while WAITING for a specific locator/selector.
+ *                         This is the most common "broken locator" symptom in Playwright.
+ *                         Action: Change locator AND increase timeout/add waits.
+ *
+ * 3. 'locator'          — Explicit "not found" / "no element" without timeout context.
+ *                         Action: Change locator AND add waits.
+ *
+ * 4. 'timeout'          — Generic timeout NOT tied to a specific locator (page load, navigation).
+ *                         Action: Only increase waits/timeouts.
+ *
+ * 5. 'navigation'       — Network/navigation errors (net::ERR_*, HTTP errors).
+ *                         Action: Environment issue, not healable via locators.
+ */
 function detectFailureType(errorMessage: string): FailureType {
   const text = errorMessage.toLowerCase();
 
-  // IMPORTANT: Check assertion FIRST, before locator.
-  // Playwright assertion errors like `expect(locator('...')).toContainText(...)` contain the word
-  // "locator" but are NOT locator failures — the locator FOUND the element, the assertion failed.
-  // Assertion keywords: toContainText, toHaveText, toBeVisible, toBeEnabled, toHaveValue,
-  // toHaveURL, toHaveTitle, toHaveCount, toHaveAttribute, toHaveCSS, toHaveClass, toBeChecked, etc.
+  // STEP 1: Assertion check FIRST.
+  // Playwright assertion errors like `expect(locator('...')).toContainText(...)` contain
+  // "locator" AND often "timeout" but are NOT locator failures — the element was found.
   const assertionPatterns = [
-    /\.to(?:contain|have|be|equal|match)/i,
-    /expect\(.*\)\.(?:not\.)?to/i,
-    /expected.*received/i,
+    /\.to(?:contain|have|be|equal|match)(?:text|url|title|value|count|attribute|css|class|checked|enabled|visible|hidden|empty|focused)/i,
+    /expect\(.*\)\.(?:not\.)?to(?:contain|have|be)/i,
     /expected substring/i,
     /expected string/i,
+    /expected.*received/i,
     /assertion failed/i,
   ];
   if (assertionPatterns.some(p => p.test(errorMessage))) return 'assertion';
 
-  if (text.includes('timeout') || text.includes('timed out')) return 'timeout';
+  // STEP 2: Locator-timeout — timeout while waiting for a SPECIFIC locator.
+  // This is the #1 symptom of a broken locator in Playwright.
+  // Pattern: "Timeout Xms exceeded." + "waiting for locator('...')" or "locator('...')"
+  const isTimeout = text.includes('timeout') || text.includes('timed out');
+  const hasLocatorContext = /waiting for (?:locator|selector)/i.test(text)
+    || /locator\(['"][^'"]+['"]\)/i.test(text)
+    || /page\.(?:click|fill|waitForSelector|locator)\(/i.test(text);
 
-  // "locator" in error context like "waiting for locator('...')" means element not found
-  // But "expect(locator('...')).toXxx" is an assertion (caught above)
-  if (/waiting for (?:locator|selector)/i.test(text) || text.includes('not found') || text.includes('no element')) return 'locator';
-  if (text.includes('selector') && !text.includes('expect(')) return 'locator';
+  if (isTimeout && hasLocatorContext) return 'locator_timeout';
 
-  if (text.includes('navigation') || text.includes('net::') || text.includes('http')) return 'navigation';
+  // STEP 3: Pure locator failure (no timeout wrapper).
+  if (/waiting for (?:locator|selector)/i.test(text)
+    || text.includes('not found')
+    || text.includes('no element')
+    || (text.includes('selector') && !text.includes('expect('))) {
+    return 'locator';
+  }
+
+  // STEP 4: Pure timeout (page load, navigation, generic).
+  if (isTimeout) return 'timeout';
+
+  // STEP 5: Navigation errors.
+  if (text.includes('navigation') || text.includes('net::') || /err_[a-z]+/i.test(text)) return 'navigation';
+
   return 'unknown';
 }
 
 function isTimingIssue(errorMessage: string): boolean {
   const t = errorMessage.toLowerCase();
-  return t.includes('timeout') || t.includes('waiting for') || t.includes('navigation') || t.includes('not visible');
+  return t.includes('timeout') || t.includes('timed out') || t.includes('waiting for') || t.includes('navigation') || t.includes('not visible');
 }
 
 export class FailureAnalyzer {
