@@ -82,7 +82,7 @@ function humanize(str: string): string {
 /* -------------------------------------------------------------------------- */
 
 export class RuleEngine {
-  generate(failure: FailureDetails): RuleEngineResult {
+  generate(failure: FailureDetails, skipLocators?: Set<string>): RuleEngineResult {
     const failedLocator = failure.failedLocator || '';
     const locator = failedLocator.trim();
     const suggestions: RuleSuggestion[] = [];
@@ -174,18 +174,47 @@ export class RuleEngine {
       const textHint = extractTextHint(locator) || className;
       rulesApplied.push('R06_class_selector');
 
-      // Rule 6a: Try common class name variations (hyphen vs no-hyphen, underscore variants)
+      // Rule 6a: Try common class name variations (hyphen vs no-hyphen, suffix swaps)
       // e.g., .oxd-user-dropdown-trigger → .oxd-userdropdown-tab, .oxd-userdropdown-trigger
       const classVariations: string[] = [];
-      // Remove one level of hyphenation: oxd-user-dropdown → oxd-userdropdown
       const parts = rawClassName.split('-');
+
       if (parts.length >= 3) {
-        // Try merging adjacent parts: [oxd, user, dropdown, trigger] → oxd-userdropdown-trigger
+        // Strategy A: Merge adjacent parts (remove one hyphen level)
+        // [oxd, user, dropdown, trigger] → oxd-userdropdown-trigger, oxd-user-dropdowntrigger, etc.
         for (let i = 0; i < parts.length - 1; i++) {
           const merged = [...parts.slice(0, i), parts[i] + parts[i + 1], ...parts.slice(i + 2)].join('-');
           if (merged !== rawClassName) classVariations.push(merged);
         }
+
+        // Strategy B: Swap last segment with common UI suffixes
+        // .oxd-user-dropdown-trigger → .oxd-user-dropdown-tab, .oxd-user-dropdown-container, etc.
+        const suffixSwaps = ['tab', 'trigger', 'container', 'wrapper', 'content', 'menu', 'toggle', 'button', 'link', 'item'];
+        const lastPart = parts[parts.length - 1];
+        const base = parts.slice(0, -1).join('-');
+        for (const suffix of suffixSwaps) {
+          if (suffix !== lastPart) {
+            classVariations.push(`${base}-${suffix}`);
+          }
+        }
+
+        // Strategy C: Merge adjacent + swap suffix (compound)
+        // [oxd, user, dropdown, trigger] → merge user+dropdown → oxd-userdropdown, then swap trigger→tab
+        for (let i = 0; i < parts.length - 1; i++) {
+          const mergedParts = [...parts.slice(0, i), parts[i] + parts[i + 1], ...parts.slice(i + 2)];
+          const mergedBase = mergedParts.slice(0, -1).join('-');
+          const mergedLast = mergedParts[mergedParts.length - 1];
+          for (const suffix of suffixSwaps) {
+            if (suffix !== mergedLast) {
+              const compound = `${mergedBase}-${suffix}`;
+              if (compound !== rawClassName && !classVariations.includes(compound)) {
+                classVariations.push(compound);
+              }
+            }
+          }
+        }
       }
+
       // Strip all hyphens: oxd-user-dropdown-trigger → oxduserdropdowntrigger (unlikely but covers edge)
       const stripped = rawClassName.replace(/-/g, '');
       if (stripped !== rawClassName) classVariations.push(stripped);
@@ -904,8 +933,15 @@ export class RuleEngine {
       addExplicitWait,
     });
 
+    let finalSuggestions = dedupeSuggestions(suggestions);
+
+    // Filter out already-tried locators (from previous iterations that failed)
+    if (skipLocators && skipLocators.size > 0) {
+      finalSuggestions = finalSuggestions.filter(s => !skipLocators.has(s.newLocator));
+    }
+
     return {
-      suggestions: dedupeSuggestions(suggestions),
+      suggestions: finalSuggestions,
       addExplicitWait,
       rulesApplied,
     };

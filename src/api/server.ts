@@ -488,6 +488,7 @@ function createHealingWorker(
 
         // Iterative healing loop: fix one locator → rerun → if still fails, fix next locator → rerun...
         const healedLocators = new Set<string>(); // Cycle detection
+        const triedLocators = new Set<string>(); // Track all tried suggestions to skip on retry
 
         for (let iteration = 0; iteration < MAX_HEAL_ITERATIONS; iteration++) {
           jobQueue.updateJob(job.id, {
@@ -505,7 +506,11 @@ function createHealingWorker(
           }
           healedLocators.add(failure.failedLocator);
 
-          const outcome = await orchestrator.heal(failure);
+          const outcome = await orchestrator.heal(failure, undefined, triedLocators);
+          // Track the suggested locator so we skip it if the same base locator fails again
+          if (outcome.suggestion) {
+            triedLocators.add(outcome.suggestion.newLocator);
+          }
           logger.info(MOD, 'Orchestrator result', {
             testName: failure.testName,
             failedLocator: failure.failedLocator,

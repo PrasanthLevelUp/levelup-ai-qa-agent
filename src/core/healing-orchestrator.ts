@@ -94,7 +94,7 @@ export class HealingOrchestrator {
    * @param failure - Analyzed failure details
    * @param domHtml - Optional: raw DOM HTML from page.content() for DOM-based healing
    */
-  async heal(failure: FailureDetails, domHtml?: string): Promise<HealingOutcome> {
+  async heal(failure: FailureDetails, domHtml?: string, skipLocators?: Set<string>): Promise<HealingOutcome> {
     const attemptedStrategies: HealingStrategy[] = [];
     let domCandidates: DOMExtractionResult | undefined;
 
@@ -180,7 +180,7 @@ export class HealingOrchestrator {
     let suggestion: HealingSuggestion | null = null;
 
     if (selected.engine === 'rule' || selected.engine === 'pattern' || selected.engine === 'ai') {
-      suggestion = await this.tryEngine(selected.engine, failure, attemptedStrategies);
+      suggestion = await this.tryEngine(selected.engine, failure, attemptedStrategies, skipLocators);
     }
 
     // If selected engine failed, try remaining engines
@@ -188,7 +188,7 @@ export class HealingOrchestrator {
       const engines: Array<'rule' | 'pattern' | 'ai'> = ['rule', 'pattern', 'ai'];
       for (const eng of engines) {
         if (attemptedStrategies.includes(this.engineToStrategy(eng))) continue;
-        suggestion = await this.tryEngine(eng, failure, attemptedStrategies);
+        suggestion = await this.tryEngine(eng, failure, attemptedStrategies, skipLocators);
         if (suggestion) break;
       }
     }
@@ -250,13 +250,14 @@ export class HealingOrchestrator {
     engine: 'rule' | 'pattern' | 'ai',
     failure: FailureDetails,
     attemptedStrategies: HealingStrategy[],
+    skipLocators?: Set<string>,
   ): Promise<HealingSuggestion | null> {
     const strategy = this.engineToStrategy(engine);
     attemptedStrategies.push(strategy);
 
     switch (engine) {
       case 'rule': {
-        const ruleResult = this.ruleEngine.generate(failure);
+        const ruleResult = this.ruleEngine.generate(failure, skipLocators);
         if (ruleResult.suggestions.length > 0) {
           for (const suggestion of ruleResult.suggestions) {
             const healSuggestion: HealingSuggestion = {

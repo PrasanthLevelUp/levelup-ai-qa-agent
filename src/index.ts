@@ -265,6 +265,7 @@ async function runCLI(): Promise<void> {
 
       // Iterative healing loop: fix one locator → rerun → fix next → repeat
       const healedLocators = new Set<string>();
+      const triedLocators = new Set<string>(); // Track all tried suggestions to skip on retry
 
       for (let iteration = 0; iteration < MAX_HEAL_ITERATIONS; iteration++) {
         // Cycle detection
@@ -273,7 +274,7 @@ async function runCLI(): Promise<void> {
           break;
         }
         healedLocators.add(failure.failedLocator);
-        const outcome = await orchestrator.heal(failure);
+        const outcome = await orchestrator.heal(failure, undefined, triedLocators);
         if (!outcome.suggestion) {
           if (iteration === 0) {
             await logHealing({
@@ -291,6 +292,7 @@ async function runCLI(): Promise<void> {
           break;
         }
 
+        triedLocators.add(outcome.suggestion.newLocator);
         const validation = validationLayer.validate(outcome.suggestion, failure);
         if (!validation.approved || !validation.updatedContent) {
           validationRejected += 1;

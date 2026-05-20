@@ -48,9 +48,11 @@ export interface FailureDetails {
 function detectFailureType(errorMessage: string): FailureType {
   const text = errorMessage.toLowerCase();
 
-  // STEP 1: Assertion check FIRST.
+  // STEP 1: Assertion check FIRST — but NOT if the element wasn't found.
   // Playwright assertion errors like `expect(locator('...')).toContainText(...)` contain
   // "locator" AND often "timeout" but are NOT locator failures — the element was found.
+  // EXCEPTION: `toBeVisible() failed` with "not found" IS a locator problem.
+  const isElementNotFound = text.includes('not found') || text.includes('no element');
   const assertionPatterns = [
     /\.to(?:contain|have|be|equal|match)(?:text|url|title|value|count|attribute|css|class|checked|enabled|visible|hidden|empty|focused)/i,
     /expect\(.*\)\.(?:not\.)?to(?:contain|have|be)/i,
@@ -59,7 +61,9 @@ function detectFailureType(errorMessage: string): FailureType {
     /expected.*received/i,
     /assertion failed/i,
   ];
-  if (assertionPatterns.some(p => p.test(errorMessage))) return 'assertion';
+  // If "not found" or "no element" is in the error, it's a locator issue even if
+  // it looks like an assertion (e.g., expect(locator).toBeVisible() → element not found)
+  if (!isElementNotFound && assertionPatterns.some(p => p.test(errorMessage))) return 'assertion';
 
   // STEP 2: Locator-timeout — timeout while waiting for a SPECIFIC locator.
   // This is the #1 symptom of a broken locator in Playwright.
