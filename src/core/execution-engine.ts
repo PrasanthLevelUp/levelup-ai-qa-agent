@@ -54,10 +54,12 @@ export class ExecutionEngine {
     }
 
     // Run npm install with retry
+    // IMPORTANT: Use --include=dev because test repos have @playwright/test in devDependencies
+    // and NODE_ENV=production (from Dockerfile) would skip them
     let installSuccess = false;
     for (let attempt = 1; attempt <= 2; attempt++) {
       try {
-        await ExecutionEngine.spawnAsync('npm', ['install'], { cwd: repoPath, timeout: 120_000 });
+        await ExecutionEngine.spawnAsync('npm', ['install', '--include=dev'], { cwd: repoPath, timeout: 120_000 });
         installSuccess = true;
         break;
       } catch (error) {
