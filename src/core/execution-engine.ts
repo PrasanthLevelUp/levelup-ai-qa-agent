@@ -40,7 +40,9 @@ export class ExecutionEngine {
   }
 
   /**
-   * Install dependencies with streaming logs and verification.
+   * Install dependencies with streaming logs.
+   * NOTE: Playwright is expected to be available globally in the Docker image
+   * (mcr.microsoft.com/playwright), so we do NOT require it in node_modules.
    */
   static async installDependencies(repoPath: string): Promise<void> {
     logger.info(MOD, 'Installing dependencies', { repoPath });
@@ -78,23 +80,25 @@ export class ExecutionEngine {
       throw new Error(`npm install failed after 2 attempts in ${repoPath}`);
     }
 
-    // Verify node_modules and playwright binary exist
-    const playwrightBin = path.join(repoPath, 'node_modules', '.bin', 'playwright');
-    if (!fs.existsSync(playwrightBin)) {
-      throw new Error(`Playwright binary not found at ${playwrightBin} after npm install — dependency installation may have been incomplete`);
+    // Verify node_modules exists (basic sanity check)
+    const nmPath = path.join(repoPath, 'node_modules');
+    if (!fs.existsSync(nmPath)) {
+      throw new Error(`node_modules not found at ${repoPath} after npm install`);
     }
 
-    logger.info(MOD, 'Dependencies installed, playwright binary verified', { repoPath });
+    // Check playwright availability — local node_modules OR global
+    const localBin = path.join(repoPath, 'node_modules', '.bin', 'playwright');
+    const hasLocal = fs.existsSync(localBin);
 
-    // Ensure Playwright browsers are installed
-    try {
-      await ExecutionEngine.spawnAsync('npx', ['playwright', 'install', 'chromium', '--with-deps'], { cwd: repoPath, timeout: 120_000 });
-      logger.info(MOD, 'Playwright chromium browser installed');
-    } catch (error) {
-      logger.warn(MOD, 'Playwright browser install had issues (tests may still work if browsers were cached)', {
-        error: (error as Error).message,
-      });
-    }
+    logger.info(MOD, 'Dependencies installed', {
+      repoPath,
+      hasLocalPlaywright: hasLocal,
+      nodeModulesExists: true,
+    });
+
+    // If playwright is not in local node_modules, that's OK — the Docker image
+    // (mcr.microsoft.com/playwright:v1.52.0-jammy) has it globally installed.
+    // The run() method uses `npx playwright test` which resolves global binaries.
   }
 
   /**
@@ -157,6 +161,7 @@ export class ExecutionEngine {
 
   /**
    * Synchronous run method (backward compatible for orchestrator).
+   * Always uses `npx playwright test` to resolve both local and global playwright.
    */
   static run(repoPath: string, testFile?: string): RunResult {
     const { execSync } = require('child_process');
@@ -164,9 +169,10 @@ export class ExecutionEngine {
     const startTime = new Date().toISOString();
     const start = Date.now();
 
+    // Always use npx to resolve playwright from local node_modules OR global install
     const cmd = testFile
       ? `npx playwright test "${testFile}" --reporter=json --output=test-results`
-      : 'npm test';
+      : `npx playwright test --reporter=json --output=test-results`;
 
     logger.info(MOD, 'Executing Playwright tests (sync)', { repoPath, cmd });
 
