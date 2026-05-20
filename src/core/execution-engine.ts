@@ -193,7 +193,7 @@ export class ExecutionEngine {
         cwd: repoPath,
         encoding: 'utf-8',
         env: process.env,
-        timeout: 180_000,
+        timeout: 600_000, // 10 minutes — tests run against live sites
         maxBuffer: 10_000_000,
         stdio: ['pipe', 'pipe', 'pipe'],
       });
@@ -207,47 +207,21 @@ export class ExecutionEngine {
     const endTime = new Date().toISOString();
     const durationMs = Date.now() - start;
 
-    // If the config's JSON reporter didn't create the file, try writing stdout
+    // If the config's JSON reporter didn't create the file, try writing stdout as fallback
     if (!fs.existsSync(resultsFile)) {
-      logger.warn(MOD, 'test-results.json not found from config reporter, attempting to write from stdout');
-      // Check if stdout contains valid JSON (Playwright JSON output starts with {)
+      logger.warn(MOD, 'test-results.json not found from config reporter', {
+        stdoutLength: stdout.length,
+        stderrLength: stderr.length,
+      });
+      // If stdout contains JSON (from --reporter=json or stdout capture), write it
       const trimmed = stdout.trim();
       if (trimmed.startsWith('{')) {
         try {
-          JSON.parse(trimmed); // validate it's valid JSON
+          JSON.parse(trimmed);
           fs.writeFileSync(resultsFile, trimmed, 'utf-8');
           logger.info(MOD, 'Wrote test-results.json from stdout');
         } catch {
-          logger.warn(MOD, 'stdout is not valid JSON, cannot create results file');
-        }
-      } else {
-        // Last resort: run again with --reporter=json to get JSON output
-        logger.info(MOD, 'Re-running with --reporter=json to capture results file');
-        try {
-          const jsonCmd = testFile
-            ? `npx playwright test "${testFile}" --reporter=json`
-            : `npx playwright test --reporter=json`;
-          let jsonOut = '';
-          try {
-            jsonOut = execSync(jsonCmd, {
-              cwd: repoPath,
-              encoding: 'utf-8',
-              env: process.env,
-              timeout: 180_000,
-              maxBuffer: 10_000_000,
-              stdio: ['pipe', 'pipe', 'pipe'],
-            });
-          } catch (e2) {
-            jsonOut = (e2 as any).stdout ?? '';
-          }
-          if (jsonOut.trim().startsWith('{')) {
-            fs.writeFileSync(resultsFile, jsonOut.trim(), 'utf-8');
-            logger.info(MOD, 'Wrote test-results.json from --reporter=json re-run');
-          }
-        } catch (rerunErr) {
-          logger.warn(MOD, 'Re-run with --reporter=json also failed', {
-            error: (rerunErr as Error).message,
-          });
+          logger.warn(MOD, 'stdout is not valid JSON');
         }
       }
     }

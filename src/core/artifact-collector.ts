@@ -49,87 +49,92 @@ export class ArtifactCollector {
 
     const rawText = fs.readFileSync(resultsFilePath, 'utf-8');
     const raw = JSON.parse(rawText) as {
-      suites?: Array<{
-        specs?: Array<{
-          title?: string;
-          file?: string;
-          tests?: Array<{
-            results?: Array<{
-              status?: string;
-              startTime?: string;
-              error?: { message?: string; location?: { file?: string; line?: number } };
-              errors?: Array<{ message?: string; location?: { file?: string; line?: number } }>;
-              errorLocation?: { file?: string; line?: number };
-              attachments?: Array<{ name?: string; contentType?: string; path?: string }>;
-            }>;
-          }>;
-        }>;
-      }>;
+      suites?: any[];
+      errors?: any[];
     };
 
     const artifacts: ArtifactCollection[] = [];
 
-    for (const suite of raw.suites ?? []) {
-      for (const spec of suite.specs ?? []) {
-        const testName = spec.title ?? 'unknown test';
+    /**
+     * Recursively walk nested suites to find all specs.
+     * Playwright JSON nests suites when test.describe() is used:
+     *   suites[file].suites[describe].specs[test]
+     * We must walk ALL levels, not just the first.
+     */
+    const walkSuites = (suites: any[], parentFile?: string): void => {
+      for (const suite of suites) {
+        const suiteFile = suite.file ?? parentFile;
 
-        for (const test of spec.tests ?? []) {
-          for (const result of test.results ?? []) {
-            if (result.status === 'passed' || result.status === 'skipped') continue;
+        // Process specs at this level
+        for (const spec of suite.specs ?? []) {
+          const testName = spec.title ?? 'unknown test';
 
-            const errorMessage = [
-              result.error?.message,
-              ...(result.errors ?? []).map((e) => e.message || ''),
-            ].filter(Boolean).join('\n\n');
+          for (const test of spec.tests ?? []) {
+            for (const result of test.results ?? []) {
+              if (result.status === 'passed' || result.status === 'skipped') continue;
 
-            const location = result.errorLocation
-              ?? result.error?.location
-              ?? result.errors?.[0]?.location;
+              const errorMessage = [
+                result.error?.message,
+                ...(result.errors ?? []).map((e: any) => e.message || ''),
+              ].filter(Boolean).join('\n\n');
 
-            const filePath = location?.file
-              ?? path.join(testRepoPath, 'tests', spec.file ?? '');
+              const location = result.errorLocation
+                ?? result.error?.location
+                ?? result.errors?.[0]?.location;
 
-            const lineNumber = location?.line ?? 0;
+              const filePath = location?.file
+                ?? path.join(testRepoPath, 'tests', spec.file ?? suiteFile ?? '');
 
-            // Use modular extractors
-            const locatorInfo = extractLocator(errorMessage);
-            const normalizedError = normalizeError(errorMessage);
-            const codeContext = extractCodeContext(filePath, lineNumber);
+              const lineNumber = location?.line ?? 0;
 
-            const screenshotPath = (result.attachments ?? []).find((a) =>
-              a.name === 'screenshot' || a.contentType?.startsWith('image/')
-            )?.path ?? null;
+              // Use modular extractors
+              const locatorInfo = extractLocator(errorMessage);
+              const normalizedError = normalizeError(errorMessage);
+              const codeContext = extractCodeContext(filePath, lineNumber);
 
-            const artifact: ArtifactCollection = {
-              test_name: testName,
-              error_message: errorMessage,
-              error_pattern: extractErrorPattern(errorMessage),
-              failed_locator: locatorInfo?.rawLocator ?? null,
-              file_path: filePath,
-              line_number: lineNumber,
-              failed_line_code: codeContext.failedLineCode,
-              screenshot_path: screenshotPath,
-              url: extractUrl(errorMessage),
-              timestamp: result.startTime ?? new Date().toISOString(),
-              test_results_json: rawText,
-              test_results_json_path: resultsFilePath,
-              surrounding_code: codeContext.surroundingCode,
-              test_file_full: codeContext.fullContent,
-              // Enhanced fields
-              locator_info: locatorInfo,
-              normalized_error: normalizedError,
-              code_context: codeContext,
-            };
+              const screenshotPath = (result.attachments ?? []).find((a: any) =>
+                a.name === 'screenshot' || a.contentType?.startsWith('image/')
+              )?.path ?? null;
 
-            artifacts.push(artifact);
+              const artifact: ArtifactCollection = {
+                test_name: testName,
+                error_message: errorMessage,
+                error_pattern: extractErrorPattern(errorMessage),
+                failed_locator: locatorInfo?.rawLocator ?? null,
+                file_path: filePath,
+                line_number: lineNumber,
+                failed_line_code: codeContext.failedLineCode,
+                screenshot_path: screenshotPath,
+                url: extractUrl(errorMessage),
+                timestamp: result.startTime ?? new Date().toISOString(),
+                test_results_json: rawText,
+                test_results_json_path: resultsFilePath,
+                surrounding_code: codeContext.surroundingCode,
+                test_file_full: codeContext.fullContent,
+                // Enhanced fields
+                locator_info: locatorInfo,
+                normalized_error: normalizedError,
+                code_context: codeContext,
+              };
+
+              artifacts.push(artifact);
+            }
           }
         }
+
+        // Recurse into nested suites (test.describe blocks create nesting)
+        if (suite.suites?.length > 0) {
+          walkSuites(suite.suites, suiteFile);
+        }
       }
-    }
+    };
+
+    walkSuites(raw.suites ?? []);
 
     logger.info(MOD, `Collected ${artifacts.length} failure artifact(s)`, {
       resultsFilePath,
       testRepoPath,
+      totalSuites: raw.suites?.length ?? 0,
     });
 
     return artifacts;
