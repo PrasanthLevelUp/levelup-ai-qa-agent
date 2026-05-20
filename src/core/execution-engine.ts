@@ -40,16 +40,60 @@ export class ExecutionEngine {
   }
 
   /**
-   * Install dependencies with streaming logs.
+   * Install dependencies with streaming logs and verification.
    */
   static async installDependencies(repoPath: string): Promise<void> {
     logger.info(MOD, 'Installing dependencies', { repoPath });
-    await ExecutionEngine.spawnAsync('npm', ['install'], { cwd: repoPath });
+
+    // Check if package.json exists
+    const pkgPath = path.join(repoPath, 'package.json');
+    if (!fs.existsSync(pkgPath)) {
+      throw new Error(`No package.json found at ${repoPath} — cannot install dependencies`);
+    }
+
+    // Run npm install with retry
+    let installSuccess = false;
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        await ExecutionEngine.spawnAsync('npm', ['install'], { cwd: repoPath, timeout: 120_000 });
+        installSuccess = true;
+        break;
+      } catch (error) {
+        logger.warn(MOD, `npm install attempt ${attempt} failed`, {
+          error: (error as Error).message,
+          repoPath,
+        });
+        if (attempt < 2) {
+          // Clean node_modules and retry
+          const nmPath = path.join(repoPath, 'node_modules');
+          if (fs.existsSync(nmPath)) {
+            fs.rmSync(nmPath, { recursive: true, force: true });
+          }
+          logger.info(MOD, 'Retrying npm install after cleanup...');
+        }
+      }
+    }
+
+    if (!installSuccess) {
+      throw new Error(`npm install failed after 2 attempts in ${repoPath}`);
+    }
+
+    // Verify node_modules and playwright binary exist
+    const playwrightBin = path.join(repoPath, 'node_modules', '.bin', 'playwright');
+    if (!fs.existsSync(playwrightBin)) {
+      throw new Error(`Playwright binary not found at ${playwrightBin} after npm install — dependency installation may have been incomplete`);
+    }
+
+    logger.info(MOD, 'Dependencies installed, playwright binary verified', { repoPath });
+
     // Ensure Playwright browsers are installed
     try {
-      await ExecutionEngine.spawnAsync('npx', ['playwright', 'install', 'chromium'], { cwd: repoPath });
-    } catch {
-      logger.warn(MOD, 'Playwright browser install skipped or failed');
+      await ExecutionEngine.spawnAsync('npx', ['playwright', 'install', 'chromium', '--with-deps'], { cwd: repoPath, timeout: 120_000 });
+      logger.info(MOD, 'Playwright chromium browser installed');
+    } catch (error) {
+      logger.warn(MOD, 'Playwright browser install had issues (tests may still work if browsers were cached)', {
+        error: (error as Error).message,
+      });
     }
   }
 
@@ -148,6 +192,17 @@ export class ExecutionEngine {
 
     const endTime = new Date().toISOString();
     const durationMs = Date.now() - start;
+
+    // Exit code 127 = command not found — likely playwright binary missing
+    if (exitCode === 127) {
+      logger.error(MOD, 'EXIT CODE 127: Command not found — playwright binary may be missing from node_modules/.bin', {
+        repoPath,
+        cmd,
+        nodeModulesExists: fs.existsSync(path.join(repoPath, 'node_modules')),
+        playwrightBinExists: fs.existsSync(path.join(repoPath, 'node_modules', '.bin', 'playwright')),
+        stderr: stderr.slice(0, 500),
+      });
+    }
 
     logger.info(MOD, 'Playwright execution complete', { exitCode, durationMs, resultsFile });
 

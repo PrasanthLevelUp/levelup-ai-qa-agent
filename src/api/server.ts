@@ -206,14 +206,28 @@ function createHealingWorker(
       });
     }
 
-    // Step 2: Install dependencies
+    // Step 2: Install dependencies (MUST succeed before running tests)
     jobQueue.updateJob(job.id, { progress: 'Installing dependencies...' });
     try {
       await ExecutionEngine.installDependencies(testRepoPath);
     } catch (error) {
-      logger.warn(MOD, 'Dependency install had issues', {
-        error: (error as Error).message,
+      const errMsg = (error as Error).message;
+      logger.error(MOD, 'Dependency install FAILED — cannot proceed with test execution', {
+        error: errMsg,
+        testRepoPath,
       });
+      jobQueue.updateJob(job.id, { progress: `FAILED: ${errMsg}` });
+      return {
+        totalTests: 0,
+        failed: 0,
+        healed: 0,
+        strategy: 'none',
+        tokensUsed: 0,
+        testResults: { exitCode: 127, durationMs: 0 },
+        healingActions: [],
+        message: `Dependency installation failed: ${errMsg}. Check that the repository has a valid package.json and npm install can succeed.`,
+        error: errMsg,
+      };
     }
 
     // Step 3: Run tests
@@ -233,15 +247,23 @@ function createHealingWorker(
     }
 
     if (artifacts.length === 0) {
+      let message = 'All tests passed — no healing needed';
+      if (run.exitCode === 127) {
+        message = 'Command not found (exit code 127). This usually means playwright is not installed. Check that npm install completed successfully and node_modules/.bin/playwright exists.';
+      } else if (run.exitCode !== 0) {
+        message = `Tests exited with code ${run.exitCode} but no failure artifacts were collected. stderr: ${(run.stderr || '').slice(0, 300)}`;
+      }
+
       const result = {
-        totalTests: 1,
-        failed: 0,
+        totalTests: run.exitCode === 0 ? 1 : 0,
+        failed: run.exitCode !== 0 ? 1 : 0,
         healed: 0,
         strategy: 'none',
         tokensUsed: 0,
         testResults: { exitCode: run.exitCode, durationMs: run.durationMs },
         healingActions: [],
-        message: run.exitCode === 0 ? 'All tests passed — no healing needed' : 'No failure artifacts collected',
+        message,
+        error: run.exitCode !== 0 ? message : undefined,
       };
       return result;
     }
