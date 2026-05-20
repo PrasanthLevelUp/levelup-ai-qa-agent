@@ -28,9 +28,29 @@ export interface FailureDetails {
 
 function detectFailureType(errorMessage: string): FailureType {
   const text = errorMessage.toLowerCase();
+
+  // IMPORTANT: Check assertion FIRST, before locator.
+  // Playwright assertion errors like `expect(locator('...')).toContainText(...)` contain the word
+  // "locator" but are NOT locator failures — the locator FOUND the element, the assertion failed.
+  // Assertion keywords: toContainText, toHaveText, toBeVisible, toBeEnabled, toHaveValue,
+  // toHaveURL, toHaveTitle, toHaveCount, toHaveAttribute, toHaveCSS, toHaveClass, toBeChecked, etc.
+  const assertionPatterns = [
+    /\.to(?:contain|have|be|equal|match)/i,
+    /expect\(.*\)\.(?:not\.)?to/i,
+    /expected.*received/i,
+    /expected substring/i,
+    /expected string/i,
+    /assertion failed/i,
+  ];
+  if (assertionPatterns.some(p => p.test(errorMessage))) return 'assertion';
+
   if (text.includes('timeout') || text.includes('timed out')) return 'timeout';
-  if (text.includes('locator') || text.includes('selector') || text.includes('element') || text.includes('not found')) return 'locator';
-  if (text.includes('expect(') || text.includes('assert')) return 'assertion';
+
+  // "locator" in error context like "waiting for locator('...')" means element not found
+  // But "expect(locator('...')).toXxx" is an assertion (caught above)
+  if (/waiting for (?:locator|selector)/i.test(text) || text.includes('not found') || text.includes('no element')) return 'locator';
+  if (text.includes('selector') && !text.includes('expect(')) return 'locator';
+
   if (text.includes('navigation') || text.includes('net::') || text.includes('http')) return 'navigation';
   return 'unknown';
 }

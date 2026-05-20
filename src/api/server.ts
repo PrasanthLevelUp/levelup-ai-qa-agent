@@ -367,11 +367,81 @@ function createHealingWorker(
       let iterFixCount = 0;
 
       try {
+        // Skip locator healing for assertion failures — the locator found the element,
+        // the assertion (toContainText, toHaveText, etc.) failed.
+        if (failure.failureType === 'assertion') {
+          logger.info(MOD, 'Skipping locator healing — assertion failure (element found, assertion failed)', {
+            testName: failure.testName,
+            failureType: failure.failureType,
+            failedLocator: failure.failedLocator,
+            errorMessage: failure.errorMessage.slice(0, 200),
+          });
+
+          // For assertion failures, try adding explicit wait only
+          if (failure.isTimingIssue || failure.errorMessage.includes('Received ""') || failure.errorMessage.includes('Received: ""')) {
+            logger.info(MOD, 'Assertion failure may be timing-related — attempting wait injection');
+            const originalContent = fs.readFileSync(failure.filePath, 'utf-8');
+            // Add networkidle wait after goto
+            if (!originalContent.includes("waitForLoadState('networkidle')")) {
+              const updatedContent = originalContent.replace(
+                /(await page\.goto\([^;]+;)/g,
+                "$1\n    await page.waitForLoadState('networkidle');"
+              );
+              if (updatedContent !== originalContent) {
+                fs.writeFileSync(failure.filePath, updatedContent, 'utf-8');
+                const relativeTestFile = path.relative(path.join(testRepoPath, 'tests'), failure.filePath);
+                const rerun = ExecutionEngine.run(testRepoPath, relativeTestFile);
+                if (rerun.exitCode === 0) {
+                  iterationSuccess = true;
+                  healedCount++;
+                  iterFixCount = 1;
+                  await updateExecution(executionId, { healing_succeeded: true, status: 'healed' });
+                  healings.push({
+                    testName: failure.testName,
+                    failedLocator: failure.failedLocator || 'assertion',
+                    healedLocator: 'Added waitForLoadState(networkidle)',
+                    strategy: 'rule_based',
+                    aiTokensUsed: 0,
+                    success: true,
+                    confidence: 0.85,
+                    validated: true,
+                    validationReason: 'Assertion timing fix — added explicit wait',
+                  });
+                  const testRow = tests.find((t) => t.testName === failure.testName);
+                  if (testRow) { testRow.healed = true; testRow.status = 'healed'; }
+                  cleanupBackup(failure.filePath);
+                } else {
+                  restoreFile(failure.filePath);
+                }
+              }
+            }
+          }
+
+          if (!iterationSuccess) {
+            restoreFile(failure.filePath);
+          }
+
+          // Continue to RCA analysis below (skip the locator healing loop)
+        } else {
+
         // Iterative healing loop: fix one locator → rerun → if still fails, fix next locator → rerun...
+        const healedLocators = new Set<string>(); // Cycle detection
+
         for (let iteration = 0; iteration < MAX_HEAL_ITERATIONS; iteration++) {
           jobQueue.updateJob(job.id, {
             progress: `Healing: ${failure.testName} (locator ${iteration + 1})...`,
           });
+
+          // Cycle detection: if we've already tried to heal this exact locator, stop
+          if (healedLocators.has(failure.failedLocator)) {
+            logger.warn(MOD, 'Cycle detected — already healed this locator, stopping', {
+              testName: failure.testName,
+              failedLocator: failure.failedLocator,
+              iteration,
+            });
+            break;
+          }
+          healedLocators.add(failure.failedLocator);
 
           const outcome = await orchestrator.heal(failure);
           logger.info(MOD, 'Orchestrator result', {
@@ -551,6 +621,8 @@ function createHealingWorker(
             fixesAttempted: iterFixCount,
           });
         }
+
+        } // end else (locator healing branch)
       } catch (error) {
         restoreFile(failure.filePath);
         logger.error(MOD, 'Healing failed for test', {

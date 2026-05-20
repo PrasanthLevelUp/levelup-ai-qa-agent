@@ -175,8 +175,25 @@ async function runCLI(): Promise<void> {
     let iterFixCount = 0;
 
     try {
+      // Skip locator healing for assertion failures
+      if (failure.failureType === 'assertion') {
+        logger.info(MOD, 'Skipping locator healing — assertion failure', {
+          testName: failure.testName,
+          failureType: failure.failureType,
+        });
+        restoreFile(failure.filePath);
+      } else {
+
       // Iterative healing loop: fix one locator → rerun → fix next → repeat
+      const healedLocators = new Set<string>();
+
       for (let iteration = 0; iteration < MAX_HEAL_ITERATIONS; iteration++) {
+        // Cycle detection
+        if (healedLocators.has(failure.failedLocator)) {
+          logger.warn(MOD, 'Cycle detected — stopping', { failedLocator: failure.failedLocator });
+          break;
+        }
+        healedLocators.add(failure.failedLocator);
         const outcome = await orchestrator.heal(failure);
         if (!outcome.suggestion) {
           if (iteration === 0) {
@@ -324,6 +341,8 @@ async function runCLI(): Promise<void> {
       } else {
         restoreFile(failure.filePath);
       }
+
+      } // end else (locator healing branch)
     } catch (error) {
       restoreFile(failure.filePath);
       logger.error(MOD, 'Healing pipeline failed for test', {
