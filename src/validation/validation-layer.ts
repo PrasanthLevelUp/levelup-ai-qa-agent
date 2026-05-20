@@ -83,6 +83,10 @@ export class ValidationLayer {
     if (/(getByRole|getByLabel|getByText|getByPlaceholder|getByTestId|getByAltText|getByTitle)/.test(locatorExpression)) {
       return true;
     }
+    // Accept page.locator('...') with stable CSS selectors inside
+    if (/^page\.locator\(/.test(locatorExpression)) {
+      return true;
+    }
     // Accept stable CSS attribute selectors like input[name="username"], #id, [data-testid="x"]
     if (/^[a-z]+\[[a-z_-]+="[^"]+"\]$/i.test(locatorExpression)) {
       return true;
@@ -91,6 +95,10 @@ export class ValidationLayer {
       return true;
     }
     if (/^\[data-testid="[^"]+"\]$/.test(locatorExpression)) {
+      return true;
+    }
+    // Accept class selectors like .oxd-userdropdown-tab
+    if (/^\.[\w-]+$/.test(locatorExpression)) {
       return true;
     }
     return false;
@@ -176,7 +184,6 @@ export class ValidationLayer {
     let result = content;
 
     // page.click('selector') → pwLocator.click()
-    // Note: NOT adding 'await' since original `await page.click(...)` already has it
     const clickPattern = new RegExp(`page\\.click\\((['\"])${escapedLocator}\\1\\)`, 'g');
     if (clickPattern.test(content)) {
       result = content.replace(new RegExp(`page\\.click\\((['\"])${escapedLocator}\\1\\)`, 'g'), `${pwLocator}.click()`);
@@ -184,10 +191,16 @@ export class ValidationLayer {
     }
 
     // page.fill('selector', value) → pwLocator.fill(value)
-    // Note: NOT adding 'await' since original `await page.fill(...)` already has it
     const fillPattern = new RegExp(`page\\.fill\\((['\"])${escapedLocator}\\1\\s*,`, 'g');
     if (fillPattern.test(content)) {
       result = content.replace(new RegExp(`page\\.fill\\((['\"])${escapedLocator}\\1\\s*,`, 'g'), `${pwLocator}.fill(`);
+      if (result !== content) return result;
+    }
+
+    // page.waitForSelector('selector') → pwLocator.waitFor()
+    const waitPattern = new RegExp(`page\\.waitForSelector\\((['\"])${escapedLocator}\\1\\)`, 'g');
+    if (waitPattern.test(content)) {
+      result = content.replace(new RegExp(`page\\.waitForSelector\\((['\"])${escapedLocator}\\1\\)`, 'g'), `${pwLocator}.waitFor()`);
       if (result !== content) return result;
     }
 

@@ -336,8 +336,10 @@ function createHealingWorker(
       ? new RCAEngine({ apiKey: process.env['OPENAI_API_KEY'] })
       : null;
 
+    const MAX_HEAL_ITERATIONS = 10; // Max locator fixes per test before giving up
+
     for (const artifact of artifacts) {
-      const failure = analyzer.analyze(artifact);
+      let failure = analyzer.analyze(artifact);
       tests.push({
         testName: failure.testName,
         status: 'failed',
@@ -359,102 +361,92 @@ function createHealingWorker(
       });
 
       const backupPath = backupFile(failure.filePath);
+      let iterationSuccess = false;
+      let lastStrategy = 'rule_based';
+      let lastConfidence = 0;
+      let iterFixCount = 0;
 
       try {
-        const outcome = await orchestrator.heal(failure);
-        logger.info(MOD, 'Orchestrator result', {
-          testName: failure.testName,
-          failedLocator: failure.failedLocator,
-          hasSuggestion: !!outcome.suggestion,
-          suggestion: outcome.suggestion ? {
+        // Iterative healing loop: fix one locator → rerun → if still fails, fix next locator → rerun...
+        for (let iteration = 0; iteration < MAX_HEAL_ITERATIONS; iteration++) {
+          jobQueue.updateJob(job.id, {
+            progress: `Healing: ${failure.testName} (locator ${iteration + 1})...`,
+          });
+
+          const outcome = await orchestrator.heal(failure);
+          logger.info(MOD, 'Orchestrator result', {
+            testName: failure.testName,
+            failedLocator: failure.failedLocator,
+            iteration,
+            hasSuggestion: !!outcome.suggestion,
+            suggestion: outcome.suggestion ? {
+              newLocator: outcome.suggestion.newLocator,
+              strategy: outcome.suggestion.strategy,
+              confidence: outcome.suggestion.confidence,
+            } : null,
+            attemptedStrategies: outcome.attemptedStrategies,
+            selectedEngine: outcome.selectedEngine,
+          });
+
+          if (!outcome.suggestion) {
+            logger.warn(MOD, 'No suggestion at iteration', { iteration, testName: failure.testName });
+            break;
+          }
+
+          const validation = validationLayer.validate(outcome.suggestion, failure);
+          logger.info(MOD, 'Validation result', {
+            testName: failure.testName,
+            approved: validation.approved,
+            reason: validation.reason,
             newLocator: outcome.suggestion.newLocator,
-            strategy: outcome.suggestion.strategy,
+            iteration,
+          });
+
+          if (!validation.approved || !validation.updatedContent) {
+            logger.warn(MOD, 'Validation rejected at iteration', { iteration, reason: validation.reason });
+            break;
+          }
+
+          totalTokensUsed += outcome.suggestion.tokensUsed;
+          validationLayer.applyValidatedFix(failure.filePath, validation.updatedContent);
+          iterFixCount++;
+          lastStrategy = outcome.suggestion.strategy;
+          lastConfidence = outcome.suggestion.confidence;
+
+          logger.info(MOD, 'Applied fix, running rerun', {
+            testName: failure.testName,
+            iteration,
+            fixedLocator: failure.failedLocator,
+            newLocator: outcome.suggestion.newLocator,
+          });
+
+          // Log each individual locator fix
+          await logHealing({
+            test_execution_id: executionId,
+            test_name: failure.testName,
+            failed_locator: failure.failedLocator,
+            healed_locator: outcome.suggestion.newLocator,
+            healing_strategy: outcome.suggestion.strategy,
+            ai_tokens_used: outcome.suggestion.tokensUsed,
+            success: false, // Will update to true if final rerun passes
             confidence: outcome.suggestion.confidence,
-          } : null,
-          attemptedStrategies: outcome.attemptedStrategies,
-          selectedEngine: outcome.selectedEngine,
-        });
+            validation_status: 'approved',
+            validation_reason: `[Iter ${iteration + 1}] ${outcome.suggestion.reasoning}`,
+            patch_path: validation.patchPath,
+          }, job.companyId);
 
-        if (!outcome.suggestion) {
-          restoreFile(failure.filePath);
-          continue;
-        }
-
-        const validation = validationLayer.validate(outcome.suggestion, failure);
-        logger.info(MOD, 'Validation result', {
-          testName: failure.testName,
-          approved: validation.approved,
-          reason: validation.reason,
-          newLocator: outcome.suggestion.newLocator,
-        });
-
-        if (!validation.approved || !validation.updatedContent) {
-          restoreFile(failure.filePath);
-          continue;
-        }
-
-        totalTokensUsed += outcome.suggestion.tokensUsed;
-        validationLayer.applyValidatedFix(failure.filePath, validation.updatedContent);
-
-        // Log the transformed file content for debugging
-        const transformedContent = fs.readFileSync(failure.filePath, 'utf-8');
-        logger.info(MOD, 'Transformed test file content', {
-          testName: failure.testName,
-          filePath: failure.filePath,
-          contentPreview: transformedContent.substring(0, 500),
-        });
-
-        const relativeTestFile = path.relative(
-          path.join(testRepoPath, 'tests'),
-          failure.filePath,
-        );
-        logger.info(MOD, 'Running healed test rerun', {
-          testRepoPath,
-          relativeTestFile,
-          cmd: `npx playwright test "${relativeTestFile}" --reporter=json --output=test-results`,
-        });
-
-        const rerun = ExecutionEngine.run(testRepoPath, relativeTestFile);
-        const success = rerun.exitCode === 0;
-
-        logger.info(MOD, 'Rerun result', {
-          exitCode: rerun.exitCode,
-          success,
-          stdout: rerun.stdout?.substring(0, 300),
-          stderr: rerun.stderr?.substring(0, 300),
-        });
-
-        await logHealing({
-          test_execution_id: executionId,
-          test_name: failure.testName,
-          failed_locator: failure.failedLocator,
-          healed_locator: outcome.suggestion.newLocator,
-          healing_strategy: outcome.suggestion.strategy,
-          ai_tokens_used: outcome.suggestion.tokensUsed,
-          success,
-          confidence: outcome.suggestion.confidence,
-          validation_status: 'approved',
-          validation_reason: outcome.suggestion.reasoning,
-          patch_path: validation.patchPath,
-        }, job.companyId);
-
-        healings.push({
-          testName: failure.testName,
-          failedLocator: failure.failedLocator,
-          healedLocator: outcome.suggestion.newLocator,
-          strategy: outcome.suggestion.strategy,
-          aiTokensUsed: outcome.suggestion.tokensUsed,
-          success,
-          confidence: outcome.suggestion.confidence,
-          validated: true,
-          validationReason: outcome.suggestion.reasoning,
-          patchPath: validation.patchPath,
-        });
-
-        if (success) {
-          healedCount++;
-          await updateExecution(executionId, { healing_succeeded: true, status: 'healed' });
-          cleanupBackup(failure.filePath);
+          healings.push({
+            testName: failure.testName,
+            failedLocator: failure.failedLocator,
+            healedLocator: outcome.suggestion.newLocator,
+            strategy: outcome.suggestion.strategy,
+            aiTokensUsed: outcome.suggestion.tokensUsed,
+            success: false, // Placeholder — updated below if final pass
+            confidence: outcome.suggestion.confidence,
+            validated: true,
+            validationReason: `[Iter ${iteration + 1}] ${outcome.suggestion.reasoning}`,
+            patchPath: validation.patchPath,
+          });
 
           await storePattern({
             test_name: failure.testName,
@@ -466,13 +458,98 @@ function createHealingWorker(
             avg_tokens_saved: outcome.suggestion.tokensUsed,
           }, job.companyId);
 
+          // Rerun the specific test file
+          const relativeTestFile = path.relative(
+            path.join(testRepoPath, 'tests'),
+            failure.filePath,
+          );
+          const rerun = ExecutionEngine.run(testRepoPath, relativeTestFile);
+
+          logger.info(MOD, 'Rerun result', {
+            exitCode: rerun.exitCode,
+            iteration,
+            stdout: rerun.stdout?.substring(0, 300),
+            stderr: rerun.stderr?.substring(0, 300),
+          });
+
+          if (rerun.exitCode === 0) {
+            // All locators healed — test passes!
+            iterationSuccess = true;
+            logger.info(MOD, 'Iterative healing SUCCESS', {
+              testName: failure.testName,
+              totalIterations: iteration + 1,
+              totalFixesApplied: iterFixCount,
+            });
+            break;
+          }
+
+          // Test still fails — collect new artifacts to find the NEXT broken locator
+          let newArtifacts: any[] = [];
+          try {
+            newArtifacts = collector.collect(rerun.resultsFile, testRepoPath);
+          } catch (e) {
+            logger.warn(MOD, 'Could not collect artifacts from rerun', { error: (e as Error).message });
+          }
+
+          if (newArtifacts.length === 0) {
+            logger.warn(MOD, 'Rerun failed but no new artifacts — cannot continue iterative healing', {
+              testName: failure.testName, iteration,
+            });
+            break;
+          }
+
+          // Find the artifact for the SAME test (it should have a NEW failed locator)
+          const nextArtifact = newArtifacts.find((a: any) => {
+            const nextFailure = analyzer.analyze(a);
+            // Must be for the same test file and a DIFFERENT locator than what we just fixed
+            return nextFailure.filePath === failure.filePath
+              && nextFailure.failedLocator !== failure.failedLocator;
+          }) || newArtifacts[0]; // Fallback to first artifact if no match
+
+          if (!nextArtifact) {
+            logger.warn(MOD, 'No next artifact found for iterative healing', { testName: failure.testName });
+            break;
+          }
+
+          // Update failure to the next broken locator and continue the loop
+          failure = analyzer.analyze(nextArtifact);
+          logger.info(MOD, 'Iterative healing — next locator', {
+            testName: failure.testName,
+            nextFailedLocator: failure.failedLocator,
+            iteration: iteration + 1,
+          });
+        }
+
+        if (iterationSuccess) {
+          healedCount++;
+          await updateExecution(executionId, { healing_succeeded: true, status: 'healed' });
+          cleanupBackup(failure.filePath);
+
+          // Mark all healings for this test as successful
+          for (const h of healings) {
+            if (h.testName === failure.testName) {
+              h.success = true;
+            }
+          }
+
           const testRow = tests.find((t) => t.testName === failure.testName);
           if (testRow) {
             testRow.healed = true;
             testRow.status = 'healed';
           }
+
+          logger.info(MOD, 'Healing success (iterative)', {
+            testName: failure.testName,
+            fixesApplied: iterFixCount,
+            lastStrategy,
+          });
         } else {
+          // Iterative healing failed — roll back all changes
           restoreFile(failure.filePath);
+          logger.warn(MOD, 'Iterative healing failed — rolled back', {
+            testName: failure.testName,
+            fixesAttempted: iterFixCount,
+          });
         }
       } catch (error) {
         restoreFile(failure.filePath);

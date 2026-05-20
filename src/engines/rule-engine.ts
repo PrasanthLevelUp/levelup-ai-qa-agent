@@ -170,8 +170,34 @@ export class RuleEngine {
     /* ================================================================== */
     if (locator.startsWith('.') || /^\.[a-zA-Z]/.test(locator)) {
       const className = locator.replace(/^\./, '').replace(/[-_]+/g, ' ').trim();
+      const rawClassName = locator.replace(/^\./, '');
       const textHint = extractTextHint(locator) || className;
       rulesApplied.push('R06_class_selector');
+
+      // Rule 6a: Try common class name variations (hyphen vs no-hyphen, underscore variants)
+      // e.g., .oxd-user-dropdown-trigger → .oxd-userdropdown-tab, .oxd-userdropdown-trigger
+      const classVariations: string[] = [];
+      // Remove one level of hyphenation: oxd-user-dropdown → oxd-userdropdown
+      const parts = rawClassName.split('-');
+      if (parts.length >= 3) {
+        // Try merging adjacent parts: [oxd, user, dropdown, trigger] → oxd-userdropdown-trigger
+        for (let i = 0; i < parts.length - 1; i++) {
+          const merged = [...parts.slice(0, i), parts[i] + parts[i + 1], ...parts.slice(i + 2)].join('-');
+          if (merged !== rawClassName) classVariations.push(merged);
+        }
+      }
+      // Strip all hyphens: oxd-user-dropdown-trigger → oxduserdropdowntrigger (unlikely but covers edge)
+      const stripped = rawClassName.replace(/-/g, '');
+      if (stripped !== rawClassName) classVariations.push(stripped);
+
+      for (const variant of classVariations) {
+        suggestions.push({
+          newLocator: `.${variant}`,
+          confidence: 0.90,
+          reasoning: `Class variant: .${rawClassName} → .${variant} (common naming pattern variation).`,
+          ruleId: 'R06_variant',
+        });
+      }
 
       // Rule 6: Class → role button
       suggestions.push({
@@ -320,25 +346,62 @@ export class RuleEngine {
       // Also try known semantic equivalences
       const semanticMappings: Record<string, string[]> = {
         'user': ['username', 'userName', 'user_name', 'login', 'loginName', 'uname'],
+        'username': ['user', 'userName', 'user_name', 'login', 'loginName', 'uname'],
+        'user_name': ['username', 'userName', 'user', 'login', 'loginName', 'uname'],
         'pass': ['password', 'passwd', 'passWord', 'pass_word', 'pwd'],
-        'pwd': ['password', 'passwd'],
+        'password': ['pass', 'passwd', 'passWord', 'pass_word', 'pwd'],
+        'pass_word': ['password', 'passwd', 'pass', 'pwd'],
+        'passwd': ['password', 'pass', 'pass_word', 'pwd'],
+        'pwd': ['password', 'passwd', 'pass', 'pass_word'],
         'email': ['emailAddress', 'email_address', 'mail', 'userEmail'],
-        'mail': ['email', 'emailAddress'],
+        'email_address': ['email', 'emailAddress', 'mail', 'userEmail'],
+        'mail': ['email', 'emailAddress', 'email_address'],
         'phone': ['phoneNumber', 'phone_number', 'tel', 'telephone', 'mobile'],
-        'tel': ['phone', 'phoneNumber', 'telephone'],
+        'phone_number': ['phone', 'phoneNumber', 'tel', 'telephone', 'mobile'],
+        'tel': ['phone', 'phoneNumber', 'telephone', 'phone_number'],
         'addr': ['address', 'streetAddress', 'street_address'],
+        'address': ['addr', 'streetAddress', 'street_address'],
+        'street_address': ['address', 'streetAddress', 'addr'],
         'fname': ['firstName', 'first_name', 'givenName'],
+        'first_name': ['firstName', 'fname', 'givenName', 'first'],
         'lname': ['lastName', 'last_name', 'surname'],
-        'first': ['firstName', 'first_name'],
-        'last': ['lastName', 'last_name'],
+        'last_name': ['lastName', 'lname', 'surname', 'last'],
+        'first': ['firstName', 'first_name', 'fname'],
+        'last': ['lastName', 'last_name', 'lname'],
         'name': ['fullName', 'full_name', 'displayName'],
+        'full_name': ['fullName', 'name', 'displayName'],
         'msg': ['message', 'comment', 'body'],
+        'message': ['msg', 'comment', 'body'],
         'search': ['query', 'searchQuery', 'keyword', 'q'],
         'zip': ['zipcode', 'zipCode', 'postalCode', 'postal_code'],
+        'zipcode': ['zip', 'zipCode', 'postalCode', 'postal_code'],
+        'postal_code': ['zipcode', 'zipCode', 'zip', 'postalCode'],
       };
 
-      // Add semantic mappings first (highest confidence for known equivalences)
-      const knownAlternatives = semanticMappings[nameValue.toLowerCase()] || [];
+      // Build alternatives from multiple lookup strategies
+      const lookupKey = nameValue.toLowerCase();
+      // Strategy 1: Direct lookup
+      let knownAlternatives = semanticMappings[lookupKey] || [];
+      // Strategy 2: Strip underscores/hyphens and look up (e.g. user_name → username)
+      const stripped = lookupKey.replace(/[-_]/g, '');
+      if (!knownAlternatives.length && stripped !== lookupKey && semanticMappings[stripped]) {
+        knownAlternatives = semanticMappings[stripped];
+      }
+      // Strategy 3: Try individual parts (e.g. user_name → look up 'user', 'name')
+      if (!knownAlternatives.length) {
+        const parts = lookupKey.split(/[-_]+/);
+        for (const part of parts) {
+          if (semanticMappings[part]) {
+            knownAlternatives = [...knownAlternatives, ...semanticMappings[part]];
+          }
+        }
+        // Deduplicate
+        knownAlternatives = [...new Set(knownAlternatives)];
+      }
+      // Strategy 4: Always add stripped version as candidate if different
+      if (stripped !== lookupKey && !knownAlternatives.includes(stripped)) {
+        knownAlternatives.push(stripped);
+      }
       for (const alt of knownAlternatives) {
         suggestions.push({
           newLocator: `input[name="${alt}"]`,
@@ -506,9 +569,31 @@ export class RuleEngine {
     /* ================================================================== */
 
     // Rule 22: Links
-    if (/link|anchor|<a[\s>]|href/.test(locator + ' ' + failedLine)) {
+    if (/link|anchor|<a[\s>]|href|^a:/.test(locator + ' ' + failedLine)) {
       const linkText = extractTextHint(locator) || 'link';
       rulesApplied.push('R22_link');
+
+      // Semantic text alternatives for common link actions
+      const linkTextMappings: Record<string, string[]> = {
+        'sign out': ['Logout', 'Log out', 'Log Out', 'Sign Out'],
+        'logout': ['Sign Out', 'Log out', 'Log Out'],
+        'log out': ['Logout', 'Sign Out', 'Sign out'],
+        'sign in': ['Login', 'Log in', 'Log In', 'Sign In'],
+        'login': ['Sign In', 'Log in', 'Log In'],
+        'log in': ['Login', 'Sign In', 'Sign in'],
+        'register': ['Sign Up', 'Sign up', 'Create Account'],
+        'sign up': ['Register', 'Create Account', 'Sign Up'],
+      };
+
+      const textAlts = linkTextMappings[linkText.toLowerCase()] || [];
+      for (const alt of textAlts) {
+        suggestions.push({
+          newLocator: `page.getByRole('link', { name: /${alt}/i })`,
+          confidence: 0.93,
+          reasoning: `Link text semantic: "${linkText}" → "${alt}" (common alternative).`,
+          ruleId: 'R22_text_alt',
+        });
+      }
 
       suggestions.push({
         newLocator: `page.getByRole('link', { name: /${linkText}/i })`,
