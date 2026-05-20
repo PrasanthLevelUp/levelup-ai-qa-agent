@@ -402,6 +402,26 @@ export class RuleEngine {
       if (stripped !== lookupKey && !knownAlternatives.includes(stripped)) {
         knownAlternatives.push(stripped);
       }
+
+      // CRITICAL: Prioritize the canonical lowercase form.
+      // When nameValue is "userName" or "user_name", lookupKey is "username".
+      // If lookupKey differs from the original value, it's likely the correct canonical form.
+      // Move it to the front so it's tried FIRST before other alternatives like "user".
+      if (lookupKey !== nameValue && knownAlternatives.includes(lookupKey)) {
+        knownAlternatives = [lookupKey, ...knownAlternatives.filter(a => a !== lookupKey)];
+      }
+      // Also: if stripped form differs from lookupKey AND is a known mapping key, prioritize it
+      if (stripped !== lookupKey && stripped !== nameValue && semanticMappings[stripped]) {
+        if (!knownAlternatives.includes(stripped)) {
+          knownAlternatives.unshift(stripped);
+        } else {
+          knownAlternatives = [stripped, ...knownAlternatives.filter(a => a !== stripped)];
+        }
+      }
+
+      // Remove the original nameValue from alternatives (no point suggesting same thing)
+      knownAlternatives = knownAlternatives.filter(a => a !== nameValue);
+
       for (const alt of knownAlternatives) {
         suggestions.push({
           newLocator: `input[name="${alt}"]`,

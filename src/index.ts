@@ -157,8 +157,35 @@ async function runCLI(): Promise<void> {
 
   const MAX_HEAL_ITERATIONS = 10;
 
-  for (const artifact of artifacts) {
+  // De-duplicate artifacts by test name
+  const seenTestsCli = new Set<string>();
+  const uniqueArtifactsCli = artifacts.filter((a: any) => {
+    const f = analyzer.analyze(a);
+    if (seenTestsCli.has(f.testName)) return false;
+    seenTestsCli.add(f.testName);
+    return true;
+  });
+
+  for (const artifact of uniqueArtifactsCli) {
     let failure = analyzer.analyze(artifact);
+
+    // PRE-CHECK: Re-run this specific test to see if it still fails
+    const preRelFile = path.relative(path.join(cfg.testRepoPath, 'tests'), failure.filePath);
+    const preCheck = ExecutionEngine.run(cfg.testRepoPath, preRelFile, failure.testName);
+    if (preCheck.exitCode === 0) {
+      logger.info(MOD, 'Test already passes (fixed by prior healing) — skipping', { testName: failure.testName });
+      healedCount++;
+      const testRow = tests.find((t) => t.testName === failure.testName);
+      if (testRow) { testRow.healed = true; testRow.status = 'healed'; }
+      continue;
+    }
+
+    // Re-collect fresh artifacts
+    try {
+      const freshArts = collector.collect(preCheck.resultsFile, cfg.testRepoPath);
+      const freshForTest = freshArts.find((a: any) => analyzer.analyze(a).testName === failure.testName);
+      if (freshForTest) failure = analyzer.analyze(freshForTest);
+    } catch (_e) { /* use original */ }
 
     const executionId = await logExecution({
       test_name: failure.testName,
@@ -205,7 +232,7 @@ async function runCLI(): Promise<void> {
             if (updatedContent !== originalContent) {
               fs.writeFileSync(failure.filePath, updatedContent, 'utf-8');
               const relativeTestFile = path.relative(path.join(cfg.testRepoPath, 'tests'), failure.filePath);
-              const rerun = ExecutionEngine.run(cfg.testRepoPath, relativeTestFile);
+              const rerun = ExecutionEngine.run(cfg.testRepoPath, relativeTestFile, failure.testName);
               if (rerun.exitCode === 0) {
                 iterationSuccess = true;
                 healedCount++;
@@ -326,13 +353,15 @@ async function runCLI(): Promise<void> {
           avg_tokens_saved: outcome.suggestion.tokensUsed,
         });
 
+        // Rerun ONLY the current test using --grep for isolation
         const relativeTestFile = path.relative(path.join(cfg.testRepoPath, 'tests'), failure.filePath);
-        const rerun = ExecutionEngine.run(cfg.testRepoPath, relativeTestFile);
+        const currentTestName = failure.testName;
+        const rerun = ExecutionEngine.run(cfg.testRepoPath, relativeTestFile, currentTestName);
 
         if (rerun.exitCode === 0) {
           iterationSuccess = true;
           logger.info(MOD, 'Iterative healing SUCCESS', {
-            testName: failure.testName,
+            testName: currentTestName,
             totalIterations: iteration + 1,
             fixesApplied: iterFixCount,
           });
@@ -349,10 +378,23 @@ async function runCLI(): Promise<void> {
 
         if (newArtifacts.length === 0) break;
 
-        const nextArtifact = newArtifacts.find((a: any) => {
+        // Filter to ONLY this test's failures
+        const sameTestArts = newArtifacts.filter((a: any) => {
           const nf = analyzer.analyze(a);
-          return nf.filePath === failure.filePath && nf.failedLocator !== failure.failedLocator;
-        }) || newArtifacts[0];
+          return nf.filePath === failure.filePath && nf.testName === currentTestName;
+        });
+
+        if (sameTestArts.length === 0) {
+          // No more failures for this test — it's healed!
+          iterationSuccess = true;
+          logger.info(MOD, 'Per-test healing SUCCESS — no more failures', { testName: currentTestName });
+          break;
+        }
+
+        const nextArtifact = sameTestArts.find((a: any) => {
+          const nf = analyzer.analyze(a);
+          return nf.failedLocator !== failure.failedLocator;
+        }) || sameTestArts[0];
 
         if (!nextArtifact) break;
 

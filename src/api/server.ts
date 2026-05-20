@@ -338,8 +338,62 @@ function createHealingWorker(
 
     const MAX_HEAL_ITERATIONS = 10; // Max locator fixes per test before giving up
 
-    for (const artifact of artifacts) {
+    // De-duplicate artifacts by test name (multiple artifacts may come from the same test)
+    const seenTests = new Set<string>();
+    const uniqueArtifacts = artifacts.filter((a: any) => {
+      const f = analyzer.analyze(a);
+      if (seenTests.has(f.testName)) return false;
+      seenTests.add(f.testName);
+      return true;
+    });
+
+    for (const artifact of uniqueArtifacts) {
       let failure = analyzer.analyze(artifact);
+
+      // PRE-CHECK: Re-run this specific test to see if it still fails.
+      // A previous test's healing may have already fixed shared locators in the same file.
+      const preCheckRelFile = path.relative(path.join(testRepoPath, 'tests'), failure.filePath);
+      const preCheck = ExecutionEngine.run(testRepoPath, preCheckRelFile, failure.testName);
+      if (preCheck.exitCode === 0) {
+        logger.info(MOD, 'Test already passes (fixed by prior healing) — skipping', {
+          testName: failure.testName,
+        });
+        tests.push({
+          testName: failure.testName,
+          status: 'healed',
+          durationMs: preCheck.durationMs,
+          error: '',
+          healed: true,
+        });
+        healedCount++;
+        const execId = await logExecution({
+          test_name: failure.testName,
+          status: 'healed',
+          error_message: '',
+          healing_attempted: false,
+          healing_succeeded: true,
+        }, job.companyId);
+        continue;
+      }
+
+      // Re-collect fresh artifacts for THIS test (in case shared locators were already healed)
+      try {
+        const freshArtifacts = collector.collect(preCheck.resultsFile, testRepoPath);
+        const freshForTest = freshArtifacts.find((a: any) => {
+          const nf = analyzer.analyze(a);
+          return nf.testName === failure.testName;
+        });
+        if (freshForTest) {
+          failure = analyzer.analyze(freshForTest);
+          logger.info(MOD, 'Using fresh artifacts for test', {
+            testName: failure.testName,
+            failedLocator: failure.failedLocator,
+          });
+        }
+      } catch (e) {
+        logger.warn(MOD, 'Could not refresh artifacts, using original', { error: (e as Error).message });
+      }
+
       tests.push({
         testName: failure.testName,
         status: 'failed',
@@ -398,7 +452,7 @@ function createHealingWorker(
               if (updatedContent !== originalContent) {
                 fs.writeFileSync(failure.filePath, updatedContent, 'utf-8');
                 const relativeTestFile = path.relative(path.join(testRepoPath, 'tests'), failure.filePath);
-                const rerun = ExecutionEngine.run(testRepoPath, relativeTestFile);
+                const rerun = ExecutionEngine.run(testRepoPath, relativeTestFile, failure.testName);
                 if (rerun.exitCode === 0) {
                   iterationSuccess = true;
                   healedCount++;
@@ -536,25 +590,29 @@ function createHealingWorker(
             avg_tokens_saved: outcome.suggestion.tokensUsed,
           }, job.companyId);
 
-          // Rerun the specific test file
+          // Rerun ONLY the current test using --grep for isolation.
+          // This prevents cross-test contamination where fixing TC01-01's locators
+          // causes the loop to pick up TC01-02's failures instead.
           const relativeTestFile = path.relative(
             path.join(testRepoPath, 'tests'),
             failure.filePath,
           );
-          const rerun = ExecutionEngine.run(testRepoPath, relativeTestFile);
+          const currentTestName = failure.testName;
+          const rerun = ExecutionEngine.run(testRepoPath, relativeTestFile, currentTestName);
 
           logger.info(MOD, 'Rerun result', {
             exitCode: rerun.exitCode,
             iteration,
+            grepFilter: currentTestName,
             stdout: rerun.stdout?.substring(0, 300),
             stderr: rerun.stderr?.substring(0, 300),
           });
 
           if (rerun.exitCode === 0) {
-            // All locators healed — test passes!
+            // This specific test passes!
             iterationSuccess = true;
             logger.info(MOD, 'Iterative healing SUCCESS', {
-              testName: failure.testName,
+              testName: currentTestName,
               totalIterations: iteration + 1,
               totalFixesApplied: iterFixCount,
             });
@@ -571,21 +629,38 @@ function createHealingWorker(
 
           if (newArtifacts.length === 0) {
             logger.warn(MOD, 'Rerun failed but no new artifacts — cannot continue iterative healing', {
-              testName: failure.testName, iteration,
+              testName: currentTestName, iteration,
             });
             break;
           }
 
-          // Find the artifact for the SAME test (it should have a NEW failed locator)
-          const nextArtifact = newArtifacts.find((a: any) => {
-            const nextFailure = analyzer.analyze(a);
-            // Must be for the same test file and a DIFFERENT locator than what we just fixed
-            return nextFailure.filePath === failure.filePath
-              && nextFailure.failedLocator !== failure.failedLocator;
-          }) || newArtifacts[0]; // Fallback to first artifact if no match
+          // Filter artifacts to ONLY this test (same test name AND same file).
+          // This is critical: a file may contain multiple tests, and we must not
+          // let failures from other tests pollute the current test's healing loop.
+          const sameTestArtifacts = newArtifacts.filter((a: any) => {
+            const nf = analyzer.analyze(a);
+            return nf.filePath === failure.filePath && nf.testName === currentTestName;
+          });
+
+          // If no more failures for THIS specific test, it's healed!
+          if (sameTestArtifacts.length === 0) {
+            iterationSuccess = true;
+            logger.info(MOD, 'Per-test healing SUCCESS — no more failures for this test', {
+              testName: currentTestName,
+              totalIterations: iteration + 1,
+              totalFixesApplied: iterFixCount,
+            });
+            break;
+          }
+
+          // Find the next broken locator (different from what we just fixed)
+          const nextArtifact = sameTestArtifacts.find((a: any) => {
+            const nf = analyzer.analyze(a);
+            return nf.failedLocator !== failure.failedLocator;
+          }) || sameTestArtifacts[0];
 
           if (!nextArtifact) {
-            logger.warn(MOD, 'No next artifact found for iterative healing', { testName: failure.testName });
+            logger.warn(MOD, 'No next artifact found for iterative healing', { testName: currentTestName });
             break;
           }
 

@@ -170,7 +170,7 @@ export class ExecutionEngine {
    * Instead, we rely on the config's ['json', { outputFile: 'test-results.json' }].
    * If the config doesn't produce the file, we write stdout as a fallback.
    */
-  static run(repoPath: string, testFile?: string): RunResult {
+  static run(repoPath: string, testFile?: string, grepFilter?: string): RunResult {
     const { execSync } = require('child_process');
     const resultsFile = path.join(repoPath, 'test-results.json');
     const startTime = new Date().toISOString();
@@ -178,9 +178,14 @@ export class ExecutionEngine {
 
     // Do NOT pass --reporter — let playwright.config.ts handle it
     // The config should have: reporter: [['json', { outputFile: 'test-results.json' }]]
-    const cmd = testFile
+    let cmd = testFile
       ? `npx playwright test "${testFile}"`
       : `npx playwright test`;
+
+    // --grep isolates a single test by name for efficient per-test reruns
+    if (grepFilter) {
+      cmd += ` --grep "${grepFilter.replace(/"/g, '\\"')}"`;
+    }
 
     logger.info(MOD, 'Executing Playwright tests (sync)', { repoPath, cmd });
 
