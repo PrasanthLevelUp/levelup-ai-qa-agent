@@ -42,7 +42,7 @@ export class PatchEngine {
   private readonly outputDir: string;
   private readonly project: Project;
 
-  constructor(outputDir = '/home/ubuntu/healing_reports/patches') {
+  constructor(outputDir = process.env['REPORT_DIR'] ? process.env['REPORT_DIR'] + '/patches' : '/tmp/healing_reports/patches') {
     this.outputDir = outputDir;
     fs.mkdirSync(this.outputDir, { recursive: true });
     this.project = new Project({

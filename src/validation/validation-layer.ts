@@ -21,7 +21,7 @@ export interface ValidationResult {
 }
 
 export class ValidationLayer {
-  constructor(private readonly patchDir: string = '/home/ubuntu/healing_reports/patches') {}
+  constructor(private readonly patchDir: string = process.env['REPORT_DIR'] ? process.env['REPORT_DIR'] + '/patches' : '/tmp/healing_reports/patches') {}
 
   validate(suggestion: HealingSuggestion, failure: FailureDetails): ValidationResult {
     if (suggestion.confidence <= 0.5) {

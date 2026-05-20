@@ -46,11 +46,11 @@ function parseArgs(): Config {
   const has = (flag: string): boolean => args.includes(flag);
 
   return {
-    testRepoPath: get('--repo', '/home/ubuntu/github_repos/selfhealing_agent_poc'),
+    testRepoPath: get('--repo', process.env['WORKSPACE_DIR'] ? process.env['WORKSPACE_DIR'] + '/selfhealing_agent_poc' : '/tmp/healing-repos/selfhealing_agent_poc'),
     siteUrl: get('--site-url', 'https://opensource-demo.orangehrmlive.com'),
     owner: get('--owner', 'PrasanthLevelUp'),
     repoName: get('--repo-name', 'selfhealing_agent_poc'),
-    reportDir: get('--report-dir', '/home/ubuntu/healing_reports'),
+    reportDir: get('--report-dir', '/tmp/healing_reports'),
     autoCommit: has('--auto-commit'),
   };
 }

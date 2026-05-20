@@ -65,7 +65,7 @@ export function createReportsRouter(jobQueue: JobQueue): Router {
     }
 
     // Check if an HTML report file was generated
-    const reportDir = process.env['REPORT_DIR'] || '/home/ubuntu/healing_reports';
+    const reportDir = process.env['REPORT_DIR'] || '/tmp/healing_reports';
     const htmlReportPath = job.result?.reportPath;
 
     if (htmlReportPath && fs.existsSync(htmlReportPath)) {

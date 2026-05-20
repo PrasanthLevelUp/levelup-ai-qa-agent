@@ -181,28 +181,60 @@ function createHealingWorker(
   repoManager: RepoManager,
 ): (job: HealingJob) => Promise<any> {
   return async (job: HealingJob) => {
-    const reportDir = process.env['REPORT_DIR'] || '/home/ubuntu/healing_reports';
+    const reportDir = process.env['REPORT_DIR'] || '/tmp/healing_reports';
     fs.mkdirSync(reportDir, { recursive: true });
 
     // Resolve repo configuration
     const repo = repoManager.findRepo(job.repositoryId);
-    const testRepoPath = repo?.localPath || `/home/ubuntu/github_repos/${repo?.name || 'test_repo'}`;
+    // Use WORKSPACE_DIR env var for Railway/Docker, fallback to /tmp/healing-repos
+    const workspaceDir = process.env['WORKSPACE_DIR'] || '/tmp/healing-repos';
+    const repoName = repo?.name || job.repositoryId.replace(/[^a-zA-Z0-9_-]/g, '_').slice(-50) || 'test_repo';
+    const testRepoPath = repo?.localPath || path.join(workspaceDir, repoName);
     const repoUrl = job.repositoryUrl || repo?.url || '';
     const branch = job.branch || repo?.branch || 'main';
 
     logger.info(MOD, 'Starting healing worker', {
       jobId: job.id,
       testRepoPath,
+      repoUrl,
       branch,
+      repoName,
+      workspaceDir,
+      repoLocalPath: repo?.localPath,
     });
 
-    // Step 1: Clone/pull repo
+    // Step 1: Clone/pull repo (MUST succeed — failing here means stale/missing code)
     jobQueue.updateJob(job.id, { progress: 'Cloning/pulling repository...' });
     try {
+      fs.mkdirSync(workspaceDir, { recursive: true });
       await ExecutionEngine.cloneRepository(repoUrl, testRepoPath, branch);
+      // Verify the tests directory exists after clone
+      const testsDir = path.join(testRepoPath, 'tests');
+      const pkgFile = path.join(testRepoPath, 'package.json');
+      const testFiles = fs.existsSync(testsDir) ? fs.readdirSync(testsDir).filter(f => f.endsWith('.spec.ts') || f.endsWith('.test.ts')) : [];
+      logger.info(MOD, 'Repository ready', {
+        testRepoPath,
+        hasTestsDir: fs.existsSync(testsDir),
+        testFileCount: testFiles.length,
+        testFiles: testFiles.slice(0, 10),
+        hasPackageJson: fs.existsSync(pkgFile),
+      });
     } catch (error) {
-      logger.warn(MOD, 'Clone failed, using existing repo', {
-        error: (error as Error).message,
+      const errMsg = (error as Error).message;
+      logger.error(MOD, 'Clone/pull FAILED', { error: errMsg, repoUrl, testRepoPath });
+      // If directory exists with tests, continue with warning; otherwise fail
+      if (!fs.existsSync(path.join(testRepoPath, 'package.json'))) {
+        jobQueue.updateJob(job.id, { progress: `FAILED: Repository clone failed — ${errMsg}` });
+        return {
+          totalTests: 0, failed: 0, healed: 0, strategy: 'none', tokensUsed: 0,
+          testResults: { exitCode: 128, durationMs: 0 },
+          healingActions: [],
+          message: `Repository clone/pull failed: ${errMsg}. Verify the repo URL is accessible and the branch exists.`,
+          error: errMsg,
+        };
+      }
+      logger.warn(MOD, 'Clone failed but repo directory exists, continuing with existing code', {
+        testRepoPath,
       });
     }
 
