@@ -21,11 +21,19 @@ export interface LocatorInfo {
 const LOCATOR_PATTERNS = [
   { pattern: /locator\('([^']+)'\)/, group: 1 },
   { pattern: /waiting for locator\('([^']+)'\)/, group: 1 },
+  // With page. prefix (from test code)
   { pattern: /page\.getByRole\(([^)]+)\)/, group: 0 },
   { pattern: /page\.getByText\(([^)]+)\)/, group: 0 },
   { pattern: /page\.getByLabel\(([^)]+)\)/, group: 0 },
   { pattern: /page\.getByPlaceholder\(([^)]+)\)/, group: 0 },
   { pattern: /page\.getByTestId\(([^)]+)\)/, group: 0 },
+  // Without page. prefix (Playwright error "waiting for getByRole(...)")
+  // Use group:1 to capture just the getByRole(...) part, prefix adds "page."
+  { pattern: /(?:waiting for\s+)(getByRole\([^)]+\))/m, group: 1, prefix: 'page.' },
+  { pattern: /(?:waiting for\s+)(getByText\([^)]+\))/m, group: 1, prefix: 'page.' },
+  { pattern: /(?:waiting for\s+)(getByLabel\([^)]+\))/m, group: 1, prefix: 'page.' },
+  { pattern: /(?:waiting for\s+)(getByPlaceholder\([^)]+\))/m, group: 1, prefix: 'page.' },
+  { pattern: /(?:waiting for\s+)(getByTestId\([^)]+\))/m, group: 1, prefix: 'page.' },
   { pattern: /page\.(?:click|fill|locator)\(([^)]+)\)/, group: 1 },
   { pattern: /selector[:\s]+['"]([^'"]+)['"]/, group: 1 },
 ];
@@ -53,10 +61,13 @@ function detectElementContext(locator: string, errorMessage: string): ElementCon
 }
 
 export function extractLocator(errorMessage: string): LocatorInfo | null {
-  for (const { pattern, group } of LOCATOR_PATTERNS) {
+  for (const entry of LOCATOR_PATTERNS) {
+    const { pattern, group } = entry;
+    const prefix = (entry as any).prefix || '';
     const match = pattern.exec(errorMessage);
     if (match) {
-      const rawLocator = (match[group] || match[1] || '').replace(/^['"]|['"]$/g, '');
+      const rawMatch = (match[group] || match[1] || '').replace(/^['"]|['"]$/g, '').trim();
+      const rawLocator = prefix ? prefix + rawMatch : rawMatch;
       const locatorType = detectLocatorType(rawLocator);
 
       const info: LocatorInfo = {
