@@ -362,7 +362,14 @@ async function runCLI(): Promise<void> {
             break;
           }
 
-          if (nextFailure && nextFailure.failedLocator !== failure.failedLocator) {
+          const appliedLocator = outcome.suggestion.newLocator;
+          const isSameLocatorFailing = !nextFailure
+            || nextFailure.failedLocator === failure.failedLocator
+            || nextFailure.failedLocator === appliedLocator
+            || appliedLocator.includes(nextFailure.failedLocator)
+            || nextFailure.failedLocator.includes(appliedLocator);
+
+          if (nextFailure && !isSameLocatorFailing) {
             // Fix worked for this locator — advance to next
             locatorFixed = true; iterFixCount++;
             healings.push({

@@ -660,8 +660,15 @@ function createHealingWorker(
               break;
             }
 
-            if (nextFailure && nextFailure.failedLocator !== failure.failedLocator) {
-              // DIFFERENT locator failed — our fix for this locator was correct!
+            const appliedLocator = outcome.suggestion.newLocator;
+            const isSameLocatorFailing = !nextFailure
+              || nextFailure.failedLocator === failure.failedLocator
+              || nextFailure.failedLocator === appliedLocator
+              || appliedLocator.includes(nextFailure.failedLocator)
+              || nextFailure.failedLocator.includes(appliedLocator);
+
+            if (nextFailure && !isSameLocatorFailing) {
+              // TRULY different locator failed — our fix for this locator was correct!
               // Keep the fix, log it, and advance to the next locator
               locatorFixed = true;
               iterFixCount++;
