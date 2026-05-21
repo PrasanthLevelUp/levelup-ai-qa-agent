@@ -31,6 +31,7 @@ import { PatternEngine } from '../engines/pattern-engine';
 import { AIEngine } from '../engines/ai-engine';
 import { OpenAIClient } from '../ai/openai-client';
 import { ValidationLayer } from '../validation/validation-layer';
+import { acceptCandidate, type LiveValidationInput } from '../core/healing-acceptance';
 import { generateReport, type ReportData, type ReportTest, type ReportHealing } from '../reports/html-report';
 import { RCAEngine, type RCAResult } from '../engines/rca-engine';
 import { createRCARouter } from './routes/rca';
@@ -535,6 +536,15 @@ function createHealingWorker(
               break;
             }
 
+            // Pre-flight: static validation via Healing Acceptance Engine
+            const preCheck = acceptCandidate(outcome.suggestion, failure, fileContentBeforeFix);
+            if (preCheck.decision === 'reject') {
+              logger.warn(MOD, 'Acceptance pre-check rejected', {
+                iteration, retry, reason: preCheck.reason, locator: outcome.suggestion.newLocator,
+              });
+              continue; // Skip this suggestion entirely
+            }
+
             const validation = validationLayer.validate(outcome.suggestion, failure);
             if (!validation.approved || !validation.updatedContent) {
               logger.warn(MOD, 'Validation rejected', { iteration, retry, reason: validation.reason });
@@ -660,14 +670,17 @@ function createHealingWorker(
               break;
             }
 
-            const appliedLocator = outcome.suggestion.newLocator;
-            const isSameLocatorFailing = !nextFailure
-              || nextFailure.failedLocator === failure.failedLocator
-              || nextFailure.failedLocator === appliedLocator
-              || appliedLocator.includes(nextFailure.failedLocator)
-              || nextFailure.failedLocator.includes(appliedLocator);
+            // Use Healing Acceptance Engine for live validation decision
+            const liveInput: LiveValidationInput = {
+              exitCode: rerun.exitCode,
+              newFailedLocator: nextFailure?.failedLocator ?? null,
+              appliedLocator: outcome.suggestion.newLocator,
+              originalLocator: failure.failedLocator,
+              sameTestArtifactCount: sameTestArtifacts.length,
+            };
+            const liveDecision = acceptCandidate(outcome.suggestion, failure, fileContentBeforeFix, liveInput);
 
-            if (nextFailure && !isSameLocatorFailing) {
+            if (liveDecision.decision === 'accept' && nextFailure && nextFailure.failedLocator !== failure.failedLocator) {
               // TRULY different locator failed — our fix for this locator was correct!
               // Keep the fix, log it, and advance to the next locator
               locatorFixed = true;
