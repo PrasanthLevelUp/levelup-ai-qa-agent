@@ -85,18 +85,18 @@ function staticValidation(
   }
 
   // 3. Must not contain obvious syntax errors
-  if (/undefined|null|NaN|\[object/.test(loc)) {
+  if (/\bundefined\b|\bnull\b|\bNaN\b|\[object/.test(loc)) {
     return { valid: false, reason: 'Contains invalid tokens' };
   }
 
-  // 4. Locator must be findable/replaceable in the file
-  if (fileContent && !fileContent.includes(failure.failedLocator)) {
-    return { valid: false, reason: 'Original locator not found in file — already modified?' };
-  }
+  // NOTE: We intentionally do NOT check fileContent.includes(failure.failedLocator) here.
+  // The failedLocator extracted from Playwright errors (e.g. "input[name='user']") often
+  // differs from the source file representation (e.g. "page.locator('input[name=\"user\"]')").
+  // The validation layer handles the actual text replacement check.
 
-  // 5. Must not be a trivially generic locator
+  // 4. Must not be a trivially generic locator (only exact matches)
   const genericPatterns = [
-    /^page\.getByRole\('button'\)$/,
+    /^page\.getByRole\('[^']+'\s*\)$/,  // getByRole('role') without name filter — no comma means no options
     /^page\.getByText\(''\)$/,
     /^div$/,
     /^\*$/,
@@ -128,11 +128,17 @@ function liveValidation(input: LiveValidationInput): { valid: boolean; reason: s
 
   // 3. Check if the failure moved to a DIFFERENT locator (our fix worked)
   if (newFailedLocator) {
+    // Normalize for comparison (trim, collapse whitespace)
+    const norm = (s: string) => s.replace(/\s+/g, ' ').trim();
+    const nNew = norm(newFailedLocator);
+    const nOrig = norm(originalLocator);
+    const nApplied = norm(appliedLocator);
+
     const isSame =
-      newFailedLocator === originalLocator ||
-      newFailedLocator === appliedLocator ||
-      appliedLocator.includes(newFailedLocator) ||
-      newFailedLocator.includes(appliedLocator);
+      nNew === nOrig ||
+      nNew === nApplied ||
+      // Only use substring if the shorter string is substantial (>10 chars)
+      (nApplied.length > 10 && nNew.length > 10 && (nApplied.includes(nNew) || nNew.includes(nApplied)));
 
     if (!isSame) {
       return { valid: true, reason: 'Test progressed to next locator', progressed: true };

@@ -680,7 +680,7 @@ function createHealingWorker(
             };
             const liveDecision = acceptCandidate(outcome.suggestion, failure, fileContentBeforeFix, liveInput);
 
-            if (liveDecision.decision === 'accept' && nextFailure && nextFailure.failedLocator !== failure.failedLocator) {
+            if (liveDecision.decision !== 'reject' && nextFailure && nextFailure.failedLocator !== failure.failedLocator) {
               // TRULY different locator failed — our fix for this locator was correct!
               // Keep the fix, log it, and advance to the next locator
               locatorFixed = true;
