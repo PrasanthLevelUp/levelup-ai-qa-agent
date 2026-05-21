@@ -266,7 +266,7 @@ async function runCLI(): Promise<void> {
       // Iterative healing loop with retry-per-locator (same logic as server.ts)
       const healedLocators = new Set<string>();
       const triedLocators = new Set<string>();
-      const RETRIES_PER_LOCATOR = 5;
+      const RETRIES_PER_LOCATOR = 8;
 
       for (let iteration = 0; iteration < MAX_HEAL_ITERATIONS; iteration++) {
         if (healedLocators.has(failure.failedLocator)) {

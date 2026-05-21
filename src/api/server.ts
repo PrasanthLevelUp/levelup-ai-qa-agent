@@ -493,7 +493,7 @@ function createHealingWorker(
         //   Only advance to the next locator when the current one is truly fixed.
         const healedLocators = new Set<string>(); // Cycle detection across locators
         const triedLocators = new Set<string>();   // All tried suggestions (global across retries)
-        const RETRIES_PER_LOCATOR = 5;             // Max suggestions to try per broken locator
+        const RETRIES_PER_LOCATOR = 8;             // Max suggestions to try per broken locator
 
         for (let iteration = 0; iteration < MAX_HEAL_ITERATIONS; iteration++) {
           jobQueue.updateJob(job.id, {

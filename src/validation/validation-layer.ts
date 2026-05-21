@@ -109,6 +109,11 @@ export class ValidationLayer {
     if (/^\.[\w-]+$/.test(locatorExpression)) {
       return true;
     }
+    // Accept compound CSS selectors: .class tag, .class .class, .class > tag, tag.class
+    // e.g., ".orangehrm-login-branding img", "button.login-submit", ".nav > .item"
+    if (/^[a-z]*\.[\w-]+(\s+[\w.#>+~\[\]='":-]+)*$/i.test(locatorExpression)) {
+      return true;
+    }
     return false;
   }
 
@@ -165,6 +170,10 @@ export class ValidationLayer {
     if (/^\[[\w-]+="[^"]+"\]$/.test(expr)) return true;
     // Class selector: .some-class
     if (/^\.[\w-]+$/.test(expr)) return true;
+    // Compound CSS selectors: .class tag, .class > .class, .class .class img
+    if (/^[a-z]*\.[\w-]+(\s+[\w.#>+~\[\]='":-]+)*$/i.test(expr) && expr.includes(' ')) return true;
+    // Tag.class without space: button.login-submit
+    if (/^[a-z]+\.[\w-]+$/i.test(expr)) return true;
     return false;
   }
 

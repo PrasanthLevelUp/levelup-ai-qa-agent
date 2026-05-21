@@ -47,11 +47,23 @@ function extractTextHint(locator: string): string {
     /has-text\(["']([^"']+)["']\)/,
     /text=["']([^"']+)["']/,
     /contains\(\s*(?:text\(\)|\.)\s*,\s*["']([^"']+)["']\)/,
-    /["']([^"']{2,30})["']/,
   ];
   for (const p of textMatches) {
     const m = p.exec(locator);
     if (m?.[1]) return m[1];
+  }
+  // Last resort: extract quoted text, but SKIP attribute values like type="button", name="user"
+  // Attribute values are preceded by = sign
+  const quotedPattern = /(?<!=\s*)["']([^"']{2,30})["']/g;
+  let qm: RegExpExecArray | null;
+  while ((qm = quotedPattern.exec(locator)) !== null) {
+    const val = qm[1];
+    // Skip common attribute value words that aren't useful as text hints
+    if (/^(button|submit|text|password|checkbox|radio|hidden|reset|email|number|search|tel|url|file|date|color|range)$/i.test(val)) continue;
+    // Skip if this is clearly an attribute value: preceded by "=" in the original string
+    const charBefore = locator[qm.index - 1];
+    if (charBefore === '=') continue;
+    return val;
   }
   return '';
 }
@@ -179,36 +191,120 @@ export class RuleEngine {
       rulesApplied.push('R06_class_selector');
 
       // Rule 6a: Try common class name variations (hyphen vs no-hyphen, suffix swaps)
-      // e.g., .oxd-user-dropdown-trigger → .oxd-userdropdown-tab, .oxd-userdropdown-trigger
+      // Priority order: Strategy C (merge+swap) FIRST, then Strategy A (merge only), then Strategy B (swap only)
+      // This matches real-world patterns where frameworks merge words AND use different suffixes
       const classVariations: string[] = [];
       const parts = rawClassName.split('-');
 
-      if (parts.length >= 3) {
-        // Strategy A: Merge adjacent parts (remove one hyphen level)
-        // [oxd, user, dropdown, trigger] → oxd-userdropdown-trigger, oxd-user-dropdowntrigger, etc.
-        for (let i = 0; i < parts.length - 1; i++) {
-          const merged = [...parts.slice(0, i), parts[i] + parts[i + 1], ...parts.slice(i + 2)].join('-');
-          if (merged !== rawClassName) classVariations.push(merged);
-        }
+      // High-priority UI suffixes (most common in real apps)
+      const topSuffixes = ['tab', 'trigger', 'container', 'wrapper', 'content', 'menu', 'toggle',
+        'button', 'link', 'item', 'branding', 'logo', 'icon', 'image', 'dropdown', 'banner'];
+      // Extended suffixes (lower priority)
+      const extSuffixes = ['title', 'header', 'footer', 'label', 'text', 'card', 'panel',
+        'section', 'area', 'group', 'list', 'nav', 'form', 'field', 'input', 'slot'];
 
-        // Strategy B: Swap last segment with common UI suffixes
-        // .oxd-user-dropdown-trigger → .oxd-user-dropdown-tab, .oxd-user-dropdown-container, etc.
-        const suffixSwaps = ['tab', 'trigger', 'container', 'wrapper', 'content', 'menu', 'toggle', 'button', 'link', 'item', 'branding', 'logo', 'icon', 'image', 'title', 'header', 'footer', 'label', 'text', 'card', 'panel', 'section', 'area', 'group', 'list', 'nav', 'form', 'field', 'input', 'dropdown', 'banner', 'slot'];
+      if (parts.length >= 3) {
         const lastPart = parts[parts.length - 1];
         const base = parts.slice(0, -1).join('-');
-        for (const suffix of suffixSwaps) {
-          if (suffix !== lastPart) {
-            classVariations.push(`${base}-${suffix}`);
+
+        // PRIORITY ZERO: Known semantic suffix swaps (highest confidence)
+        // When the last segment has known alternatives, try those FIRST
+        const knownSuffixSwaps: Record<string, string[]> = {
+          'logo': ['branding', 'icon', 'image', 'banner'],
+          'branding': ['logo', 'icon', 'image', 'banner'],
+          'trigger': ['tab', 'toggle', 'button', 'menu'],
+          'tab': ['trigger', 'toggle', 'button', 'menu'],
+          'toggle': ['trigger', 'tab', 'button'],
+          'container': ['wrapper', 'content', 'panel', 'section'],
+          'wrapper': ['container', 'content', 'panel'],
+          'content': ['container', 'wrapper', 'body', 'panel'],
+          'btn': ['button', 'submit', 'action'],
+          'button': ['btn', 'submit', 'action', 'trigger'],
+          'link': ['item', 'action', 'button'],
+          'item': ['link', 'element', 'entry'],
+          'input': ['field', 'textbox', 'control'],
+          'field': ['input', 'control', 'textbox'],
+          'header': ['title', 'heading', 'top'],
+          'footer': ['bottom', 'base'],
+          'label': ['title', 'text', 'caption'],
+          'title': ['label', 'heading', 'name'],
+          'dropdown': ['select', 'menu', 'popover', 'combobox'],
+          'menu': ['dropdown', 'nav', 'list', 'popover'],
+          'icon': ['logo', 'image', 'symbol', 'glyph'],
+          'image': ['logo', 'icon', 'photo', 'picture'],
+        };
+        const knownAlts = knownSuffixSwaps[lastPart] || [];
+        for (const alt of knownAlts) {
+          // Strategy B (simple swap) for known alternatives
+          const variant = `${base}-${alt}`;
+          if (variant !== rawClassName && !classVariations.includes(variant)) {
+            classVariations.push(variant);
+          }
+          // Strategy C (merge+swap) for known alternatives
+          for (let i = parts.length - 2; i >= 0; i--) {
+            const mergedParts = [...parts.slice(0, i), parts[i] + parts[i + 1], ...parts.slice(i + 2)];
+            const mergedBase = mergedParts.slice(0, -1).join('-');
+            const mergedLast = mergedParts[mergedParts.length - 1];
+            if (alt !== mergedLast) {
+              const compound = `${mergedBase}-${alt}`;
+              if (compound !== rawClassName && !classVariations.includes(compound)) {
+                classVariations.push(compound);
+              }
+            }
           }
         }
 
-        // Strategy C: Merge adjacent + swap suffix (compound)
-        // [oxd, user, dropdown, trigger] → merge user+dropdown → oxd-userdropdown, then swap trigger→tab
+        // INTERLEAVED generation: for each suffix, generate Strategy B (simple swap)
+        // AND Strategy C (merge+swap) variants. This ensures the correct fix is found
+        // within the first few retries regardless of which strategy is needed.
+        //
+        // Order per suffix: B variant first (simpler, more common), then C variants
+        // E.g., for suffix "tab":
+        //   B: orangehrm-login-tab
+        //   C: orangehrm-logintab (merge login+logo, then the merged last != tab, but base is wrong)
+        //   C: orangehrmlogin-tab (merge orangehrm+login)
+        //   C: oxd-userdropdown-tab (for 4-part names)
+
+        for (const suffix of topSuffixes) {
+          // Strategy B: Simple suffix swap (no merge)
+          if (suffix !== lastPart) {
+            const variant = `${base}-${suffix}`;
+            if (variant !== rawClassName && !classVariations.includes(variant)) {
+              classVariations.push(variant);
+            }
+          }
+          // Strategy C: Merge adjacent + swap suffix
+          for (let i = parts.length - 2; i >= 0; i--) {
+            const mergedParts = [...parts.slice(0, i), parts[i] + parts[i + 1], ...parts.slice(i + 2)];
+            const mergedBase = mergedParts.slice(0, -1).join('-');
+            const mergedLast = mergedParts[mergedParts.length - 1];
+            if (suffix !== mergedLast) {
+              const compound = `${mergedBase}-${suffix}`;
+              if (compound !== rawClassName && !classVariations.includes(compound)) {
+                classVariations.push(compound);
+              }
+            }
+          }
+        }
+
+        // Strategy A: Merge adjacent parts only (no suffix swap)
         for (let i = 0; i < parts.length - 1; i++) {
-          const mergedParts = [...parts.slice(0, i), parts[i] + parts[i + 1], ...parts.slice(i + 2)];
-          const mergedBase = mergedParts.slice(0, -1).join('-');
-          const mergedLast = mergedParts[mergedParts.length - 1];
-          for (const suffix of suffixSwaps) {
+          const merged = [...parts.slice(0, i), parts[i] + parts[i + 1], ...parts.slice(i + 2)].join('-');
+          if (merged !== rawClassName && !classVariations.includes(merged)) classVariations.push(merged);
+        }
+
+        // Extended suffixes (lower priority) — same interleaved pattern
+        for (const suffix of extSuffixes) {
+          if (suffix !== lastPart) {
+            const variant = `${base}-${suffix}`;
+            if (variant !== rawClassName && !classVariations.includes(variant)) {
+              classVariations.push(variant);
+            }
+          }
+          for (let i = parts.length - 2; i >= 0; i--) {
+            const mergedParts = [...parts.slice(0, i), parts[i] + parts[i + 1], ...parts.slice(i + 2)];
+            const mergedBase = mergedParts.slice(0, -1).join('-');
+            const mergedLast = mergedParts[mergedParts.length - 1];
             if (suffix !== mergedLast) {
               const compound = `${mergedBase}-${suffix}`;
               if (compound !== rawClassName && !classVariations.includes(compound)) {
@@ -221,7 +317,7 @@ export class RuleEngine {
 
       // Strip all hyphens: oxd-user-dropdown-trigger → oxduserdropdowntrigger (unlikely but covers edge)
       const stripped = rawClassName.replace(/-/g, '');
-      if (stripped !== rawClassName) classVariations.push(stripped);
+      if (stripped !== rawClassName && !classVariations.includes(stripped)) classVariations.push(stripped);
 
       for (const variant of classVariations) {
         suggestions.push({
@@ -568,15 +664,68 @@ export class RuleEngine {
     // Rule 19: Explicit button
     if (locator.includes('button') || /type=['"]submit['"]/.test(locator)) {
       const textHint = extractTextHint(locator);
-      const buttonText = textHint || 'login|submit|save|continue';
       rulesApplied.push('R19_button');
+
+      // Context-aware button text inference:
+      // If no text hint from locator, analyze surrounding code to determine page context
+      let buttonText = textHint;
+      if (!buttonText) {
+        const ctx = (surrounding + ' ' + errorMsg).toLowerCase();
+        if (/login|auth|sign.?in|credential|username|password/.test(ctx)) {
+          buttonText = 'Login';
+        } else if (/register|sign.?up|create.?account/.test(ctx)) {
+          buttonText = 'Register|Sign Up';
+        } else if (/search|find|query/.test(ctx)) {
+          buttonText = 'Search';
+        } else if (/save|update|edit|apply/.test(ctx)) {
+          buttonText = 'Save|Update|Apply';
+        } else if (/delete|remove|trash/.test(ctx)) {
+          buttonText = 'Delete|Remove';
+        } else if (/confirm|ok|yes|accept/.test(ctx)) {
+          buttonText = 'Confirm|OK|Yes';
+        } else if (/cancel|close|dismiss|no/.test(ctx)) {
+          buttonText = 'Cancel|Close|No';
+        } else {
+          buttonText = 'Login|Submit|Save|Continue';
+        }
+      }
 
       suggestions.push({
         newLocator: `page.getByRole('button', { name: /${buttonText}/i })`,
-        confidence: 0.92,
-        reasoning: 'Button element → role-based semantic lookup.',
+        confidence: 0.94,
+        reasoning: `Button element → role-based semantic lookup (context: "${buttonText}").`,
         ruleId: 'R19',
       });
+
+      // Button type swap: button[type="button"] → button[type="submit"] and vice versa
+      const typeMatch = /button\[type=["'](\w+)["']\]/.exec(locator);
+      if (typeMatch) {
+        const currentType = typeMatch[1];
+        const typeSwaps: Record<string, string[]> = {
+          'button': ['submit', 'reset'],
+          'submit': ['button', 'reset'],
+          'reset': ['submit', 'button'],
+        };
+        for (const altType of (typeSwaps[currentType] || [])) {
+          suggestions.push({
+            newLocator: `button[type="${altType}"]`,
+            confidence: 0.93,
+            reasoning: `Button type swap: type="${currentType}" → type="${altType}" (common mismatch).`,
+            ruleId: 'R19_typeswap',
+          });
+        }
+      }
+
+      // Also try tag.class → button[type="submit"] for cases like button.login-submit
+      if (/^button\.[\w-]+$/.test(locator)) {
+        suggestions.push({
+          newLocator: `button[type="submit"]`,
+          confidence: 0.92,
+          reasoning: 'Button class selector → type=submit attribute selector.',
+          ruleId: 'R19_class_to_type',
+        });
+      }
+
       suggestions.push({
         newLocator: `page.getByText(/${buttonText}/i)`,
         confidence: 0.85,
