@@ -29,7 +29,7 @@ export interface HealingAction {
   success?: boolean;
   confidence?: number;
   error_context?: string;
-  validation_status?: 'approved' | 'rejected';
+  validation_status?: 'approved' | 'rejected' | 'reverted';
   validation_reason?: string;
   patch_path?: string;
 }

@@ -48,11 +48,21 @@ export interface FailureDetails {
 function detectFailureType(errorMessage: string): FailureType {
   const text = errorMessage.toLowerCase();
 
-  // STEP 1: Assertion check FIRST — but NOT if the element wasn't found.
-  // Playwright assertion errors like `expect(locator('...')).toContainText(...)` contain
-  // "locator" AND often "timeout" but are NOT locator failures — the element was found.
-  // EXCEPTION: `toBeVisible() failed` with "not found" IS a locator problem.
+  // STEP 1: Assertion check — but many assertion-looking errors are actually locator issues.
+  //
+  // Key insight: In Playwright, expect(locator).toBeVisible() with a WRONG selector
+  // produces "expect(locator).toBeVisible() failed" + "timeout exceeded" but does NOT
+  // say "not found". The element simply never appeared because the locator is wrong.
+  //
+  // We classify as assertion ONLY when:
+  // - It matches assertion patterns AND
+  // - The element was NOT "not found" AND
+  // - It's NOT toBeVisible/toBeHidden with a timeout (those are locator issues)
   const isElementNotFound = text.includes('not found') || text.includes('no element');
+  const isTimeout = text.includes('timeout') || text.includes('timed out');
+  const isVisibilityCheck = /\.to(?:be)(?:visible|hidden)/i.test(errorMessage);
+  const hasLocatorRef = /locator\(['"][^'"]+['"]\)/i.test(text) || /waiting for/i.test(text);
+
   const assertionPatterns = [
     /\.to(?:contain|have|be|equal|match)(?:text|url|title|value|count|attribute|css|class|checked|enabled|visible|hidden|empty|focused)/i,
     /expect\(.*\)\.(?:not\.)?to(?:contain|have|be)/i,
@@ -61,14 +71,27 @@ function detectFailureType(errorMessage: string): FailureType {
     /expected.*received/i,
     /assertion failed/i,
   ];
-  // If "not found" or "no element" is in the error, it's a locator issue even if
-  // it looks like an assertion (e.g., expect(locator).toBeVisible() → element not found)
-  if (!isElementNotFound && assertionPatterns.some(p => p.test(errorMessage))) return 'assertion';
+
+  if (assertionPatterns.some(p => p.test(errorMessage))) {
+    // These are real assertion failures (element found but wrong content):
+    // - toContainText, toHaveURL, toHaveValue, etc. WITHOUT timeout → true assertion
+    // These are locator issues disguised as assertions:
+    // - toBeVisible + timeout → element never found because locator is wrong
+    // - toBeVisible + "not found" → element not in DOM
+    // - Any assertion + "not found" → locator wrong
+    if (isElementNotFound) {
+      // Element explicitly not found — it's a locator issue
+    } else if (isVisibilityCheck && isTimeout && hasLocatorRef) {
+      // toBeVisible/toBeHidden timed out waiting for a locator — locator is wrong
+    } else {
+      return 'assertion';
+    }
+  }
 
   // STEP 2: Locator-timeout — timeout while waiting for a SPECIFIC locator.
   // This is the #1 symptom of a broken locator in Playwright.
   // Pattern: "Timeout Xms exceeded." + "waiting for locator('...')" or "locator('...')"
-  const isTimeout = text.includes('timeout') || text.includes('timed out');
+  // (isTimeout already computed in Step 1)
   const hasLocatorContext = /waiting for (?:locator|selector)/i.test(text)
     || /locator\(['"][^'"]+['"]\)/i.test(text)
     || /page\.(?:click|fill|waitForSelector|locator)\(/i.test(text);

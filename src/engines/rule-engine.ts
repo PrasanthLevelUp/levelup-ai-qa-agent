@@ -169,8 +169,12 @@ export class RuleEngine {
     /*  RULE 6-8: Class Selectors (.class)                                */
     /* ================================================================== */
     if (locator.startsWith('.') || /^\.[a-zA-Z]/.test(locator)) {
-      const className = locator.replace(/^\./, '').replace(/[-_]+/g, ' ').trim();
-      const rawClassName = locator.replace(/^\./, '');
+      // Extract just the class name part (before any space/combinator/tag)
+      // e.g., ".orangehrm-login-logo img" → "orangehrm-login-logo"
+      const classOnly = locator.replace(/^\./, '').split(/[\s>+~[]/)[0];
+      const restOfSelector = locator.slice(1 + classOnly.length); // " img", " > div", etc.
+      const className = classOnly.replace(/[-_]+/g, ' ').trim();
+      const rawClassName = classOnly;
       const textHint = extractTextHint(locator) || className;
       rulesApplied.push('R06_class_selector');
 
@@ -189,7 +193,7 @@ export class RuleEngine {
 
         // Strategy B: Swap last segment with common UI suffixes
         // .oxd-user-dropdown-trigger → .oxd-user-dropdown-tab, .oxd-user-dropdown-container, etc.
-        const suffixSwaps = ['tab', 'trigger', 'container', 'wrapper', 'content', 'menu', 'toggle', 'button', 'link', 'item'];
+        const suffixSwaps = ['tab', 'trigger', 'container', 'wrapper', 'content', 'menu', 'toggle', 'button', 'link', 'item', 'branding', 'logo', 'icon', 'image', 'title', 'header', 'footer', 'label', 'text', 'card', 'panel', 'section', 'area', 'group', 'list', 'nav', 'form', 'field', 'input', 'dropdown', 'banner', 'slot'];
         const lastPart = parts[parts.length - 1];
         const base = parts.slice(0, -1).join('-');
         for (const suffix of suffixSwaps) {
@@ -221,7 +225,7 @@ export class RuleEngine {
 
       for (const variant of classVariations) {
         suggestions.push({
-          newLocator: `.${variant}`,
+          newLocator: `.${variant}${restOfSelector}`,
           confidence: 0.90,
           reasoning: `Class variant: .${rawClassName} → .${variant} (common naming pattern variation).`,
           ruleId: 'R06_variant',
@@ -435,8 +439,8 @@ export class RuleEngine {
       // CRITICAL: Prioritize the canonical lowercase form.
       // When nameValue is "userName" or "user_name", lookupKey is "username".
       // If lookupKey differs from the original value, it's likely the correct canonical form.
-      // Move it to the front so it's tried FIRST before other alternatives like "user".
-      if (lookupKey !== nameValue && knownAlternatives.includes(lookupKey)) {
+      // Insert it at the front — even if it's not already in the alternatives list.
+      if (lookupKey !== nameValue) {
         knownAlternatives = [lookupKey, ...knownAlternatives.filter(a => a !== lookupKey)];
       }
       // Also: if stripped form differs from lookupKey AND is a known mapping key, prioritize it
