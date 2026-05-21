@@ -52,6 +52,7 @@ import { createBillingRouter } from './routes/billing';
 import { createIngestRouter } from './routes/ingest';
 import { apiKeysRouter } from './routes/api-keys';
 import { hooksRouter } from './routes/hooks';
+import { createRepoIntelligenceRouter } from './routes/repo-intelligence';
 import { notifyRca } from '../integrations/slack';
 import { createRcaTicket } from '../integrations/jira';
 import cookieParser from 'cookie-parser';
@@ -143,6 +144,7 @@ export function createServer(): express.Application {
   app.use('/api/test-coverage', authMiddleware, companyMiddleware, createTestCoverageRouter());
   app.use('/api/billing', authMiddleware, companyMiddleware, createBillingRouter());
   app.use('/api/keys', authMiddleware, companyMiddleware, apiKeysRouter);
+  app.use('/api/repo-intelligence', authMiddleware, companyMiddleware, createRepoIntelligenceRouter());
 
   // List all jobs
   app.get('/api/jobs', authMiddleware, (_req, res) => {

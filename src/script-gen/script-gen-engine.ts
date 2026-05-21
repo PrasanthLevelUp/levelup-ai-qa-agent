@@ -128,6 +128,7 @@ export interface GenerationConfig {
   maxPages?: number;
   includeNegativeTests?: boolean;
   framework?: 'playwright';   // future: cypress, selenium
+  repoIntelligence?: string;  // injected from Repository Intelligence Engine
 }
 
 /* -------------------------------------------------------------------------- */
@@ -325,6 +326,7 @@ ${config.instructions ? `User Instructions: ${config.instructions}` : ''}
 ${config.testTypes?.length ? `Requested Test Types: ${config.testTypes.join(', ')}` : ''}
 ${config.includeNegativeTests ? 'Include negative test cases (invalid inputs, empty fields, etc.)' : ''}
 ${config.credentials ? 'Credentials will be provided via environment variables (process.env.USERNAME, process.env.PASSWORD)' : ''}
+${config.repoIntelligence ? `\n--- REPOSITORY INTELLIGENCE ---\nThe target repo already has existing tests. Match its style, reuse its helpers/page-objects, and follow its conventions:\n\n${config.repoIntelligence}\n--- END REPOSITORY INTELLIGENCE ---` : ''}
 
 Generate comprehensive test flows covering all detected functionality.`;
 

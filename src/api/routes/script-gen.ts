@@ -20,6 +20,7 @@ import {
   logProjectExport,
 } from '../../db/postgres';
 import { ScriptGenEngine, type GenerationConfig, type GenerationResult, type GeneratedFile } from '../../script-gen/script-gen-engine';
+import { getRepositoryContext } from '../../db/postgres';
 import { AIReviewEngine } from '../../script-gen/ai-review-engine';
 import { ValidationRunner } from '../../script-gen/validation-runner';
 import { ProjectExportEngine } from '../../script-gen/project-export-engine';
@@ -49,6 +50,7 @@ export function createScriptGenRouter(): Router {
         includeNegativeTests,
         followLinks,
         maxPages,
+        repoId,
       } = req.body;
 
       if (!url || typeof url !== 'string') {
@@ -56,6 +58,18 @@ export function createScriptGenRouter(): Router {
       }
 
       console.log(`[ScriptGen] Starting generation for: ${url}`);
+
+      // Auto-load repository intelligence if repoId provided
+      let repoIntelligence: string | undefined;
+      if (repoId) {
+        const companyId = (req as any).companyId as number | undefined;
+        const profile = await getRepositoryContext(repoId, companyId);
+        if (profile) {
+          const { buildAIPromptContext } = await import('../../context/prompt-builder');
+          repoIntelligence = buildAIPromptContext(profile);
+          console.log(`[ScriptGen] Loaded repo intelligence for ${repoId}: ${profile.framework}, pattern=${profile.testPattern}`);
+        }
+      }
 
       const config: GenerationConfig = {
         url,
@@ -65,6 +79,7 @@ export function createScriptGenRouter(): Router {
         includeNegativeTests: includeNegativeTests ?? true,
         followLinks: followLinks ?? false,
         maxPages: maxPages ?? 3,
+        repoIntelligence,
       };
 
       const engine = new ScriptGenEngine();

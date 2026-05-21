@@ -585,6 +585,41 @@ async function initSchema(client: PoolClient): Promise<void> {
     );
   `);
 
+  /* ---- Repository Intelligence Engine tables ---- */
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS repository_contexts (
+      id              SERIAL PRIMARY KEY,
+      repo_id         VARCHAR(500) NOT NULL,
+      company_id      INTEGER REFERENCES companies(id),
+      profile         JSONB NOT NULL DEFAULT '{}',
+      scan_duration_ms INTEGER DEFAULT 0,
+      profile_version  INTEGER DEFAULT 1,
+      created_at      TIMESTAMPTZ DEFAULT NOW(),
+      updated_at      TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_repo_ctx_repo_company
+      ON repository_contexts(repo_id, COALESCE(company_id, 0));
+    CREATE INDEX IF NOT EXISTS idx_repo_ctx_company
+      ON repository_contexts(company_id);
+  `);
+
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS code_chunks (
+      id              SERIAL PRIMARY KEY,
+      repo_context_id INTEGER REFERENCES repository_contexts(id) ON DELETE CASCADE,
+      file_path       VARCHAR(1000) NOT NULL,
+      chunk_type      VARCHAR(50) NOT NULL,
+      chunk_name      VARCHAR(500) NOT NULL,
+      content         TEXT NOT NULL,
+      line_start      INTEGER,
+      line_end        INTEGER,
+      metadata        JSONB DEFAULT '{}',
+      created_at      TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_code_chunks_repo ON code_chunks(repo_context_id);
+    CREATE INDEX IF NOT EXISTS idx_code_chunks_type ON code_chunks(chunk_type);
+  `);
+
   // Seed default plans & roles
   await seedDefaultPlans(client);
   await seedDefaultRoles(client);
@@ -3548,4 +3583,168 @@ export async function checkLicense(companyId: number, operation: string): Promis
     subscription: sub,
     usage: { creditsUsed: usageSummary.totalCreditsUsed, creditsAllowed: usageSummary.creditsAllowed, creditsRemaining: usageSummary.creditsRemaining },
   };
+}
+
+/* ========================================================================== */
+/*  Repository Intelligence – CRUD                                            */
+/* ========================================================================== */
+
+import type { RepositoryProfile, CodeChunk } from '../context/types';
+
+export async function saveRepositoryContext(
+  repoId: string,
+  profile: RepositoryProfile,
+  scanDurationMs: number,
+  companyId?: number,
+): Promise<number> {
+  const p = getPool();
+  const cid = companyId ?? null;
+  const profileJson = JSON.stringify(profile);
+
+  // Upsert – update if same repo+company exists
+  const existing = await p.query(
+    `SELECT id, profile_version FROM repository_contexts
+     WHERE repo_id = $1 AND COALESCE(company_id, 0) = COALESCE($2, 0)`,
+    [repoId, cid],
+  );
+
+  if (existing.rows.length > 0) {
+    const row = existing.rows[0];
+    const newVersion = (row.profile_version ?? 1) + 1;
+    await p.query(
+      `UPDATE repository_contexts SET profile=$1, scan_duration_ms=$2,
+       profile_version=$3, updated_at=NOW() WHERE id=$4`,
+      [profileJson, scanDurationMs, newVersion, row.id],
+    );
+    return row.id;
+  }
+
+  const res = await p.query(
+    `INSERT INTO repository_contexts (repo_id, company_id, profile, scan_duration_ms)
+     VALUES ($1,$2,$3,$4) RETURNING id`,
+    [repoId, cid, profileJson, scanDurationMs],
+  );
+  return res.rows[0].id;
+}
+
+export async function getRepositoryContext(
+  repoId: string,
+  companyId?: number,
+): Promise<RepositoryProfile | null> {
+  const p = getPool();
+  const res = await p.query(
+    `SELECT profile FROM repository_contexts
+     WHERE repo_id = $1 AND COALESCE(company_id, 0) = COALESCE($2, 0)
+     ORDER BY updated_at DESC LIMIT 1`,
+    [repoId, companyId ?? null],
+  );
+  if (res.rows.length === 0) return null;
+  return res.rows[0].profile as RepositoryProfile;
+}
+
+export async function getRepositoryContextById(
+  contextId: number,
+): Promise<{ repoId: string; companyId: number | null; profile: RepositoryProfile; version: number } | null> {
+  const p = getPool();
+  const res = await p.query(`SELECT * FROM repository_contexts WHERE id = $1`, [contextId]);
+  if (res.rows.length === 0) return null;
+  const r = res.rows[0];
+  return {
+    repoId: r.repo_id,
+    companyId: r.company_id,
+    version: r.profile_version ?? 1,
+    profile: r.profile as RepositoryProfile,
+  };
+}
+
+export async function saveCodeChunks(
+  repoContextId: number,
+  chunks: CodeChunk[],
+): Promise<number> {
+  if (chunks.length === 0) return 0;
+  const p = getPool();
+  // Clear old chunks for this context before inserting fresh ones
+  await p.query(`DELETE FROM code_chunks WHERE repo_context_id = $1`, [repoContextId]);
+
+  let inserted = 0;
+  const batchSize = 50;
+  for (let i = 0; i < chunks.length; i += batchSize) {
+    const batch = chunks.slice(i, i + batchSize);
+    const values: any[] = [];
+    const placeholders: string[] = [];
+    let idx = 1;
+    for (const c of batch) {
+      placeholders.push(`($${idx},$${idx+1},$${idx+2},$${idx+3},$${idx+4},$${idx+5},$${idx+6},$${idx+7})`);
+      values.push(
+        repoContextId, c.filePath, c.chunkType, c.chunkName,
+        c.content.substring(0, 10000),
+        c.lineStart ?? null, c.lineEnd ?? null,
+        JSON.stringify(c.metadata ?? {}),
+      );
+      idx += 8;
+    }
+    await p.query(
+      `INSERT INTO code_chunks
+        (repo_context_id, file_path, chunk_type, chunk_name, content, line_start, line_end, metadata)
+       VALUES ${placeholders.join(',')}`,
+      values,
+    );
+    inserted += batch.length;
+  }
+  return inserted;
+}
+
+export async function searchCodeChunks(
+  repoContextId: number,
+  opts: { type?: string; namePattern?: string; limit?: number },
+): Promise<CodeChunk[]> {
+  const p = getPool();
+  const conditions = ['repo_context_id = $1'];
+  const params: any[] = [repoContextId];
+  let idx = 2;
+
+  if (opts.type) {
+    conditions.push(`chunk_type = $${idx++}`);
+    params.push(opts.type);
+  }
+  if (opts.namePattern) {
+    conditions.push(`chunk_name ILIKE $${idx++}`);
+    params.push(`%${opts.namePattern}%`);
+  }
+
+  const limit = opts.limit ?? 100;
+  const res = await p.query(
+    `SELECT * FROM code_chunks WHERE ${conditions.join(' AND ')} ORDER BY id LIMIT ${limit}`,
+    params,
+  );
+  return res.rows.map((r: any) => ({
+    filePath: r.file_path,
+    chunkType: r.chunk_type,
+    chunkName: r.chunk_name,
+    content: r.content,
+    lineStart: r.line_start,
+    lineEnd: r.line_end,
+    metadata: r.metadata ?? {},
+  }));
+}
+
+export async function listRepositoryContexts(
+  companyId?: number,
+): Promise<Array<{ id: number; repoId: string; framework: string; testPattern: string; updatedAt: string; version: number }>> {
+  const p = getPool();
+  const res = companyId
+    ? await p.query(
+        `SELECT id, repo_id, profile, updated_at, profile_version
+         FROM repository_contexts WHERE company_id = $1 ORDER BY updated_at DESC`, [companyId])
+    : await p.query(
+        `SELECT id, repo_id, profile, updated_at, profile_version
+         FROM repository_contexts ORDER BY updated_at DESC`);
+  return res.rows.map((r: any) => ({
+    id: r.id,
+    repoId: r.repo_id,
+    framework: r.profile?.framework ?? 'unknown',
+    testPattern: r.profile?.testPattern ?? 'unknown',
+    updatedAt: r.updated_at,
+    version: r.profile_version ?? 1,
+  }));
 }
