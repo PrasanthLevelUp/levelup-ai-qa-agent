@@ -337,7 +337,7 @@ function createHealingWorker(
       ? new RCAEngine({ apiKey: process.env['OPENAI_API_KEY'] })
       : null;
 
-    const MAX_HEAL_ITERATIONS = 10; // Max locator fixes per test before giving up
+    const MAX_HEAL_ITERATIONS = 15; // Max locator fixes per test before giving up
 
     // De-duplicate artifacts by test name (multiple artifacts may come from the same test)
     const seenTests = new Set<string>();
@@ -632,42 +632,86 @@ function createHealingWorker(
               : null;
 
             if (sameTestArtifacts.length === 0) {
-              // No more failures for this test — it's healed!
-              locatorFixed = true;
-              iterFixCount++;
-              lastStrategy = outcome.suggestion.strategy;
-              lastConfidence = outcome.suggestion.confidence;
-              totalTokensUsed += outcome.suggestion.tokensUsed;
-              iterationSuccess = true;
-
-              await logHealing({
-                test_execution_id: executionId,
-                test_name: failure.testName,
-                failed_locator: failure.failedLocator,
-                healed_locator: outcome.suggestion.newLocator,
-                healing_strategy: outcome.suggestion.strategy,
-                ai_tokens_used: outcome.suggestion.tokensUsed,
-                success: true,
-                confidence: outcome.suggestion.confidence,
-                validation_status: 'approved',
-                validation_reason: `[Iter ${iteration + 1} R${retry + 1}] ${outcome.suggestion.reasoning}`,
-                patch_path: validation.patchPath,
-              }, job.companyId);
-
-              healings.push({
-                testName: failure.testName,
-                failedLocator: failure.failedLocator,
-                healedLocator: outcome.suggestion.newLocator,
-                strategy: outcome.suggestion.strategy,
-                aiTokensUsed: outcome.suggestion.tokensUsed,
-                success: true,
-                confidence: outcome.suggestion.confidence,
-                validated: true,
-                validationReason: `[Iter ${iteration + 1} R${retry + 1}] ${outcome.suggestion.reasoning}`,
-                patchPath: validation.patchPath,
+              // No failure artifacts for this test in the rerun results.
+              // But exitCode != 0, so something still failed — could be:
+              //   a) Our fix healed this test but another test in the same file failed (grep leak)
+              //   b) Artifact collection couldn't parse the error format
+              //   c) Test name mismatch in artifact filter
+              // SAFETY: Do a dedicated confirmation rerun with only this test.
+              logger.info(MOD, 'No artifacts but exitCode!=0, running confirmation rerun', {
+                testName: failure.testName, iteration, retry,
+                exitCode: rerun.exitCode,
               });
+              const confirmRerun = ExecutionEngine.run(testRepoPath, relativeTestFile, currentTestName);
+              if (confirmRerun.exitCode === 0) {
+                // Confirmed healed!
+                locatorFixed = true;
+                iterFixCount++;
+                lastStrategy = outcome.suggestion.strategy;
+                lastConfidence = outcome.suggestion.confidence;
+                totalTokensUsed += outcome.suggestion.tokensUsed;
+                iterationSuccess = true;
 
-              break;
+                await logHealing({
+                  test_execution_id: executionId,
+                  test_name: failure.testName,
+                  failed_locator: failure.failedLocator,
+                  healed_locator: outcome.suggestion.newLocator,
+                  healing_strategy: outcome.suggestion.strategy,
+                  ai_tokens_used: outcome.suggestion.tokensUsed,
+                  success: true,
+                  confidence: outcome.suggestion.confidence,
+                  validation_status: 'approved',
+                  validation_reason: `[Iter ${iteration + 1} R${retry + 1}] Confirmed healed via confirmation rerun.`,
+                  patch_path: validation.patchPath,
+                }, job.companyId);
+
+                healings.push({
+                  testName: failure.testName,
+                  failedLocator: failure.failedLocator,
+                  healedLocator: outcome.suggestion.newLocator,
+                  strategy: outcome.suggestion.strategy,
+                  aiTokensUsed: outcome.suggestion.tokensUsed,
+                  success: true,
+                  confidence: outcome.suggestion.confidence,
+                  validated: true,
+                  validationReason: `[Iter ${iteration + 1} R${retry + 1}] Confirmed healed via confirmation rerun.`,
+                  patchPath: validation.patchPath,
+                });
+
+                break;
+              }
+
+              // Confirmation rerun also failed — try to get fresh artifacts
+              let confirmArtifacts: any[] = [];
+              try {
+                confirmArtifacts = collector.collect(confirmRerun.resultsFile, testRepoPath);
+              } catch (e2) {
+                logger.warn(MOD, 'Confirmation rerun artifact collection failed', { error: (e2 as Error).message });
+              }
+              const confirmTestArtifacts = confirmArtifacts.filter((a: any) => {
+                const nf = analyzer.analyze(a);
+                return nf.filePath === failure.filePath && nf.testName === currentTestName;
+              });
+              if (confirmTestArtifacts.length > 0) {
+                const confirmFailure = analyzer.analyze(confirmTestArtifacts[0]);
+                if (confirmFailure.failedLocator && confirmFailure.failedLocator !== failure.failedLocator) {
+                  // Different locator — treat as progression
+                  locatorFixed = true;
+                  iterFixCount++;
+                  healedLocators.add(failure.failedLocator);
+                  failure = confirmFailure;
+                  logger.info(MOD, 'Confirmation rerun shows different locator — advancing', {
+                    newLocator: confirmFailure.failedLocator,
+                  });
+                  break;
+                }
+              }
+
+              // Still can't determine — revert and try next suggestion
+              logger.warn(MOD, 'Cannot confirm fix, reverting', { iteration, retry });
+              fs.writeFileSync(failure.filePath, fileContentBeforeFix, 'utf-8');
+              continue;
             }
 
             // Use Healing Acceptance Engine for live validation decision

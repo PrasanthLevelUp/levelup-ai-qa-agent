@@ -235,7 +235,32 @@ export class ValidationLayer {
       if (result !== content) return result;
     }
 
-    // Fallback: simple string replacement
+    // Fallback: Try replacing the raw locator string in ANY Playwright API pattern
+    // This catches patterns we haven't explicitly handled above
+    const allPatterns = [
+      // page.X('locator') → pwLocator.X()
+      { regex: new RegExp(`page\\.(\\w+)\\((['\"])${escapedLocator}\\2\\)`, 'g'), replacement: `${pwLocator}.$1()` },
+      // page.X('locator', ...) → pwLocator.X(...)
+      { regex: new RegExp(`page\\.(\\w+)\\((['\"])${escapedLocator}\\2\\s*,\\s*`, 'g'), replacement: `${pwLocator}.$1(` },
+    ];
+
+    for (const p of allPatterns) {
+      if (p.regex.test(content)) {
+        result = content.replace(new RegExp(p.regex.source, 'g'), p.replacement);
+        if (result !== content) return result;
+      }
+    }
+
+    // Last resort: direct string replacement (only within quotes to avoid breaking code structure)
+    const quotedPattern = new RegExp(`(['"])${escapedLocator}\\1`, 'g');
+    if (quotedPattern.test(content)) {
+      return content.replace(new RegExp(`(['"])${escapedLocator}\\1`, 'g'), `'${newLocatorExpr}'`);
+    }
+
+    // Absolute last fallback
+    logger.warn(MOD, 'Using raw string replacement fallback — may produce invalid code', {
+      failedLocator, newLocatorExpr,
+    });
     return content.replace(failedLocator, newLocatorExpr);
   }
 
@@ -246,6 +271,22 @@ export class ValidationLayer {
     if (!result.includes("waitForLoadState('networkidle')")) {
       result = result.replace(/(await page\.goto\([^;]+;)/, "$1\n  await page.waitForLoadState('networkidle');");
     }
+
+    // 1b. Add waitForLoadState('networkidle') after login/submit button clicks
+    // After clicking a login/submit button, the page often navigates to a new route.
+    // Without an explicit wait, subsequent locator lookups may fail due to page transition.
+    result = result.replace(
+      /(await\s+page\.getByRole\(\s*'button'[^)]*\)\.click\([^)]*\)\s*;)([ \t]*\n)/g,
+      (match, clickLine, lineEnd) => {
+        // Skip if the next content already has waitForLoadState or waitForURL
+        const afterPos = result.indexOf(match) + match.length;
+        const nextChunk = result.slice(afterPos, afterPos + 200);
+        if (/waitForLoadState|waitForURL|waitForNavigation/.test(nextChunk.split('\n')[0] || '')) {
+          return match;
+        }
+        return `${clickLine}${lineEnd}    await page.waitForLoadState('networkidle');\n`;
+      }
+    );
 
     // 2. Add explicit timeout to locator actions that don't already have one.
     // This handles locator_timeout failures where the element exists but takes

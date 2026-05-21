@@ -19,7 +19,12 @@ export interface LocatorInfo {
 }
 
 const LOCATOR_PATTERNS = [
+  // Playwright errors use double quotes: locator("selector")
+  // Test source code uses single quotes: locator('selector')
+  // Handle both, plus escaped inner quotes: locator("a:has-text(\"Sign Out\")")
+  { pattern: /locator\("([^"\\]*(?:\\.[^"\\]*)*)"\)/, group: 1 },
   { pattern: /locator\('([^']+)'\)/, group: 1 },
+  { pattern: /waiting for locator\("([^"\\]*(?:\\.[^"\\]*)*)"\)/, group: 1 },
   { pattern: /waiting for locator\('([^']+)'\)/, group: 1 },
   // With page. prefix (from test code)
   { pattern: /page\.getByRole\(([^)]+)\)/, group: 0 },
@@ -66,7 +71,10 @@ export function extractLocator(errorMessage: string): LocatorInfo | null {
     const prefix = (entry as any).prefix || '';
     const match = pattern.exec(errorMessage);
     if (match) {
-      const rawMatch = (match[group] || match[1] || '').replace(/^['"]|['"]$/g, '').trim();
+      const rawMatch = (match[group] || match[1] || '')
+        .replace(/^['"]|['"]$/g, '')  // Strip surrounding quotes
+        .replace(/\\"/g, '"')          // Unescape inner quotes (Playwright error format)
+        .trim();
       const rawLocator = prefix ? prefix + rawMatch : rawMatch;
       const locatorType = detectLocatorType(rawLocator);
 

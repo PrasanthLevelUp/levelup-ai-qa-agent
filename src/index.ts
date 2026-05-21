@@ -155,7 +155,7 @@ async function runCLI(): Promise<void> {
     });
   }
 
-  const MAX_HEAL_ITERATIONS = 10;
+  const MAX_HEAL_ITERATIONS = 15;
 
   // De-duplicate artifacts by test name
   const seenTestsCli = new Set<string>();
