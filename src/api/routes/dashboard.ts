@@ -589,3 +589,5 @@ export function createDashboardRouter(): Router {
 
   return router;
 }
+
+// Trigger Railway redeploy — dashboard TS2345 fix verified
