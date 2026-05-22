@@ -55,7 +55,7 @@ export function createDashboardRouter(): Router {
   /** GET /api/dashboard/healings/:id */
   router.get('/healings/:id', async (req: Request, res: Response) => {
     try {
-      const id = parseInt(req.params.id, 10);
+      const id = parseInt(String(req.params.id), 10);
       if (!id) return res.status(400).json({ error: 'Invalid ID' });
 
       const pool = getPool();
@@ -458,7 +458,7 @@ export function createDashboardRouter(): Router {
   /** GET /api/dashboard/scripts/:id */
   router.get('/scripts/:id', async (req: Request, res: Response) => {
     try {
-      const id = parseInt(req.params.id, 10);
+      const id = parseInt(String(req.params.id), 10);
       if (isNaN(id)) return res.status(400).json({ success: false, error: 'Invalid ID' });
 
       const pool = getPool();
@@ -550,7 +550,7 @@ export function createDashboardRouter(): Router {
   /** GET /api/dashboard/project-context/:id */
   router.get('/project-context/:id', async (req: Request, res: Response) => {
     try {
-      const id = parseInt(req.params.id, 10);
+      const id = parseInt(String(req.params.id), 10);
       if (isNaN(id)) return res.status(400).json({ success: false, error: 'Invalid ID' });
 
       const pool = getPool();
@@ -575,7 +575,7 @@ export function createDashboardRouter(): Router {
   /** DELETE /api/dashboard/project-context/:id */
   router.delete('/project-context/:id', async (req: Request, res: Response) => {
     try {
-      const id = parseInt(req.params.id, 10);
+      const id = parseInt(String(req.params.id), 10);
       if (isNaN(id)) return res.status(400).json({ success: false, error: 'Invalid ID' });
 
       const pool = getPool();
