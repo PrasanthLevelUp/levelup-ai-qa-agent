@@ -730,6 +730,51 @@ async function migrateDefaultCompany(client: PoolClient): Promise<void> {
     );
     CREATE INDEX IF NOT EXISTS idx_app_knowledge_company ON application_knowledge(company_id);
     CREATE INDEX IF NOT EXISTS idx_app_knowledge_module ON application_knowledge(module);
+
+    -- ========================================================================
+    -- Knowledge Management — Enterprise Knowledge Graph
+    -- ========================================================================
+
+    CREATE TABLE IF NOT EXISTS knowledge_items (
+      id SERIAL PRIMARY KEY,
+      company_id INTEGER REFERENCES companies(id),
+      category VARCHAR(50) NOT NULL CHECK (category IN (
+        'business_rule','workflow','architecture','dependency','integration',
+        'automation','manual_test','bug_pattern','domain'
+      )),
+      title VARCHAR(500) NOT NULL,
+      description TEXT NOT NULL,
+      metadata JSONB DEFAULT '{}',
+      tags TEXT[] DEFAULT '{}',
+      related_modules TEXT[] DEFAULT '{}',
+      status VARCHAR(20) NOT NULL DEFAULT 'active' CHECK (status IN ('draft','active','archived')),
+      priority VARCHAR(20) NOT NULL DEFAULT 'medium' CHECK (priority IN ('low','medium','high','critical')),
+      created_by VARCHAR(200),
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      updated_at TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_ki_company ON knowledge_items(company_id);
+    CREATE INDEX IF NOT EXISTS idx_ki_category ON knowledge_items(category);
+    CREATE INDEX IF NOT EXISTS idx_ki_status ON knowledge_items(status);
+    CREATE INDEX IF NOT EXISTS idx_ki_tags ON knowledge_items USING GIN(tags);
+    CREATE INDEX IF NOT EXISTS idx_ki_modules ON knowledge_items USING GIN(related_modules);
+    CREATE INDEX IF NOT EXISTS idx_ki_search ON knowledge_items USING GIN(to_tsvector('english', coalesce(title,'') || ' ' || coalesce(description,'')));
+
+    CREATE TABLE IF NOT EXISTS knowledge_relationships (
+      id SERIAL PRIMARY KEY,
+      company_id INTEGER REFERENCES companies(id),
+      source_knowledge_id INTEGER NOT NULL REFERENCES knowledge_items(id) ON DELETE CASCADE,
+      target_knowledge_id INTEGER NOT NULL REFERENCES knowledge_items(id) ON DELETE CASCADE,
+      relationship_type VARCHAR(30) NOT NULL CHECK (relationship_type IN (
+        'depends_on','related_to','implements','blocks','duplicates'
+      )),
+      description TEXT,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      UNIQUE(source_knowledge_id, target_knowledge_id, relationship_type)
+    );
+    CREATE INDEX IF NOT EXISTS idx_kr_source ON knowledge_relationships(source_knowledge_id);
+    CREATE INDEX IF NOT EXISTS idx_kr_target ON knowledge_relationships(target_knowledge_id);
+    CREATE INDEX IF NOT EXISTS idx_kr_company ON knowledge_relationships(company_id);
   `);
 }
 
@@ -3747,4 +3792,301 @@ export async function listRepositoryContexts(
     updatedAt: r.updated_at,
     version: r.profile_version ?? 1,
   }));
+}
+
+
+
+/* ========================================================================== */
+/*  Knowledge Management — CRUD, Search, Relationships, Stats                 */
+/* ========================================================================== */
+
+const KNOWLEDGE_CATEGORIES = [
+  'business_rule','workflow','architecture','dependency','integration',
+  'automation','manual_test','bug_pattern','domain',
+] as const;
+type KnowledgeCategory = typeof KNOWLEDGE_CATEGORIES[number];
+
+const KNOWLEDGE_STATUSES = ['draft','active','archived'] as const;
+const KNOWLEDGE_PRIORITIES = ['low','medium','high','critical'] as const;
+const RELATIONSHIP_TYPES = ['depends_on','related_to','implements','blocks','duplicates'] as const;
+
+// ---- Knowledge Items CRUD ----
+
+export async function createKnowledgeItem(data: {
+  companyId?: number; category: string; title: string; description: string;
+  metadata?: any; tags?: string[]; relatedModules?: string[];
+  status?: string; priority?: string; createdBy?: string;
+}): Promise<any> {
+  const pool = getPool();
+  const r = await pool.query(
+    `INSERT INTO knowledge_items
+       (company_id, category, title, description, metadata, tags, related_modules,
+        status, priority, created_by)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+     RETURNING *`,
+    [
+      data.companyId || null,
+      data.category,
+      data.title,
+      data.description,
+      JSON.stringify(data.metadata || {}),
+      data.tags || [],
+      data.relatedModules || [],
+      data.status || 'active',
+      data.priority || 'medium',
+      data.createdBy || null,
+    ]
+  );
+  return r.rows[0];
+}
+
+export async function updateKnowledgeItem(id: number, companyId: number | undefined, data: {
+  category?: string; title?: string; description?: string;
+  metadata?: any; tags?: string[]; relatedModules?: string[];
+  status?: string; priority?: string;
+}): Promise<any | null> {
+  const pool = getPool();
+  const sets: string[] = [];
+  const params: any[] = [];
+  let idx = 1;
+
+  if (data.category !== undefined) { sets.push(`category = $${idx}`); params.push(data.category); idx++; }
+  if (data.title !== undefined) { sets.push(`title = $${idx}`); params.push(data.title); idx++; }
+  if (data.description !== undefined) { sets.push(`description = $${idx}`); params.push(data.description); idx++; }
+  if (data.metadata !== undefined) { sets.push(`metadata = $${idx}`); params.push(JSON.stringify(data.metadata)); idx++; }
+  if (data.tags !== undefined) { sets.push(`tags = $${idx}`); params.push(data.tags); idx++; }
+  if (data.relatedModules !== undefined) { sets.push(`related_modules = $${idx}`); params.push(data.relatedModules); idx++; }
+  if (data.status !== undefined) { sets.push(`status = $${idx}`); params.push(data.status); idx++; }
+  if (data.priority !== undefined) { sets.push(`priority = $${idx}`); params.push(data.priority); idx++; }
+
+  if (sets.length === 0) return null;
+  sets.push('updated_at = NOW()');
+
+  params.push(id); const idIdx = idx; idx++;
+  let where = `id = $${idIdx}`;
+  if (companyId) { params.push(companyId); where += ` AND company_id = $${idx}`; }
+
+  const r = await pool.query(
+    `UPDATE knowledge_items SET ${sets.join(', ')} WHERE ${where} RETURNING *`,
+    params
+  );
+  return r.rows[0] || null;
+}
+
+export async function getKnowledgeItem(id: number, companyId?: number): Promise<any | null> {
+  const pool = getPool();
+  const params: any[] = [id];
+  let where = 'id = $1';
+  if (companyId) { params.push(companyId); where += ` AND company_id = $2`; }
+  const r = await pool.query(`SELECT * FROM knowledge_items WHERE ${where}`, params);
+  return r.rows[0] || null;
+}
+
+export async function deleteKnowledgeItem(id: number, companyId?: number): Promise<boolean> {
+  const pool = getPool();
+  const params: any[] = [id];
+  let where = 'id = $1';
+  if (companyId) { params.push(companyId); where += ` AND company_id = $2`; }
+  const r = await pool.query(`DELETE FROM knowledge_items WHERE ${where}`, params);
+  return (r.rowCount ?? 0) > 0;
+}
+
+export async function listKnowledgeItems(opts: {
+  companyId?: number; category?: string; status?: string; priority?: string;
+  tags?: string[]; module?: string; search?: string;
+  limit?: number; offset?: number; sortBy?: string; sortDir?: string;
+}): Promise<{ items: any[]; total: number }> {
+  const pool = getPool();
+  const conds: string[] = [];
+  const params: any[] = [];
+  let idx = 1;
+
+  if (opts.companyId) { conds.push(`company_id = $${idx}`); params.push(opts.companyId); idx++; }
+  if (opts.category) { conds.push(`category = $${idx}`); params.push(opts.category); idx++; }
+  if (opts.status) { conds.push(`status = $${idx}`); params.push(opts.status); idx++; }
+  if (opts.priority) { conds.push(`priority = $${idx}`); params.push(opts.priority); idx++; }
+  if (opts.tags?.length) { conds.push(`tags && $${idx}`); params.push(opts.tags); idx++; }
+  if (opts.module) { conds.push(`$${idx} = ANY(related_modules)`); params.push(opts.module); idx++; }
+  if (opts.search) {
+    conds.push(`to_tsvector('english', coalesce(title,'') || ' ' || coalesce(description,'')) @@ plainto_tsquery('english', $${idx})`);
+    params.push(opts.search); idx++;
+  }
+
+  const whereClause = conds.length > 0 ? `WHERE ${conds.join(' AND ')}` : '';
+
+  const allowedSorts: Record<string, string> = {
+    created_at: 'created_at', updated_at: 'updated_at', title: 'title',
+    category: 'category', priority: 'priority', status: 'status',
+  };
+  const sortCol = allowedSorts[opts.sortBy || 'updated_at'] || 'updated_at';
+  const sortDir = opts.sortDir === 'asc' ? 'ASC' : 'DESC';
+
+  const countR = await pool.query(`SELECT COUNT(*) as c FROM knowledge_items ${whereClause}`, params);
+  const total = parseInt(countR.rows[0].c, 10);
+
+  const limit = Math.min(opts.limit || 50, 200);
+  const offset = opts.offset || 0;
+
+  params.push(limit); const limIdx = idx; idx++;
+  params.push(offset); const offIdx = idx;
+
+  const r = await pool.query(
+    `SELECT * FROM knowledge_items ${whereClause}
+     ORDER BY ${sortCol} ${sortDir}
+     LIMIT $${limIdx} OFFSET $${offIdx}`,
+    params
+  );
+
+  return { items: r.rows, total };
+}
+
+// ---- Full-text search ----
+
+export async function searchKnowledgeItems(query: string, companyId?: number, limit = 20): Promise<any[]> {
+  const pool = getPool();
+  const params: any[] = [query, limit];
+  let companyFilter = '';
+  if (companyId) { params.push(companyId); companyFilter = `AND company_id = $3`; }
+
+  const r = await pool.query(
+    `SELECT *, ts_rank(
+        to_tsvector('english', coalesce(title,'') || ' ' || coalesce(description,'')),
+        plainto_tsquery('english', $1)
+     ) as rank
+     FROM knowledge_items
+     WHERE to_tsvector('english', coalesce(title,'') || ' ' || coalesce(description,''))
+           @@ plainto_tsquery('english', $1)
+       AND status != 'archived'
+       ${companyFilter}
+     ORDER BY rank DESC
+     LIMIT $2`,
+    params
+  );
+  return r.rows;
+}
+
+// ---- Knowledge Statistics ----
+
+export async function getKnowledgeStats(companyId?: number): Promise<{
+  total: number; byCategory: Record<string, number>;
+  byStatus: Record<string, number>; byPriority: Record<string, number>;
+  recentCount: number; tagCloud: Array<{ tag: string; count: number }>;
+}> {
+  const pool = getPool();
+  const cond = companyId ? 'WHERE company_id = $1' : '';
+  const params = companyId ? [companyId] : [];
+
+  const totalR = await pool.query(`SELECT COUNT(*) as c FROM knowledge_items ${cond}`, params);
+  const total = parseInt(totalR.rows[0].c, 10);
+
+  const catR = await pool.query(
+    `SELECT category, COUNT(*) as c FROM knowledge_items ${cond} GROUP BY category ORDER BY c DESC`, params
+  );
+  const byCategory: Record<string, number> = {};
+  catR.rows.forEach((r: any) => { byCategory[r.category] = parseInt(r.c, 10); });
+
+  const statusR = await pool.query(
+    `SELECT status, COUNT(*) as c FROM knowledge_items ${cond} GROUP BY status`, params
+  );
+  const byStatus: Record<string, number> = {};
+  statusR.rows.forEach((r: any) => { byStatus[r.status] = parseInt(r.c, 10); });
+
+  const prioR = await pool.query(
+    `SELECT priority, COUNT(*) as c FROM knowledge_items ${cond} GROUP BY priority`, params
+  );
+  const byPriority: Record<string, number> = {};
+  prioR.rows.forEach((r: any) => { byPriority[r.priority] = parseInt(r.c, 10); });
+
+  const recentCond = companyId
+    ? `WHERE company_id = $1 AND created_at > NOW() - INTERVAL '7 days'`
+    : `WHERE created_at > NOW() - INTERVAL '7 days'`;
+  const recentR = await pool.query(`SELECT COUNT(*) as c FROM knowledge_items ${recentCond}`, params);
+  const recentCount = parseInt(recentR.rows[0].c, 10);
+
+  // Tag cloud — unnest tags and count
+  const tagR = await pool.query(
+    `SELECT unnest(tags) as tag, COUNT(*) as c FROM knowledge_items ${cond}
+     GROUP BY tag ORDER BY c DESC LIMIT 30`, params
+  );
+  const tagCloud = tagR.rows.map((r: any) => ({ tag: r.tag, count: parseInt(r.c, 10) }));
+
+  return { total, byCategory, byStatus, byPriority, recentCount, tagCloud };
+}
+
+// ---- Get all unique tags ----
+
+export async function getKnowledgeTags(companyId?: number): Promise<string[]> {
+  const pool = getPool();
+  const cond = companyId ? 'WHERE company_id = $1' : '';
+  const params = companyId ? [companyId] : [];
+  const r = await pool.query(
+    `SELECT DISTINCT unnest(tags) as tag FROM knowledge_items ${cond} ORDER BY tag`, params
+  );
+  return r.rows.map((row: any) => row.tag);
+}
+
+// ---- Get category distribution ----
+
+export async function getKnowledgeCategoryDistribution(companyId?: number): Promise<Array<{category: string; count: number; active: number}>> {
+  const pool = getPool();
+  const cond = companyId ? 'WHERE company_id = $1' : '';
+  const params = companyId ? [companyId] : [];
+  const r = await pool.query(
+    `SELECT category,
+            COUNT(*) as total,
+            COUNT(*) FILTER (WHERE status = 'active') as active
+     FROM knowledge_items ${cond}
+     GROUP BY category
+     ORDER BY total DESC`, params
+  );
+  return r.rows.map((row: any) => ({
+    category: row.category,
+    count: parseInt(row.total, 10),
+    active: parseInt(row.active, 10),
+  }));
+}
+
+// ---- Knowledge Relationships ----
+
+export async function createKnowledgeRelationship(data: {
+  companyId?: number; sourceKnowledgeId: number; targetKnowledgeId: number;
+  relationshipType: string; description?: string;
+}): Promise<any> {
+  const pool = getPool();
+  const r = await pool.query(
+    `INSERT INTO knowledge_relationships
+       (company_id, source_knowledge_id, target_knowledge_id, relationship_type, description)
+     VALUES ($1,$2,$3,$4,$5)
+     ON CONFLICT (source_knowledge_id, target_knowledge_id, relationship_type) DO UPDATE
+       SET description = EXCLUDED.description
+     RETURNING *`,
+    [data.companyId || null, data.sourceKnowledgeId, data.targetKnowledgeId,
+     data.relationshipType, data.description || null]
+  );
+  return r.rows[0];
+}
+
+export async function getKnowledgeRelationships(knowledgeId: number): Promise<any[]> {
+  const pool = getPool();
+  const r = await pool.query(
+    `SELECT kr.*,
+       ks.title as source_title, ks.category as source_category,
+       kt.title as target_title, kt.category as target_category
+     FROM knowledge_relationships kr
+     JOIN knowledge_items ks ON kr.source_knowledge_id = ks.id
+     JOIN knowledge_items kt ON kr.target_knowledge_id = kt.id
+     WHERE kr.source_knowledge_id = $1 OR kr.target_knowledge_id = $1
+     ORDER BY kr.created_at DESC`,
+    [knowledgeId]
+  );
+  return r.rows;
+}
+
+export async function deleteKnowledgeRelationship(id: number, companyId?: number): Promise<boolean> {
+  const pool = getPool();
+  const params: any[] = [id];
+  let where = 'id = $1';
+  if (companyId) { params.push(companyId); where += ` AND company_id = $2`; }
+  const r = await pool.query(`DELETE FROM knowledge_relationships WHERE ${where}`, params);
+  return (r.rowCount ?? 0) > 0;
 }
