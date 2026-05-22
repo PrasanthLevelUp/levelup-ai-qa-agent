@@ -18,6 +18,7 @@ import {
   createKnowledgeRelationship,
   getKnowledgeRelationships,
   deleteKnowledgeRelationship,
+  suggestKnowledgeItems,
 } from '../../db/postgres';
 
 const MOD = 'knowledge-routes';
@@ -72,6 +73,29 @@ export function createKnowledgeRouter(): Router {
     } catch (err: any) {
       logger.error(MOD, 'Failed to get knowledge stats', { error: err.message });
       return res.status(500).json({ error: 'Failed to get stats', details: err.message });
+    }
+  });
+
+  /* ---- GET /suggest — Suggest relevant knowledge for test generation ---- */
+  router.get('/suggest', async (req: Request, res: Response) => {
+    try {
+      const companyId = (req as any).companyId;
+      const module = req.query.module ? String(req.query.module).trim() : undefined;
+      const searchTerm = req.query.searchTerm ? String(req.query.searchTerm).trim() : undefined;
+      const category = req.query.category ? String(req.query.category).trim() : undefined;
+      const limit = req.query.limit ? parseInt(String(req.query.limit), 10) : 10;
+
+      if (!module && !searchTerm && !category) {
+        // Return recent high-priority items as default suggestions
+        const items = await suggestKnowledgeItems({ companyId, limit });
+        return res.json(items);
+      }
+
+      const items = await suggestKnowledgeItems({ companyId, module, searchTerm, category, limit });
+      return res.json(items);
+    } catch (err: any) {
+      logger.error(MOD, 'Suggest failed', { error: err.message });
+      return res.status(500).json({ error: 'Suggest failed', details: err.message });
     }
   });
 

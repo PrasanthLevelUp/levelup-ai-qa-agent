@@ -24,6 +24,7 @@ import {
   getApplicationKnowledge,
   deleteApplicationKnowledge,
   getTestCoverageStats,
+  getKnowledgeItem,
 } from '../../db/postgres';
 
 const MOD = 'test-coverage-routes';
@@ -43,6 +44,7 @@ export function createTestCoverageRouter(): Router {
       const {
         title, description, jiraId, businessFlow, acceptanceCriteria,
         apiDocs, releaseNotes, module: mod, coverageTypes,
+        knowledgeItemIds,
       } = req.body;
 
       if (!title || !description) {
@@ -54,9 +56,9 @@ export function createTestCoverageRouter(): Router {
         : ['positive', 'negative', 'edge_cases'];
 
       const companyId = (req as any).companyId;
-      logger.info(MOD, 'Generate request', { title, companyId, coverageTypes: selectedTypes });
+      logger.info(MOD, 'Generate request', { title, companyId, coverageTypes: selectedTypes, knowledgeItemIds });
 
-      // Fetch app knowledge for context
+      // Fetch app knowledge for context (legacy application_knowledge table)
       let knowledge: KnowledgeContext = { modules: [], historicalBugs: [] };
       try {
         const knowledgeRows = await getApplicationKnowledge(companyId);
@@ -72,7 +74,35 @@ export function createTestCoverageRouter(): Router {
             .map((k: any) => k.historical_bugs),
         };
       } catch (knowledgeErr: any) {
-        logger.warn(MOD, 'Could not load knowledge context', { error: knowledgeErr.message });
+        logger.warn(MOD, 'Could not load legacy knowledge context', { error: knowledgeErr.message });
+      }
+
+      // Fetch enterprise knowledge items if IDs provided
+      let knowledgeItemsUsed: any[] = [];
+      if (Array.isArray(knowledgeItemIds) && knowledgeItemIds.length > 0) {
+        try {
+          const items = await Promise.all(
+            knowledgeItemIds.slice(0, 20).map((id: number) => getKnowledgeItem(id, companyId))
+          );
+          knowledgeItemsUsed = items.filter(Boolean);
+          logger.info(MOD, 'Enterprise knowledge items loaded', { requested: knowledgeItemIds.length, found: knowledgeItemsUsed.length });
+
+          // Merge enterprise knowledge into context
+          if (knowledgeItemsUsed.length > 0) {
+            knowledge.enterpriseKnowledge = knowledgeItemsUsed.map((ki: any) => ({
+              id: ki.id,
+              category: ki.category,
+              title: ki.title,
+              description: ki.description,
+              tags: ki.tags || [],
+              relatedModules: ki.related_modules || [],
+              priority: ki.priority,
+              metadata: ki.metadata,
+            }));
+          }
+        } catch (kiErr: any) {
+          logger.warn(MOD, 'Could not load enterprise knowledge items', { error: kiErr.message });
+        }
       }
 
       const input: RequirementInput = {
@@ -80,7 +110,10 @@ export function createTestCoverageRouter(): Router {
         acceptanceCriteria, apiDocs, releaseNotes, module: mod,
       };
 
-      logger.info(MOD, 'Calling AI engine for test coverage generation');
+      logger.info(MOD, 'Calling AI engine for test coverage generation', {
+        knowledgeModules: knowledge.modules?.length || 0,
+        enterpriseKnowledge: knowledge.enterpriseKnowledge?.length || 0,
+      });
       const result = await getEngine().generateFullCoverage(input, selectedTypes, knowledge);
       logger.info(MOD, 'AI engine returned', {
         scenarios: result.scenarios.length,
@@ -88,7 +121,13 @@ export function createTestCoverageRouter(): Router {
         gaps: result.coverageGaps.length,
       });
 
-      // Persist to DB
+      // Persist to DB — store knowledge item references in analysis
+      const analysisWithKnowledge = {
+        ...result.requirementAnalysis,
+        knowledgeItemIds: knowledgeItemsUsed.map((ki: any) => ki.id),
+        knowledgeItemTitles: knowledgeItemsUsed.map((ki: any) => ki.title),
+      };
+
       let reqId: number;
       try {
         reqId = await createTestRequirement({
@@ -96,7 +135,7 @@ export function createTestCoverageRouter(): Router {
           apiDocs, releaseNotes, module: mod,
           featureType: result.requirementAnalysis.featureType,
           riskLevel: result.requirementAnalysis.riskLevel,
-          analysis: result.requirementAnalysis,
+          analysis: analysisWithKnowledge,
           companyId,
         });
         logger.info(MOD, 'Requirement persisted', { reqId });
@@ -165,6 +204,11 @@ export function createTestCoverageRouter(): Router {
       return res.json({
         requirementId: reqId,
         ...result,
+        knowledgeUsed: knowledgeItemsUsed.length > 0 ? knowledgeItemsUsed.map((ki: any) => ({
+          id: ki.id,
+          title: ki.title,
+          category: ki.category,
+        })) : undefined,
       });
     } catch (err: any) {
       logger.error(MOD, 'Generation failed', { error: err.message, stack: err.stack });

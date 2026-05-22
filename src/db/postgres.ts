@@ -4090,3 +4090,83 @@ export async function deleteKnowledgeRelationship(id: number, companyId?: number
   const r = await pool.query(`DELETE FROM knowledge_relationships WHERE ${where}`, params);
   return (r.rowCount ?? 0) > 0;
 }
+
+
+
+/* ------------------------------------------------------------------ */
+/*  Knowledge Suggestion for Test Case Lab Integration                 */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Suggest relevant knowledge items based on module, search term, and/or category.
+ * Prioritizes: module match > text relevance > business_rule/workflow categories.
+ * Returns top N most relevant items (default 10).
+ */
+export async function suggestKnowledgeItems(opts: {
+  companyId?: number;
+  module?: string;
+  searchTerm?: string;
+  category?: string;
+  limit?: number;
+}): Promise<any[]> {
+  const pool = getPool();
+  const limit = opts.limit || 10;
+  const params: any[] = [];
+  let paramIdx = 0;
+
+  // Build scoring query
+  const scoreExprs: string[] = [];
+  const conditions: string[] = ['status = \'active\''];
+
+  if (opts.companyId) {
+    paramIdx++;
+    conditions.push(`company_id = $${paramIdx}`);
+    params.push(opts.companyId);
+  }
+
+  if (opts.category) {
+    paramIdx++;
+    conditions.push(`category = $${paramIdx}`);
+    params.push(opts.category);
+  }
+
+  // Module matching: exact array match or partial match in title/description
+  if (opts.module) {
+    paramIdx++;
+    params.push(opts.module);
+    // Score boost for related_modules array containing the module
+    scoreExprs.push(`CASE WHEN $${paramIdx} = ANY(related_modules) THEN 10 ELSE 0 END`);
+    // Partial match in title/description
+    scoreExprs.push(`CASE WHEN title ILIKE '%' || $${paramIdx} || '%' OR description ILIKE '%' || $${paramIdx} || '%' THEN 3 ELSE 0 END`);
+  }
+
+  // Full-text search boost
+  if (opts.searchTerm) {
+    paramIdx++;
+    const tsQuery = opts.searchTerm.trim().split(/\s+/).join(' & ');
+    params.push(tsQuery);
+    scoreExprs.push(`CASE WHEN to_tsvector('english', coalesce(title,'') || ' ' || coalesce(description,'')) @@ to_tsquery('english', $${paramIdx}) THEN 5 ELSE 0 END`);
+  }
+
+  // Category relevance boost (business_rule and workflow are most useful for test gen)
+  scoreExprs.push(`CASE WHEN category IN ('business_rule', 'workflow', 'bug_pattern') THEN 2 WHEN category IN ('integration', 'architecture', 'domain') THEN 1 ELSE 0 END`);
+
+  // Priority boost
+  scoreExprs.push(`CASE WHEN priority = 'critical' THEN 2 WHEN priority = 'high' THEN 1 ELSE 0 END`);
+
+  const scoreExpr = scoreExprs.length > 0 ? scoreExprs.join(' + ') : '0';
+
+  paramIdx++;
+  params.push(limit);
+
+  const sql = `
+    SELECT *, (${scoreExpr}) AS relevance_score
+    FROM knowledge_items
+    WHERE ${conditions.join(' AND ')}
+    ORDER BY relevance_score DESC, updated_at DESC
+    LIMIT $${paramIdx}
+  `;
+
+  const r = await pool.query(sql, params);
+  return r.rows;
+}
