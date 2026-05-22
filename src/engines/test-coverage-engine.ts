@@ -341,8 +341,13 @@ Return ONLY valid JSON array.`;
         { role: 'user', content: prompt },
       ],
     });
-    const content = resp.choices[0]?.message?.content || '{}';
+    let content = resp.choices[0]?.message?.content || '{}';
+    // Strip markdown code fences that GPT sometimes wraps around JSON
+    content = content.trim();
+    if (content.startsWith('```')) {
+      content = content.replace(/^```(?:json)?\s*\n?/, '').replace(/\n?```\s*$/, '');
+    }
     const tokensUsed = (resp.usage?.prompt_tokens || 0) + (resp.usage?.completion_tokens || 0);
-    return { content, tokensUsed };
+    return { content: content.trim(), tokensUsed };
   }
 }
