@@ -5,6 +5,13 @@
 
 import { Router, type Request, type Response } from 'express';
 import { getPool } from '../../db/postgres';
+import {
+  getDailyAiMetrics,
+  getAiUsageByModel,
+  getAiUsageByFeature,
+  getAiCostTrend,
+  getDailyBudgetStatus,
+} from '../../db/postgres';
 import { logger } from '../../utils/logger';
 
 const MOD = 'dashboard-api';
@@ -584,6 +591,74 @@ export function createDashboardRouter(): Router {
     } catch (err) {
       logger.error(MOD, 'project-context DELETE failed', { error: err });
       res.status(500).json({ success: false, error: 'Failed to delete context' });
+    }
+  });
+
+  // ─── AI Cost Dashboard ────────────────────────────────────────────
+
+  /** GET /api/dashboard/ai-usage/daily — today's AI usage metrics */
+  router.get('/ai-usage/daily', async (_req: Request, res: Response) => {
+    try {
+      const metrics = await getDailyAiMetrics();
+      const maxDaily = parseFloat(process.env['MAX_DAILY_AI_COST_USD'] || '5.00');
+      res.json({
+        success: true,
+        data: {
+          ...metrics,
+          budgetRemaining: maxDaily - metrics.dailyCostUsd,
+          isOverBudget: metrics.dailyCostUsd >= maxDaily,
+          monthlyProjection: metrics.dailyCostUsd * 30,
+        },
+      });
+    } catch (err) {
+      logger.error(MOD, 'ai-usage daily failed', { error: err });
+      res.status(500).json({ success: false, error: 'Failed to fetch AI usage metrics' });
+    }
+  });
+
+  /** GET /api/dashboard/ai-usage/by-model — usage breakdown by model */
+  router.get('/ai-usage/by-model', async (_req: Request, res: Response) => {
+    try {
+      const data = await getAiUsageByModel();
+      res.json({ success: true, data });
+    } catch (err) {
+      logger.error(MOD, 'ai-usage by-model failed', { error: err });
+      res.status(500).json({ success: false, error: 'Failed to fetch model usage' });
+    }
+  });
+
+  /** GET /api/dashboard/ai-usage/by-feature — usage breakdown by feature (current month) */
+  router.get('/ai-usage/by-feature', async (_req: Request, res: Response) => {
+    try {
+      const data = await getAiUsageByFeature();
+      res.json({ success: true, data });
+    } catch (err) {
+      logger.error(MOD, 'ai-usage by-feature failed', { error: err });
+      res.status(500).json({ success: false, error: 'Failed to fetch feature usage' });
+    }
+  });
+
+  /** GET /api/dashboard/ai-usage/trend?days=30 — daily cost trend */
+  router.get('/ai-usage/trend', async (req: Request, res: Response) => {
+    try {
+      const days = Math.min(parseInt(req.query.days as string) || 30, 90);
+      const data = await getAiCostTrend(days);
+      res.json({ success: true, data });
+    } catch (err) {
+      logger.error(MOD, 'ai-usage trend failed', { error: err });
+      res.status(500).json({ success: false, error: 'Failed to fetch cost trend' });
+    }
+  });
+
+  /** GET /api/dashboard/ai-usage/budget — today's budget status */
+  router.get('/ai-usage/budget', async (_req: Request, res: Response) => {
+    try {
+      const maxDaily = parseFloat(process.env['MAX_DAILY_AI_COST_USD'] || '5.00');
+      const data = await getDailyBudgetStatus(maxDaily);
+      res.json({ success: true, data });
+    } catch (err) {
+      logger.error(MOD, 'ai-usage budget failed', { error: err });
+      res.status(500).json({ success: false, error: 'Failed to fetch budget status' });
     }
   });
 

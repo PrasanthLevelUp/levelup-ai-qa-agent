@@ -775,6 +775,23 @@ async function migrateDefaultCompany(client: PoolClient): Promise<void> {
     CREATE INDEX IF NOT EXISTS idx_kr_source ON knowledge_relationships(source_knowledge_id);
     CREATE INDEX IF NOT EXISTS idx_kr_target ON knowledge_relationships(target_knowledge_id);
     CREATE INDEX IF NOT EXISTS idx_kr_company ON knowledge_relationships(company_id);
+
+    -- AI Usage Logging & Cost Tracking
+    CREATE TABLE IF NOT EXISTS ai_usage_logs (
+      id SERIAL PRIMARY KEY,
+      model TEXT NOT NULL,
+      tokens_used INTEGER NOT NULL,
+      cost_usd DECIMAL(10, 6) NOT NULL,
+      feature TEXT NOT NULL,
+      task_type TEXT,
+      user_id TEXT,
+      metadata JSONB,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_ai_usage_date ON ai_usage_logs(DATE(created_at));
+    CREATE INDEX IF NOT EXISTS idx_ai_usage_feature ON ai_usage_logs(feature);
+    CREATE INDEX IF NOT EXISTS idx_ai_usage_user ON ai_usage_logs(user_id);
+    CREATE INDEX IF NOT EXISTS idx_ai_usage_model ON ai_usage_logs(model);
   `);
 }
 
@@ -4169,4 +4186,167 @@ export async function suggestKnowledgeItems(opts: {
 
   const r = await pool.query(sql, params);
   return r.rows;
+}
+
+
+
+/* -------------------------------------------------------------------------- */
+/*  AI Usage Logging & Cost Tracking                                          */
+/* -------------------------------------------------------------------------- */
+
+export async function logAiUsage(record: {
+  model: string;
+  tokensUsed: number;
+  costUsd: number;
+  feature: string;
+  taskType?: string;
+  userId?: string;
+  metadata?: any;
+}): Promise<void> {
+  const pool = getPool();
+  await pool.query(
+    `INSERT INTO ai_usage_logs
+       (model, tokens_used, cost_usd, feature, task_type, user_id, metadata, created_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())`,
+    [
+      record.model,
+      record.tokensUsed,
+      record.costUsd,
+      record.feature,
+      record.taskType || null,
+      record.userId || null,
+      record.metadata ? JSON.stringify(record.metadata) : null,
+    ],
+  );
+}
+
+export async function getDailyAiMetrics(): Promise<{
+  dailyTokens: number;
+  dailyCostUsd: number;
+  byFeature: Record<string, { tokens: number; cost: number; requests: number }>;
+}> {
+  const pool = getPool();
+
+  const totals = await pool.query(
+    `SELECT COALESCE(SUM(tokens_used), 0) AS daily_tokens,
+            COALESCE(SUM(cost_usd), 0)    AS daily_cost
+     FROM ai_usage_logs
+     WHERE DATE(created_at) = CURRENT_DATE`,
+  );
+
+  const features = await pool.query(
+    `SELECT feature,
+            SUM(tokens_used)::int AS tokens,
+            SUM(cost_usd)         AS cost,
+            COUNT(*)::int         AS requests
+     FROM ai_usage_logs
+     WHERE DATE(created_at) = CURRENT_DATE
+     GROUP BY feature
+     ORDER BY cost DESC`,
+  );
+
+  const byFeature: Record<string, { tokens: number; cost: number; requests: number }> = {};
+  for (const r of features.rows) {
+    byFeature[r.feature] = {
+      tokens: parseInt(r.tokens, 10),
+      cost: parseFloat(r.cost),
+      requests: parseInt(r.requests, 10),
+    };
+  }
+
+  return {
+    dailyTokens: parseInt(totals.rows[0]?.daily_tokens ?? '0', 10),
+    dailyCostUsd: parseFloat(totals.rows[0]?.daily_cost ?? '0'),
+    byFeature,
+  };
+}
+
+export async function getAiUsageByModel(): Promise<
+  Array<{ model: string; requests: number; tokens: number; costUsd: number }>
+> {
+  const pool = getPool();
+  const r = await pool.query(
+    `SELECT model,
+            COUNT(*)::int          AS requests,
+            SUM(tokens_used)::int  AS tokens,
+            SUM(cost_usd)          AS cost_usd
+     FROM ai_usage_logs
+     GROUP BY model
+     ORDER BY cost_usd DESC`,
+  );
+  return r.rows.map((row: any) => ({
+    model: row.model,
+    requests: parseInt(row.requests, 10),
+    tokens: parseInt(row.tokens, 10),
+    costUsd: parseFloat(row.cost_usd),
+  }));
+}
+
+export async function getAiUsageByFeature(): Promise<
+  Array<{ feature: string; requests: number; tokens: number; costUsd: number }>
+> {
+  const pool = getPool();
+  const r = await pool.query(
+    `SELECT feature,
+            COUNT(*)::int          AS requests,
+            SUM(tokens_used)::int  AS tokens,
+            SUM(cost_usd)          AS cost_usd
+     FROM ai_usage_logs
+     WHERE created_at >= DATE_TRUNC('month', CURRENT_DATE)
+     GROUP BY feature
+     ORDER BY cost_usd DESC`,
+  );
+  return r.rows.map((row: any) => ({
+    feature: row.feature,
+    requests: parseInt(row.requests, 10),
+    tokens: parseInt(row.tokens, 10),
+    costUsd: parseFloat(row.cost_usd),
+  }));
+}
+
+export async function getAiCostTrend(days: number = 30): Promise<
+  Array<{ date: string; tokens: number; costUsd: number; requests: number }>
+> {
+  const pool = getPool();
+  const r = await pool.query(
+    `SELECT DATE(created_at)::text   AS date,
+            SUM(tokens_used)::int    AS tokens,
+            SUM(cost_usd)            AS cost_usd,
+            COUNT(*)::int            AS requests
+     FROM ai_usage_logs
+     WHERE created_at >= CURRENT_DATE - ($1 || ' days')::interval
+     GROUP BY DATE(created_at)
+     ORDER BY date DESC`,
+    [days],
+  );
+  return r.rows.map((row: any) => ({
+    date: row.date,
+    tokens: parseInt(row.tokens, 10),
+    costUsd: parseFloat(row.cost_usd),
+    requests: parseInt(row.requests, 10),
+  }));
+}
+
+export async function getDailyBudgetStatus(maxDailyCostUsd: number = 5.0): Promise<{
+  date: string;
+  totalCostUsd: number;
+  budgetRemaining: number;
+  isOverBudget: boolean;
+  percentUsed: number;
+}> {
+  const pool = getPool();
+  const r = await pool.query(
+    `SELECT CURRENT_DATE::text              AS date,
+            COALESCE(SUM(cost_usd), 0)      AS total_cost
+     FROM ai_usage_logs
+     WHERE DATE(created_at) = CURRENT_DATE`,
+  );
+  const totalCostUsd = parseFloat(r.rows[0]?.total_cost ?? '0');
+  return {
+    date: r.rows[0]?.date ?? new Date().toISOString().slice(0, 10),
+    totalCostUsd,
+    budgetRemaining: maxDailyCostUsd - totalCostUsd,
+    isOverBudget: totalCostUsd >= maxDailyCostUsd,
+    percentUsed: maxDailyCostUsd > 0 ? Math.round((totalCostUsd / maxDailyCostUsd) * 10000) / 100 : 0,
+  };
 }
