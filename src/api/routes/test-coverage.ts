@@ -54,74 +54,112 @@ export function createTestCoverageRouter(): Router {
         : ['positive', 'negative', 'edge_cases'];
 
       const companyId = (req as any).companyId;
+      logger.info(MOD, 'Generate request', { title, companyId, coverageTypes: selectedTypes });
 
       // Fetch app knowledge for context
-      const knowledgeRows = await getApplicationKnowledge(companyId);
-      const knowledge: KnowledgeContext = {
-        modules: knowledgeRows.map((k: any) => ({
-          name: k.module,
-          workflows: k.workflow,
-          businessRules: k.business_rules,
-          apis: k.apis,
-        })),
-        historicalBugs: knowledgeRows
-          .filter((k: any) => k.historical_bugs)
-          .map((k: any) => k.historical_bugs),
-      };
+      let knowledge: KnowledgeContext = { modules: [], historicalBugs: [] };
+      try {
+        const knowledgeRows = await getApplicationKnowledge(companyId);
+        knowledge = {
+          modules: knowledgeRows.map((k: any) => ({
+            name: k.module,
+            workflows: k.workflow,
+            businessRules: k.business_rules,
+            apis: k.apis,
+          })),
+          historicalBugs: knowledgeRows
+            .filter((k: any) => k.historical_bugs)
+            .map((k: any) => k.historical_bugs),
+        };
+      } catch (knowledgeErr: any) {
+        logger.warn(MOD, 'Could not load knowledge context', { error: knowledgeErr.message });
+      }
 
       const input: RequirementInput = {
         title, description, jiraId, businessFlow,
         acceptanceCriteria, apiDocs, releaseNotes, module: mod,
       };
 
-      logger.info(MOD, 'Generating test coverage', { title, coverageTypes: selectedTypes });
+      logger.info(MOD, 'Calling AI engine for test coverage generation');
       const result = await getEngine().generateFullCoverage(input, selectedTypes, knowledge);
-
-      // Persist to DB
-      const reqId = await createTestRequirement({
-        title, description, jiraId, businessFlow, acceptanceCriteria,
-        apiDocs, releaseNotes, module: mod,
-        featureType: result.requirementAnalysis.featureType,
-        riskLevel: result.requirementAnalysis.riskLevel,
-        analysis: result.requirementAnalysis,
-        companyId,
+      logger.info(MOD, 'AI engine returned', {
+        scenarios: result.scenarios.length,
+        testCases: result.testCases.length,
+        gaps: result.coverageGaps.length,
       });
 
+      // Persist to DB
+      let reqId: number;
+      try {
+        reqId = await createTestRequirement({
+          title, description, jiraId, businessFlow, acceptanceCriteria,
+          apiDocs, releaseNotes, module: mod,
+          featureType: result.requirementAnalysis.featureType,
+          riskLevel: result.requirementAnalysis.riskLevel,
+          analysis: result.requirementAnalysis,
+          companyId,
+        });
+        logger.info(MOD, 'Requirement persisted', { reqId });
+      } catch (dbErr: any) {
+        logger.error(MOD, 'Failed to persist requirement to DB', { error: dbErr.message, stack: dbErr.stack });
+        // Return AI results even if DB save fails, but flag the error
+        return res.json({
+          requirementId: null,
+          ...result,
+          _warning: 'AI generation succeeded but database persistence failed. Results shown are not saved.',
+        });
+      }
+
       // Insert scenarios
-      const scenarioIds = await insertTestScenarios(reqId, result.scenarios.map(s => ({
-        scenario: s.scenario,
-        coverageType: s.coverageType,
-        priority: s.priority,
-        riskArea: s.riskArea,
-      })), companyId);
+      let scenarioIds: number[] = [];
+      try {
+        scenarioIds = await insertTestScenarios(reqId, result.scenarios.map(s => ({
+          scenario: s.scenario,
+          coverageType: s.coverageType,
+          priority: s.priority,
+          riskArea: s.riskArea,
+        })), companyId);
+        logger.info(MOD, 'Scenarios persisted', { count: scenarioIds.length });
+      } catch (scenErr: any) {
+        logger.error(MOD, 'Failed to persist scenarios', { error: scenErr.message });
+      }
 
-      // Map test cases to scenarios (distribute evenly if no direct mapping)
+      // Map test cases to scenarios
       if (result.testCases.length > 0 && scenarioIds.length > 0) {
-        // Group test cases by matching coverage type with scenario
         const scenariosWithType = result.scenarios.map((s, i) => ({ ...s, dbId: scenarioIds[i] }));
+        let insertedCases = 0;
         for (const tc of result.testCases) {
-          // Find best matching scenario by tags/coverage type
-          const matchingScenario = scenariosWithType.find(s => {
-            if (tc.tags?.length) {
-              return tc.tags.some(t => s.coverageType.includes(t) || s.scenario.toLowerCase().includes(t.toLowerCase()));
-            }
-            return false;
-          }) || scenariosWithType[0];
+          try {
+            // Find best matching scenario by tags/coverage type
+            const matchingScenario = scenariosWithType.find(s => {
+              if (tc.tags?.length) {
+                return tc.tags.some(t =>
+                  s.coverageType.includes(t) ||
+                  s.scenario.toLowerCase().includes(t.toLowerCase())
+                );
+              }
+              return false;
+            }) || scenariosWithType[0];
 
-          await insertTestCases(matchingScenario.dbId, [{
-            title: tc.title,
-            preconditions: tc.preconditions,
-            steps: tc.steps,
-            expectedResult: tc.expectedResult,
-            testData: tc.testData,
-            priority: tc.priority,
-            severity: tc.severity,
-            tags: tc.tags,
-            automationReady: tc.automationReady,
-            automationComplexity: tc.automationComplexity,
-            selectorAvailability: tc.selectorAvailability,
-          }], companyId);
+            await insertTestCases(matchingScenario.dbId, [{
+              title: tc.title,
+              preconditions: tc.preconditions || '',
+              steps: tc.steps || [],
+              expectedResult: tc.expectedResult || '',
+              testData: tc.testData || '',
+              priority: tc.priority || 'P2',
+              severity: tc.severity || 'major',
+              tags: tc.tags || [],
+              automationReady: tc.automationReady ?? false,
+              automationComplexity: tc.automationComplexity || 'medium',
+              selectorAvailability: tc.selectorAvailability || 'unknown',
+            }], companyId);
+            insertedCases++;
+          } catch (tcErr: any) {
+            logger.error(MOD, 'Failed to persist test case', { title: tc.title, error: tcErr.message });
+          }
         }
+        logger.info(MOD, 'Test cases persisted', { inserted: insertedCases, total: result.testCases.length });
       }
 
       return res.json({
@@ -129,7 +167,7 @@ export function createTestCoverageRouter(): Router {
         ...result,
       });
     } catch (err: any) {
-      logger.error(MOD, 'Generation failed', { error: err.message });
+      logger.error(MOD, 'Generation failed', { error: err.message, stack: err.stack });
       return res.status(500).json({ error: 'Generation failed', details: err.message });
     }
   });
@@ -138,9 +176,12 @@ export function createTestCoverageRouter(): Router {
   router.get('/requirements', async (req: Request, res: Response) => {
     try {
       const companyId = (req as any).companyId;
+      logger.info(MOD, 'Fetching requirements', { companyId });
       const reqs = await getTestRequirements(companyId);
+      logger.info(MOD, 'Requirements fetched', { count: reqs.length, companyId });
       return res.json(reqs);
     } catch (err: any) {
+      logger.error(MOD, 'Failed to fetch requirements', { error: err.message });
       return res.status(500).json({ error: 'Failed to fetch requirements', details: err.message });
     }
   });
