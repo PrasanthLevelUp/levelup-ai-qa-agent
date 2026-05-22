@@ -53,6 +53,7 @@ import { createIngestRouter } from './routes/ingest';
 import { apiKeysRouter } from './routes/api-keys';
 import { hooksRouter } from './routes/hooks';
 import { createRepoIntelligenceRouter } from './routes/repo-intelligence';
+import { createKnowledgeRouter } from './routes/knowledge';
 import { createDashboardRouter } from './routes/dashboard';
 import { notifyRca } from '../integrations/slack';
 import { createRcaTicket } from '../integrations/jira';
@@ -146,6 +147,7 @@ export function createServer(): express.Application {
   app.use('/api/billing', authMiddleware, companyMiddleware, createBillingRouter());
   app.use('/api/keys', authMiddleware, companyMiddleware, apiKeysRouter);
   app.use('/api/repo-intelligence', authMiddleware, companyMiddleware, createRepoIntelligenceRouter());
+  app.use('/api/knowledge', authMiddleware, companyMiddleware, createKnowledgeRouter());
   app.use('/api/dashboard', authMiddleware, companyMiddleware, createDashboardRouter());
 
   // List all jobs
