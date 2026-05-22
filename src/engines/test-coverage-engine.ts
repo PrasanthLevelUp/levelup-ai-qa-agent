@@ -88,11 +88,23 @@ export interface GenerationResult {
   };
 }
 
+export interface EnterpriseKnowledgeItem {
+  id: number;
+  category: string;
+  title: string;
+  description: string;
+  tags: string[];
+  relatedModules: string[];
+  priority: string;
+  metadata?: Record<string, any>;
+}
+
 export interface KnowledgeContext {
   modules?: Array<{ name: string; workflows?: string; businessRules?: string; apis?: string; }>;
   historicalBugs?: string[];
   existingTestCases?: string[];
   automationCoverage?: string[];
+  enterpriseKnowledge?: EnterpriseKnowledgeItem[];
 }
 
 /* ------------------------------------------------------------------ */
@@ -108,6 +120,54 @@ export class TestCoverageEngine {
     this.openai = new OpenAI({ apiKey });
   }
 
+  /* ---- Build Enterprise Knowledge Block ---- */
+  private buildEnterpriseKnowledgeBlock(knowledge?: KnowledgeContext): string {
+    if (!knowledge?.enterpriseKnowledge?.length) return '';
+
+    const items = knowledge.enterpriseKnowledge;
+    const sections: string[] = [];
+
+    // Group by category for structured prompt
+    const businessRules = items.filter(i => i.category === 'business_rule');
+    const workflows = items.filter(i => i.category === 'workflow');
+    const architecture = items.filter(i => i.category === 'architecture');
+    const bugPatterns = items.filter(i => i.category === 'bug_pattern');
+    const integrations = items.filter(i => i.category === 'integration');
+    const dependencies = items.filter(i => i.category === 'dependency');
+    const automation = items.filter(i => i.category === 'automation');
+    const manualTests = items.filter(i => i.category === 'manual_test');
+    const domain = items.filter(i => i.category === 'domain');
+
+    const formatItems = (label: string, list: EnterpriseKnowledgeItem[]) => {
+      if (!list.length) return '';
+      return `\n${label}:\n${list.map(i =>
+        `  - [${i.priority.toUpperCase()}] ${i.title}: ${i.description.slice(0, 300)}${i.tags.length ? ` (tags: ${i.tags.join(', ')})` : ''}`
+      ).join('\n')}`;
+    };
+
+    sections.push(formatItems('BUSINESS RULES (must be tested)', businessRules));
+    sections.push(formatItems('WORKFLOWS (test each step + transitions)', workflows));
+    sections.push(formatItems('ARCHITECTURE CONTEXT', architecture));
+    sections.push(formatItems('KNOWN BUG PATTERNS (create regression tests)', bugPatterns));
+    sections.push(formatItems('INTEGRATION POINTS (test boundaries)', integrations));
+    sections.push(formatItems('DEPENDENCIES', dependencies));
+    sections.push(formatItems('EXISTING AUTOMATION COVERAGE (avoid duplication)', automation));
+    sections.push(formatItems('EXISTING MANUAL TESTS (extend, don\'t duplicate)', manualTests));
+    sections.push(formatItems('DOMAIN KNOWLEDGE', domain));
+
+    const content = sections.filter(Boolean).join('');
+    if (!content) return '';
+
+    return `\n\nCOMPANY-SPECIFIC KNOWLEDGE (${items.length} items — use this to generate contextual, company-aware test cases):${content}
+
+IMPORTANT: Use the above company-specific knowledge to:
+1. Create test cases that validate business rules explicitly
+2. Include regression tests for known bug patterns
+3. Test workflow transitions and edge cases specific to this company
+4. Verify integration points and dependencies
+5. Avoid duplicating existing automation/manual test coverage`;
+  }
+
   /* ---- Phase 2: Requirement Understanding ---- */
   async analyzeRequirement(
     input: RequirementInput,
@@ -118,6 +178,7 @@ export class TestCoverageEngine {
           `Module: ${m.name}\n  Workflows: ${m.workflows || 'N/A'}\n  Business Rules: ${m.businessRules || 'N/A'}\n  APIs: ${m.apis || 'N/A'}`
         ).join('\n')}\n\nHistorical Bugs: ${(knowledge.historicalBugs || []).join('; ') || 'None'}\nExisting Tests: ${(knowledge.existingTestCases || []).join('; ') || 'None'}`
       : '';
+    const enterpriseBlock = this.buildEnterpriseKnowledgeBlock(knowledge);
 
     const prompt = `You are a senior QA architect analyzing a software requirement.
 
@@ -128,7 +189,7 @@ ${input.acceptanceCriteria ? `Acceptance Criteria: ${input.acceptanceCriteria}` 
 ${input.businessFlow ? `Business Flow: ${input.businessFlow}` : ''}
 ${input.module ? `Module: ${input.module}` : ''}
 ${input.apiDocs ? `API Documentation: ${input.apiDocs}` : ''}
-${input.releaseNotes ? `Release Notes: ${input.releaseNotes}` : ''}${knowledgeBlock}
+${input.releaseNotes ? `Release Notes: ${input.releaseNotes}` : ''}${knowledgeBlock}${enterpriseBlock}
 
 Analyze this requirement and return a JSON object with:
 - featureType: string (e.g. "authentication", "payment", "search", "data_entry", "reporting")
@@ -176,6 +237,7 @@ Return ONLY valid JSON, no markdown fences.`;
     const knowledgeTests = knowledge?.existingTestCases?.length
       ? `\nExisting test coverage: ${knowledge.existingTestCases.join('; ')}`
       : '';
+    const enterpriseBlock = this.buildEnterpriseKnowledgeBlock(knowledge);
 
     const prompt = `You are a senior QA engineer with 15+ years experience. Generate test coverage that a real senior QA engineer would write — NOT generic textbook cases.
 
@@ -190,7 +252,7 @@ Feature Type: ${analysis.featureType}
 Risk Level: ${analysis.riskLevel}
 Impacted Modules: ${analysis.impactedModules.join(', ')}
 Workflow: ${analysis.workflowSteps.join(' → ')}
-User Roles: ${analysis.userRolesAffected.join(', ')}${knowledgeBugs}${knowledgeTests}
+User Roles: ${analysis.userRolesAffected.join(', ')}${knowledgeBugs}${knowledgeTests}${enterpriseBlock}
 
 COVERAGE TYPES REQUESTED: ${coverageTypes.join(', ')}
 
@@ -249,6 +311,7 @@ Return ONLY valid JSON.`;
     const existingCoverage = knowledge?.existingTestCases?.length
       ? `\nExisting Test Cases: ${knowledge.existingTestCases.join('; ')}`
       : '';
+    const enterpriseBlock = this.buildEnterpriseKnowledgeBlock(knowledge);
 
     const prompt = `You are a QA coverage analyst. Analyze the following test scenarios for a requirement and identify COVERAGE GAPS — things that should be tested but are NOT covered.
 
@@ -258,7 +321,7 @@ Description: ${input.description}
 Feature Type: ${analysis.featureType}
 Risk Level: ${analysis.riskLevel}
 Workflow: ${analysis.workflowSteps.join(' → ')}
-Impacted Modules: ${analysis.impactedModules.join(', ')}${existingCoverage}
+Impacted Modules: ${analysis.impactedModules.join(', ')}${existingCoverage}${enterpriseBlock}
 
 CURRENT SCENARIOS:
 ${scenarios.map((s, i) => `${i + 1}. [${s.coverageType}] ${s.scenario}`).join('\n')}
