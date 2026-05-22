@@ -6,9 +6,10 @@
 
 import OpenAI from 'openai';
 import { logger } from '../utils/logger';
+import { ModelSelector } from '../ai/model-selector';
+import { CostTracker } from '../ai/cost-tracker';
 
 const MOD = 'test-coverage-engine';
-const MODEL = 'gpt-4o-mini';
 
 /* ------------------------------------------------------------------ */
 /*  Types                                                              */
@@ -113,11 +114,15 @@ export interface KnowledgeContext {
 
 export class TestCoverageEngine {
   private openai: OpenAI;
+  private modelSelector: ModelSelector;
+  private costTracker: CostTracker;
 
   constructor() {
     const apiKey = process.env['OPENAI_API_KEY'];
     if (!apiKey) throw new Error('OPENAI_API_KEY required for TestCoverageEngine');
     this.openai = new OpenAI({ apiKey });
+    this.modelSelector = new ModelSelector();
+    this.costTracker = new CostTracker();
   }
 
   /* ---- Build Enterprise Knowledge Block ---- */
@@ -155,8 +160,14 @@ export class TestCoverageEngine {
     sections.push(formatItems('EXISTING MANUAL TESTS (extend, don\'t duplicate)', manualTests));
     sections.push(formatItems('DOMAIN KNOWLEDGE', domain));
 
-    const content = sections.filter(Boolean).join('');
+    let content = sections.filter(Boolean).join('');
     if (!content) return '';
+
+    // Token optimization: limit enterprise knowledge block to avoid bloating prompts
+    const maxKnowledgeChars = 2000;
+    if (content.length > maxKnowledgeChars) {
+      content = content.slice(0, maxKnowledgeChars) + '\n  [... additional items truncated for token optimization]';
+    }
 
     return `\n\nCOMPANY-SPECIFIC KNOWLEDGE (${items.length} items — use this to generate contextual, company-aware test cases):${content}
 
@@ -393,15 +404,25 @@ Return ONLY valid JSON array.`;
     };
   }
 
-  /* ---- LLM Call Helper ---- */
+  /* ---- LLM Call Helper (cost-optimized) ---- */
   private async callLLM(prompt: string, maxTokens: number): Promise<{ content: string; tokensUsed: number }> {
+    // Use ModelSelector for intelligent model selection
+    const modelConfig = this.modelSelector.selectModel('test_generation', 'standard');
+    const effectiveMaxTokens = Math.min(maxTokens, modelConfig.maxTokens);
+
+    // Truncate prompt to avoid excessive token usage (token optimization)
+    const maxPromptChars = parseInt(process.env['MAX_TOKENS_PER_REQUEST'] || '4000', 10) * 4;
+    const truncatedPrompt = prompt.length > maxPromptChars
+      ? prompt.slice(0, maxPromptChars) + '\n\n[Context truncated for cost optimization]'
+      : prompt;
+
     const resp = await this.openai.chat.completions.create({
-      model: MODEL,
-      temperature: 0.3,
-      max_tokens: maxTokens,
+      model: modelConfig.model,
+      temperature: modelConfig.temperature,
+      max_tokens: effectiveMaxTokens,
       messages: [
         { role: 'system', content: 'You are a senior QA architect and test engineer. Always return valid JSON only — no markdown, no explanation, no code fences.' },
-        { role: 'user', content: prompt },
+        { role: 'user', content: truncatedPrompt },
       ],
     });
     let content = resp.choices[0]?.message?.content || '{}';
@@ -411,6 +432,17 @@ Return ONLY valid JSON array.`;
       content = content.replace(/^```(?:json)?\s*\n?/, '').replace(/\n?```\s*$/, '');
     }
     const tokensUsed = (resp.usage?.prompt_tokens || 0) + (resp.usage?.completion_tokens || 0);
+
+    // Track cost (fire-and-forget to avoid blocking)
+    this.costTracker.trackRequest({
+      model: modelConfig.model,
+      tokensUsed,
+      feature: 'test_coverage',
+      taskType: 'test_generation',
+    }).catch((err) => {
+      logger.warn(MOD, 'Cost tracking failed (non-blocking)', { error: (err as Error).message });
+    });
+
     return { content: content.trim(), tokensUsed };
   }
 }

@@ -28,6 +28,7 @@ export interface LocatorSuggestionResponse {
 interface OpenAIConfig {
   apiKey: string;
   model?: string;
+  embeddingModel?: string;
   retries?: number;
 }
 
@@ -38,6 +39,7 @@ function sleep(ms: number): Promise<void> {
 export class OpenAIClient {
   private readonly client: OpenAI;
   private readonly model: string;
+  private readonly embeddingModel: string;
   private readonly retries: number;
 
   constructor(config?: Partial<OpenAIConfig>) {
@@ -47,7 +49,8 @@ export class OpenAIClient {
     }
 
     this.client = new OpenAI({ apiKey });
-    this.model = config?.model || DEFAULT_MODEL;
+    this.model = config?.model || process.env['OPENAI_PRIMARY_MODEL'] || DEFAULT_MODEL;
+    this.embeddingModel = config?.embeddingModel || process.env['OPENAI_EMBEDDING_MODEL'] || 'text-embedding-3-small';
     this.retries = config?.retries ?? 2;
   }
 
@@ -141,5 +144,67 @@ export class OpenAIClient {
         reasoning: 'Invalid JSON from model.',
       };
     }
+  }
+
+  /* ------------------------------------------------------------------ */
+  /*  Embedding Support (99 % cheaper than LLM calls)                   */
+  /* ------------------------------------------------------------------ */
+
+  /**
+   * Generate an embedding vector for a piece of text.
+   * Cost: ~$0.02 per 1 M tokens vs $0.15 per 1 M for gpt-4o-mini.
+   */
+  async generateEmbedding(text: string): Promise<number[]> {
+    const truncated = text.slice(0, 8000);
+    try {
+      logger.debug(MOD, 'Generating embedding', { model: this.embeddingModel, len: truncated.length });
+      const resp = await this.client.embeddings.create({
+        model: this.embeddingModel,
+        input: truncated,
+      });
+      return resp.data[0].embedding;
+    } catch (error) {
+      const msg = (error as Error).message;
+      logger.error(MOD, 'Embedding generation failed', { error: msg });
+      throw new Error(`Failed to generate embedding: ${msg}`);
+    }
+  }
+
+  /**
+   * Batch-generate embeddings (up to 2 048 inputs per request).
+   */
+  async batchGenerateEmbeddings(texts: string[]): Promise<number[][]> {
+    if (texts.length === 0) return [];
+    const batchSize = 2048;
+    const results: number[][] = [];
+
+    for (let i = 0; i < texts.length; i += batchSize) {
+      const batch = texts.slice(i, i + batchSize).map((t) => t.slice(0, 8000));
+      try {
+        const resp = await this.client.embeddings.create({ model: this.embeddingModel, input: batch });
+        results.push(...resp.data.map((d) => d.embedding));
+      } catch (error) {
+        const msg = (error as Error).message;
+        logger.error(MOD, 'Batch embedding failed', { error: msg, batchIdx: i });
+        throw new Error(`Failed to generate batch embeddings: ${msg}`);
+      }
+    }
+    return results;
+  }
+
+  /**
+   * Cosine similarity between two embedding vectors (0 = unrelated, 1 = identical).
+   */
+  cosineSimilarity(a: number[], b: number[]): number {
+    if (a.length !== b.length) throw new Error(`Vector dimension mismatch: ${a.length} vs ${b.length}`);
+    let dot = 0, magA = 0, magB = 0;
+    for (let i = 0; i < a.length; i++) {
+      dot  += a[i] * b[i];
+      magA += a[i] * a[i];
+      magB += b[i] * b[i];
+    }
+    magA = Math.sqrt(magA);
+    magB = Math.sqrt(magB);
+    return magA === 0 || magB === 0 ? 0 : dot / (magA * magB);
   }
 }
