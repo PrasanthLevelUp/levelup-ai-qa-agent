@@ -250,7 +250,34 @@ Return ONLY valid JSON, no markdown fences.`;
       : '';
     const enterpriseBlock = this.buildEnterpriseKnowledgeBlock(knowledge);
 
-    const prompt = `You are a senior QA engineer with 15+ years experience. Generate test coverage that a real senior QA engineer would write — NOT generic textbook cases.
+    // Build per-type coverage expectations
+    const coverageExpectations = coverageTypes.map(ct => {
+      const expectations: Record<string, string> = {
+        positive: 'positive — 2-3 scenarios covering happy paths, successful workflows, valid inputs. 3-5 test cases each.',
+        negative: 'negative — 2-3 scenarios covering invalid inputs, error handling, permission denied, missing data. 3-4 test cases each.',
+        edge_cases: 'edge_cases — 2-3 scenarios covering corner cases, unusual inputs, empty states, concurrent actions, timing issues. 3-4 test cases each.',
+        boundary: 'boundary — 2 scenarios covering min/max values, character limits, zero values, overflow conditions. 2-3 test cases each.',
+        security: 'security — 2 scenarios covering auth bypass, injection, XSS, CSRF, session hijacking. 2-3 test cases each.',
+        api: 'api — 2 scenarios covering endpoint contracts, response codes, payload validation, rate limits. 2-3 test cases each.',
+        ui: 'ui — 2 scenarios covering layout, responsiveness, form validation, loading states. 2-3 test cases each.',
+        mobile: 'mobile — 2 scenarios covering touch interactions, responsive behavior, orientation changes. 2-3 test cases each.',
+        accessibility: 'accessibility — 2 scenarios covering screen reader, keyboard navigation, ARIA labels, color contrast. 2-3 test cases each.',
+        performance: 'performance — 1-2 scenarios covering load time, large datasets, concurrent requests. 2-3 test cases each.',
+        integration: 'integration — 2 scenarios covering cross-module flows, third-party API interactions, data consistency. 2-3 test cases each.',
+        regression: 'regression — 2 scenarios covering previously broken features, critical paths after changes. 2-3 test cases each.',
+        cross_browser: 'cross_browser — 1-2 scenarios covering Chrome, Firefox, Safari, Edge rendering differences. 2-3 test cases each.',
+        data_validation: 'data_validation — 2 scenarios covering input sanitization, format validation, required fields, type checking. 2-3 test cases each.',
+        role_based: 'role_based — 2 scenarios covering permission levels, role transitions, unauthorized access. 2-3 test cases each.',
+        localization: 'localization — 1-2 scenarios covering language switching, RTL support, date/number formats. 2-3 test cases each.',
+      };
+      return expectations[ct] || `${ct} — 2 scenarios, 2-3 test cases each.`;
+    }).join('\n  - ');
+
+    const numTypes = coverageTypes.length;
+    const minScenarios = Math.max(8, numTypes * 2);
+    const minTestCases = Math.max(15, numTypes * 4);
+
+    const prompt = `You are a principal QA engineer writing release-ready test coverage. Generate comprehensive, thorough test scenarios and detailed test cases that a QA lead would approve for production release.
 
 REQUIREMENT:
 Title: ${input.title}
@@ -265,27 +292,43 @@ Impacted Modules: ${analysis.impactedModules.join(', ')}
 Workflow: ${analysis.workflowSteps.join(' → ')}
 User Roles: ${analysis.userRolesAffected.join(', ')}${knowledgeBugs}${knowledgeTests}${enterpriseBlock}
 
-COVERAGE TYPES REQUESTED: ${coverageTypes.join(', ')}
+COVERAGE TYPES REQUESTED (${numTypes} types): ${coverageTypes.join(', ')}
 
-GENERATE:
-1. Test Scenarios (high-level, 2-4 per coverage type)
-2. Detailed Test Cases (3-6 per scenario, senior-QA quality)
+MANDATORY COVERAGE REQUIREMENTS:
+  - ${coverageExpectations}
 
-BAD examples (do NOT generate these):
-- "Verify login works" (too vague)
-- "Verify password works" (no specificity)
+MINIMUM OUTPUT TARGETS:
+  - At least ${minScenarios} scenarios total across all coverage types
+  - At least ${minTestCases} test cases total
+  - Every requested coverage type MUST have at least 2 scenarios and 4 test cases
+  - Critical/high risk areas need MORE test cases
+
+QUALITY STANDARDS — Each test case must have:
+  - Specific, actionable title (NOT vague like "Verify login works")
+  - Clear preconditions (what must be true before testing)
+  - Numbered steps (3-6 steps, specific user actions)
+  - Precise expected result (what exactly should happen)
+  - Realistic test data examples
+
+BAD examples (NEVER generate):
+  - "Verify login works" (too vague)
+  - "Test error handling" (no specificity)
+  - "Check boundary values" (which values?)
 
 GOOD examples:
-- "Verify session token invalidation after password reset"
-- "Verify concurrent login policy enforcement for same role"
-- "Verify failed login throttling after 5 attempts"
-- "Verify remember-me session persistence after browser restart"
+  - "Verify session token invalidation after password reset from another device"
+  - "Verify failed login throttling locks account after 5 consecutive attempts within 15 minutes"
+  - "Verify SQL injection prevention in search field with payload: ' OR 1=1 --"
+  - "Verify form submission with maximum character limit (255 chars) in name field"
 
-Return JSON with:
+IMPORTANT: Each test case must include a "scenarioIndex" field (0-based) linking it to the scenario it belongs to. This ensures proper grouping.
+
+Return JSON:
 {
   "scenarios": [{ "scenario": string, "coverageType": string, "priority": "P0"|"P1"|"P2"|"P3", "riskArea": string }],
   "testCases": [{
     "title": string,
+    "scenarioIndex": number,
     "preconditions": string,
     "steps": string[],
     "expectedResult": string,
@@ -299,9 +342,9 @@ Return JSON with:
   }]
 }
 
-Return ONLY valid JSON.`;
+Return ONLY valid JSON. Generate comprehensive coverage — this is for a production release.`;
 
-    const resp = await this.callLLM(prompt, 4000);
+    const resp = await this.callLLM(prompt, 6000);
     let parsed: { scenarios: TestScenario[]; testCases: TestCase[] };
     try {
       parsed = JSON.parse(resp.content);
