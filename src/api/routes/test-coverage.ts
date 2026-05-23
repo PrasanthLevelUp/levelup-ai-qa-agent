@@ -121,9 +121,10 @@ export function createTestCoverageRouter(): Router {
         gaps: result.coverageGaps.length,
       });
 
-      // Persist to DB — store knowledge item references in analysis
+      // Persist to DB — store knowledge item references and coverage types in analysis
       const analysisWithKnowledge = {
         ...result.requirementAnalysis,
+        coverageTypes: selectedTypes,
         knowledgeItemIds: knowledgeItemsUsed.map((ki: any) => ki.id),
         knowledgeItemTitles: knowledgeItemsUsed.map((ki: any) => ki.title),
       };
@@ -163,22 +164,31 @@ export function createTestCoverageRouter(): Router {
         logger.error(MOD, 'Failed to persist scenarios', { error: scenErr.message });
       }
 
-      // Map test cases to scenarios
+      // Map test cases to scenarios — prefer scenarioIndex from AI, fallback to tag matching
       if (result.testCases.length > 0 && scenarioIds.length > 0) {
-        const scenariosWithType = result.scenarios.map((s, i) => ({ ...s, dbId: scenarioIds[i] }));
+        const scenariosWithType = result.scenarios.map((s, i) => ({ ...s, dbId: scenarioIds[i], index: i }));
         let insertedCases = 0;
         for (const tc of result.testCases) {
           try {
-            // Find best matching scenario by tags/coverage type
-            const matchingScenario = scenariosWithType.find(s => {
-              if (tc.tags?.length) {
-                return tc.tags.some(t =>
+            // 1. Use scenarioIndex if provided by AI (most reliable)
+            let matchingScenario = (tc as any).scenarioIndex != null && (tc as any).scenarioIndex < scenariosWithType.length
+              ? scenariosWithType[(tc as any).scenarioIndex]
+              : null;
+
+            // 2. Fallback: match by coverage type tag
+            if (!matchingScenario && tc.tags?.length) {
+              matchingScenario = scenariosWithType.find(s =>
+                tc.tags.some(t =>
                   s.coverageType.includes(t) ||
                   s.scenario.toLowerCase().includes(t.toLowerCase())
-                );
-              }
-              return false;
-            }) || scenariosWithType[0];
+                )
+              ) || null;
+            }
+
+            // 3. Final fallback: first scenario
+            if (!matchingScenario) {
+              matchingScenario = scenariosWithType[0];
+            }
 
             await insertTestCases(matchingScenario.dbId, [{
               title: tc.title,

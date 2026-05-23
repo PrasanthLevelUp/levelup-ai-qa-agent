@@ -178,7 +178,7 @@ export class ModelSelector {
   private getMaxTokens(taskType: TaskType, complexity: TaskComplexity): number {
     const base: Record<TaskType, number> = {
       healing: 500,
-      test_generation: 3000,
+      test_generation: 6000,
       script_generation: 2000,
       rca: 1000,
       enterprise_demo: 4000,
