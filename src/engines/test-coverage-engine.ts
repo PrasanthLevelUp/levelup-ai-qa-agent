@@ -8,6 +8,7 @@ import OpenAI from 'openai';
 import { logger } from '../utils/logger';
 import { ModelSelector } from '../ai/model-selector';
 import { CostTracker } from '../ai/cost-tracker';
+import { KnowledgeOptimizer, type KnowledgeItem as OptimizerKnowledgeItem } from '../ai/knowledge-optimizer';
 
 const MOD = 'test-coverage-engine';
 
@@ -125,51 +126,45 @@ export class TestCoverageEngine {
     this.costTracker = new CostTracker();
   }
 
-  /* ---- Build Enterprise Knowledge Block ---- */
-  private buildEnterpriseKnowledgeBlock(knowledge?: KnowledgeContext): string {
+  /* ---- Build Enterprise Knowledge Block (uses KnowledgeOptimizer for smart selection) ---- */
+  private buildEnterpriseKnowledgeBlock(knowledge?: KnowledgeContext, input?: RequirementInput): string {
     if (!knowledge?.enterpriseKnowledge?.length) return '';
 
     const items = knowledge.enterpriseKnowledge;
-    const sections: string[] = [];
 
-    // Group by category for structured prompt
-    const businessRules = items.filter(i => i.category === 'business_rule');
-    const workflows = items.filter(i => i.category === 'workflow');
-    const architecture = items.filter(i => i.category === 'architecture');
-    const bugPatterns = items.filter(i => i.category === 'bug_pattern');
-    const integrations = items.filter(i => i.category === 'integration');
-    const dependencies = items.filter(i => i.category === 'dependency');
-    const automation = items.filter(i => i.category === 'automation');
-    const manualTests = items.filter(i => i.category === 'manual_test');
-    const domain = items.filter(i => i.category === 'domain');
+    // Use KnowledgeOptimizer for smart selection and formatting
+    const optimizer = new KnowledgeOptimizer();
+    const optimizerItems: OptimizerKnowledgeItem[] = items.map(i => ({
+      id: i.id,
+      category: i.category,
+      title: i.title,
+      description: i.description,
+      tags: i.tags || [],
+      related_modules: i.relatedModules || [],
+      priority: i.priority,
+      metadata: i.metadata,
+    }));
 
-    const formatItems = (label: string, list: EnterpriseKnowledgeItem[]) => {
-      if (!list.length) return '';
-      return `\n${label}:\n${list.map(i =>
-        `  - [${i.priority.toUpperCase()}] ${i.title}: ${i.description.slice(0, 300)}${i.tags.length ? ` (tags: ${i.tags.join(', ')})` : ''}`
-      ).join('\n')}`;
-    };
+    const optimized = optimizer.selectRelevantKnowledge(optimizerItems, {
+      module: input?.module,
+      testDescription: input ? `${input.title} ${input.description}` : undefined,
+      tags: input?.businessFlow ? [input.businessFlow] : undefined,
+    }, {
+      maxTokens: 2000,
+      maxItems: 10,
+      format: 'test-case-lab',
+    });
 
-    sections.push(formatItems('BUSINESS RULES (must be tested)', businessRules));
-    sections.push(formatItems('WORKFLOWS (test each step + transitions)', workflows));
-    sections.push(formatItems('ARCHITECTURE CONTEXT', architecture));
-    sections.push(formatItems('KNOWN BUG PATTERNS (create regression tests)', bugPatterns));
-    sections.push(formatItems('INTEGRATION POINTS (test boundaries)', integrations));
-    sections.push(formatItems('DEPENDENCIES', dependencies));
-    sections.push(formatItems('EXISTING AUTOMATION COVERAGE (avoid duplication)', automation));
-    sections.push(formatItems('EXISTING MANUAL TESTS (extend, don\'t duplicate)', manualTests));
-    sections.push(formatItems('DOMAIN KNOWLEDGE', domain));
+    if (!optimized.formattedContext) return '';
 
-    let content = sections.filter(Boolean).join('');
-    if (!content) return '';
+    logger.info(MOD, 'Enterprise knowledge optimized for test case lab', {
+      totalItems: items.length,
+      selectedItems: optimized.stats.selectedCount,
+      estimatedTokens: optimized.stats.estimatedTokens,
+      avgRelevance: optimized.stats.avgRelevanceScore,
+    });
 
-    // Token optimization: limit enterprise knowledge block to avoid bloating prompts
-    const maxKnowledgeChars = 2000;
-    if (content.length > maxKnowledgeChars) {
-      content = content.slice(0, maxKnowledgeChars) + '\n  [... additional items truncated for token optimization]';
-    }
-
-    return `\n\nCOMPANY-SPECIFIC KNOWLEDGE (${items.length} items — use this to generate contextual, company-aware test cases):${content}
+    return `\n\nCOMPANY-SPECIFIC KNOWLEDGE (${optimized.stats.selectedCount} of ${items.length} items — smart-selected by relevance):\n\n${optimized.formattedContext}
 
 IMPORTANT: Use the above company-specific knowledge to:
 1. Create test cases that validate business rules explicitly
@@ -189,7 +184,7 @@ IMPORTANT: Use the above company-specific knowledge to:
           `Module: ${m.name}\n  Workflows: ${m.workflows || 'N/A'}\n  Business Rules: ${m.businessRules || 'N/A'}\n  APIs: ${m.apis || 'N/A'}`
         ).join('\n')}\n\nHistorical Bugs: ${(knowledge.historicalBugs || []).join('; ') || 'None'}\nExisting Tests: ${(knowledge.existingTestCases || []).join('; ') || 'None'}`
       : '';
-    const enterpriseBlock = this.buildEnterpriseKnowledgeBlock(knowledge);
+    const enterpriseBlock = this.buildEnterpriseKnowledgeBlock(knowledge, input);
 
     const prompt = `You are a senior QA architect analyzing a software requirement.
 
@@ -248,7 +243,7 @@ Return ONLY valid JSON, no markdown fences.`;
     const knowledgeTests = knowledge?.existingTestCases?.length
       ? `\nExisting test coverage: ${knowledge.existingTestCases.join('; ')}`
       : '';
-    const enterpriseBlock = this.buildEnterpriseKnowledgeBlock(knowledge);
+    const enterpriseBlock = this.buildEnterpriseKnowledgeBlock(knowledge, input);
 
     // Build per-type coverage expectations
     const coverageExpectations = coverageTypes.map(ct => {
@@ -365,7 +360,7 @@ Return ONLY valid JSON. Generate comprehensive coverage — this is for a produc
     const existingCoverage = knowledge?.existingTestCases?.length
       ? `\nExisting Test Cases: ${knowledge.existingTestCases.join('; ')}`
       : '';
-    const enterpriseBlock = this.buildEnterpriseKnowledgeBlock(knowledge);
+    const enterpriseBlock = this.buildEnterpriseKnowledgeBlock(knowledge, input);
 
     const prompt = `You are a QA coverage analyst. Analyze the following test scenarios for a requirement and identify COVERAGE GAPS — things that should be tested but are NOT covered.
 

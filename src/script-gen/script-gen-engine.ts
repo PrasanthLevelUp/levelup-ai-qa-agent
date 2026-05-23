@@ -129,6 +129,7 @@ export interface GenerationConfig {
   includeNegativeTests?: boolean;
   framework?: 'playwright';   // future: cypress, selenium
   repoIntelligence?: string;  // injected from Repository Intelligence Engine
+  knowledgeContext?: string;   // injected from App Knowledge via KnowledgeOptimizer
 }
 
 /* -------------------------------------------------------------------------- */
@@ -326,6 +327,7 @@ ${config.instructions ? `User Instructions: ${config.instructions}` : ''}
 ${config.testTypes?.length ? `Requested Test Types: ${config.testTypes.join(', ')}` : ''}
 ${config.includeNegativeTests ? 'Include negative test cases (invalid inputs, empty fields, etc.)' : ''}
 ${config.credentials ? 'Credentials will be provided via environment variables (process.env.USERNAME, process.env.PASSWORD)' : ''}
+${config.knowledgeContext ? `\n--- APP KNOWLEDGE ---\nBusiness context and domain knowledge to incorporate into test scenarios:\n\n${config.knowledgeContext}\n\nIMPORTANT: Use the above knowledge to:\n- Validate business rules in assertions\n- Create regression tests for known bug patterns\n- Test workflow transitions and edge cases\n- Verify integration points and dependencies\n--- END APP KNOWLEDGE ---` : ''}
 ${config.repoIntelligence ? `\n--- REPOSITORY INTELLIGENCE ---\nThe target repo already has existing tests. Match its style, reuse its helpers/page-objects, and follow its conventions:\n\n${config.repoIntelligence}\n--- END REPOSITORY INTELLIGENCE ---` : ''}
 
 Generate comprehensive test flows covering all detected functionality.`;

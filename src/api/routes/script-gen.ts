@@ -18,9 +18,11 @@ import {
   logSelectorScores,
   logWorkflowMaps,
   logProjectExport,
+  getKnowledgeItem,
 } from '../../db/postgres';
 import { ScriptGenEngine, type GenerationConfig, type GenerationResult, type GeneratedFile } from '../../script-gen/script-gen-engine';
 import { getRepositoryContext } from '../../db/postgres';
+import { KnowledgeOptimizer, type KnowledgeItem } from '../../ai/knowledge-optimizer';
 import { AIReviewEngine } from '../../script-gen/ai-review-engine';
 import { ValidationRunner } from '../../script-gen/validation-runner';
 import { ProjectExportEngine } from '../../script-gen/project-export-engine';
@@ -51,6 +53,7 @@ export function createScriptGenRouter(): Router {
         followLinks,
         maxPages,
         repoId,
+        knowledgeItemIds,
       } = req.body;
 
       if (!url || typeof url !== 'string') {
@@ -58,16 +61,58 @@ export function createScriptGenRouter(): Router {
       }
 
       console.log(`[ScriptGen] Starting generation for: ${url}`);
+      const companyId = (req as any).companyId as number | undefined;
 
       // Auto-load repository intelligence if repoId provided
       let repoIntelligence: string | undefined;
       if (repoId) {
-        const companyId = (req as any).companyId as number | undefined;
         const profile = await getRepositoryContext(repoId, companyId);
         if (profile) {
           const { buildAIPromptContext } = await import('../../context/prompt-builder');
           repoIntelligence = buildAIPromptContext(profile);
           console.log(`[ScriptGen] Loaded repo intelligence for ${repoId}: ${profile.framework}, pattern=${profile.testPattern}`);
+        }
+      }
+
+      // Load and optimize App Knowledge if knowledgeItemIds provided
+      let knowledgeContext: string | undefined;
+      let knowledgeItemsUsed: any[] = [];
+      if (Array.isArray(knowledgeItemIds) && knowledgeItemIds.length > 0) {
+        try {
+          const items = await Promise.all(
+            knowledgeItemIds.slice(0, 20).map((id: number) => getKnowledgeItem(id, companyId))
+          );
+          const validItems: KnowledgeItem[] = items
+            .filter(Boolean)
+            .map((ki: any) => ({
+              id: ki.id,
+              category: ki.category,
+              title: ki.title,
+              description: ki.description,
+              tags: ki.tags || [],
+              related_modules: ki.related_modules || [],
+              priority: ki.priority,
+              metadata: ki.metadata,
+            }));
+
+          if (validItems.length > 0) {
+            const optimizer = new KnowledgeOptimizer();
+            const optimized = optimizer.selectRelevantKnowledge(validItems, {
+              testDescription: instructions,
+              url,
+              testTypes,
+            }, {
+              maxTokens: 1500,
+              maxItems: 7,
+              format: 'script-gen',
+            });
+
+            knowledgeContext = optimized.formattedContext || undefined;
+            knowledgeItemsUsed = optimized.selectedItems;
+            console.log(`[ScriptGen] Knowledge optimized: ${optimized.stats.selectedCount}/${validItems.length} items, ~${optimized.stats.estimatedTokens} tokens`);
+          }
+        } catch (kiErr: any) {
+          console.warn(`[ScriptGen] Could not load knowledge items (non-blocking): ${kiErr.message}`);
         }
       }
 
@@ -80,6 +125,7 @@ export function createScriptGenRouter(): Router {
         followLinks: followLinks ?? false,
         maxPages: maxPages ?? 3,
         repoIntelligence,
+        knowledgeContext,
       };
 
       const engine = new ScriptGenEngine();
@@ -95,14 +141,17 @@ export function createScriptGenRouter(): Router {
       const validationStatus = validationReport.overallScore >= 80 ? 'passed' : 'needs_review';
 
       // Persist to DB
-      const cid = (req as any).companyId;
       const scriptId = await logGeneratedScript({
         url: config.url,
         page_type: result.testPlan?.pageType || 'unknown',
         workflow_graph: null,
         instructions: config.instructions,
         script_content: result.generatedFiles.map((f: GeneratedFile) => `// === ${f.path} ===\n${f.content}`).join('\n\n'),
-        test_plan: result.testPlan,
+        test_plan: {
+          ...result.testPlan,
+          knowledgeItemIds: knowledgeItemsUsed.map((ki: any) => ki.id),
+          knowledgeItemTitles: knowledgeItemsUsed.map((ki: any) => ki.title),
+        },
         validation_status: validationStatus,
         reliability_score: validationReport.overallScore,
         tokens_used: result.stats.tokensUsed,
@@ -110,7 +159,7 @@ export function createScriptGenRouter(): Router {
         generation_time_ms: generationTimeMs,
         files_generated: result.generatedFiles.map((f: GeneratedFile) => ({ path: f.path, size: f.content.length, type: f.type })),
         negative_tests_included: config.includeNegativeTests,
-      }, cid);
+      }, companyId);
 
       console.log(`[ScriptGen] ✅ Generation complete — ID ${scriptId}, ${result.generatedFiles.length} files, ${generationTimeMs}ms`);
 
