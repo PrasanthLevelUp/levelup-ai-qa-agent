@@ -97,6 +97,8 @@ const REQUIRED_TABLES = [
   'rca_analyses',
   // Token & AI usage
   'token_usage', 'ai_usage_logs',
+  // DOM Memory ↔ Healing
+  'selector_history',
   // API keys & ingestion
   'api_keys', 'ingestion_logs',
   // Repository intelligence
@@ -812,6 +814,35 @@ async function initSchema(client: PoolClient): Promise<void> {
   console.log(`🔧 [DB] Table creation complete: ${ok} succeeded, ${fail} failed`);
 
   // Seed default plans & roles
+  // ─── Phase 9: Selector History (DOM Memory ↔ Healing integration) ───
+  console.log('🔧 [DB] Phase 9: Selector History tracking...');
+  await run('selector_history', `CREATE TABLE IF NOT EXISTS selector_history (
+    id SERIAL PRIMARY KEY,
+    project_id INTEGER REFERENCES projects(id) ON DELETE SET NULL,
+    company_id INTEGER REFERENCES companies(id),
+    page_url TEXT,
+    selector TEXT NOT NULL,
+    previous_selector TEXT,
+    element_type TEXT,
+    element_identifier TEXT,
+    change_type TEXT DEFAULT 'observed',
+    source TEXT DEFAULT 'scan',
+    stability_score REAL DEFAULT 1.0,
+    metadata JSONB DEFAULT '{}',
+    captured_at TIMESTAMPTZ DEFAULT NOW()
+  )`);
+
+  // Indexes for fast lookups during healing
+  for (const idx of [
+    `CREATE INDEX IF NOT EXISTS idx_sel_hist_selector ON selector_history(selector)`,
+    `CREATE INDEX IF NOT EXISTS idx_sel_hist_project ON selector_history(project_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_sel_hist_element ON selector_history(element_identifier)`,
+    `CREATE INDEX IF NOT EXISTS idx_sel_hist_captured ON selector_history(captured_at DESC)`,
+    `CREATE INDEX IF NOT EXISTS idx_sel_hist_proj_sel ON selector_history(project_id, selector)`,
+  ]) {
+    await safeExec(client, idx.match(/idx_\w+/)![0], idx);
+  }
+
   console.log('🔧 [DB] Seeding plans & roles...');
   await seedDefaultPlans(client);
   await seedDefaultRoles(client);
@@ -4768,4 +4799,280 @@ export async function deleteRepository(id: number, companyId: number): Promise<b
     [id, companyId],
   );
   return (rowCount ?? 0) > 0;
+}
+
+
+
+/* -------------------------------------------------------------------------- */
+/*  DOM Memory ↔ Healing Integration — Selector History & Stability           */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Record a selector observation (from DOM scan, healing, or script gen).
+ */
+export async function recordSelectorObservation(data: {
+  projectId?: number;
+  companyId?: number;
+  pageUrl?: string;
+  selector: string;
+  previousSelector?: string;
+  elementType?: string;
+  elementIdentifier?: string;
+  changeType?: string;
+  source?: string;
+  metadata?: Record<string, any>;
+}): Promise<number> {
+  const pool = getPool();
+  const r = await pool.query(
+    `INSERT INTO selector_history
+       (project_id, company_id, page_url, selector, previous_selector, element_type,
+        element_identifier, change_type, source, metadata)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+     RETURNING id`,
+    [
+      data.projectId || null, data.companyId || null, data.pageUrl || null,
+      data.selector, data.previousSelector || null, data.elementType || null,
+      data.elementIdentifier || null, data.changeType || 'observed',
+      data.source || 'scan', data.metadata ? JSON.stringify(data.metadata) : '{}',
+    ],
+  );
+  return r.rows[0].id;
+}
+
+/**
+ * Get the full history of a specific selector.
+ */
+export async function getSelectorHistory(
+  selector: string,
+  projectId?: number,
+): Promise<{
+  selector: string;
+  changeCount: number;
+  firstSeen: string | null;
+  lastSeen: string | null;
+  recentChanges: number;
+  observations: number;
+  stabilityScore: number;
+}> {
+  const pool = getPool();
+  const projFilter = projectId ? `AND project_id = ${projectId}` : '';
+
+  // Get all observations matching this selector (as current or previous)
+  const r = await pool.query(
+    `SELECT
+       COUNT(*) AS total_obs,
+       COUNT(*) FILTER (WHERE change_type = 'changed') AS change_count,
+       COUNT(*) FILTER (WHERE change_type = 'changed' AND captured_at > NOW() - INTERVAL '30 days') AS recent_changes,
+       MIN(captured_at) AS first_seen,
+       MAX(captured_at) AS last_seen
+     FROM selector_history
+     WHERE (selector = $1 OR previous_selector = $1) ${projFilter}`,
+    [selector],
+  );
+
+  const row = r.rows[0] || {};
+  const total = parseInt(row.total_obs || '0', 10);
+  const changes = parseInt(row.change_count || '0', 10);
+  const recent = parseInt(row.recent_changes || '0', 10);
+
+  // Calculate stability score
+  const stability = calculateStabilityScore(changes, recent, total, row.first_seen);
+
+  return {
+    selector,
+    changeCount: changes,
+    firstSeen: row.first_seen ? new Date(row.first_seen).toISOString() : null,
+    lastSeen: row.last_seen ? new Date(row.last_seen).toISOString() : null,
+    recentChanges: recent,
+    observations: total,
+    stabilityScore: stability,
+  };
+}
+
+/**
+ * Get alternative selectors for the same element (by element_identifier or page_url).
+ * Uses selector_scores, healing_actions, and selector_history to find all known
+ * ways to reach the same element.
+ */
+export async function getAlternativeSelectors(
+  failedSelector: string,
+  projectId?: number,
+  companyId?: number,
+): Promise<Array<{
+  selector: string;
+  source: string;
+  score: number;
+  stabilityScore: number;
+  lastSeen: string | null;
+  usageCount: number;
+}>> {
+  const pool = getPool();
+  const alternatives: Array<{
+    selector: string;
+    source: string;
+    score: number;
+    stabilityScore: number;
+    lastSeen: string | null;
+    usageCount: number;
+  }> = [];
+
+  const seen = new Set<string>();
+  seen.add(failedSelector);
+
+  // 1. From healing_actions: selectors that healed THIS failed selector
+  const cfAnd = companyId ? `AND company_id = ${companyId}` : '';
+  const healRes = await pool.query(
+    `SELECT healed_locator AS selector, COUNT(*) AS usage,
+            MAX(confidence) AS score, MAX(created_at) AS last_seen
+     FROM healing_actions
+     WHERE failed_locator = $1 AND success = true AND healed_locator IS NOT NULL ${cfAnd}
+     GROUP BY healed_locator
+     ORDER BY COUNT(*) DESC, MAX(confidence) DESC
+     LIMIT 10`,
+    [failedSelector],
+  );
+  for (const row of healRes.rows) {
+    if (!seen.has(row.selector)) {
+      seen.add(row.selector);
+      const hist = await getSelectorHistory(row.selector, projectId);
+      alternatives.push({
+        selector: row.selector,
+        source: 'healing_history',
+        score: parseFloat(row.score) || 0.5,
+        stabilityScore: hist.stabilityScore,
+        lastSeen: row.last_seen ? new Date(row.last_seen).toISOString() : null,
+        usageCount: parseInt(row.usage, 10),
+      });
+    }
+  }
+
+  // 2. From learned_patterns: patterns that map from this failed locator
+  const patRes = await pool.query(
+    `SELECT healed_locator AS selector, confidence AS score,
+            success_count AS usage, last_used AS last_seen
+     FROM learned_patterns
+     WHERE failed_locator = $1 AND success_count > 0
+     ORDER BY confidence DESC, success_count DESC
+     LIMIT 10`,
+    [failedSelector],
+  );
+  for (const row of patRes.rows) {
+    if (!seen.has(row.selector)) {
+      seen.add(row.selector);
+      const hist = await getSelectorHistory(row.selector, projectId);
+      alternatives.push({
+        selector: row.selector,
+        source: 'learned_pattern',
+        score: parseFloat(row.score) || 0.5,
+        stabilityScore: hist.stabilityScore,
+        lastSeen: row.last_seen ? new Date(row.last_seen).toISOString() : null,
+        usageCount: parseInt(row.usage, 10),
+      });
+    }
+  }
+
+  // 3. From selector_history: same element_identifier, different selector
+  if (projectId) {
+    const elemRes = await pool.query(
+      `SELECT DISTINCT ON (sh2.selector) sh2.selector, sh2.source, sh2.captured_at AS last_seen
+       FROM selector_history sh1
+       JOIN selector_history sh2
+         ON sh2.element_identifier = sh1.element_identifier
+         AND sh2.project_id = sh1.project_id
+         AND sh2.selector != sh1.selector
+       WHERE sh1.selector = $1 AND sh1.project_id = $2
+         AND sh1.element_identifier IS NOT NULL
+       ORDER BY sh2.selector, sh2.captured_at DESC
+       LIMIT 10`,
+      [failedSelector, projectId],
+    );
+    for (const row of elemRes.rows) {
+      if (!seen.has(row.selector)) {
+        seen.add(row.selector);
+        const hist = await getSelectorHistory(row.selector, projectId);
+        alternatives.push({
+          selector: row.selector,
+          source: 'element_history',
+          score: 0.5,
+          stabilityScore: hist.stabilityScore,
+          lastSeen: row.last_seen ? new Date(row.last_seen).toISOString() : null,
+          usageCount: 1,
+        });
+      }
+    }
+  }
+
+  // 4. From selector_scores: same element_type selectors on same pages
+  const scoreRes = await pool.query(
+    `SELECT ss.selector, AVG(ss.score) AS avg_score, COUNT(*) AS usage,
+            MAX(ss.created_at) AS last_seen
+     FROM selector_scores ss
+     WHERE ss.element_type = (
+       SELECT element_type FROM selector_scores WHERE selector = $1 LIMIT 1
+     )
+     AND ss.selector != $1
+     AND ss.score > 0.6
+     GROUP BY ss.selector
+     ORDER BY AVG(ss.score) DESC
+     LIMIT 10`,
+    [failedSelector],
+  );
+  for (const row of scoreRes.rows) {
+    if (!seen.has(row.selector)) {
+      seen.add(row.selector);
+      const hist = await getSelectorHistory(row.selector, projectId);
+      alternatives.push({
+        selector: row.selector,
+        source: 'selector_scores',
+        score: parseFloat(row.avg_score) || 0.5,
+        stabilityScore: hist.stabilityScore,
+        lastSeen: row.last_seen ? new Date(row.last_seen).toISOString() : null,
+        usageCount: parseInt(row.usage, 10),
+      });
+    }
+  }
+
+  // Sort by combined score: stability * base_score
+  alternatives.sort((a, b) => {
+    const aComposite = a.stabilityScore * 0.6 + a.score * 0.4;
+    const bComposite = b.stabilityScore * 0.6 + b.score * 0.4;
+    return bComposite - aComposite;
+  });
+
+  return alternatives;
+}
+
+/**
+ * Calculate stability score for a selector.
+ * 1.0 = perfectly stable, 0.0 = constantly changing.
+ */
+function calculateStabilityScore(
+  totalChanges: number,
+  recentChanges: number,
+  observations: number,
+  firstSeen: string | Date | null,
+): number {
+  if (observations === 0) return 0.5; // Unknown — neutral score
+
+  // Base penalty for changes (each change reduces stability)
+  const changePenalty = Math.min(totalChanges * 0.15, 0.6);
+
+  // Recent changes (last 30 days) are penalised more heavily
+  const recentPenalty = Math.min(recentChanges * 0.25, 0.5);
+
+  // Age bonus: older selectors that haven't changed much are more stable
+  let ageBonus = 0;
+  if (firstSeen) {
+    const ageMs = Date.now() - new Date(firstSeen).getTime();
+    const ageDays = ageMs / (1000 * 60 * 60 * 24);
+    if (ageDays > 90 && totalChanges === 0) ageBonus = 0.15;
+    else if (ageDays > 60 && totalChanges <= 1) ageBonus = 0.10;
+    else if (ageDays > 30 && totalChanges === 0) ageBonus = 0.05;
+  }
+
+  // Observation volume bonus: more observations without changes = higher confidence
+  const volumeBonus = observations > 10 && totalChanges === 0 ? 0.05 : 0;
+
+  const raw = 1.0 - changePenalty - recentPenalty + ageBonus + volumeBonus;
+  return Math.max(0, Math.min(1, parseFloat(raw.toFixed(3))));
 }
