@@ -498,16 +498,33 @@ export function createDashboardRouter(): Router {
   // ─── Project Context ────────────────────────────────────────
 
   /** GET /api/dashboard/project-context */
-  router.get('/project-context', async (_req: Request, res: Response) => {
+  router.get('/project-context', async (req: Request, res: Response) => {
     try {
       const pool = getPool();
-      const { rows } = await pool.query(
-        `SELECT pc.*,
-                (SELECT COUNT(*) FROM generated_scripts gs WHERE gs.project_context_id = pc.id) AS scripts_count
-         FROM project_contexts pc
-         WHERE pc.is_active = true
-         ORDER BY pc.created_at DESC`,
-      );
+      const companyId = (req as any).companyId;
+
+      // Use LEFT JOIN with generated_scripts; handle case where generated_scripts
+      // may not have project_context_id column yet (fresh vs. migrated DB)
+      let rows: any[];
+      try {
+        const result = await pool.query(
+          `SELECT pc.*,
+                  (SELECT COUNT(*) FROM generated_scripts gs WHERE gs.project_context_id = pc.id) AS scripts_count
+           FROM project_contexts pc
+           WHERE pc.is_active = true
+           ORDER BY pc.updated_at DESC NULLS LAST, pc.created_at DESC`,
+        );
+        rows = result.rows;
+      } catch {
+        // Fallback if generated_scripts doesn't have project_context_id yet
+        const result = await pool.query(
+          `SELECT pc.*, 0 AS scripts_count
+           FROM project_contexts pc
+           WHERE pc.is_active = true
+           ORDER BY pc.created_at DESC`,
+        );
+        rows = result.rows;
+      }
 
       const data = rows.map((c: any) => ({
         ...c,
@@ -515,8 +532,8 @@ export function createDashboardRouter(): Router {
       }));
 
       res.json({ success: true, data });
-    } catch (err) {
-      logger.error(MOD, 'project-context GET failed', { error: err });
+    } catch (err: any) {
+      logger.error(MOD, 'project-context GET failed', { error: err?.message || err });
       res.status(500).json({ success: false, error: 'Failed to fetch project contexts' });
     }
   });
@@ -530,27 +547,49 @@ export function createDashboardRouter(): Router {
         return res.status(400).json({ success: false, error: 'name and appUrl are required' });
       }
 
+      const companyId = (req as any).companyId || null;
       const pool = getPool();
+
+      // Safely handle credentials — could be string or object
+      let credentialsStr: string | null = null;
+      if (credentials) {
+        credentialsStr = typeof credentials === 'string' ? credentials : JSON.stringify(credentials);
+      }
 
       if (id) {
         const { rows } = await pool.query(
           `UPDATE project_contexts SET name=$1, app_url=$2, framework=$3, auth_method=$4,
-           selector_strategy=$5, app_description=$6, navigation_flow=$7, custom_rules=$8, credentials=$9
+           selector_strategy=$5, app_description=$6, navigation_flow=$7, custom_rules=$8,
+           credentials=$9, updated_at=NOW()
            WHERE id=$10 RETURNING *`,
-          [name, appUrl, framework || null, authMethod || null, selectorStrategy || null, appDescription || null, navigationFlow || null, customRules || null, credentials || null, Number(id)],
+          [name, appUrl, framework || null, authMethod || null, selectorStrategy || null,
+           appDescription || null, navigationFlow || null, customRules || null,
+           credentialsStr, Number(id)],
         );
+        if (rows.length === 0) {
+          return res.status(404).json({ success: false, error: 'Project context not found' });
+        }
         return res.json({ success: true, data: rows[0] });
       }
 
       const { rows } = await pool.query(
-        `INSERT INTO project_contexts (name, app_url, framework, auth_method, selector_strategy, app_description, navigation_flow, custom_rules, credentials)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
-        [name, appUrl, framework || null, authMethod || null, selectorStrategy || null, appDescription || null, navigationFlow || null, customRules || null, credentials || null],
+        `INSERT INTO project_contexts (company_id, name, app_url, framework, auth_method, selector_strategy, app_description, navigation_flow, custom_rules, credentials)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
+        [companyId, name, appUrl, framework || null, authMethod || null, selectorStrategy || null,
+         appDescription || null, navigationFlow || null, customRules || null, credentialsStr],
       );
       res.json({ success: true, data: rows[0] });
-    } catch (err) {
-      logger.error(MOD, 'project-context POST failed', { error: err });
-      res.status(500).json({ success: false, error: 'Failed to save project context' });
+    } catch (err: any) {
+      logger.error(MOD, 'project-context POST failed', {
+        error: err?.message || err,
+        stack: err?.stack,
+        body: { ...req.body, credentials: req.body.credentials ? '[REDACTED]' : undefined },
+      });
+      res.status(500).json({
+        success: false,
+        error: 'Failed to save project context',
+        details: process.env.NODE_ENV !== 'production' ? err?.message : undefined,
+      });
     }
   });
 

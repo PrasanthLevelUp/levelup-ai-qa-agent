@@ -228,9 +228,31 @@ async function initSchema(client: PoolClient): Promise<void> {
     CREATE INDEX IF NOT EXISTS idx_pr_job_id ON pr_automations(job_id);
     CREATE INDEX IF NOT EXISTS idx_pr_status ON pr_automations(status);
 
+    -- Project Contexts table (stores project settings for Script Gen)
+    CREATE TABLE IF NOT EXISTS project_contexts (
+      id SERIAL PRIMARY KEY,
+      company_id INTEGER,
+      name VARCHAR(500) NOT NULL,
+      app_url TEXT NOT NULL,
+      framework TEXT,
+      auth_method TEXT,
+      selector_strategy TEXT,
+      app_description TEXT,
+      navigation_flow TEXT,
+      custom_rules TEXT,
+      credentials TEXT,
+      is_active BOOLEAN DEFAULT true,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      updated_at TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_pc_company ON project_contexts(company_id);
+    CREATE INDEX IF NOT EXISTS idx_pc_active ON project_contexts(is_active) WHERE is_active = true;
+
     -- Script Generation tables
     CREATE TABLE IF NOT EXISTS generated_scripts (
       id SERIAL PRIMARY KEY,
+      company_id INTEGER,
+      project_context_id INTEGER REFERENCES project_contexts(id) ON DELETE SET NULL,
       url TEXT NOT NULL,
       page_type TEXT,
       workflow_graph JSONB,
@@ -250,6 +272,8 @@ async function initSchema(client: PoolClient): Promise<void> {
     );
     CREATE INDEX IF NOT EXISTS idx_gs_url ON generated_scripts(url);
     CREATE INDEX IF NOT EXISTS idx_gs_created ON generated_scripts(created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_gs_company ON generated_scripts(company_id);
+    CREATE INDEX IF NOT EXISTS idx_gs_project_ctx ON generated_scripts(project_context_id);
 
     CREATE TABLE IF NOT EXISTS dom_snapshots (
       id SERIAL PRIMARY KEY,
@@ -793,6 +817,24 @@ async function migrateDefaultCompany(client: PoolClient): Promise<void> {
     CREATE INDEX IF NOT EXISTS idx_ai_usage_user ON ai_usage_logs(user_id);
     CREATE INDEX IF NOT EXISTS idx_ai_usage_model ON ai_usage_logs(model);
   `);
+
+  // ── Migrations for existing databases ──────────────────────────────
+  // These safely add columns/tables that may be missing on existing deployments.
+  const migrations = [
+    `ALTER TABLE generated_scripts ADD COLUMN IF NOT EXISTS company_id INTEGER`,
+    `ALTER TABLE generated_scripts ADD COLUMN IF NOT EXISTS project_context_id INTEGER REFERENCES project_contexts(id) ON DELETE SET NULL`,
+  ];
+
+  for (const sql of migrations) {
+    try {
+      await client.query(sql);
+    } catch (err: any) {
+      // Ignore errors from already-applied migrations or missing dependencies
+      if (!err.message?.includes('already exists') && !err.message?.includes('duplicate column')) {
+        console.warn(`[DB Migration] Non-fatal: ${err.message}`);
+      }
+    }
+  }
 }
 
 /* -------------------------------------------------------------------------- */
