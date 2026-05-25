@@ -108,14 +108,26 @@ const REQUIRED_TABLES = [
 ];
 
 export async function initDb(): Promise<void> {
+  console.log('🔧 [DB] initDb() called — connecting to PostgreSQL...');
   const client = await getPool().connect();
+  console.log('🔧 [DB] Connected to PostgreSQL pool');
   try {
+    // Quick connection test
+    const now = await client.query('SELECT NOW() AS t');
+    console.log(`🔧 [DB] Connection verified: ${now.rows[0]?.t}`);
+
     logger.info(MOD, '🚀 Starting database schema initialization...');
+    console.log('🔧 [DB] Running initSchema...');
     await initSchema(client);
     logger.info(MOD, '✅ PostgreSQL schema initialized');
+    console.log('✅ [DB] initSchema completed');
 
     // Verify all required tables exist post-init
     await verifySchema(client);
+  } catch (err: any) {
+    console.error('❌ [DB] initDb FAILED:', err?.message, err?.code, err?.detail);
+    logger.error(MOD, 'initDb failed', { error: err?.message, code: err?.code, detail: err?.detail });
+    throw err; // Re-throw to prevent server from starting with broken schema
   } finally {
     client.release();
   }
@@ -185,560 +197,590 @@ export async function closeDb(): Promise<void> {
   }
 }
 
+/**
+ * Execute a single SQL statement with error isolation.
+ * Logs success/failure for each statement — never lets one failure kill the rest.
+ */
+async function safeExec(client: PoolClient, label: string, sql: string): Promise<boolean> {
+  try {
+    await client.query(sql);
+    return true;
+  } catch (err: any) {
+    console.error(`❌ [DB] Failed: ${label} — ${err?.code}: ${err?.message}`);
+    logger.error(MOD, `Schema statement failed: ${label}`, {
+      code: err?.code, message: err?.message, detail: err?.detail, hint: err?.hint,
+    });
+    return false;
+  }
+}
+
 async function initSchema(client: PoolClient): Promise<void> {
-  await client.query(`
-    CREATE TABLE IF NOT EXISTS test_executions (
-      id SERIAL PRIMARY KEY,
-      test_name TEXT NOT NULL,
-      status TEXT NOT NULL,
-      error_message TEXT,
-      screenshot_path TEXT,
-      github_commit_sha TEXT,
-      duration_ms INTEGER DEFAULT 0,
-      healing_attempted BOOLEAN DEFAULT FALSE,
-      healing_succeeded BOOLEAN DEFAULT FALSE,
-      created_at TIMESTAMPTZ DEFAULT NOW()
-    );
+  let ok = 0;
+  let fail = 0;
+  const run = async (label: string, sql: string) => {
+    (await safeExec(client, label, sql)) ? ok++ : fail++;
+  };
 
-    CREATE TABLE IF NOT EXISTS healing_actions (
-      id SERIAL PRIMARY KEY,
-      test_execution_id INTEGER NOT NULL REFERENCES test_executions(id),
-      test_name TEXT NOT NULL,
-      failed_locator TEXT NOT NULL,
-      healed_locator TEXT,
-      healing_strategy TEXT NOT NULL,
-      ai_tokens_used INTEGER DEFAULT 0,
-      success BOOLEAN DEFAULT FALSE,
-      confidence REAL DEFAULT 0,
-      error_context TEXT,
-      validation_status TEXT,
-      validation_reason TEXT,
-      patch_path TEXT,
-      created_at TIMESTAMPTZ DEFAULT NOW()
-    );
+  // ─── Phase 1: Core tables (no foreign-key dependencies) ─────────
+  console.log('🔧 [DB] Phase 1: Core tables...');
 
-    CREATE TABLE IF NOT EXISTS learned_patterns (
-      id SERIAL PRIMARY KEY,
-      test_name TEXT NOT NULL,
-      error_pattern TEXT NOT NULL,
-      failed_locator TEXT NOT NULL,
-      healed_locator TEXT NOT NULL,
-      solution_strategy TEXT NOT NULL,
-      confidence REAL DEFAULT 0,
-      success_count INTEGER DEFAULT 1,
-      failure_count INTEGER DEFAULT 0,
-      usage_count INTEGER DEFAULT 0,
-      avg_tokens_saved INTEGER DEFAULT 0,
-      last_used TIMESTAMPTZ DEFAULT NOW(),
-      created_at TIMESTAMPTZ DEFAULT NOW(),
-      UNIQUE(test_name, error_pattern, failed_locator)
-    );
+  await run('test_executions', `CREATE TABLE IF NOT EXISTS test_executions (
+    id SERIAL PRIMARY KEY,
+    test_name TEXT NOT NULL,
+    status TEXT NOT NULL,
+    error_message TEXT,
+    screenshot_path TEXT,
+    github_commit_sha TEXT,
+    duration_ms INTEGER DEFAULT 0,
+    healing_attempted BOOLEAN DEFAULT FALSE,
+    healing_succeeded BOOLEAN DEFAULT FALSE,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+  )`);
 
-    CREATE TABLE IF NOT EXISTS healing_jobs (
-      id TEXT PRIMARY KEY,
-      repository_id TEXT NOT NULL,
-      repository_url TEXT,
-      branch TEXT DEFAULT 'main',
-      commit_sha TEXT,
-      status TEXT NOT NULL DEFAULT 'pending',
-      progress TEXT DEFAULT '',
-      created_at TIMESTAMPTZ DEFAULT NOW(),
-      started_at TIMESTAMPTZ,
-      completed_at TIMESTAMPTZ,
-      result TEXT,
-      error TEXT
-    );
+  await run('healing_actions', `CREATE TABLE IF NOT EXISTS healing_actions (
+    id SERIAL PRIMARY KEY,
+    test_execution_id INTEGER NOT NULL REFERENCES test_executions(id),
+    test_name TEXT NOT NULL,
+    failed_locator TEXT NOT NULL,
+    healed_locator TEXT,
+    healing_strategy TEXT NOT NULL,
+    ai_tokens_used INTEGER DEFAULT 0,
+    success BOOLEAN DEFAULT FALSE,
+    confidence REAL DEFAULT 0,
+    error_context TEXT,
+    validation_status TEXT,
+    validation_reason TEXT,
+    patch_path TEXT,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+  )`);
 
-    CREATE TABLE IF NOT EXISTS token_usage (
-      id SERIAL PRIMARY KEY,
-      date TEXT NOT NULL,
-      engine TEXT NOT NULL,
-      tokens_used INTEGER NOT NULL,
-      cost_usd REAL NOT NULL,
-      created_at TIMESTAMPTZ DEFAULT NOW()
-    );
+  await run('learned_patterns', `CREATE TABLE IF NOT EXISTS learned_patterns (
+    id SERIAL PRIMARY KEY,
+    test_name TEXT NOT NULL,
+    error_pattern TEXT NOT NULL,
+    failed_locator TEXT NOT NULL,
+    healed_locator TEXT NOT NULL,
+    solution_strategy TEXT NOT NULL,
+    confidence REAL DEFAULT 0,
+    success_count INTEGER DEFAULT 1,
+    failure_count INTEGER DEFAULT 0,
+    usage_count INTEGER DEFAULT 0,
+    avg_tokens_saved INTEGER DEFAULT 0,
+    last_used TIMESTAMPTZ DEFAULT NOW(),
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(test_name, error_pattern, failed_locator)
+  )`);
 
-    CREATE TABLE IF NOT EXISTS rca_analyses (
-      id SERIAL PRIMARY KEY,
-      test_execution_id INTEGER REFERENCES test_executions(id),
-      job_id TEXT,
-      test_name TEXT NOT NULL,
-      root_cause TEXT NOT NULL,
-      classification TEXT NOT NULL,
-      severity TEXT NOT NULL DEFAULT 'medium',
-      confidence REAL DEFAULT 0,
-      suggested_fix TEXT,
-      affected_component TEXT,
-      is_flaky BOOLEAN DEFAULT FALSE,
-      flaky_reason TEXT,
-      summary TEXT,
-      technical_details TEXT,
-      tokens_used INTEGER DEFAULT 0,
-      model TEXT DEFAULT 'gpt-4o-mini',
-      analysis_time_ms INTEGER DEFAULT 0,
-      healing_attempted BOOLEAN DEFAULT FALSE,
-      healing_succeeded BOOLEAN DEFAULT FALSE,
-      healed_locator TEXT,
-      healing_strategy TEXT,
-      error_message TEXT,
-      created_at TIMESTAMPTZ DEFAULT NOW()
-    );
+  await run('healing_jobs', `CREATE TABLE IF NOT EXISTS healing_jobs (
+    id TEXT PRIMARY KEY,
+    repository_id TEXT NOT NULL,
+    repository_url TEXT,
+    branch TEXT DEFAULT 'main',
+    commit_sha TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',
+    progress TEXT DEFAULT '',
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    started_at TIMESTAMPTZ,
+    completed_at TIMESTAMPTZ,
+    result TEXT,
+    error TEXT
+  )`);
 
-    CREATE INDEX IF NOT EXISTS idx_exec_status ON test_executions(status);
-    CREATE INDEX IF NOT EXISTS idx_exec_test_name ON test_executions(test_name);
-    CREATE INDEX IF NOT EXISTS idx_heal_exec_id ON healing_actions(test_execution_id);
-    CREATE INDEX IF NOT EXISTS idx_heal_strategy ON healing_actions(healing_strategy);
-    CREATE INDEX IF NOT EXISTS idx_pattern_locator ON learned_patterns(failed_locator);
-    CREATE INDEX IF NOT EXISTS idx_pattern_test_name ON learned_patterns(test_name);
-    CREATE INDEX IF NOT EXISTS idx_pattern_error ON learned_patterns(error_pattern);
-    CREATE INDEX IF NOT EXISTS idx_jobs_status ON healing_jobs(status);
-    CREATE INDEX IF NOT EXISTS idx_token_usage_date ON token_usage(date);
-    CREATE INDEX IF NOT EXISTS idx_rca_test_name ON rca_analyses(test_name);
-    CREATE INDEX IF NOT EXISTS idx_rca_classification ON rca_analyses(classification);
-    CREATE INDEX IF NOT EXISTS idx_rca_job_id ON rca_analyses(job_id);
-    CREATE INDEX IF NOT EXISTS idx_rca_exec_id ON rca_analyses(test_execution_id);
+  await run('token_usage', `CREATE TABLE IF NOT EXISTS token_usage (
+    id SERIAL PRIMARY KEY,
+    date TEXT NOT NULL,
+    engine TEXT NOT NULL,
+    tokens_used INTEGER NOT NULL,
+    cost_usd REAL NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+  )`);
 
-    CREATE TABLE IF NOT EXISTS pr_automations (
-      id SERIAL PRIMARY KEY,
-      job_id TEXT NOT NULL,
-      pr_url TEXT NOT NULL,
-      pr_number INTEGER NOT NULL,
-      branch_name TEXT NOT NULL,
-      commit_sha TEXT,
-      repo_owner TEXT NOT NULL,
-      repo_name TEXT NOT NULL,
-      base_branch TEXT NOT NULL,
-      files_changed TEXT[],
-      healing_count INTEGER DEFAULT 0,
-      status TEXT DEFAULT 'open',
-      merged_at TIMESTAMPTZ,
-      created_at TIMESTAMPTZ DEFAULT NOW()
-    );
-    CREATE INDEX IF NOT EXISTS idx_pr_job_id ON pr_automations(job_id);
-    CREATE INDEX IF NOT EXISTS idx_pr_status ON pr_automations(status);
+  await run('rca_analyses', `CREATE TABLE IF NOT EXISTS rca_analyses (
+    id SERIAL PRIMARY KEY,
+    test_execution_id INTEGER REFERENCES test_executions(id),
+    job_id TEXT,
+    test_name TEXT NOT NULL,
+    root_cause TEXT NOT NULL,
+    classification TEXT NOT NULL,
+    severity TEXT NOT NULL DEFAULT 'medium',
+    confidence REAL DEFAULT 0,
+    suggested_fix TEXT,
+    affected_component TEXT,
+    is_flaky BOOLEAN DEFAULT FALSE,
+    flaky_reason TEXT,
+    summary TEXT,
+    technical_details TEXT,
+    tokens_used INTEGER DEFAULT 0,
+    model TEXT DEFAULT 'gpt-4o-mini',
+    analysis_time_ms INTEGER DEFAULT 0,
+    healing_attempted BOOLEAN DEFAULT FALSE,
+    healing_succeeded BOOLEAN DEFAULT FALSE,
+    healed_locator TEXT,
+    healing_strategy TEXT,
+    error_message TEXT,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+  )`);
 
-    -- Project Contexts table (stores project settings for Script Gen)
-    CREATE TABLE IF NOT EXISTS project_contexts (
-      id SERIAL PRIMARY KEY,
-      company_id INTEGER,
-      name VARCHAR(500) NOT NULL,
-      app_url TEXT NOT NULL,
-      framework TEXT,
-      auth_method TEXT,
-      selector_strategy TEXT,
-      app_description TEXT,
-      navigation_flow TEXT,
-      custom_rules TEXT,
-      credentials TEXT,
-      is_active BOOLEAN DEFAULT true,
-      created_at TIMESTAMPTZ DEFAULT NOW(),
-      updated_at TIMESTAMPTZ DEFAULT NOW()
-    );
-    CREATE INDEX IF NOT EXISTS idx_pc_company ON project_contexts(company_id);
-    CREATE INDEX IF NOT EXISTS idx_pc_active ON project_contexts(is_active) WHERE is_active = true;
+  await run('pr_automations', `CREATE TABLE IF NOT EXISTS pr_automations (
+    id SERIAL PRIMARY KEY,
+    job_id TEXT NOT NULL,
+    pr_url TEXT NOT NULL,
+    pr_number INTEGER NOT NULL,
+    branch_name TEXT NOT NULL,
+    commit_sha TEXT,
+    repo_owner TEXT NOT NULL,
+    repo_name TEXT NOT NULL,
+    base_branch TEXT NOT NULL,
+    files_changed TEXT[],
+    healing_count INTEGER DEFAULT 0,
+    status TEXT DEFAULT 'open',
+    merged_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+  )`);
 
-    -- Script Generation tables
-    CREATE TABLE IF NOT EXISTS generated_scripts (
-      id SERIAL PRIMARY KEY,
-      company_id INTEGER,
-      project_context_id INTEGER REFERENCES project_contexts(id) ON DELETE SET NULL,
-      url TEXT NOT NULL,
-      page_type TEXT,
-      workflow_graph JSONB,
-      instructions TEXT,
-      script_content TEXT,
-      test_plan JSONB,
-      validation_status TEXT DEFAULT 'pending',
-      reliability_score REAL DEFAULT 0,
-      review_score REAL,
-      review_issues JSONB,
-      tokens_used INTEGER DEFAULT 0,
-      model TEXT,
-      generation_time_ms INTEGER,
-      files_generated JSONB,
-      negative_tests_included BOOLEAN DEFAULT false,
-      created_at TIMESTAMPTZ DEFAULT NOW()
-    );
-    CREATE INDEX IF NOT EXISTS idx_gs_url ON generated_scripts(url);
-    CREATE INDEX IF NOT EXISTS idx_gs_created ON generated_scripts(created_at DESC);
-    CREATE INDEX IF NOT EXISTS idx_gs_company ON generated_scripts(company_id);
-    CREATE INDEX IF NOT EXISTS idx_gs_project_ctx ON generated_scripts(project_context_id);
+  // ─── Phase 2: Project contexts & script gen (critical for the 42P01 bug) ───
+  console.log('🔧 [DB] Phase 2: Project contexts & script gen...');
 
-    CREATE TABLE IF NOT EXISTS dom_snapshots (
-      id SERIAL PRIMARY KEY,
-      script_id INTEGER REFERENCES generated_scripts(id) ON DELETE CASCADE,
-      page_url TEXT NOT NULL,
-      html_snapshot TEXT,
-      elements_count INTEGER DEFAULT 0,
-      page_type TEXT,
-      created_at TIMESTAMPTZ DEFAULT NOW()
-    );
-    CREATE INDEX IF NOT EXISTS idx_dom_script ON dom_snapshots(script_id);
+  await run('project_contexts', `CREATE TABLE IF NOT EXISTS project_contexts (
+    id SERIAL PRIMARY KEY,
+    company_id INTEGER,
+    name VARCHAR(500) NOT NULL,
+    app_url TEXT NOT NULL,
+    framework TEXT,
+    auth_method TEXT,
+    selector_strategy TEXT,
+    app_description TEXT,
+    navigation_flow TEXT,
+    custom_rules TEXT,
+    credentials TEXT,
+    is_active BOOLEAN DEFAULT true,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+  )`);
 
-    CREATE TABLE IF NOT EXISTS selector_scores (
-      id SERIAL PRIMARY KEY,
-      script_id INTEGER REFERENCES generated_scripts(id) ON DELETE CASCADE,
-      selector TEXT NOT NULL,
-      score REAL DEFAULT 0,
-      strategy TEXT,
-      element_type TEXT,
-      reason TEXT,
-      created_at TIMESTAMPTZ DEFAULT NOW()
-    );
-    CREATE INDEX IF NOT EXISTS idx_sel_script ON selector_scores(script_id);
+  await run('generated_scripts', `CREATE TABLE IF NOT EXISTS generated_scripts (
+    id SERIAL PRIMARY KEY,
+    company_id INTEGER,
+    project_context_id INTEGER REFERENCES project_contexts(id) ON DELETE SET NULL,
+    url TEXT NOT NULL,
+    page_type TEXT,
+    workflow_graph JSONB,
+    instructions TEXT,
+    script_content TEXT,
+    test_plan JSONB,
+    validation_status TEXT DEFAULT 'pending',
+    reliability_score REAL DEFAULT 0,
+    review_score REAL,
+    review_issues JSONB,
+    tokens_used INTEGER DEFAULT 0,
+    model TEXT,
+    generation_time_ms INTEGER,
+    files_generated JSONB,
+    negative_tests_included BOOLEAN DEFAULT false,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+  )`);
 
-    CREATE TABLE IF NOT EXISTS workflow_maps (
-      id SERIAL PRIMARY KEY,
-      script_id INTEGER REFERENCES generated_scripts(id) ON DELETE CASCADE,
-      source_page TEXT,
-      target_page TEXT,
-      action TEXT,
-      link_text TEXT,
-      created_at TIMESTAMPTZ DEFAULT NOW()
-    );
-    CREATE INDEX IF NOT EXISTS idx_wf_script ON workflow_maps(script_id);
+  await run('dom_snapshots', `CREATE TABLE IF NOT EXISTS dom_snapshots (
+    id SERIAL PRIMARY KEY,
+    script_id INTEGER REFERENCES generated_scripts(id) ON DELETE CASCADE,
+    page_url TEXT NOT NULL,
+    html_snapshot TEXT,
+    elements_count INTEGER DEFAULT 0,
+    page_type TEXT,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+  )`);
 
-    CREATE TABLE IF NOT EXISTS generated_projects (
-      id SERIAL PRIMARY KEY,
-      script_id INTEGER REFERENCES generated_scripts(id) ON DELETE CASCADE,
-      project_dir TEXT,
-      file_count INTEGER DEFAULT 0,
-      total_size INTEGER DEFAULT 0,
-      structure JSONB,
-      created_at TIMESTAMPTZ DEFAULT NOW()
-    );
-    CREATE INDEX IF NOT EXISTS idx_gp_script ON generated_projects(script_id);
+  await run('selector_scores', `CREATE TABLE IF NOT EXISTS selector_scores (
+    id SERIAL PRIMARY KEY,
+    script_id INTEGER REFERENCES generated_scripts(id) ON DELETE CASCADE,
+    selector TEXT NOT NULL,
+    score REAL DEFAULT 0,
+    strategy TEXT,
+    element_type TEXT,
+    reason TEXT,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+  )`);
 
-    -- Authentication tables
-    CREATE TABLE IF NOT EXISTS users (
-      id SERIAL PRIMARY KEY,
-      username VARCHAR(100) UNIQUE NOT NULL,
-      password_hash TEXT NOT NULL,
-      role VARCHAR(50) DEFAULT 'client',
-      company_name VARCHAR(255),
-      is_active BOOLEAN DEFAULT true,
-      last_login TIMESTAMPTZ,
-      created_at TIMESTAMPTZ DEFAULT NOW(),
-      updated_at TIMESTAMPTZ DEFAULT NOW()
-    );
-    CREATE INDEX IF NOT EXISTS idx_users_username ON users(username);
-    CREATE INDEX IF NOT EXISTS idx_users_active ON users(is_active);
+  await run('workflow_maps', `CREATE TABLE IF NOT EXISTS workflow_maps (
+    id SERIAL PRIMARY KEY,
+    script_id INTEGER REFERENCES generated_scripts(id) ON DELETE CASCADE,
+    source_page TEXT,
+    target_page TEXT,
+    action TEXT,
+    link_text TEXT,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+  )`);
 
-    CREATE TABLE IF NOT EXISTS audit_logs (
-      id SERIAL PRIMARY KEY,
-      user_id INTEGER REFERENCES users(id),
-      username VARCHAR(100),
-      action TEXT NOT NULL,
-      resource TEXT,
-      resource_id TEXT,
-      ip_address VARCHAR(45),
-      user_agent TEXT,
-      details JSONB,
-      created_at TIMESTAMPTZ DEFAULT NOW()
-    );
-    CREATE INDEX IF NOT EXISTS idx_audit_user ON audit_logs(user_id);
-    CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_logs(action);
-    CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_logs(created_at DESC);
+  await run('generated_projects', `CREATE TABLE IF NOT EXISTS generated_projects (
+    id SERIAL PRIMARY KEY,
+    script_id INTEGER REFERENCES generated_scripts(id) ON DELETE CASCADE,
+    project_dir TEXT,
+    file_count INTEGER DEFAULT 0,
+    total_size INTEGER DEFAULT 0,
+    structure JSONB,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+  )`);
 
-    CREATE TABLE IF NOT EXISTS sessions (
-      id SERIAL PRIMARY KEY,
-      user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-      token_hash TEXT NOT NULL,
-      ip_address VARCHAR(45),
-      user_agent TEXT,
-      expires_at TIMESTAMPTZ NOT NULL,
-      created_at TIMESTAMPTZ DEFAULT NOW()
-    );
-    CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
-    CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);
+  // ─── Phase 3: Auth, notifications, multi-tenant ─────────────────
+  console.log('🔧 [DB] Phase 3: Auth & multi-tenant...');
 
-    CREATE TABLE IF NOT EXISTS notification_configs (
-      id SERIAL PRIMARY KEY,
-      tool_type TEXT NOT NULL UNIQUE,
-      display_name TEXT NOT NULL,
-      status TEXT DEFAULT 'connected',
-      config JSONB DEFAULT '{}',
-      connected_at TIMESTAMPTZ,
-      last_tested_at TIMESTAMPTZ,
-      last_test_result TEXT,
-      created_at TIMESTAMPTZ DEFAULT NOW(),
-      updated_at TIMESTAMPTZ DEFAULT NOW()
-    );
-    CREATE INDEX IF NOT EXISTS idx_notif_tool ON notification_configs(tool_type);
+  await run('users', `CREATE TABLE IF NOT EXISTS users (
+    id SERIAL PRIMARY KEY,
+    username VARCHAR(100) UNIQUE NOT NULL,
+    password_hash TEXT NOT NULL,
+    role VARCHAR(50) DEFAULT 'client',
+    company_name VARCHAR(255),
+    is_active BOOLEAN DEFAULT true,
+    last_login TIMESTAMPTZ,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+  )`);
 
-    CREATE TABLE IF NOT EXISTS notification_logs (
-      id SERIAL PRIMARY KEY,
-      tool_type TEXT NOT NULL,
-      event_type TEXT NOT NULL,
-      channel TEXT,
-      message_preview TEXT,
-      status TEXT DEFAULT 'sent',
-      error TEXT,
-      metadata JSONB DEFAULT '{}',
-      created_at TIMESTAMPTZ DEFAULT NOW()
-    );
-    CREATE INDEX IF NOT EXISTS idx_notif_log_type ON notification_logs(tool_type);
-    CREATE INDEX IF NOT EXISTS idx_notif_log_created ON notification_logs(created_at DESC);
+  await run('audit_logs', `CREATE TABLE IF NOT EXISTS audit_logs (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER REFERENCES users(id),
+    username VARCHAR(100),
+    action TEXT NOT NULL,
+    resource TEXT,
+    resource_id TEXT,
+    ip_address VARCHAR(45),
+    user_agent TEXT,
+    details JSONB,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+  )`);
 
-    -- Multi-tenant: Companies
-    CREATE TABLE IF NOT EXISTS companies (
-      id SERIAL PRIMARY KEY,
-      name VARCHAR(255) NOT NULL UNIQUE,
-      slug VARCHAR(100) NOT NULL UNIQUE,
-      is_active BOOLEAN DEFAULT true,
-      created_at TIMESTAMPTZ DEFAULT NOW(),
-      updated_at TIMESTAMPTZ DEFAULT NOW()
-    );
-    CREATE INDEX IF NOT EXISTS idx_companies_slug ON companies(slug);
+  await run('sessions', `CREATE TABLE IF NOT EXISTS sessions (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+    token_hash TEXT NOT NULL,
+    ip_address VARCHAR(45),
+    user_agent TEXT,
+    expires_at TIMESTAMPTZ NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+  )`);
 
-    -- Add company_id columns (safe idempotent ALTER)
-    DO $$ BEGIN
-      -- test_executions
-      IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='test_executions' AND column_name='company_id') THEN
-        ALTER TABLE test_executions ADD COLUMN company_id INTEGER REFERENCES companies(id);
-      END IF;
-      -- healing_actions
-      IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='healing_actions' AND column_name='company_id') THEN
-        ALTER TABLE healing_actions ADD COLUMN company_id INTEGER REFERENCES companies(id);
-      END IF;
-      -- learned_patterns
-      IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='learned_patterns' AND column_name='company_id') THEN
-        ALTER TABLE learned_patterns ADD COLUMN company_id INTEGER REFERENCES companies(id);
-      END IF;
-      -- healing_jobs
-      IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='healing_jobs' AND column_name='company_id') THEN
-        ALTER TABLE healing_jobs ADD COLUMN company_id INTEGER REFERENCES companies(id);
-      END IF;
-      -- token_usage
-      IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='token_usage' AND column_name='company_id') THEN
-        ALTER TABLE token_usage ADD COLUMN company_id INTEGER REFERENCES companies(id);
-      END IF;
-      -- rca_analyses
-      IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='rca_analyses' AND column_name='company_id') THEN
-        ALTER TABLE rca_analyses ADD COLUMN company_id INTEGER REFERENCES companies(id);
-      END IF;
-      -- pr_automations
-      IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='pr_automations' AND column_name='company_id') THEN
-        ALTER TABLE pr_automations ADD COLUMN company_id INTEGER REFERENCES companies(id);
-      END IF;
-      -- generated_scripts
-      IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='generated_scripts' AND column_name='company_id') THEN
-        ALTER TABLE generated_scripts ADD COLUMN company_id INTEGER REFERENCES companies(id);
-      END IF;
-      -- notification_configs
-      IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='notification_configs' AND column_name='company_id') THEN
-        ALTER TABLE notification_configs ADD COLUMN company_id INTEGER REFERENCES companies(id);
-      END IF;
-      -- notification_logs
-      IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='notification_logs' AND column_name='company_id') THEN
-        ALTER TABLE notification_logs ADD COLUMN company_id INTEGER REFERENCES companies(id);
-      END IF;
-      -- users
-      IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='company_id') THEN
-        ALTER TABLE users ADD COLUMN company_id INTEGER REFERENCES companies(id);
-      END IF;
-    END $$;
+  await run('notification_configs', `CREATE TABLE IF NOT EXISTS notification_configs (
+    id SERIAL PRIMARY KEY,
+    tool_type TEXT NOT NULL UNIQUE,
+    display_name TEXT NOT NULL,
+    status TEXT DEFAULT 'connected',
+    config JSONB DEFAULT '{}',
+    connected_at TIMESTAMPTZ,
+    last_tested_at TIMESTAMPTZ,
+    last_test_result TEXT,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+  )`);
 
-    -- Indexes for company_id columns
-    CREATE INDEX IF NOT EXISTS idx_exec_company ON test_executions(company_id);
-    CREATE INDEX IF NOT EXISTS idx_heal_company ON healing_actions(company_id);
-    CREATE INDEX IF NOT EXISTS idx_pattern_company ON learned_patterns(company_id);
-    CREATE INDEX IF NOT EXISTS idx_jobs_company ON healing_jobs(company_id);
-    CREATE INDEX IF NOT EXISTS idx_token_company ON token_usage(company_id);
-    CREATE INDEX IF NOT EXISTS idx_rca_company ON rca_analyses(company_id);
-    CREATE INDEX IF NOT EXISTS idx_pr_company ON pr_automations(company_id);
-    CREATE INDEX IF NOT EXISTS idx_gs_company ON generated_scripts(company_id);
-    CREATE INDEX IF NOT EXISTS idx_notif_config_company ON notification_configs(company_id);
-    CREATE INDEX IF NOT EXISTS idx_notif_log_company ON notification_logs(company_id);
-    CREATE INDEX IF NOT EXISTS idx_users_company ON users(company_id);
+  await run('notification_logs', `CREATE TABLE IF NOT EXISTS notification_logs (
+    id SERIAL PRIMARY KEY,
+    tool_type TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    channel TEXT,
+    message_preview TEXT,
+    status TEXT DEFAULT 'sent',
+    error TEXT,
+    metadata JSONB DEFAULT '{}',
+    created_at TIMESTAMPTZ DEFAULT NOW()
+  )`);
 
-    -- ==================== API KEYS (Enterprise Machine Auth) ====================
-    CREATE TABLE IF NOT EXISTS api_keys (
-      id            SERIAL PRIMARY KEY,
-      company_id    INTEGER NOT NULL REFERENCES companies(id),
-      name          VARCHAR(255) NOT NULL,
-      prefix        VARCHAR(20) NOT NULL,
-      key_hash      VARCHAR(64) NOT NULL UNIQUE,
-      scopes        JSONB DEFAULT '["ingest:write"]',
-      rate_limit    INTEGER DEFAULT 1000,
-      is_active     BOOLEAN DEFAULT TRUE,
-      last_used_at  TIMESTAMPTZ,
-      expires_at    TIMESTAMPTZ,
-      created_at    TIMESTAMPTZ DEFAULT NOW()
-    );
-    CREATE INDEX IF NOT EXISTS idx_api_keys_hash ON api_keys(key_hash);
-    CREATE INDEX IF NOT EXISTS idx_api_keys_company ON api_keys(company_id);
+  await run('companies', `CREATE TABLE IF NOT EXISTS companies (
+    id SERIAL PRIMARY KEY,
+    name VARCHAR(255) NOT NULL UNIQUE,
+    slug VARCHAR(100) NOT NULL UNIQUE,
+    is_active BOOLEAN DEFAULT true,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+  )`);
 
-    -- ==================== INGESTION LOGS ====================
-    CREATE TABLE IF NOT EXISTS ingestion_logs (
-      id            SERIAL PRIMARY KEY,
-      company_id    INTEGER NOT NULL REFERENCES companies(id),
-      provider      VARCHAR(50) NOT NULL,
-      build_id      VARCHAR(255),
-      repo_url      TEXT,
-      branch        VARCHAR(255),
-      commit_sha    VARCHAR(64),
-      total_tests   INTEGER DEFAULT 0,
-      passed_tests  INTEGER DEFAULT 0,
-      failed_tests  INTEGER DEFAULT 0,
-      skipped_tests INTEGER DEFAULT 0,
-      status        VARCHAR(20) DEFAULT 'received',
-      healing_job_id VARCHAR(255),
-      error_message TEXT,
-      metadata      JSONB DEFAULT '{}',
-      created_at    TIMESTAMPTZ DEFAULT NOW(),
-      completed_at  TIMESTAMPTZ
-    );
-    CREATE INDEX IF NOT EXISTS idx_ingest_company ON ingestion_logs(company_id);
-    CREATE INDEX IF NOT EXISTS idx_ingest_status ON ingestion_logs(status);
-    CREATE INDEX IF NOT EXISTS idx_ingest_created ON ingestion_logs(created_at DESC);
+  // ─── Phase 4: Add company_id columns to existing tables ─────────
+  console.log('🔧 [DB] Phase 4: Company ID migrations...');
 
-    -- ==================== BILLING & LICENSING TABLES ====================
+  await run('company_id_alters', `DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='test_executions' AND column_name='company_id') THEN
+      ALTER TABLE test_executions ADD COLUMN company_id INTEGER REFERENCES companies(id);
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='healing_actions' AND column_name='company_id') THEN
+      ALTER TABLE healing_actions ADD COLUMN company_id INTEGER REFERENCES companies(id);
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='learned_patterns' AND column_name='company_id') THEN
+      ALTER TABLE learned_patterns ADD COLUMN company_id INTEGER REFERENCES companies(id);
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='healing_jobs' AND column_name='company_id') THEN
+      ALTER TABLE healing_jobs ADD COLUMN company_id INTEGER REFERENCES companies(id);
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='token_usage' AND column_name='company_id') THEN
+      ALTER TABLE token_usage ADD COLUMN company_id INTEGER REFERENCES companies(id);
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='rca_analyses' AND column_name='company_id') THEN
+      ALTER TABLE rca_analyses ADD COLUMN company_id INTEGER REFERENCES companies(id);
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='pr_automations' AND column_name='company_id') THEN
+      ALTER TABLE pr_automations ADD COLUMN company_id INTEGER REFERENCES companies(id);
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='generated_scripts' AND column_name='company_id') THEN
+      ALTER TABLE generated_scripts ADD COLUMN company_id INTEGER REFERENCES companies(id);
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='notification_configs' AND column_name='company_id') THEN
+      ALTER TABLE notification_configs ADD COLUMN company_id INTEGER REFERENCES companies(id);
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='notification_logs' AND column_name='company_id') THEN
+      ALTER TABLE notification_logs ADD COLUMN company_id INTEGER REFERENCES companies(id);
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='company_id') THEN
+      ALTER TABLE users ADD COLUMN company_id INTEGER REFERENCES companies(id);
+    END IF;
+  END $$`);
 
-    CREATE TABLE IF NOT EXISTS plans (
-      id            SERIAL PRIMARY KEY,
-      name          VARCHAR(100) NOT NULL,
-      slug          VARCHAR(50) UNIQUE NOT NULL,
-      price_usd_monthly    NUMERIC(10,2) DEFAULT 0,
-      price_usd_annually   NUMERIC(10,2) DEFAULT 0,
-      price_inr_monthly    NUMERIC(10,2) DEFAULT 0,
-      price_inr_annually   NUMERIC(10,2) DEFAULT 0,
-      credits_monthly      INTEGER NOT NULL DEFAULT 0,
-      max_users            INTEGER NOT NULL DEFAULT 1,
-      max_repos            INTEGER NOT NULL DEFAULT 1,
-      max_jobs_per_month   INTEGER NOT NULL DEFAULT 25,
-      retention_days       INTEGER NOT NULL DEFAULT 7,
-      features             JSONB DEFAULT '{}',
-      is_active            BOOLEAN DEFAULT TRUE,
-      created_at           TIMESTAMPTZ DEFAULT NOW(),
-      updated_at           TIMESTAMPTZ DEFAULT NOW()
-    );
+  // ─── Phase 5: Indexes ───────────────────────────────────────────
+  console.log('🔧 [DB] Phase 5: Indexes...');
 
-    CREATE TABLE IF NOT EXISTS subscriptions (
-      id                     SERIAL PRIMARY KEY,
-      company_id             INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
-      plan_id                INTEGER NOT NULL REFERENCES plans(id),
-      status                 VARCHAR(20) NOT NULL DEFAULT 'active'
-                             CHECK (status IN ('active','trialing','past_due','cancelled','expired')),
-      billing_cycle          VARCHAR(10) NOT NULL DEFAULT 'monthly'
-                             CHECK (billing_cycle IN ('monthly','annually')),
-      currency               VARCHAR(3) NOT NULL DEFAULT 'USD',
-      current_period_start   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      current_period_end     TIMESTAMPTZ NOT NULL DEFAULT (NOW() + INTERVAL '30 days'),
-      cancelled_at           TIMESTAMPTZ,
-      payment_gateway        VARCHAR(20) DEFAULT 'stripe',
-      gateway_subscription_id VARCHAR(255),
-      gateway_customer_id    VARCHAR(255),
-      created_at             TIMESTAMPTZ DEFAULT NOW(),
-      updated_at             TIMESTAMPTZ DEFAULT NOW()
-    );
+  const indexes = [
+    `CREATE INDEX IF NOT EXISTS idx_exec_status ON test_executions(status)`,
+    `CREATE INDEX IF NOT EXISTS idx_exec_test_name ON test_executions(test_name)`,
+    `CREATE INDEX IF NOT EXISTS idx_heal_exec_id ON healing_actions(test_execution_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_heal_strategy ON healing_actions(healing_strategy)`,
+    `CREATE INDEX IF NOT EXISTS idx_pattern_locator ON learned_patterns(failed_locator)`,
+    `CREATE INDEX IF NOT EXISTS idx_pattern_test_name ON learned_patterns(test_name)`,
+    `CREATE INDEX IF NOT EXISTS idx_pattern_error ON learned_patterns(error_pattern)`,
+    `CREATE INDEX IF NOT EXISTS idx_jobs_status ON healing_jobs(status)`,
+    `CREATE INDEX IF NOT EXISTS idx_token_usage_date ON token_usage(date)`,
+    `CREATE INDEX IF NOT EXISTS idx_rca_test_name ON rca_analyses(test_name)`,
+    `CREATE INDEX IF NOT EXISTS idx_rca_classification ON rca_analyses(classification)`,
+    `CREATE INDEX IF NOT EXISTS idx_rca_job_id ON rca_analyses(job_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_rca_exec_id ON rca_analyses(test_execution_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_pr_job_id ON pr_automations(job_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_pr_status ON pr_automations(status)`,
+    `CREATE INDEX IF NOT EXISTS idx_pc_company ON project_contexts(company_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_pc_active ON project_contexts(is_active) WHERE is_active = true`,
+    `CREATE INDEX IF NOT EXISTS idx_gs_url ON generated_scripts(url)`,
+    `CREATE INDEX IF NOT EXISTS idx_gs_created ON generated_scripts(created_at DESC)`,
+    `CREATE INDEX IF NOT EXISTS idx_gs_company ON generated_scripts(company_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_gs_project_ctx ON generated_scripts(project_context_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_dom_script ON dom_snapshots(script_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_sel_script ON selector_scores(script_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_wf_script ON workflow_maps(script_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_gp_script ON generated_projects(script_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_users_username ON users(username)`,
+    `CREATE INDEX IF NOT EXISTS idx_users_active ON users(is_active)`,
+    `CREATE INDEX IF NOT EXISTS idx_audit_user ON audit_logs(user_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_logs(action)`,
+    `CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_logs(created_at DESC)`,
+    `CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at)`,
+    `CREATE INDEX IF NOT EXISTS idx_notif_tool ON notification_configs(tool_type)`,
+    `CREATE INDEX IF NOT EXISTS idx_notif_log_type ON notification_logs(tool_type)`,
+    `CREATE INDEX IF NOT EXISTS idx_notif_log_created ON notification_logs(created_at DESC)`,
+    `CREATE INDEX IF NOT EXISTS idx_companies_slug ON companies(slug)`,
+    `CREATE INDEX IF NOT EXISTS idx_exec_company ON test_executions(company_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_heal_company ON healing_actions(company_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_pattern_company ON learned_patterns(company_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_jobs_company ON healing_jobs(company_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_token_company ON token_usage(company_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_rca_company ON rca_analyses(company_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_pr_company ON pr_automations(company_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_notif_config_company ON notification_configs(company_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_notif_log_company ON notification_logs(company_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_users_company ON users(company_id)`,
+  ];
+  for (const idx of indexes) {
+    await safeExec(client, idx.match(/idx_\w+/)?.[0] || 'index', idx);
+  }
 
-    CREATE TABLE IF NOT EXISTS subscription_usage (
-      id              SERIAL PRIMARY KEY,
-      subscription_id INTEGER REFERENCES subscriptions(id) ON DELETE CASCADE,
-      company_id      INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
-      operation       VARCHAR(50) NOT NULL,
-      credits_used    INTEGER NOT NULL DEFAULT 0,
-      metadata        JSONB DEFAULT '{}',
-      period_start    TIMESTAMPTZ NOT NULL,
-      period_end      TIMESTAMPTZ NOT NULL,
-      created_at      TIMESTAMPTZ DEFAULT NOW()
-    );
+  // ─── Phase 6: API keys, ingestion, billing, roles ───────────────
+  console.log('🔧 [DB] Phase 6: API keys, billing, roles...');
 
-    CREATE TABLE IF NOT EXISTS billing_events (
-      id                  SERIAL PRIMARY KEY,
-      company_id          INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
-      subscription_id     INTEGER REFERENCES subscriptions(id) ON DELETE SET NULL,
-      event_type          VARCHAR(50) NOT NULL,
-      amount              NUMERIC(10,2) DEFAULT 0,
-      currency            VARCHAR(3) DEFAULT 'USD',
-      gateway             VARCHAR(20),
-      gateway_event_id    VARCHAR(255),
-      invoice_number      VARCHAR(50),
-      status              VARCHAR(20) DEFAULT 'completed',
-      description         TEXT,
-      metadata            JSONB DEFAULT '{}',
-      created_at          TIMESTAMPTZ DEFAULT NOW()
-    );
+  await run('api_keys', `CREATE TABLE IF NOT EXISTS api_keys (
+    id            SERIAL PRIMARY KEY,
+    company_id    INTEGER NOT NULL REFERENCES companies(id),
+    name          VARCHAR(255) NOT NULL,
+    prefix        VARCHAR(20) NOT NULL,
+    key_hash      VARCHAR(64) NOT NULL UNIQUE,
+    scopes        JSONB DEFAULT '["ingest:write"]',
+    rate_limit    INTEGER DEFAULT 1000,
+    is_active     BOOLEAN DEFAULT TRUE,
+    last_used_at  TIMESTAMPTZ,
+    expires_at    TIMESTAMPTZ,
+    created_at    TIMESTAMPTZ DEFAULT NOW()
+  )`);
 
-    CREATE TABLE IF NOT EXISTS payment_methods (
-      id              SERIAL PRIMARY KEY,
-      company_id      INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
-      type            VARCHAR(20) NOT NULL DEFAULT 'card',
-      last_four       VARCHAR(4),
-      brand           VARCHAR(20),
-      exp_month       INTEGER,
-      exp_year        INTEGER,
-      is_default      BOOLEAN DEFAULT FALSE,
-      gateway         VARCHAR(20) DEFAULT 'stripe',
-      gateway_pm_id   VARCHAR(255),
-      created_at      TIMESTAMPTZ DEFAULT NOW()
-    );
+  await run('ingestion_logs', `CREATE TABLE IF NOT EXISTS ingestion_logs (
+    id            SERIAL PRIMARY KEY,
+    company_id    INTEGER NOT NULL REFERENCES companies(id),
+    provider      VARCHAR(50) NOT NULL,
+    build_id      VARCHAR(255),
+    repo_url      TEXT,
+    branch        VARCHAR(255),
+    commit_sha    VARCHAR(64),
+    total_tests   INTEGER DEFAULT 0,
+    passed_tests  INTEGER DEFAULT 0,
+    failed_tests  INTEGER DEFAULT 0,
+    skipped_tests INTEGER DEFAULT 0,
+    status        VARCHAR(20) DEFAULT 'received',
+    healing_job_id VARCHAR(255),
+    error_message TEXT,
+    metadata      JSONB DEFAULT '{}',
+    created_at    TIMESTAMPTZ DEFAULT NOW(),
+    completed_at  TIMESTAMPTZ
+  )`);
 
-    -- Billing indexes
-    CREATE INDEX IF NOT EXISTS idx_subscriptions_company ON subscriptions(company_id);
-    CREATE INDEX IF NOT EXISTS idx_subscriptions_status ON subscriptions(status);
-    CREATE INDEX IF NOT EXISTS idx_sub_usage_company ON subscription_usage(company_id);
-    CREATE INDEX IF NOT EXISTS idx_sub_usage_period ON subscription_usage(period_start, period_end);
-    CREATE INDEX IF NOT EXISTS idx_sub_usage_operation ON subscription_usage(operation);
-    CREATE INDEX IF NOT EXISTS idx_billing_events_company ON billing_events(company_id);
-    CREATE INDEX IF NOT EXISTS idx_billing_events_type ON billing_events(event_type);
-    CREATE INDEX IF NOT EXISTS idx_payment_methods_company ON payment_methods(company_id);
+  await run('plans', `CREATE TABLE IF NOT EXISTS plans (
+    id            SERIAL PRIMARY KEY,
+    name          VARCHAR(100) NOT NULL,
+    slug          VARCHAR(50) UNIQUE NOT NULL,
+    price_usd_monthly    NUMERIC(10,2) DEFAULT 0,
+    price_usd_annually   NUMERIC(10,2) DEFAULT 0,
+    price_inr_monthly    NUMERIC(10,2) DEFAULT 0,
+    price_inr_annually   NUMERIC(10,2) DEFAULT 0,
+    credits_monthly      INTEGER NOT NULL DEFAULT 0,
+    max_users            INTEGER NOT NULL DEFAULT 1,
+    max_repos            INTEGER NOT NULL DEFAULT 1,
+    max_jobs_per_month   INTEGER NOT NULL DEFAULT 25,
+    retention_days       INTEGER NOT NULL DEFAULT 7,
+    features             JSONB DEFAULT '{}',
+    is_active            BOOLEAN DEFAULT TRUE,
+    created_at           TIMESTAMPTZ DEFAULT NOW(),
+    updated_at           TIMESTAMPTZ DEFAULT NOW()
+  )`);
 
-    -- ==================== ROLES TABLE ====================
+  await run('subscriptions', `CREATE TABLE IF NOT EXISTS subscriptions (
+    id                     SERIAL PRIMARY KEY,
+    company_id             INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+    plan_id                INTEGER NOT NULL REFERENCES plans(id),
+    status                 VARCHAR(20) NOT NULL DEFAULT 'active'
+                           CHECK (status IN ('active','trialing','past_due','cancelled','expired')),
+    billing_cycle          VARCHAR(10) NOT NULL DEFAULT 'monthly'
+                           CHECK (billing_cycle IN ('monthly','annually')),
+    currency               VARCHAR(3) NOT NULL DEFAULT 'USD',
+    current_period_start   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    current_period_end     TIMESTAMPTZ NOT NULL DEFAULT (NOW() + INTERVAL '30 days'),
+    cancelled_at           TIMESTAMPTZ,
+    payment_gateway        VARCHAR(20) DEFAULT 'stripe',
+    gateway_subscription_id VARCHAR(255),
+    gateway_customer_id    VARCHAR(255),
+    created_at             TIMESTAMPTZ DEFAULT NOW(),
+    updated_at             TIMESTAMPTZ DEFAULT NOW()
+  )`);
 
-    CREATE TABLE IF NOT EXISTS roles (
-      id            SERIAL PRIMARY KEY,
-      name          VARCHAR(50) NOT NULL,
-      slug          VARCHAR(50) UNIQUE NOT NULL,
-      description   TEXT,
-      permissions   JSONB DEFAULT '{}',
-      is_system     BOOLEAN DEFAULT FALSE,
-      created_at    TIMESTAMPTZ DEFAULT NOW()
-    );
-  `);
+  await run('subscription_usage', `CREATE TABLE IF NOT EXISTS subscription_usage (
+    id              SERIAL PRIMARY KEY,
+    subscription_id INTEGER REFERENCES subscriptions(id) ON DELETE CASCADE,
+    company_id      INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+    operation       VARCHAR(50) NOT NULL,
+    credits_used    INTEGER NOT NULL DEFAULT 0,
+    metadata        JSONB DEFAULT '{}',
+    period_start    TIMESTAMPTZ NOT NULL,
+    period_end      TIMESTAMPTZ NOT NULL,
+    created_at      TIMESTAMPTZ DEFAULT NOW()
+  )`);
 
-  /* ---- Repository Intelligence Engine tables ---- */
-  await client.query(`
-    CREATE TABLE IF NOT EXISTS repository_contexts (
-      id              SERIAL PRIMARY KEY,
-      repo_id         VARCHAR(500) NOT NULL,
-      company_id      INTEGER REFERENCES companies(id),
-      profile         JSONB NOT NULL DEFAULT '{}',
-      scan_duration_ms INTEGER DEFAULT 0,
-      profile_version  INTEGER DEFAULT 1,
-      created_at      TIMESTAMPTZ DEFAULT NOW(),
-      updated_at      TIMESTAMPTZ DEFAULT NOW()
-    );
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_repo_ctx_repo_company
-      ON repository_contexts(repo_id, COALESCE(company_id, 0));
-    CREATE INDEX IF NOT EXISTS idx_repo_ctx_company
-      ON repository_contexts(company_id);
-  `);
+  await run('billing_events', `CREATE TABLE IF NOT EXISTS billing_events (
+    id                  SERIAL PRIMARY KEY,
+    company_id          INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+    subscription_id     INTEGER REFERENCES subscriptions(id) ON DELETE SET NULL,
+    event_type          VARCHAR(50) NOT NULL,
+    amount              NUMERIC(10,2) DEFAULT 0,
+    currency            VARCHAR(3) DEFAULT 'USD',
+    gateway             VARCHAR(20),
+    gateway_event_id    VARCHAR(255),
+    invoice_number      VARCHAR(50),
+    status              VARCHAR(20) DEFAULT 'completed',
+    description         TEXT,
+    metadata            JSONB DEFAULT '{}',
+    created_at          TIMESTAMPTZ DEFAULT NOW()
+  )`);
 
-  await client.query(`
-    CREATE TABLE IF NOT EXISTS code_chunks (
-      id              SERIAL PRIMARY KEY,
-      repo_context_id INTEGER REFERENCES repository_contexts(id) ON DELETE CASCADE,
-      file_path       VARCHAR(1000) NOT NULL,
-      chunk_type      VARCHAR(50) NOT NULL,
-      chunk_name      VARCHAR(500) NOT NULL,
-      content         TEXT NOT NULL,
-      line_start      INTEGER,
-      line_end        INTEGER,
-      metadata        JSONB DEFAULT '{}',
-      created_at      TIMESTAMPTZ DEFAULT NOW()
-    );
-    CREATE INDEX IF NOT EXISTS idx_code_chunks_repo ON code_chunks(repo_context_id);
-    CREATE INDEX IF NOT EXISTS idx_code_chunks_type ON code_chunks(chunk_type);
-  `);
+  await run('payment_methods', `CREATE TABLE IF NOT EXISTS payment_methods (
+    id              SERIAL PRIMARY KEY,
+    company_id      INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+    type            VARCHAR(20) NOT NULL DEFAULT 'card',
+    last_four       VARCHAR(4),
+    brand           VARCHAR(20),
+    exp_month       INTEGER,
+    exp_year        INTEGER,
+    is_default      BOOLEAN DEFAULT FALSE,
+    gateway         VARCHAR(20) DEFAULT 'stripe',
+    gateway_pm_id   VARCHAR(255),
+    created_at      TIMESTAMPTZ DEFAULT NOW()
+  )`);
+
+  // Billing indexes
+  const billingIndexes = [
+    `CREATE INDEX IF NOT EXISTS idx_subscriptions_company ON subscriptions(company_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_subscriptions_status ON subscriptions(status)`,
+    `CREATE INDEX IF NOT EXISTS idx_sub_usage_company ON subscription_usage(company_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_sub_usage_period ON subscription_usage(period_start, period_end)`,
+    `CREATE INDEX IF NOT EXISTS idx_sub_usage_operation ON subscription_usage(operation)`,
+    `CREATE INDEX IF NOT EXISTS idx_billing_events_company ON billing_events(company_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_billing_events_type ON billing_events(event_type)`,
+    `CREATE INDEX IF NOT EXISTS idx_payment_methods_company ON payment_methods(company_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_api_keys_hash ON api_keys(key_hash)`,
+    `CREATE INDEX IF NOT EXISTS idx_api_keys_company ON api_keys(company_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_ingest_company ON ingestion_logs(company_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_ingest_status ON ingestion_logs(status)`,
+    `CREATE INDEX IF NOT EXISTS idx_ingest_created ON ingestion_logs(created_at DESC)`,
+  ];
+  for (const idx of billingIndexes) {
+    await safeExec(client, idx.match(/idx_\w+/)?.[0] || 'billing_index', idx);
+  }
+
+  await run('roles', `CREATE TABLE IF NOT EXISTS roles (
+    id            SERIAL PRIMARY KEY,
+    name          VARCHAR(50) NOT NULL,
+    slug          VARCHAR(50) UNIQUE NOT NULL,
+    description   TEXT,
+    permissions   JSONB DEFAULT '{}',
+    is_system     BOOLEAN DEFAULT FALSE,
+    created_at    TIMESTAMPTZ DEFAULT NOW()
+  )`);
+
+  // ─── Phase 7: Repository Intelligence Engine ────────────────────
+  console.log('🔧 [DB] Phase 7: Repository Intelligence...');
+
+  await run('repository_contexts', `CREATE TABLE IF NOT EXISTS repository_contexts (
+    id              SERIAL PRIMARY KEY,
+    repo_id         VARCHAR(500) NOT NULL,
+    company_id      INTEGER REFERENCES companies(id),
+    profile         JSONB NOT NULL DEFAULT '{}',
+    scan_duration_ms INTEGER DEFAULT 0,
+    profile_version  INTEGER DEFAULT 1,
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ DEFAULT NOW()
+  )`);
+  await safeExec(client, 'idx_repo_ctx_repo_company',
+    `CREATE UNIQUE INDEX IF NOT EXISTS idx_repo_ctx_repo_company ON repository_contexts(repo_id, COALESCE(company_id, 0))`);
+  await safeExec(client, 'idx_repo_ctx_company',
+    `CREATE INDEX IF NOT EXISTS idx_repo_ctx_company ON repository_contexts(company_id)`);
+
+  await run('code_chunks', `CREATE TABLE IF NOT EXISTS code_chunks (
+    id              SERIAL PRIMARY KEY,
+    repo_context_id INTEGER REFERENCES repository_contexts(id) ON DELETE CASCADE,
+    file_path       VARCHAR(1000) NOT NULL,
+    chunk_type      VARCHAR(50) NOT NULL,
+    chunk_name      VARCHAR(500) NOT NULL,
+    content         TEXT NOT NULL,
+    line_start      INTEGER,
+    line_end        INTEGER,
+    metadata        JSONB DEFAULT '{}',
+    created_at      TIMESTAMPTZ DEFAULT NOW()
+  )`);
+  await safeExec(client, 'idx_code_chunks_repo',
+    `CREATE INDEX IF NOT EXISTS idx_code_chunks_repo ON code_chunks(repo_context_id)`);
+  await safeExec(client, 'idx_code_chunks_type',
+    `CREATE INDEX IF NOT EXISTS idx_code_chunks_type ON code_chunks(chunk_type)`);
+
+  console.log(`🔧 [DB] Table creation complete: ${ok} succeeded, ${fail} failed`);
 
   // Seed default plans & roles
+  console.log('🔧 [DB] Seeding plans & roles...');
   await seedDefaultPlans(client);
   await seedDefaultRoles(client);
 
   // Ensure default company exists and backfill orphaned data
+  console.log('🔧 [DB] Running migrations...');
   await migrateDefaultCompany(client);
+
+  console.log(`✅ [DB] initSchema complete (${ok} ok, ${fail} errors)`);
 }
 
 /* -------------------------------------------------------------------------- */
