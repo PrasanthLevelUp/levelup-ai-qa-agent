@@ -107,6 +107,8 @@ const REQUIRED_TABLES = [
   'application_knowledge', 'knowledge_items', 'knowledge_relationships',
   // Projects
   'projects', 'repositories',
+  // Webhooks
+  'webhook_configs', 'webhook_events',
 ];
 
 export async function initDb(): Promise<void> {
@@ -808,6 +810,49 @@ async function initSchema(client: PoolClient): Promise<void> {
     `CREATE INDEX IF NOT EXISTS idx_repos_project ON repositories(project_id)`);
   await safeExec(client, 'idx_repos_company',
     `CREATE INDEX IF NOT EXISTS idx_repos_company ON repositories(company_id)`);
+
+  // ─── Phase 9: Webhook Configs & Events (Autonomous CI Healing) ───
+  console.log('🔧 [DB] Phase 9: Webhooks...');
+
+  await run('webhook_configs', `CREATE TABLE IF NOT EXISTS webhook_configs (
+    id SERIAL PRIMARY KEY,
+    project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+    repository_id INTEGER REFERENCES repositories(id) ON DELETE SET NULL,
+    webhook_secret VARCHAR(255) NOT NULL,
+    is_active BOOLEAN DEFAULT true,
+    events_received INTEGER DEFAULT 0,
+    last_event_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+  )`);
+  await safeExec(client, 'idx_wh_project',
+    `CREATE INDEX IF NOT EXISTS idx_wh_project ON webhook_configs(project_id)`);
+  await safeExec(client, 'uq_wh_project_repo',
+    `CREATE UNIQUE INDEX IF NOT EXISTS uq_wh_project_repo ON webhook_configs(project_id, COALESCE(repository_id, 0))`);
+
+  await run('webhook_events', `CREATE TABLE IF NOT EXISTS webhook_events (
+    id SERIAL PRIMARY KEY,
+    webhook_config_id INTEGER REFERENCES webhook_configs(id) ON DELETE SET NULL,
+    company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+    event_type VARCHAR(100) NOT NULL,
+    action VARCHAR(100),
+    repo_url TEXT,
+    branch VARCHAR(255),
+    commit_sha VARCHAR(64),
+    workflow_name VARCHAR(255),
+    workflow_conclusion VARCHAR(50),
+    test_failures JSONB,
+    healing_job_id VARCHAR(100),
+    payload_summary JSONB,
+    status VARCHAR(50) DEFAULT 'received',
+    processed_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+  )`);
+  await safeExec(client, 'idx_whe_company',
+    `CREATE INDEX IF NOT EXISTS idx_whe_company ON webhook_events(company_id)`);
+  await safeExec(client, 'idx_whe_status',
+    `CREATE INDEX IF NOT EXISTS idx_whe_status ON webhook_events(status)`);
 
   console.log(`🔧 [DB] Table creation complete: ${ok} succeeded, ${fail} failed`);
 
@@ -4768,4 +4813,139 @@ export async function deleteRepository(id: number, companyId: number): Promise<b
     [id, companyId],
   );
   return (rowCount ?? 0) > 0;
+}
+
+
+
+// ─── Webhook Configs ──────────────────────────────────────────────────────────
+
+export async function createWebhookConfig(data: {
+  projectId: number;
+  companyId: number;
+  repositoryId?: number;
+  webhookSecret: string;
+}): Promise<any> {
+  const pool = getPool();
+  const { rows } = await pool.query(
+    `INSERT INTO webhook_configs (project_id, company_id, repository_id, webhook_secret)
+     VALUES ($1, $2, $3, $4)
+     ON CONFLICT ON CONSTRAINT uq_wh_project_repo
+     DO UPDATE SET webhook_secret = $4, is_active = true, updated_at = NOW()
+     RETURNING *`,
+    [data.projectId, data.companyId, data.repositoryId || null, data.webhookSecret],
+  );
+  return rows[0];
+}
+
+export async function getWebhookConfig(projectId: number, companyId: number): Promise<any | null> {
+  const pool = getPool();
+  const { rows } = await pool.query(
+    `SELECT wc.*, r.url as repository_url, r.name as repository_name, r.branch as repository_branch
+     FROM webhook_configs wc
+     LEFT JOIN repositories r ON r.id = wc.repository_id
+     WHERE wc.project_id = $1 AND wc.company_id = $2 AND wc.is_active = true
+     ORDER BY wc.created_at DESC LIMIT 1`,
+    [projectId, companyId],
+  );
+  return rows[0] || null;
+}
+
+export async function getWebhookConfigBySecret(secret: string): Promise<any | null> {
+  const pool = getPool();
+  const { rows } = await pool.query(
+    `SELECT wc.*, r.url as repository_url, r.name as repository_name, r.branch as repository_branch,
+            p.name as project_name, c.name as company_name
+     FROM webhook_configs wc
+     LEFT JOIN repositories r ON r.id = wc.repository_id
+     LEFT JOIN projects p ON p.id = wc.project_id
+     LEFT JOIN companies c ON c.id = wc.company_id
+     WHERE wc.webhook_secret = $1 AND wc.is_active = true`,
+    [secret],
+  );
+  return rows[0] || null;
+}
+
+export async function findWebhookConfigByRepoUrl(repoUrl: string): Promise<any | null> {
+  const pool = getPool();
+  // Match by repository URL (strip .git suffix for comparison)
+  const normalizedUrl = repoUrl.replace(/\.git$/, '');
+  const { rows } = await pool.query(
+    `SELECT wc.*, r.url as repository_url, r.name as repository_name, r.branch as repository_branch,
+            p.name as project_name, c.name as company_name
+     FROM webhook_configs wc
+     JOIN repositories r ON r.id = wc.repository_id
+     LEFT JOIN projects p ON p.id = wc.project_id
+     LEFT JOIN companies c ON c.id = wc.company_id
+     WHERE wc.is_active = true
+       AND (r.url = $1 OR r.url = $2 OR REPLACE(r.url, '.git', '') = $1)
+     ORDER BY wc.created_at DESC LIMIT 1`,
+    [normalizedUrl, normalizedUrl + '.git'],
+  );
+  return rows[0] || null;
+}
+
+export async function incrementWebhookEventCount(configId: number): Promise<void> {
+  const pool = getPool();
+  await pool.query(
+    `UPDATE webhook_configs SET events_received = events_received + 1, last_event_at = NOW(), updated_at = NOW() WHERE id = $1`,
+    [configId],
+  );
+}
+
+export async function logWebhookEvent(data: {
+  webhookConfigId?: number;
+  companyId: number;
+  eventType: string;
+  action?: string;
+  repoUrl?: string;
+  branch?: string;
+  commitSha?: string;
+  workflowName?: string;
+  workflowConclusion?: string;
+  testFailures?: any;
+  healingJobId?: string;
+  payloadSummary?: any;
+  status?: string;
+}): Promise<number> {
+  const pool = getPool();
+  const { rows } = await pool.query(
+    `INSERT INTO webhook_events
+     (webhook_config_id, company_id, event_type, action, repo_url, branch, commit_sha,
+      workflow_name, workflow_conclusion, test_failures, healing_job_id, payload_summary, status)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+     RETURNING id`,
+    [
+      data.webhookConfigId || null,
+      data.companyId,
+      data.eventType,
+      data.action || null,
+      data.repoUrl || null,
+      data.branch || null,
+      data.commitSha || null,
+      data.workflowName || null,
+      data.workflowConclusion || null,
+      data.testFailures ? JSON.stringify(data.testFailures) : null,
+      data.healingJobId || null,
+      data.payloadSummary ? JSON.stringify(data.payloadSummary) : null,
+      data.status || 'received',
+    ],
+  );
+  return rows[0].id;
+}
+
+export async function updateWebhookEventStatus(eventId: number, status: string, healingJobId?: string): Promise<void> {
+  const pool = getPool();
+  await pool.query(
+    `UPDATE webhook_events SET status = $2, healing_job_id = COALESCE($3, healing_job_id), processed_at = NOW() WHERE id = $1`,
+    [eventId, status, healingJobId || null],
+  );
+}
+
+export async function getWebhookEvents(companyId: number, limit = 50): Promise<any[]> {
+  const pool = getPool();
+  const { rows } = await pool.query(
+    `SELECT * FROM webhook_events WHERE company_id = $1 ORDER BY created_at DESC LIMIT $2`,
+    [companyId, limit],
+  );
+  return rows;
 }
