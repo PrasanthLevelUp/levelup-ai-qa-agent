@@ -184,17 +184,32 @@ export function createServer(): express.Application {
 export async function startAPIServer(): Promise<void> {
   const port = parseInt(process.env['PORT'] || '8080', 10);
 
-  // Initialize PostgreSQL schema before starting server
-  await initDb();
-
   const app = createServer();
 
+  // START SERVER FIRST — Railway healthcheck requires a listening port within ~5 min.
+  // Database init happens AFTER the server is up so /api/health can respond immediately.
   const server = app.listen(port, () => {
     logger.info(MOD, `API server started on port ${port}`, { port });
     console.log(`\n🚀 LevelUp AI QA Agent API running at http://localhost:${port}`);
     console.log(`   Health: http://localhost:${port}/api/health`);
     console.log(`   Docs:   See README.md for API documentation\n`);
   });
+
+  // Initialize PostgreSQL schema AFTER server is listening
+  // Non-fatal: log errors but don't crash the server
+  try {
+    console.log('🔧 [DB] Starting database initialization (server already listening)...');
+    await initDb();
+    console.log('✅ [DB] Database initialization complete');
+  } catch (err: any) {
+    console.error('⚠️ [DB] Database initialization failed — server is running but DB may be incomplete');
+    console.error('⚠️ [DB] Error:', err?.message, err?.code);
+    logger.error(MOD, 'Database initialization failed (non-fatal)', {
+      error: err?.message, code: err?.code, detail: err?.detail,
+    });
+    // Server continues running — /api/health still responds
+    // /api/health/database will show which tables are missing
+  }
 
   // Graceful shutdown
   const shutdown = async () => {
