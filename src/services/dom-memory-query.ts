@@ -86,6 +86,7 @@ export class DOMMemoryQuery {
       });
 
       return {
+        selector,
         ...history,
         assessment,
       };
@@ -115,7 +116,7 @@ export class DOMMemoryQuery {
     try {
       const raw = await dbGetAlternativeSelectors(failedSelector, projectId, companyId);
 
-      const alternatives: AlternativeSelector[] = raw.map(alt => {
+      const alternatives: AlternativeSelector[] = raw.map((alt: any) => {
         const compositeScore = alt.stabilityScore * 0.6 + alt.score * 0.4;
         return {
           ...alt,

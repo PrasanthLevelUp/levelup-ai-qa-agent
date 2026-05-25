@@ -4980,3 +4980,141 @@ export async function getWebhookEvents(companyId: number, limit = 50): Promise<a
   );
   return rows;
 }
+
+
+
+/* ───────────────────────────────────────────────────────────────────────────
+   DOM Memory / Selector History helpers
+   (consumed by src/services/dom-memory-query.ts)
+   ─────────────────────────────────────────────────────────────────────────── */
+
+export async function getSelectorHistory(
+  selector: string,
+  projectId?: number,
+): Promise<{
+  stabilityScore: number;
+  changeCount: number;
+  recentChanges: number;
+  firstSeen: string | null;
+  lastSeen: string | null;
+  observations: number;
+}> {
+  const pool = getPool();
+  const conditions = ['selector = $1'];
+  const params: any[] = [selector];
+  if (projectId) {
+    conditions.push(`project_id = $${params.length + 1}`);
+    params.push(projectId);
+  }
+  const where = conditions.join(' AND ');
+
+  const { rows } = await pool.query(
+    `SELECT
+       COUNT(*)::int                              AS observations,
+       MIN(captured_at)                           AS first_seen,
+       MAX(captured_at)                           AS last_seen,
+       COUNT(DISTINCT change_type) FILTER (WHERE change_type <> 'observed')::int AS change_count,
+       COUNT(*) FILTER (WHERE captured_at > NOW() - INTERVAL '7 days')::int       AS recent_changes,
+       COALESCE(AVG(stability_score), 1.0)::real  AS stability_score
+     FROM selector_history
+     WHERE ${where}`,
+    params,
+  );
+
+  const row = rows[0] || {};
+  return {
+    stabilityScore: row.stability_score ?? 1.0,
+    changeCount: row.change_count ?? 0,
+    recentChanges: row.recent_changes ?? 0,
+    firstSeen: row.first_seen ?? null,
+    lastSeen: row.last_seen ?? null,
+    observations: row.observations ?? 0,
+  };
+}
+
+export async function getAlternativeSelectors(
+  failedSelector: string,
+  projectId?: number,
+  companyId?: number,
+): Promise<
+  Array<{
+    selector: string;
+    source: string;
+    score: number;
+    stabilityScore: number;
+    lastSeen: string | null;
+    usageCount: number;
+  }>
+> {
+  const pool = getPool();
+  const conditions = ['element_identifier IN (SELECT element_identifier FROM selector_history WHERE selector = $1)'];
+  const params: any[] = [failedSelector];
+
+  if (projectId) {
+    conditions.push(`project_id = $${params.length + 1}`);
+    params.push(projectId);
+  }
+  if (companyId) {
+    conditions.push(`company_id = $${params.length + 1}`);
+    params.push(companyId);
+  }
+  conditions.push('selector <> $1');  // exclude the failed selector itself
+
+  const where = conditions.join(' AND ');
+
+  const { rows } = await pool.query(
+    `SELECT
+       selector,
+       COALESCE(source, 'observed')                   AS source,
+       COALESCE(AVG(stability_score), 0.5)::real       AS stability_score,
+       COALESCE(AVG(stability_score), 0.5)::real       AS score,
+       MAX(captured_at)                                AS last_seen,
+       COUNT(*)::int                                   AS usage_count
+     FROM selector_history
+     WHERE ${where}
+     GROUP BY selector, source
+     ORDER BY stability_score DESC
+     LIMIT 20`,
+    params,
+  );
+
+  return rows.map((r: any) => ({
+    selector: r.selector,
+    source: r.source,
+    score: r.score,
+    stabilityScore: r.stability_score,
+    lastSeen: r.last_seen,
+    usageCount: r.usage_count,
+  }));
+}
+
+export async function recordSelectorObservation(data: {
+  projectId?: number;
+  companyId?: number;
+  pageUrl?: string;
+  selector: string;
+  previousSelector?: string;
+  elementType?: string;
+  changeType?: string;
+  source?: string;
+  metadata?: Record<string, any>;
+}): Promise<void> {
+  const pool = getPool();
+  await pool.query(
+    `INSERT INTO selector_history
+       (project_id, company_id, page_url, selector, previous_selector,
+        element_type, change_type, source, stability_score, metadata)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 1.0, $9)`,
+    [
+      data.projectId ?? null,
+      data.companyId ?? null,
+      data.pageUrl ?? null,
+      data.selector,
+      data.previousSelector ?? null,
+      data.elementType ?? null,
+      data.changeType ?? 'observed',
+      data.source ?? 'scan',
+      JSON.stringify(data.metadata ?? {}),
+    ],
+  );
+}

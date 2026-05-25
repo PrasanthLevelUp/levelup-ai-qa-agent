@@ -57,6 +57,7 @@ import { createKnowledgeRouter } from './routes/knowledge';
 import { createDashboardRouter } from './routes/dashboard';
 import { createProjectsRouter } from './routes/projects';
 import { createCIWebhookRouter } from './routes/ci-webhooks';
+import { createHealingPRRouter } from './routes/healing-pr';
 import { notifyRca } from '../integrations/slack';
 import { createRcaTicket } from '../integrations/jira';
 import cookieParser from 'cookie-parser';
