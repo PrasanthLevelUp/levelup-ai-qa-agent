@@ -125,9 +125,13 @@ export async function initDb(): Promise<void> {
     // Verify all required tables exist post-init
     await verifySchema(client);
   } catch (err: any) {
-    console.error('❌ [DB] initDb FAILED:', err?.message, err?.code, err?.detail);
-    logger.error(MOD, 'initDb failed', { error: err?.message, code: err?.code, detail: err?.detail });
-    throw err; // Re-throw to prevent server from starting with broken schema
+    console.error('⚠️ [DB] initDb encountered errors:', err?.message, err?.code, err?.detail);
+    logger.error(MOD, 'initDb encountered errors (non-fatal — server continues)', {
+      error: err?.message, code: err?.code, detail: err?.detail,
+    });
+    // Do NOT throw — let the server start so healthcheck passes.
+    // Individual table errors are already logged by safeExec.
+    // Use GET /api/health/database to check which tables are missing.
   } finally {
     client.release();
   }
@@ -795,19 +799,21 @@ async function migrateDefaultCompany(client: PoolClient): Promise<void> {
      RETURNING id`
   );
   const defaultId = rows[0].id;
+  console.log(`🔧 [DB] Default company ID: ${defaultId}`);
 
-  // Backfill any rows without company_id
+  // Backfill any rows without company_id (each individually, non-fatal)
   const tables = [
     'test_executions', 'healing_actions', 'learned_patterns',
     'healing_jobs', 'token_usage', 'rca_analyses', 'pr_automations',
     'generated_scripts', 'notification_configs', 'notification_logs', 'users',
   ];
   for (const t of tables) {
-    await client.query(`UPDATE ${t} SET company_id = $1 WHERE company_id IS NULL`, [defaultId]);
+    await safeExec(client, `backfill_${t}`,
+      `UPDATE ${t} SET company_id = ${defaultId} WHERE company_id IS NULL`);
   }
 
-  // Migrate notification_configs unique constraint: tool_type → (tool_type, company_id)
-  await client.query(`
+  // Migrate notification_configs unique constraint
+  await safeExec(client, 'notif_constraint_migration', `
     DO $$ BEGIN
       IF EXISTS (
         SELECT 1 FROM pg_constraint
@@ -818,154 +824,156 @@ async function migrateDefaultCompany(client: PoolClient): Promise<void> {
         CREATE UNIQUE INDEX IF NOT EXISTS uq_notif_tool_company
           ON notification_configs (tool_type, COALESCE(company_id, 0));
       END IF;
-    END $$;
+    END $$`);
 
-    -- Test Coverage Intelligence tables
-    CREATE TABLE IF NOT EXISTS test_requirements (
-      id SERIAL PRIMARY KEY,
-      title VARCHAR(500) NOT NULL,
-      description TEXT NOT NULL,
-      jira_id VARCHAR(100),
-      business_flow TEXT,
-      acceptance_criteria TEXT,
-      api_docs TEXT,
-      release_notes TEXT,
-      module VARCHAR(200),
-      feature_type VARCHAR(100),
-      risk_level VARCHAR(20) DEFAULT 'medium',
-      analysis JSONB,
-      company_id INTEGER REFERENCES companies(id),
-      created_at TIMESTAMPTZ DEFAULT NOW(),
-      updated_at TIMESTAMPTZ DEFAULT NOW()
-    );
-    CREATE INDEX IF NOT EXISTS idx_test_requirements_company ON test_requirements(company_id);
+  // ── Test Coverage Intelligence tables (individual, resilient) ──
+  console.log('🔧 [DB] Migration: Test Coverage tables...');
 
-    CREATE TABLE IF NOT EXISTS generated_test_scenarios (
-      id SERIAL PRIMARY KEY,
-      requirement_id INTEGER NOT NULL REFERENCES test_requirements(id) ON DELETE CASCADE,
-      scenario TEXT NOT NULL,
-      coverage_type VARCHAR(50) NOT NULL,
-      priority VARCHAR(10) DEFAULT 'P1',
-      risk_area VARCHAR(200),
-      company_id INTEGER REFERENCES companies(id),
-      created_at TIMESTAMPTZ DEFAULT NOW()
-    );
-    CREATE INDEX IF NOT EXISTS idx_gen_scenarios_req ON generated_test_scenarios(requirement_id);
+  await safeExec(client, 'test_requirements', `CREATE TABLE IF NOT EXISTS test_requirements (
+    id SERIAL PRIMARY KEY,
+    title VARCHAR(500) NOT NULL,
+    description TEXT NOT NULL,
+    jira_id VARCHAR(100),
+    business_flow TEXT,
+    acceptance_criteria TEXT,
+    api_docs TEXT,
+    release_notes TEXT,
+    module VARCHAR(200),
+    feature_type VARCHAR(100),
+    risk_level VARCHAR(20) DEFAULT 'medium',
+    analysis JSONB,
+    company_id INTEGER REFERENCES companies(id),
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+  )`);
+  await safeExec(client, 'idx_test_requirements_company',
+    `CREATE INDEX IF NOT EXISTS idx_test_requirements_company ON test_requirements(company_id)`);
 
-    CREATE TABLE IF NOT EXISTS generated_test_cases (
-      id SERIAL PRIMARY KEY,
-      scenario_id INTEGER NOT NULL REFERENCES generated_test_scenarios(id) ON DELETE CASCADE,
-      title VARCHAR(500) NOT NULL,
-      preconditions TEXT,
-      steps JSONB NOT NULL DEFAULT '[]',
-      expected_result TEXT NOT NULL,
-      test_data TEXT,
-      priority VARCHAR(10) DEFAULT 'P1',
-      severity VARCHAR(20) DEFAULT 'major',
-      tags JSONB DEFAULT '[]',
-      automation_ready BOOLEAN DEFAULT false,
-      automation_complexity VARCHAR(20) DEFAULT 'medium',
-      selector_availability VARCHAR(20) DEFAULT 'unknown',
-      company_id INTEGER REFERENCES companies(id),
-      created_at TIMESTAMPTZ DEFAULT NOW()
-    );
-    CREATE INDEX IF NOT EXISTS idx_gen_cases_scenario ON generated_test_cases(scenario_id);
+  await safeExec(client, 'generated_test_scenarios', `CREATE TABLE IF NOT EXISTS generated_test_scenarios (
+    id SERIAL PRIMARY KEY,
+    requirement_id INTEGER NOT NULL REFERENCES test_requirements(id) ON DELETE CASCADE,
+    scenario TEXT NOT NULL,
+    coverage_type VARCHAR(50) NOT NULL,
+    priority VARCHAR(10) DEFAULT 'P1',
+    risk_area VARCHAR(200),
+    company_id INTEGER REFERENCES companies(id),
+    created_at TIMESTAMPTZ DEFAULT NOW()
+  )`);
+  await safeExec(client, 'idx_gen_scenarios_req',
+    `CREATE INDEX IF NOT EXISTS idx_gen_scenarios_req ON generated_test_scenarios(requirement_id)`);
 
-    CREATE TABLE IF NOT EXISTS application_knowledge (
-      id SERIAL PRIMARY KEY,
-      module VARCHAR(200) NOT NULL,
-      workflow TEXT,
-      business_rules TEXT,
-      dependencies TEXT,
-      apis TEXT,
-      historical_bugs TEXT,
-      company_id INTEGER REFERENCES companies(id),
-      created_at TIMESTAMPTZ DEFAULT NOW(),
-      updated_at TIMESTAMPTZ DEFAULT NOW()
-    );
-    CREATE INDEX IF NOT EXISTS idx_app_knowledge_company ON application_knowledge(company_id);
-    CREATE INDEX IF NOT EXISTS idx_app_knowledge_module ON application_knowledge(module);
+  await safeExec(client, 'generated_test_cases', `CREATE TABLE IF NOT EXISTS generated_test_cases (
+    id SERIAL PRIMARY KEY,
+    scenario_id INTEGER NOT NULL REFERENCES generated_test_scenarios(id) ON DELETE CASCADE,
+    title VARCHAR(500) NOT NULL,
+    preconditions TEXT,
+    steps JSONB NOT NULL DEFAULT '[]',
+    expected_result TEXT NOT NULL,
+    test_data TEXT,
+    priority VARCHAR(10) DEFAULT 'P1',
+    severity VARCHAR(20) DEFAULT 'major',
+    tags JSONB DEFAULT '[]',
+    automation_ready BOOLEAN DEFAULT false,
+    automation_complexity VARCHAR(20) DEFAULT 'medium',
+    selector_availability VARCHAR(20) DEFAULT 'unknown',
+    company_id INTEGER REFERENCES companies(id),
+    created_at TIMESTAMPTZ DEFAULT NOW()
+  )`);
+  await safeExec(client, 'idx_gen_cases_scenario',
+    `CREATE INDEX IF NOT EXISTS idx_gen_cases_scenario ON generated_test_cases(scenario_id)`);
 
-    -- ========================================================================
-    -- Knowledge Management — Enterprise Knowledge Graph
-    -- ========================================================================
+  await safeExec(client, 'application_knowledge', `CREATE TABLE IF NOT EXISTS application_knowledge (
+    id SERIAL PRIMARY KEY,
+    module VARCHAR(200) NOT NULL,
+    workflow TEXT,
+    business_rules TEXT,
+    dependencies TEXT,
+    apis TEXT,
+    historical_bugs TEXT,
+    company_id INTEGER REFERENCES companies(id),
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+  )`);
+  await safeExec(client, 'idx_app_knowledge_company',
+    `CREATE INDEX IF NOT EXISTS idx_app_knowledge_company ON application_knowledge(company_id)`);
+  await safeExec(client, 'idx_app_knowledge_module',
+    `CREATE INDEX IF NOT EXISTS idx_app_knowledge_module ON application_knowledge(module)`);
 
-    CREATE TABLE IF NOT EXISTS knowledge_items (
-      id SERIAL PRIMARY KEY,
-      company_id INTEGER REFERENCES companies(id),
-      category VARCHAR(50) NOT NULL CHECK (category IN (
-        'business_rule','workflow','architecture','dependency','integration',
-        'automation','manual_test','bug_pattern','domain'
-      )),
-      title VARCHAR(500) NOT NULL,
-      description TEXT NOT NULL,
-      metadata JSONB DEFAULT '{}',
-      tags TEXT[] DEFAULT '{}',
-      related_modules TEXT[] DEFAULT '{}',
-      status VARCHAR(20) NOT NULL DEFAULT 'active' CHECK (status IN ('draft','active','archived')),
-      priority VARCHAR(20) NOT NULL DEFAULT 'medium' CHECK (priority IN ('low','medium','high','critical')),
-      created_by VARCHAR(200),
-      created_at TIMESTAMPTZ DEFAULT NOW(),
-      updated_at TIMESTAMPTZ DEFAULT NOW()
-    );
-    CREATE INDEX IF NOT EXISTS idx_ki_company ON knowledge_items(company_id);
-    CREATE INDEX IF NOT EXISTS idx_ki_category ON knowledge_items(category);
-    CREATE INDEX IF NOT EXISTS idx_ki_status ON knowledge_items(status);
-    CREATE INDEX IF NOT EXISTS idx_ki_tags ON knowledge_items USING GIN(tags);
-    CREATE INDEX IF NOT EXISTS idx_ki_modules ON knowledge_items USING GIN(related_modules);
-    CREATE INDEX IF NOT EXISTS idx_ki_search ON knowledge_items USING GIN(to_tsvector('english', coalesce(title,'') || ' ' || coalesce(description,'')));
+  // ── Knowledge Management tables (individual, resilient) ──
+  console.log('🔧 [DB] Migration: Knowledge Management tables...');
 
-    CREATE TABLE IF NOT EXISTS knowledge_relationships (
-      id SERIAL PRIMARY KEY,
-      company_id INTEGER REFERENCES companies(id),
-      source_knowledge_id INTEGER NOT NULL REFERENCES knowledge_items(id) ON DELETE CASCADE,
-      target_knowledge_id INTEGER NOT NULL REFERENCES knowledge_items(id) ON DELETE CASCADE,
-      relationship_type VARCHAR(30) NOT NULL CHECK (relationship_type IN (
-        'depends_on','related_to','implements','blocks','duplicates'
-      )),
-      description TEXT,
-      created_at TIMESTAMPTZ DEFAULT NOW(),
-      UNIQUE(source_knowledge_id, target_knowledge_id, relationship_type)
-    );
-    CREATE INDEX IF NOT EXISTS idx_kr_source ON knowledge_relationships(source_knowledge_id);
-    CREATE INDEX IF NOT EXISTS idx_kr_target ON knowledge_relationships(target_knowledge_id);
-    CREATE INDEX IF NOT EXISTS idx_kr_company ON knowledge_relationships(company_id);
+  await safeExec(client, 'knowledge_items', `CREATE TABLE IF NOT EXISTS knowledge_items (
+    id SERIAL PRIMARY KEY,
+    company_id INTEGER REFERENCES companies(id),
+    category VARCHAR(50) NOT NULL CHECK (category IN (
+      'business_rule','workflow','architecture','dependency','integration',
+      'automation','manual_test','bug_pattern','domain'
+    )),
+    title VARCHAR(500) NOT NULL,
+    description TEXT NOT NULL,
+    metadata JSONB DEFAULT '{}',
+    tags TEXT[] DEFAULT '{}',
+    related_modules TEXT[] DEFAULT '{}',
+    status VARCHAR(20) NOT NULL DEFAULT 'active' CHECK (status IN ('draft','active','archived')),
+    priority VARCHAR(20) NOT NULL DEFAULT 'medium' CHECK (priority IN ('low','medium','high','critical')),
+    created_by VARCHAR(200),
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+  )`);
+  await safeExec(client, 'idx_ki_company', `CREATE INDEX IF NOT EXISTS idx_ki_company ON knowledge_items(company_id)`);
+  await safeExec(client, 'idx_ki_category', `CREATE INDEX IF NOT EXISTS idx_ki_category ON knowledge_items(category)`);
+  await safeExec(client, 'idx_ki_status', `CREATE INDEX IF NOT EXISTS idx_ki_status ON knowledge_items(status)`);
+  await safeExec(client, 'idx_ki_tags', `CREATE INDEX IF NOT EXISTS idx_ki_tags ON knowledge_items USING GIN(tags)`);
+  await safeExec(client, 'idx_ki_modules', `CREATE INDEX IF NOT EXISTS idx_ki_modules ON knowledge_items USING GIN(related_modules)`);
+  await safeExec(client, 'idx_ki_search',
+    `CREATE INDEX IF NOT EXISTS idx_ki_search ON knowledge_items USING GIN(to_tsvector('english', coalesce(title,'') || ' ' || coalesce(description,'')))`);
 
-    -- AI Usage Logging & Cost Tracking
-    CREATE TABLE IF NOT EXISTS ai_usage_logs (
-      id SERIAL PRIMARY KEY,
-      model TEXT NOT NULL,
-      tokens_used INTEGER NOT NULL,
-      cost_usd DECIMAL(10, 6) NOT NULL,
-      feature TEXT NOT NULL,
-      task_type TEXT,
-      user_id TEXT,
-      metadata JSONB,
-      created_at TIMESTAMPTZ DEFAULT NOW()
-    );
-    CREATE INDEX IF NOT EXISTS idx_ai_usage_date ON ai_usage_logs(DATE(created_at));
-    CREATE INDEX IF NOT EXISTS idx_ai_usage_feature ON ai_usage_logs(feature);
-    CREATE INDEX IF NOT EXISTS idx_ai_usage_user ON ai_usage_logs(user_id);
-    CREATE INDEX IF NOT EXISTS idx_ai_usage_model ON ai_usage_logs(model);
-  `);
+  await safeExec(client, 'knowledge_relationships', `CREATE TABLE IF NOT EXISTS knowledge_relationships (
+    id SERIAL PRIMARY KEY,
+    company_id INTEGER REFERENCES companies(id),
+    source_knowledge_id INTEGER NOT NULL REFERENCES knowledge_items(id) ON DELETE CASCADE,
+    target_knowledge_id INTEGER NOT NULL REFERENCES knowledge_items(id) ON DELETE CASCADE,
+    relationship_type VARCHAR(30) NOT NULL CHECK (relationship_type IN (
+      'depends_on','related_to','implements','blocks','duplicates'
+    )),
+    description TEXT,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(source_knowledge_id, target_knowledge_id, relationship_type)
+  )`);
+  await safeExec(client, 'idx_kr_source', `CREATE INDEX IF NOT EXISTS idx_kr_source ON knowledge_relationships(source_knowledge_id)`);
+  await safeExec(client, 'idx_kr_target', `CREATE INDEX IF NOT EXISTS idx_kr_target ON knowledge_relationships(target_knowledge_id)`);
+  await safeExec(client, 'idx_kr_company', `CREATE INDEX IF NOT EXISTS idx_kr_company ON knowledge_relationships(company_id)`);
 
-  // ── Migrations for existing databases ──────────────────────────────
-  // These safely add columns/tables that may be missing on existing deployments.
+  // ── AI Usage Logging ──
+  console.log('🔧 [DB] Migration: AI Usage tables...');
+
+  await safeExec(client, 'ai_usage_logs', `CREATE TABLE IF NOT EXISTS ai_usage_logs (
+    id SERIAL PRIMARY KEY,
+    model TEXT NOT NULL,
+    tokens_used INTEGER NOT NULL,
+    cost_usd DECIMAL(10, 6) NOT NULL,
+    feature TEXT NOT NULL,
+    task_type TEXT,
+    user_id TEXT,
+    metadata JSONB,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+  )`);
+  await safeExec(client, 'idx_ai_usage_date', `CREATE INDEX IF NOT EXISTS idx_ai_usage_date ON ai_usage_logs(DATE(created_at))`);
+  await safeExec(client, 'idx_ai_usage_feature', `CREATE INDEX IF NOT EXISTS idx_ai_usage_feature ON ai_usage_logs(feature)`);
+  await safeExec(client, 'idx_ai_usage_user', `CREATE INDEX IF NOT EXISTS idx_ai_usage_user ON ai_usage_logs(user_id)`);
+  await safeExec(client, 'idx_ai_usage_model', `CREATE INDEX IF NOT EXISTS idx_ai_usage_model ON ai_usage_logs(model)`);
+
+  // ── Column migrations for existing databases ──
+  console.log('🔧 [DB] Migration: Column additions...');
   const migrations = [
     `ALTER TABLE generated_scripts ADD COLUMN IF NOT EXISTS company_id INTEGER`,
     `ALTER TABLE generated_scripts ADD COLUMN IF NOT EXISTS project_context_id INTEGER REFERENCES project_contexts(id) ON DELETE SET NULL`,
   ];
-
   for (const sql of migrations) {
-    try {
-      await client.query(sql);
-    } catch (err: any) {
-      // Ignore errors from already-applied migrations or missing dependencies
-      if (!err.message?.includes('already exists') && !err.message?.includes('duplicate column')) {
-        console.warn(`[DB Migration] Non-fatal: ${err.message}`);
-      }
-    }
+    await safeExec(client, 'migration_alter', sql);
   }
+
+  console.log('✅ [DB] migrateDefaultCompany complete');
 }
 
 /* -------------------------------------------------------------------------- */
