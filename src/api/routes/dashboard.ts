@@ -580,15 +580,42 @@ export function createDashboardRouter(): Router {
       );
       res.json({ success: true, data: rows[0] });
     } catch (err: any) {
+      // Log comprehensive PostgreSQL error details for debugging
+      const pgErrorInfo: Record<string, unknown> = {
+        message: err?.message,
+        code: err?.code,          // e.g. 42P01 = undefined_table, 23505 = unique_violation
+        detail: err?.detail,      // PG constraint/detail info
+        hint: err?.hint,
+        position: err?.position,  // position in query where error occurred
+        constraint: err?.constraint,
+        table: err?.table,
+        column: err?.column,
+        dataType: err?.dataType,
+        severity: err?.severity,
+        routine: err?.routine,
+        file: err?.file,
+        line: err?.line,
+      };
+
       logger.error(MOD, 'project-context POST failed', {
-        error: err?.message || err,
-        stack: err?.stack,
+        ts: new Date().toISOString(),
+        ...pgErrorInfo,
+        stack: err?.stack?.split('\n').slice(0, 5).join('\n'),
         body: { ...req.body, credentials: req.body.credentials ? '[REDACTED]' : undefined },
       });
+
+      // Return actionable error info in non-production environments
+      const isProd = process.env.NODE_ENV === 'production';
       res.status(500).json({
         success: false,
         error: 'Failed to save project context',
-        details: process.env.NODE_ENV !== 'production' ? err?.message : undefined,
+        ...(isProd ? {} : {
+          details: err?.message,
+          pgCode: err?.code,
+          pgDetail: err?.detail,
+          pgHint: err?.hint,
+          pgTable: err?.table,
+        }),
       });
     }
   });
