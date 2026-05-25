@@ -105,6 +105,8 @@ const REQUIRED_TABLES = [
   'test_requirements', 'generated_test_scenarios', 'generated_test_cases',
   // Knowledge
   'application_knowledge', 'knowledge_items', 'knowledge_relationships',
+  // Projects
+  'projects', 'repositories',
 ];
 
 export async function initDb(): Promise<void> {
@@ -773,6 +775,40 @@ async function initSchema(client: PoolClient): Promise<void> {
   await safeExec(client, 'idx_code_chunks_type',
     `CREATE INDEX IF NOT EXISTS idx_code_chunks_type ON code_chunks(chunk_type)`);
 
+  // ─── Phase 8: Projects & DB-based Repositories ───────────────────
+  console.log('🔧 [DB] Phase 8: Projects & Repositories...');
+
+  await run('projects', `CREATE TABLE IF NOT EXISTS projects (
+    id SERIAL PRIMARY KEY,
+    company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+    name VARCHAR(255) NOT NULL,
+    description TEXT,
+    is_active BOOLEAN DEFAULT true,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+  )`);
+  await safeExec(client, 'idx_projects_company',
+    `CREATE INDEX IF NOT EXISTS idx_projects_company ON projects(company_id)`);
+  await safeExec(client, 'uq_project_name_company',
+    `CREATE UNIQUE INDEX IF NOT EXISTS uq_project_name_company ON projects(company_id, name)`);
+
+  await run('repositories', `CREATE TABLE IF NOT EXISTS repositories (
+    id SERIAL PRIMARY KEY,
+    project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+    name VARCHAR(255) NOT NULL,
+    url TEXT NOT NULL,
+    branch VARCHAR(255) DEFAULT 'main',
+    type VARCHAR(50) DEFAULT 'web',
+    is_active BOOLEAN DEFAULT true,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+  )`);
+  await safeExec(client, 'idx_repos_project',
+    `CREATE INDEX IF NOT EXISTS idx_repos_project ON repositories(project_id)`);
+  await safeExec(client, 'idx_repos_company',
+    `CREATE INDEX IF NOT EXISTS idx_repos_company ON repositories(company_id)`);
+
   console.log(`🔧 [DB] Table creation complete: ${ok} succeeded, ${fail} failed`);
 
   // Seed default plans & roles
@@ -825,6 +861,56 @@ async function migrateDefaultCompany(client: PoolClient): Promise<void> {
           ON notification_configs (tool_type, COALESCE(company_id, 0));
       END IF;
     END $$`);
+
+  // ── Add project_id to existing tables ──
+  console.log('🔧 [DB] Migration: Adding project_id columns...');
+  await safeExec(client, 'project_id_alters', `DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='project_contexts' AND column_name='project_id') THEN
+      ALTER TABLE project_contexts ADD COLUMN project_id INTEGER REFERENCES projects(id) ON DELETE SET NULL;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='generated_scripts' AND column_name='project_id') THEN
+      ALTER TABLE generated_scripts ADD COLUMN project_id INTEGER REFERENCES projects(id) ON DELETE SET NULL;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='test_executions' AND column_name='project_id') THEN
+      ALTER TABLE test_executions ADD COLUMN project_id INTEGER REFERENCES projects(id) ON DELETE SET NULL;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='healing_actions' AND column_name='project_id') THEN
+      ALTER TABLE healing_actions ADD COLUMN project_id INTEGER REFERENCES projects(id) ON DELETE SET NULL;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='healing_jobs' AND column_name='project_id') THEN
+      ALTER TABLE healing_jobs ADD COLUMN project_id INTEGER REFERENCES projects(id) ON DELETE SET NULL;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='rca_analyses' AND column_name='project_id') THEN
+      ALTER TABLE rca_analyses ADD COLUMN project_id INTEGER REFERENCES projects(id) ON DELETE SET NULL;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='test_requirements' AND column_name='project_id') THEN
+      ALTER TABLE test_requirements ADD COLUMN project_id INTEGER REFERENCES projects(id) ON DELETE SET NULL;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='repository_contexts' AND column_name='project_id') THEN
+      ALTER TABLE repository_contexts ADD COLUMN project_id INTEGER REFERENCES projects(id) ON DELETE SET NULL;
+    END IF;
+  END $$`);
+  const projectIdIndexes = [
+    `CREATE INDEX IF NOT EXISTS idx_pc_project ON project_contexts(project_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_gs_project ON generated_scripts(project_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_exec_project ON test_executions(project_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_heal_project ON healing_actions(project_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_jobs_project ON healing_jobs(project_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_rca_project ON rca_analyses(project_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_test_req_project ON test_requirements(project_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_repo_ctx_project ON repository_contexts(project_id)`,
+  ];
+  for (const idx of projectIdIndexes) {
+    await safeExec(client, idx.match(/idx_\w+/)?.[0] || 'project_index', idx);
+  }
+
+  // Seed default project for existing data
+  await safeExec(client, 'seed_default_project', `
+    INSERT INTO projects (company_id, name, description)
+    SELECT id, 'Default Project', 'Auto-created default project'
+    FROM companies
+    WHERE NOT EXISTS (SELECT 1 FROM projects WHERE company_id = companies.id AND name = 'Default Project')
+  `);
 
   // ── Test Coverage Intelligence tables (individual, resilient) ──
   console.log('🔧 [DB] Migration: Test Coverage tables...');
@@ -4530,4 +4616,156 @@ export async function getDailyBudgetStatus(maxDailyCostUsd: number = 5.0): Promi
     isOverBudget: totalCostUsd >= maxDailyCostUsd,
     percentUsed: maxDailyCostUsd > 0 ? Math.round((totalCostUsd / maxDailyCostUsd) * 10000) / 100 : 0,
   };
+}
+
+
+
+/* -------------------------------------------------------------------------- */
+/*  Projects & Repositories CRUD                                              */
+/* -------------------------------------------------------------------------- */
+
+export async function createProject(data: {
+  company_id: number;
+  name: string;
+  description?: string;
+}): Promise<any> {
+  const pool = getPool();
+  const { rows } = await pool.query(
+    `INSERT INTO projects (company_id, name, description)
+     VALUES ($1, $2, $3) RETURNING *`,
+    [data.company_id, data.name, data.description || null],
+  );
+  return rows[0];
+}
+
+export async function listProjects(companyId: number): Promise<any[]> {
+  const pool = getPool();
+  const { rows } = await pool.query(
+    `SELECT p.*,
+            (SELECT COUNT(*) FROM repositories r WHERE r.project_id = p.id AND r.is_active = true) AS repo_count
+     FROM projects p
+     WHERE p.company_id = $1 AND p.is_active = true
+     ORDER BY p.created_at DESC`,
+    [companyId],
+  );
+  return rows;
+}
+
+export async function getProject(id: number, companyId: number): Promise<any | null> {
+  const pool = getPool();
+  const { rows } = await pool.query(
+    `SELECT * FROM projects WHERE id = $1 AND company_id = $2`,
+    [id, companyId],
+  );
+  return rows[0] || null;
+}
+
+export async function updateProject(id: number, companyId: number, data: {
+  name?: string;
+  description?: string;
+}): Promise<any | null> {
+  const pool = getPool();
+  const sets: string[] = [];
+  const vals: any[] = [];
+  let idx = 1;
+  if (data.name !== undefined) { sets.push(`name = $${idx++}`); vals.push(data.name); }
+  if (data.description !== undefined) { sets.push(`description = $${idx++}`); vals.push(data.description); }
+  if (sets.length === 0) return getProject(id, companyId);
+  sets.push(`updated_at = NOW()`);
+  vals.push(id, companyId);
+  const { rows } = await pool.query(
+    `UPDATE projects SET ${sets.join(', ')} WHERE id = $${idx++} AND company_id = $${idx} RETURNING *`,
+    vals,
+  );
+  return rows[0] || null;
+}
+
+export async function deleteProject(id: number, companyId: number): Promise<boolean> {
+  const pool = getPool();
+  const { rowCount } = await pool.query(
+    `UPDATE projects SET is_active = false, updated_at = NOW() WHERE id = $1 AND company_id = $2`,
+    [id, companyId],
+  );
+  return (rowCount ?? 0) > 0;
+}
+
+export async function addRepository(data: {
+  project_id: number;
+  company_id: number;
+  name: string;
+  url: string;
+  branch?: string;
+  type?: string;
+}): Promise<any> {
+  const pool = getPool();
+  const { rows } = await pool.query(
+    `INSERT INTO repositories (project_id, company_id, name, url, branch, type)
+     VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+    [data.project_id, data.company_id, data.name, data.url, data.branch || 'main', data.type || 'web'],
+  );
+  return rows[0];
+}
+
+export async function listRepositories(projectId: number, companyId: number): Promise<any[]> {
+  const pool = getPool();
+  const { rows } = await pool.query(
+    `SELECT * FROM repositories WHERE project_id = $1 AND company_id = $2 AND is_active = true ORDER BY created_at DESC`,
+    [projectId, companyId],
+  );
+  return rows;
+}
+
+export async function listAllRepositories(companyId: number): Promise<any[]> {
+  const pool = getPool();
+  const { rows } = await pool.query(
+    `SELECT r.*, p.name as project_name
+     FROM repositories r
+     JOIN projects p ON p.id = r.project_id
+     WHERE r.company_id = $1 AND r.is_active = true AND p.is_active = true
+     ORDER BY p.name, r.name`,
+    [companyId],
+  );
+  return rows;
+}
+
+export async function getRepository(id: number, companyId: number): Promise<any | null> {
+  const pool = getPool();
+  const { rows } = await pool.query(
+    `SELECT * FROM repositories WHERE id = $1 AND company_id = $2`,
+    [id, companyId],
+  );
+  return rows[0] || null;
+}
+
+export async function updateRepository(id: number, companyId: number, data: {
+  name?: string;
+  url?: string;
+  branch?: string;
+  type?: string;
+}): Promise<any | null> {
+  const pool = getPool();
+  const sets: string[] = [];
+  const vals: any[] = [];
+  let idx = 1;
+  if (data.name !== undefined) { sets.push(`name = $${idx++}`); vals.push(data.name); }
+  if (data.url !== undefined) { sets.push(`url = $${idx++}`); vals.push(data.url); }
+  if (data.branch !== undefined) { sets.push(`branch = $${idx++}`); vals.push(data.branch); }
+  if (data.type !== undefined) { sets.push(`type = $${idx++}`); vals.push(data.type); }
+  if (sets.length === 0) return getRepository(id, companyId);
+  sets.push(`updated_at = NOW()`);
+  vals.push(id, companyId);
+  const { rows } = await pool.query(
+    `UPDATE repositories SET ${sets.join(', ')} WHERE id = $${idx++} AND company_id = $${idx} RETURNING *`,
+    vals,
+  );
+  return rows[0] || null;
+}
+
+export async function deleteRepository(id: number, companyId: number): Promise<boolean> {
+  const pool = getPool();
+  const { rowCount } = await pool.query(
+    `UPDATE repositories SET is_active = false, updated_at = NOW() WHERE id = $1 AND company_id = $2`,
+    [id, companyId],
+  );
+  return (rowCount ?? 0) > 0;
 }

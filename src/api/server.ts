@@ -55,6 +55,7 @@ import { hooksRouter } from './routes/hooks';
 import { createRepoIntelligenceRouter } from './routes/repo-intelligence';
 import { createKnowledgeRouter } from './routes/knowledge';
 import { createDashboardRouter } from './routes/dashboard';
+import { createProjectsRouter } from './routes/projects';
 import { notifyRca } from '../integrations/slack';
 import { createRcaTicket } from '../integrations/jira';
 import cookieParser from 'cookie-parser';
@@ -168,6 +169,7 @@ export function createServer(): express.Application {
   app.use('/api/repo-intelligence', authMiddleware, companyMiddleware, createRepoIntelligenceRouter());
   app.use('/api/knowledge', authMiddleware, companyMiddleware, createKnowledgeRouter());
   app.use('/api/dashboard', authMiddleware, companyMiddleware, createDashboardRouter());
+  app.use('/api/projects', authMiddleware, companyMiddleware, createProjectsRouter());
 
   // List all jobs
   app.get('/api/jobs', authMiddleware, (_req, res) => {
