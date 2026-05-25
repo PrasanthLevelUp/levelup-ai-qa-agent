@@ -174,6 +174,7 @@ export function createServer(): express.Application {
   app.use('/api/knowledge', authMiddleware, companyMiddleware, createKnowledgeRouter());
   app.use('/api/dashboard', authMiddleware, companyMiddleware, createDashboardRouter());
   app.use('/api/projects', authMiddleware, companyMiddleware, createProjectsRouter());
+  app.use('/api/healings', authMiddleware, companyMiddleware, createHealingPRRouter());
 
   // List all jobs
   app.get('/api/jobs', authMiddleware, (_req, res) => {

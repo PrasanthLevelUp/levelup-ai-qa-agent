@@ -97,6 +97,8 @@ const REQUIRED_TABLES = [
   'rca_analyses',
   // Token & AI usage
   'token_usage', 'ai_usage_logs',
+  // DOM Memory ↔ Healing
+  'selector_history',
   // API keys & ingestion
   'api_keys', 'ingestion_logs',
   // Repository intelligence
@@ -857,6 +859,35 @@ async function initSchema(client: PoolClient): Promise<void> {
   console.log(`🔧 [DB] Table creation complete: ${ok} succeeded, ${fail} failed`);
 
   // Seed default plans & roles
+  // ─── Phase 9: Selector History (DOM Memory ↔ Healing integration) ───
+  console.log('🔧 [DB] Phase 9: Selector History tracking...');
+  await run('selector_history', `CREATE TABLE IF NOT EXISTS selector_history (
+    id SERIAL PRIMARY KEY,
+    project_id INTEGER REFERENCES projects(id) ON DELETE SET NULL,
+    company_id INTEGER REFERENCES companies(id),
+    page_url TEXT,
+    selector TEXT NOT NULL,
+    previous_selector TEXT,
+    element_type TEXT,
+    element_identifier TEXT,
+    change_type TEXT DEFAULT 'observed',
+    source TEXT DEFAULT 'scan',
+    stability_score REAL DEFAULT 1.0,
+    metadata JSONB DEFAULT '{}',
+    captured_at TIMESTAMPTZ DEFAULT NOW()
+  )`);
+
+  // Indexes for fast lookups during healing
+  for (const idx of [
+    `CREATE INDEX IF NOT EXISTS idx_sel_hist_selector ON selector_history(selector)`,
+    `CREATE INDEX IF NOT EXISTS idx_sel_hist_project ON selector_history(project_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_sel_hist_element ON selector_history(element_identifier)`,
+    `CREATE INDEX IF NOT EXISTS idx_sel_hist_captured ON selector_history(captured_at DESC)`,
+    `CREATE INDEX IF NOT EXISTS idx_sel_hist_proj_sel ON selector_history(project_id, selector)`,
+  ]) {
+    await safeExec(client, idx.match(/idx_\w+/)![0], idx);
+  }
+
   console.log('🔧 [DB] Seeding plans & roles...');
   await seedDefaultPlans(client);
   await seedDefaultRoles(client);
