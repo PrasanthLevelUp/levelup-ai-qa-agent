@@ -19,7 +19,7 @@ import { createWebhookRouter } from './routes/webhook';
 import { JobQueue } from './queue/job-queue';
 import { RepoManager } from './services/repo-manager';
 import { logger } from '../utils/logger';
-import { initDb, closeDb } from '../db/postgres';
+import { initDb, closeDb, getDatabaseHealth } from '../db/postgres';
 
 // Import healing pipeline components
 import { ExecutionEngine } from '../core/execution-engine';
@@ -111,6 +111,25 @@ export function createServer(): express.Application {
       uptime: process.uptime(),
       timestamp: new Date().toISOString(),
     });
+  });
+
+  // Database health check — verifies all required tables exist
+  app.get('/api/health/database', async (_req, res) => {
+    try {
+      const health = await getDatabaseHealth();
+      res.status(health.healthy ? 200 : 503).json({
+        status: health.healthy ? 'ok' : 'degraded',
+        ...health,
+        timestamp: new Date().toISOString(),
+      });
+    } catch (err: any) {
+      logger.error(MOD, 'Database health check failed', { error: err?.message });
+      res.status(503).json({
+        status: 'error',
+        error: err?.message || 'Database health check failed',
+        timestamp: new Date().toISOString(),
+      });
+    }
   });
 
   // Webhook — no auth (uses its own signature validation)

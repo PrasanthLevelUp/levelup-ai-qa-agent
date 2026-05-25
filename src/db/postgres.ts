@@ -78,11 +78,100 @@ export function getPool(): Pool {
   return pool;
 }
 
+/** All tables that MUST exist for the application to function correctly. */
+const REQUIRED_TABLES = [
+  // Core
+  'companies', 'users', 'roles', 'sessions', 'audit_logs',
+  // Test execution & healing
+  'test_executions', 'healing_actions', 'learned_patterns', 'healing_jobs',
+  // Notifications
+  'notification_configs', 'notification_logs',
+  // Billing
+  'plans', 'subscriptions', 'subscription_usage', 'billing_events', 'payment_methods',
+  // Script generation
+  'project_contexts', 'generated_scripts', 'dom_snapshots', 'selector_scores',
+  'workflow_maps', 'generated_projects',
+  // PR automation
+  'pr_automations',
+  // RCA
+  'rca_analyses',
+  // Token & AI usage
+  'token_usage', 'ai_usage_logs',
+  // API keys & ingestion
+  'api_keys', 'ingestion_logs',
+  // Repository intelligence
+  'repository_contexts', 'code_chunks',
+  // Test coverage
+  'test_requirements', 'generated_test_scenarios', 'generated_test_cases',
+  // Knowledge
+  'application_knowledge', 'knowledge_items', 'knowledge_relationships',
+];
+
 export async function initDb(): Promise<void> {
   const client = await getPool().connect();
   try {
+    logger.info(MOD, '🚀 Starting database schema initialization...');
     await initSchema(client);
-    logger.info(MOD, 'PostgreSQL schema initialized');
+    logger.info(MOD, '✅ PostgreSQL schema initialized');
+
+    // Verify all required tables exist post-init
+    await verifySchema(client);
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Verify all required tables exist in the database.
+ * Logs warnings for any missing tables — does NOT throw.
+ */
+async function verifySchema(client: PoolClient): Promise<void> {
+  const { rows } = await client.query(
+    `SELECT table_name FROM information_schema.tables
+     WHERE table_schema = 'public' AND table_type = 'BASE TABLE'`
+  );
+  const existing = new Set(rows.map((r: any) => r.table_name));
+  const missing = REQUIRED_TABLES.filter(t => !existing.has(t));
+
+  if (missing.length > 0) {
+    logger.error(MOD, `❌ Missing tables after init: ${missing.join(', ')}`, { missing, total: REQUIRED_TABLES.length, found: existing.size });
+  } else {
+    logger.info(MOD, `✅ All ${REQUIRED_TABLES.length} required tables verified`, { total: REQUIRED_TABLES.length });
+  }
+}
+
+/**
+ * Health check: returns the status of every required table.
+ * Used by GET /api/health/database
+ */
+export async function getDatabaseHealth(): Promise<{
+  healthy: boolean;
+  tables: { name: string; exists: boolean; rowCount?: number }[];
+  totalRequired: number;
+  totalFound: number;
+  missingTables: string[];
+}> {
+  const client = await getPool().connect();
+  try {
+    const { rows } = await client.query(
+      `SELECT table_name FROM information_schema.tables
+       WHERE table_schema = 'public' AND table_type = 'BASE TABLE'`
+    );
+    const existing = new Set(rows.map((r: any) => r.table_name));
+    const missing = REQUIRED_TABLES.filter(t => !existing.has(t));
+
+    const tables = REQUIRED_TABLES.map(name => ({
+      name,
+      exists: existing.has(name),
+    }));
+
+    return {
+      healthy: missing.length === 0,
+      tables,
+      totalRequired: REQUIRED_TABLES.length,
+      totalFound: REQUIRED_TABLES.filter(t => existing.has(t)).length,
+      missingTables: missing,
+    };
   } finally {
     client.release();
   }
