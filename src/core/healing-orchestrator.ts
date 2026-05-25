@@ -1,7 +1,14 @@
 /**
- * Healing Orchestrator v2 (Hardened)
- * Integrates: Strategy Selector → Rule/Pattern/AI Engines → Validation → AST Patch → Rerun
- * Features: Confidence-based routing, token budget management, rollback support.
+ * Healing Orchestrator v3 (DOM Memory Enhanced)
+ * Integrates: DOM Memory → Strategy Selector → Rule/Pattern/AI Engines → Validation → AST Patch → Rerun
+ * Features: Confidence-based routing, token budget management, rollback support,
+ *           DOM Memory stability scoring, historical selector ranking.
+ *
+ * KEY DIFFERENTIATOR: Before generating new fixes, queries DOM Memory for:
+ *  1. Selector stability history (how often has this selector changed?)
+ *  2. Alternative selectors with stability scores
+ *  3. Ranks ALL suggestions (engine-generated + DOM Memory alternatives) by stability
+ *  4. Records healing observations for future learning
  */
 
 import type { FailureDetails } from './failure-analyzer';
@@ -15,6 +22,7 @@ import { ConfidenceEngine, type ConfidenceResult } from '../engines/confidence-e
 import { ValidationEngine, type ValidationResult } from '../engines/validation-engine';
 import { PatchEngine, type PatchResult } from '../engines/patch-engine';
 import { RerunEngine, type RerunResult } from '../engines/rerun-engine';
+import { DOMMemoryQuery, type DOMMemoryInsight, type AlternativeSelector } from '../services/dom-memory-query';
 import { logger } from '../utils/logger';
 import {
   logHealing,
@@ -36,6 +44,10 @@ export interface HealingSuggestion {
   tokensUsed: number;
   reasoning: string;
   addExplicitWait: boolean;
+  /** Stability score from DOM Memory (0–1, higher = more stable) */
+  stabilityScore?: number;
+  /** Human-readable stability assessment */
+  stabilityAssessment?: string;
 }
 
 export interface HealingOutcome {
@@ -45,6 +57,8 @@ export interface HealingOutcome {
   selectedEngine?: string;
   confidenceResult?: ConfidenceResult;
   domCandidates?: DOMExtractionResult;
+  /** DOM Memory insight for the failed selector */
+  domMemoryInsight?: DOMMemoryInsight;
 }
 
 export interface FinalizeResult {
@@ -54,6 +68,7 @@ export interface FinalizeResult {
   engine?: string;
   confidence?: number;
   tokensUsed?: number;
+  stabilityScore?: number;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -68,6 +83,7 @@ export class HealingOrchestrator {
   private readonly domExtractor: DOMCandidateExtractor;
   private readonly similarityEngine: SemanticSimilarityEngine;
   private readonly confidenceEngine: ConfidenceEngine;
+  private readonly domMemory: DOMMemoryQuery;
 
   constructor(
     private readonly ruleEngine: RuleEngine,
@@ -85,20 +101,102 @@ export class HealingOrchestrator {
     this.domExtractor = new DOMCandidateExtractor();
     this.similarityEngine = new SemanticSimilarityEngine();
     this.confidenceEngine = new ConfidenceEngine();
+    this.domMemory = new DOMMemoryQuery();
   }
 
   /**
-   * Main healing flow — enhanced with DOM candidate extraction.
-   * Priority: DOM Candidates → Rule Engine → Pattern Engine → AI Engine
+   * Main healing flow — enhanced with DOM Memory + DOM candidate extraction.
+   * Priority: DOM Memory Alternatives → DOM Candidates → Rule Engine → Pattern Engine → AI Engine
+   *
+   * DOM Memory integration (v3):
+   *  - Before trying any engine, queries historical selector data
+   *  - If a stable alternative exists from past healings, uses it immediately (0 tokens!)
+   *  - After engine-generated fixes, ranks them by stability score
+   *  - Records healing observation for future learning
    *
    * @param failure - Analyzed failure details
    * @param domHtml - Optional: raw DOM HTML from page.content() for DOM-based healing
+   * @param skipLocators - Optional: locators to skip (already tried)
+   * @param projectId - Optional: project ID for project-scoped DOM Memory queries
+   * @param companyId - Optional: company ID for company-scoped queries
    */
-  async heal(failure: FailureDetails, domHtml?: string, skipLocators?: Set<string>): Promise<HealingOutcome> {
+  async heal(
+    failure: FailureDetails,
+    domHtml?: string,
+    skipLocators?: Set<string>,
+    projectId?: number,
+    companyId?: number,
+  ): Promise<HealingOutcome> {
     const attemptedStrategies: HealingStrategy[] = [];
     let domCandidates: DOMExtractionResult | undefined;
+    let domMemoryInsight: DOMMemoryInsight | undefined;
 
-    // Step 0: DOM Candidate Extraction (if DOM HTML is available)
+    // ── Step 0a: DOM Memory Query (THE MOAT) ──────────────────
+    // Query historical selector data BEFORE doing anything else.
+    // This is what makes LevelUp different from every other tool.
+    if (failure.failedLocator) {
+      try {
+        domMemoryInsight = await this.domMemory.getInsight(
+          failure.failedLocator,
+          projectId,
+          companyId,
+        );
+
+        logger.info(MOD, 'DOM Memory insight retrieved', {
+          testName: failure.testName,
+          failedSelector: failure.failedLocator.slice(0, 60),
+          selectorStability: domMemoryInsight.selectorHistory.stabilityScore,
+          alternativesFound: domMemoryInsight.alternatives.length,
+          recommendation: domMemoryInsight.recommendation.slice(0, 100),
+        });
+
+        // If DOM Memory has a high-confidence stable alternative, use it immediately!
+        // This means 0 AI tokens, 0 latency — just historical knowledge.
+        const bestAlt = domMemoryInsight.bestAlternative;
+        if (bestAlt && bestAlt.compositeScore >= 0.75) {
+          // Validate the DOM Memory suggestion
+          const validation = this.validationEngine.validate({
+            newLocator: bestAlt.selector,
+            confidence: bestAlt.compositeScore,
+            originalCode: '',
+            filePath: failure.filePath,
+          });
+
+          if (validation.isValid) {
+            logger.info(MOD, '🧠 DOM Memory alternative accepted — 0 AI tokens!', {
+              selector: bestAlt.selector,
+              compositeScore: bestAlt.compositeScore,
+              stabilityScore: bestAlt.stabilityScore,
+              source: bestAlt.source,
+              reasoning: bestAlt.reasoning,
+            });
+
+            const suggestion: HealingSuggestion = {
+              newLocator: bestAlt.selector,
+              strategy: 'database_pattern', // Closest match — it's from historical data
+              confidence: bestAlt.compositeScore,
+              tokensUsed: 0,
+              reasoning: `[DOM Memory] ${bestAlt.reasoning} — ${domMemoryInsight.recommendation}`,
+              addExplicitWait: false,
+              stabilityScore: bestAlt.stabilityScore,
+              stabilityAssessment: domMemoryInsight.selectorHistory.assessment,
+            };
+
+            return {
+              suggestion,
+              attemptedStrategies: ['database_pattern'],
+              selectedEngine: 'dom_memory',
+              domMemoryInsight,
+            };
+          }
+        }
+      } catch (err: any) {
+        // Non-critical — DOM Memory is an enhancement, not a requirement
+        logger.warn(MOD, 'DOM Memory query failed (non-critical)', { error: err.message });
+      }
+    }
+
+    // ── Step 0b: DOM Candidate Extraction (from live DOM HTML) ──
     if (domHtml && failure.failedLocator) {
       logger.info(MOD, 'Running DOM candidate extraction', {
         testName: failure.testName,
@@ -126,22 +224,39 @@ export class HealingOrchestrator {
           sameTag: true,
         });
 
-        if (confidenceResult.finalScore >= 0.70) {
+        // Boost confidence if DOM Memory says this candidate is stable
+        let stabilityBoost = 0;
+        let stabilityScore: number | undefined;
+        if (domMemoryInsight) {
+          const altMatch = domMemoryInsight.alternatives.find(
+            a => a.selector === topCandidate.selector,
+          );
+          if (altMatch && altMatch.stabilityScore >= 0.7) {
+            stabilityBoost = 0.05; // Small boost for stability-confirmed candidates
+            stabilityScore = altMatch.stabilityScore;
+          }
+        }
+
+        const finalScore = Math.min(1.0, confidenceResult.finalScore + stabilityBoost);
+
+        if (finalScore >= 0.70) {
           logger.info(MOD, 'DOM candidate accepted', {
             selector: topCandidate.selector,
             score: topCandidate.score,
-            confidence: confidenceResult.finalScore,
+            confidence: finalScore,
+            stabilityBoost,
             grade: confidenceResult.grade,
             reasoning: topCandidate.reasoning,
           });
 
           const suggestion: HealingSuggestion = {
             newLocator: topCandidate.selector,
-            strategy: 'rule_based', // DOM extraction is deterministic, 0 tokens
-            confidence: confidenceResult.finalScore,
+            strategy: 'rule_based',
+            confidence: finalScore,
             tokensUsed: 0,
             reasoning: `[DOM Candidate] ${topCandidate.reasoning}`,
             addExplicitWait: false,
+            stabilityScore,
           };
 
           return {
@@ -150,12 +265,13 @@ export class HealingOrchestrator {
             selectedEngine: 'dom_candidate',
             confidenceResult,
             domCandidates,
+            domMemoryInsight,
           };
         }
       }
     }
 
-    // Step 1: Use strategy selector to determine best approach
+    // ── Step 1: Use strategy selector to determine best approach ──
     const selected = await this.strategySelector.selectStrategy(
       failure,
       this.ruleEngine,
@@ -172,8 +288,13 @@ export class HealingOrchestrator {
 
     // Step 2: Execute selected engine (or fall through all in priority order)
     if (selected.engine === 'none') {
-      // Try all engines in order as fallback
-      return this.healFallbackChain(failure, attemptedStrategies);
+      const outcome = await this.healFallbackChain(failure, attemptedStrategies);
+      // Enrich with stability scores
+      if (outcome.suggestion) {
+        await this.enrichWithStability(outcome.suggestion, domMemoryInsight);
+      }
+      outcome.domMemoryInsight = domMemoryInsight;
+      return outcome;
     }
 
     // Try selected engine first, then fall through
@@ -198,7 +319,7 @@ export class HealingOrchestrator {
         testName: failure.testName,
         attemptedStrategies,
       });
-      return { suggestion: null, attemptedStrategies, selectedEngine: selected.engine, domCandidates };
+      return { suggestion: null, attemptedStrategies, selectedEngine: selected.engine, domCandidates, domMemoryInsight };
     }
 
     // Calculate enhanced confidence for the chosen suggestion
@@ -214,12 +335,15 @@ export class HealingOrchestrator {
     // Update confidence with enhanced score
     suggestion.confidence = confidenceResult.finalScore;
 
+    // ── Enrich with DOM Memory stability data ──
+    await this.enrichWithStability(suggestion, domMemoryInsight);
+
     // Record token usage for AI calls
     if (suggestion.strategy === 'ai_reasoning' && suggestion.tokensUsed > 0) {
       await this.strategySelector.recordUsage('ai', suggestion.tokensUsed);
     }
 
-    return { suggestion, attemptedStrategies, selectedEngine: selected.engine, confidenceResult, domCandidates };
+    return { suggestion, attemptedStrategies, selectedEngine: selected.engine, confidenceResult, domCandidates, domMemoryInsight };
   }
 
   /**
@@ -359,7 +483,59 @@ export class HealingOrchestrator {
   }
 
   /**
-   * Finalize a successful healing — generate patch, store to DB, etc.
+   * Enrich a healing suggestion with DOM Memory stability data.
+   * Looks up the proposed new locator in DOM Memory and attaches stability info.
+   * Also applies a confidence boost for stable selectors.
+   */
+  private async enrichWithStability(
+    suggestion: HealingSuggestion,
+    domMemoryInsight?: DOMMemoryInsight,
+  ): Promise<void> {
+    try {
+      // Check if the proposed locator matches any DOM Memory alternative
+      if (domMemoryInsight?.alternatives.length) {
+        const match = domMemoryInsight.alternatives.find(
+          a => a.selector === suggestion.newLocator,
+        );
+        if (match) {
+          suggestion.stabilityScore = match.stabilityScore;
+          suggestion.stabilityAssessment =
+            match.stabilityScore >= 0.8 ? 'Highly stable — historically reliable' :
+            match.stabilityScore >= 0.5 ? 'Moderately stable' :
+            'Stability unknown — no significant history';
+
+          // Boost confidence for stable selectors (max +0.05)
+          if (match.stabilityScore >= 0.8) {
+            suggestion.confidence = Math.min(1.0, suggestion.confidence + 0.05);
+          } else if (match.stabilityScore < 0.3) {
+            // Penalise unstable selectors slightly
+            suggestion.confidence = Math.max(0.1, suggestion.confidence - 0.03);
+          }
+
+          logger.info(MOD, 'Stability data attached to suggestion', {
+            selector: suggestion.newLocator.slice(0, 60),
+            stabilityScore: match.stabilityScore,
+            adjustedConfidence: suggestion.confidence,
+          });
+          return;
+        }
+      }
+
+      // If no match in DOM Memory alternatives, do a direct lookup
+      const history = await this.domMemory.getSelectorHistory(suggestion.newLocator);
+      if (history.observations > 0) {
+        suggestion.stabilityScore = history.stabilityScore;
+        suggestion.stabilityAssessment = history.observations > 0
+          ? `Stability: ${history.stabilityScore.toFixed(2)} — ${history.changeCount} change(s) recorded`
+          : 'New selector — no history available';
+      }
+    } catch {
+      // Non-critical — don't break healing
+    }
+  }
+
+  /**
+   * Finalize a successful healing — generate patch, store to DB, record to DOM Memory.
    */
   async finalize(
     suggestion: HealingSuggestion,
@@ -367,6 +543,8 @@ export class HealingOrchestrator {
     originalCode: string,
     fixedCode: string,
     executionId: number,
+    projectId?: number,
+    companyId?: number,
   ): Promise<FinalizeResult> {
     // Generate patch
     const patch = this.patchEngine.generatePatch(
@@ -405,11 +583,27 @@ export class HealingOrchestrator {
       avg_tokens_saved: suggestion.tokensUsed,
     });
 
+    // ── Record to DOM Memory for future learning ──
+    // This is how the system gets smarter over time
+    try {
+      await this.domMemory.recordHealingObservation({
+        failedSelector: failure.failedLocator,
+        healedSelector: suggestion.newLocator,
+        projectId,
+        companyId,
+        pageUrl: failure.url || undefined,
+        source: `healing:${suggestion.strategy}`,
+      });
+    } catch {
+      // Non-critical — don't fail the finalize
+    }
+
     logger.info(MOD, 'Healing finalized', {
       testName: failure.testName,
       strategy: suggestion.strategy,
       patchPath: patch.patchPath,
       confidence: suggestion.confidence,
+      stabilityScore: suggestion.stabilityScore,
     });
 
     return {
@@ -418,6 +612,7 @@ export class HealingOrchestrator {
       engine: suggestion.strategy,
       confidence: suggestion.confidence,
       tokensUsed: suggestion.tokensUsed,
+      stabilityScore: suggestion.stabilityScore,
     };
   }
 }
