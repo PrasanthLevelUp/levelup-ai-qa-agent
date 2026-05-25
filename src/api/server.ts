@@ -56,7 +56,7 @@ import { createRepoIntelligenceRouter } from './routes/repo-intelligence';
 import { createKnowledgeRouter } from './routes/knowledge';
 import { createDashboardRouter } from './routes/dashboard';
 import { createProjectsRouter } from './routes/projects';
-import { createHealingPRRouter } from './routes/healing-pr';
+import { createCIWebhookRouter } from './routes/ci-webhooks';
 import { notifyRca } from '../integrations/slack';
 import { createRcaTicket } from '../integrations/jira';
 import cookieParser from 'cookie-parser';
@@ -136,6 +136,9 @@ export function createServer(): express.Application {
 
   // Webhook — no auth (uses its own signature validation)
   app.use('/api/webhook', createWebhookRouter(jobQueue, repoManager));
+
+  // CI Webhooks — autonomous healing (no auth, uses HMAC signature)
+  app.use('/api/ci-webhooks', createCIWebhookRouter(jobQueue));
 
   // Ingest API — uses its own API key auth (Bearer lvlp_live_xxx)
   // Must support both JSON and raw text/xml bodies

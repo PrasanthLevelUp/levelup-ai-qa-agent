@@ -5,6 +5,7 @@
 
 import { Router, type Request, type Response } from 'express';
 import { logger } from '../../utils/logger';
+import * as crypto from 'crypto';
 import {
   createProject,
   listProjects,
@@ -17,6 +18,8 @@ import {
   getRepository,
   updateRepository,
   deleteRepository,
+  createWebhookConfig,
+  getWebhookConfig,
 } from '../../db/postgres';
 
 const MOD = 'projects-route';
@@ -236,6 +239,98 @@ export function createProjectsRouter(): Router {
     } catch (err: any) {
       logger.error(MOD, 'Failed to list all repositories', { error: err.message });
       res.status(500).json({ error: 'Failed to list repositories' });
+    }
+  });
+
+  // ─── Webhook Configuration ─────────────────────────────────────
+
+  // POST /api/projects/:id/configure-webhook — Generate/update webhook config
+  router.post('/:id/configure-webhook', async (req: Request, res: Response) => {
+    try {
+      const projectId = parseInt(String(req.params.id), 10);
+      const companyId = (req as any).companyId;
+      const { repositoryId } = req.body;
+
+      // Generate a webhook secret
+      const secret = 'whsec_' + crypto.randomBytes(24).toString('hex');
+
+      const config = await createWebhookConfig({
+        projectId,
+        companyId,
+        repositoryId: repositoryId ? parseInt(repositoryId, 10) : undefined,
+        webhookSecret: secret,
+      });
+
+      // Build the webhook URL
+      const baseUrl = process.env['PUBLIC_API_URL']
+        || process.env['RAILWAY_PUBLIC_DOMAIN']
+          ? `https://${process.env['RAILWAY_PUBLIC_DOMAIN']}`
+          : 'https://levelup-ai-qa-agent-production.up.railway.app';
+      const webhookUrl = `${baseUrl}/api/ci-webhooks/github`;
+
+      logger.info(MOD, 'Webhook configured', { projectId, configId: config.id });
+
+      res.json({
+        success: true,
+        webhook: {
+          id: config.id,
+          webhookUrl,
+          secret,
+          events: ['workflow_run'],
+          contentType: 'application/json',
+          instructions: {
+            step1: 'Go to your GitHub repository → Settings → Webhooks → Add webhook',
+            step2: `Payload URL: ${webhookUrl}`,
+            step3: `Secret: ${secret}`,
+            step4: 'Content type: application/json',
+            step5: 'Select: "Let me select individual events" → Check "Workflow runs"',
+            step6: 'Click "Add webhook"',
+          },
+        },
+      });
+    } catch (err: any) {
+      logger.error(MOD, 'Failed to configure webhook', { error: err.message });
+      res.status(500).json({ error: 'Failed to configure webhook' });
+    }
+  });
+
+  // GET /api/projects/:id/webhook-status — Check webhook configuration
+  router.get('/:id/webhook-status', async (req: Request, res: Response) => {
+    try {
+      const projectId = parseInt(String(req.params.id), 10);
+      const companyId = (req as any).companyId;
+
+      const config = await getWebhookConfig(projectId, companyId);
+
+      if (!config) {
+        return res.json({
+          configured: false,
+          message: 'No webhook configured for this project. Use POST /configure-webhook to set up.',
+        });
+      }
+
+      const baseUrl = process.env['PUBLIC_API_URL']
+        || process.env['RAILWAY_PUBLIC_DOMAIN']
+          ? `https://${process.env['RAILWAY_PUBLIC_DOMAIN']}`
+          : 'https://levelup-ai-qa-agent-production.up.railway.app';
+      const webhookUrl = `${baseUrl}/api/ci-webhooks/github`;
+
+      res.json({
+        configured: true,
+        webhook: {
+          id: config.id,
+          webhookUrl,
+          repositoryName: config.repository_name || null,
+          repositoryUrl: config.repository_url || null,
+          eventsReceived: config.events_received,
+          lastEventAt: config.last_event_at,
+          isActive: config.is_active,
+          createdAt: config.created_at,
+        },
+      });
+    } catch (err: any) {
+      logger.error(MOD, 'Failed to get webhook status', { error: err.message });
+      res.status(500).json({ error: 'Failed to get webhook status' });
     }
   });
 
