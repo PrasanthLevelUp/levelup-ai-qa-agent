@@ -151,6 +151,7 @@ export function createScriptGenRouter(): Router {
         maxPages: maxPages ?? 3,
         repoIntelligence,
         knowledgeContext,
+        ...(repoProfile ? { repoProfile } : {}),
         ...(sanitizedAuthConfig ? { authConfig: sanitizedAuthConfig } : {}),
         ...(Array.isArray(additionalUrls) && additionalUrls.length > 0
           ? { additionalUrls: additionalUrls.filter((u: any) => typeof u === 'string').slice(0, 10) }

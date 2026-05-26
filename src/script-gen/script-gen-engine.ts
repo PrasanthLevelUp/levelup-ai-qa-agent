@@ -136,6 +136,8 @@ export interface GenerationConfig {
   framework?: 'playwright';   // future: cypress, selenium
   repoIntelligence?: string;  // injected from Repository Intelligence Engine
   knowledgeContext?: string;   // injected from App Knowledge via KnowledgeOptimizer
+  /** Structured repository profile for adaptive code generation */
+  repoProfile?: import('../context/types').RepositoryProfile;
   /** Authentication config for crawling behind login walls */
   authConfig?: AuthConfig;
   /** Additional URLs to crawl in the same authenticated session */
