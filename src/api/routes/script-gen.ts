@@ -65,11 +65,13 @@ export function createScriptGenRouter(): Router {
 
       // Auto-load repository intelligence if repoId provided
       let repoIntelligence: string | undefined;
+      let repoProfile: import('../../context/types').RepositoryProfile | undefined;
       if (repoId) {
         const profile = await getRepositoryContext(repoId, companyId);
         if (profile) {
           const { buildAIPromptContext } = await import('../../context/prompt-builder');
           repoIntelligence = buildAIPromptContext(profile);
+          repoProfile = profile; // pass structured profile for adaptive code generation
           console.log(`[ScriptGen] Loaded repo intelligence for ${repoId}: ${profile.framework}, pattern=${profile.testPattern}`);
         }
       }
@@ -126,6 +128,7 @@ export function createScriptGenRouter(): Router {
         maxPages: maxPages ?? 3,
         repoIntelligence,
         knowledgeContext,
+        repoProfile,
       };
 
       const engine = new ScriptGenEngine();
