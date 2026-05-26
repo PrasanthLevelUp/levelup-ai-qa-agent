@@ -25,6 +25,9 @@ import { SelectorQualityEngine, type ScoredSelector } from './selector-quality-e
 import { AssertionEngine, type GeneratedAssertion } from './assertion-engine';
 import { WaitStrategyEngine, type WaitStrategy } from './wait-strategy-engine';
 import { logger } from '../utils/logger';
+import type { RepositoryProfile } from '../context/types';
+import { analyzeRepoStructure } from './repo-analyzer';
+import { adaptiveGenerateFiles } from './adaptive-codegen';
 
 const MOD = 'script-gen-engine';
 
@@ -130,6 +133,7 @@ export interface GenerationConfig {
   framework?: 'playwright';   // future: cypress, selenium
   repoIntelligence?: string;  // injected from Repository Intelligence Engine
   knowledgeContext?: string;   // injected from App Knowledge via KnowledgeOptimizer
+  repoProfile?: RepositoryProfile;  // structured repo profile for adaptive code generation
 }
 
 /* -------------------------------------------------------------------------- */
@@ -564,6 +568,32 @@ Generate comprehensive test flows covering all detected functionality.`;
   /* ──────────────────────────────────────────────────────────────────────── */
 
   private generatePlaywrightCode(testPlan: TestPlan, config: GenerationConfig): GeneratedFile[] {
+    // ─── Adaptive generation: match existing repo structure ────────────
+    if (config.repoProfile) {
+      try {
+        const analysis = analyzeRepoStructure(config.repoProfile);
+        logger.info(MOD, 'Repo structure analysis', {
+          mode: analysis.mode,
+          nextNum: analysis.nextFileNumber,
+          naming: analysis.naming.pattern,
+          hasConfig: analysis.hasPlaywrightConfig,
+          hasCI: analysis.hasCIWorkflow,
+        });
+
+        const adaptiveFiles = adaptiveGenerateFiles(testPlan, config, analysis);
+        if (adaptiveFiles !== null) {
+          logger.info(MOD, 'Using adaptive code generation', {
+            mode: analysis.mode,
+            fileCount: adaptiveFiles.length,
+          });
+          return adaptiveFiles;
+        }
+        // adaptiveFiles === null → mode is POM, fall through to default
+      } catch (err: any) {
+        logger.warn(MOD, 'Adaptive codegen failed, falling back to default', { error: err.message });
+      }
+    }
+    // ─── Default POM generation (original behaviour) ──────────────────
     const files: GeneratedFile[] = [];
 
     // 1. Page Objects
