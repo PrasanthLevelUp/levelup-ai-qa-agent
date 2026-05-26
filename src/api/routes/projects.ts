@@ -20,6 +20,10 @@ import {
   deleteRepository,
   createWebhookConfig,
   getWebhookConfig,
+  createReleaseWindow,
+  listReleaseWindows,
+  updateReleaseWindow,
+  deleteReleaseWindow,
 } from '../../db/postgres';
 
 const MOD = 'projects-route';
@@ -239,6 +243,126 @@ export function createProjectsRouter(): Router {
     } catch (err: any) {
       logger.error(MOD, 'Failed to list all repositories', { error: err.message });
       res.status(500).json({ error: 'Failed to list repositories' });
+    }
+  });
+
+  // ─── Release Cycle Configuration ───────────────────────────────
+
+  // PUT /api/projects/:id/release-config — Update release cycle settings
+  router.put('/:id/release-config', async (req: Request, res: Response) => {
+    try {
+      const companyId = (req as any).companyId;
+      const id = parseInt(req.params['id'] as string, 10);
+      if (isNaN(id)) {
+        res.status(400).json({ error: 'Invalid project ID' });
+        return;
+      }
+      const { release_cycle_type, release_cycle_days, release_day_of_week, release_timezone, overview_default_range } = req.body;
+      const validTypes = ['continuous', 'sprint', 'monthly', 'quarterly', 'custom'];
+      if (release_cycle_type && !validTypes.includes(release_cycle_type)) {
+        res.status(400).json({ error: `Invalid release_cycle_type. Must be one of: ${validTypes.join(', ')}` });
+        return;
+      }
+      const updated = await updateProject(id, companyId, {
+        release_cycle_type,
+        release_cycle_days,
+        release_day_of_week,
+        release_timezone,
+        overview_default_range,
+      });
+      if (!updated) {
+        res.status(404).json({ error: 'Project not found' });
+        return;
+      }
+      logger.info(MOD, 'Release config updated', { projectId: id, type: release_cycle_type });
+      res.json({ project: updated });
+    } catch (err: any) {
+      logger.error(MOD, 'Failed to update release config', { error: err.message });
+      res.status(500).json({ error: 'Failed to update release config' });
+    }
+  });
+
+  // ─── Release Windows CRUD ─────────────────────────────────────
+
+  // GET /api/projects/:id/release-windows — List release windows
+  router.get('/:id/release-windows', async (req: Request, res: Response) => {
+    try {
+      const companyId = (req as any).companyId;
+      const projectId = parseInt(req.params['id'] as string, 10);
+      if (isNaN(projectId)) {
+        res.status(400).json({ error: 'Invalid project ID' });
+        return;
+      }
+      const windows = await listReleaseWindows(projectId, companyId);
+      res.json({ windows });
+    } catch (err: any) {
+      logger.error(MOD, 'Failed to list release windows', { error: err.message });
+      res.status(500).json({ error: 'Failed to list release windows' });
+    }
+  });
+
+  // POST /api/projects/:id/release-windows — Create release window
+  router.post('/:id/release-windows', async (req: Request, res: Response) => {
+    try {
+      const companyId = (req as any).companyId;
+      const projectId = parseInt(req.params['id'] as string, 10);
+      if (isNaN(projectId)) {
+        res.status(400).json({ error: 'Invalid project ID' });
+        return;
+      }
+      const { name, startDate, endDate, status } = req.body;
+      if (!name || !startDate || !endDate) {
+        res.status(400).json({ error: 'name, startDate, and endDate are required' });
+        return;
+      }
+      const window = await createReleaseWindow({ projectId, companyId, name, startDate, endDate, status });
+      logger.info(MOD, 'Release window created', { windowId: window.id, projectId });
+      res.status(201).json({ window });
+    } catch (err: any) {
+      logger.error(MOD, 'Failed to create release window', { error: err.message });
+      res.status(500).json({ error: 'Failed to create release window' });
+    }
+  });
+
+  // PUT /api/projects/:projectId/release-windows/:windowId — Update release window
+  router.put('/:projectId/release-windows/:windowId', async (req: Request, res: Response) => {
+    try {
+      const companyId = (req as any).companyId;
+      const windowId = parseInt(req.params['windowId'] as string, 10);
+      if (isNaN(windowId)) {
+        res.status(400).json({ error: 'Invalid window ID' });
+        return;
+      }
+      const updated = await updateReleaseWindow(windowId, companyId, req.body);
+      if (!updated) {
+        res.status(404).json({ error: 'Release window not found' });
+        return;
+      }
+      res.json({ window: updated });
+    } catch (err: any) {
+      logger.error(MOD, 'Failed to update release window', { error: err.message });
+      res.status(500).json({ error: 'Failed to update release window' });
+    }
+  });
+
+  // DELETE /api/projects/:projectId/release-windows/:windowId — Delete release window
+  router.delete('/:projectId/release-windows/:windowId', async (req: Request, res: Response) => {
+    try {
+      const companyId = (req as any).companyId;
+      const windowId = parseInt(req.params['windowId'] as string, 10);
+      if (isNaN(windowId)) {
+        res.status(400).json({ error: 'Invalid window ID' });
+        return;
+      }
+      const deleted = await deleteReleaseWindow(windowId, companyId);
+      if (!deleted) {
+        res.status(404).json({ error: 'Release window not found' });
+        return;
+      }
+      res.json({ message: 'Release window deleted' });
+    } catch (err: any) {
+      logger.error(MOD, 'Failed to delete release window', { error: err.message });
+      res.status(500).json({ error: 'Failed to delete release window' });
     }
   });
 
