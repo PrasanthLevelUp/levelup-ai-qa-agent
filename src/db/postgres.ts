@@ -110,7 +110,7 @@ const REQUIRED_TABLES = [
   // Projects
   'projects', 'repositories',
   // Webhooks
-  'webhook_configs', 'webhook_events',
+  'webhook_configs', 'webhook_events', 'release_windows',
 ];
 
 export async function initDb(): Promise<void> {
@@ -856,6 +856,25 @@ async function initSchema(client: PoolClient): Promise<void> {
   await safeExec(client, 'idx_whe_status',
     `CREATE INDEX IF NOT EXISTS idx_whe_status ON webhook_events(status)`);
 
+  // ─── Phase 10: Release Cycle Architecture ───
+  console.log('🔧 [DB] Phase 10: Release Cycles...');
+
+  await run('release_windows', `CREATE TABLE IF NOT EXISTS release_windows (
+    id SERIAL PRIMARY KEY,
+    project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+    name VARCHAR(255) NOT NULL,
+    start_date TIMESTAMPTZ NOT NULL,
+    end_date TIMESTAMPTZ NOT NULL,
+    status VARCHAR(50) DEFAULT 'planned',
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+  )`);
+  await safeExec(client, 'idx_rw_project',
+    `CREATE INDEX IF NOT EXISTS idx_rw_project ON release_windows(project_id)`);
+  await safeExec(client, 'idx_rw_status',
+    `CREATE INDEX IF NOT EXISTS idx_rw_status ON release_windows(status)`);
+
   console.log(`🔧 [DB] Table creation complete: ${ok} succeeded, ${fail} failed`);
 
   // Seed default plans & roles
@@ -979,6 +998,29 @@ async function migrateDefaultCompany(client: PoolClient): Promise<void> {
   for (const idx of projectIdIndexes) {
     await safeExec(client, idx.match(/idx_\w+/)?.[0] || 'project_index', idx);
   }
+
+  // ── Add release cycle + repo role columns ──
+  console.log('🔧 [DB] Migration: Adding release cycle columns...');
+  await safeExec(client, 'release_cycle_alters', `DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='projects' AND column_name='release_cycle_type') THEN
+      ALTER TABLE projects ADD COLUMN release_cycle_type VARCHAR(50) DEFAULT 'continuous';
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='projects' AND column_name='release_cycle_days') THEN
+      ALTER TABLE projects ADD COLUMN release_cycle_days INTEGER DEFAULT 14;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='projects' AND column_name='release_day_of_week') THEN
+      ALTER TABLE projects ADD COLUMN release_day_of_week INTEGER;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='projects' AND column_name='release_timezone') THEN
+      ALTER TABLE projects ADD COLUMN release_timezone VARCHAR(50) DEFAULT 'UTC';
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='projects' AND column_name='overview_default_range') THEN
+      ALTER TABLE projects ADD COLUMN overview_default_range VARCHAR(20) DEFAULT '7d';
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='repositories' AND column_name='role') THEN
+      ALTER TABLE repositories ADD COLUMN role VARCHAR(50) DEFAULT 'primary';
+    END IF;
+  END $$`);
 
   // Seed default project for existing data
   await safeExec(client, 'seed_default_project', `
@@ -4739,6 +4781,11 @@ export async function getProject(id: number, companyId: number): Promise<any | n
 export async function updateProject(id: number, companyId: number, data: {
   name?: string;
   description?: string;
+  release_cycle_type?: string;
+  release_cycle_days?: number;
+  release_day_of_week?: number | null;
+  release_timezone?: string;
+  overview_default_range?: string;
 }): Promise<any | null> {
   const pool = getPool();
   const sets: string[] = [];
@@ -4746,6 +4793,11 @@ export async function updateProject(id: number, companyId: number, data: {
   let idx = 1;
   if (data.name !== undefined) { sets.push(`name = $${idx++}`); vals.push(data.name); }
   if (data.description !== undefined) { sets.push(`description = $${idx++}`); vals.push(data.description); }
+  if (data.release_cycle_type !== undefined) { sets.push(`release_cycle_type = $${idx++}`); vals.push(data.release_cycle_type); }
+  if (data.release_cycle_days !== undefined) { sets.push(`release_cycle_days = $${idx++}`); vals.push(data.release_cycle_days); }
+  if (data.release_day_of_week !== undefined) { sets.push(`release_day_of_week = $${idx++}`); vals.push(data.release_day_of_week); }
+  if (data.release_timezone !== undefined) { sets.push(`release_timezone = $${idx++}`); vals.push(data.release_timezone); }
+  if (data.overview_default_range !== undefined) { sets.push(`overview_default_range = $${idx++}`); vals.push(data.overview_default_range); }
   if (sets.length === 0) return getProject(id, companyId);
   sets.push(`updated_at = NOW()`);
   vals.push(id, companyId);
@@ -5117,4 +5169,71 @@ export async function recordSelectorObservation(data: {
       JSON.stringify(data.metadata ?? {}),
     ],
   );
+}
+
+
+
+/* ───────────────────────────────────────────────────────────────────────────
+   Release Windows CRUD
+   ─────────────────────────────────────────────────────────────────────────── */
+
+export async function createReleaseWindow(data: {
+  projectId: number;
+  companyId: number;
+  name: string;
+  startDate: string;
+  endDate: string;
+  status?: string;
+}): Promise<any> {
+  const pool = getPool();
+  const { rows } = await pool.query(
+    `INSERT INTO release_windows (project_id, company_id, name, start_date, end_date, status)
+     VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+    [data.projectId, data.companyId, data.name, data.startDate, data.endDate, data.status || 'planned'],
+  );
+  return rows[0];
+}
+
+export async function listReleaseWindows(projectId: number, companyId: number): Promise<any[]> {
+  const pool = getPool();
+  const { rows } = await pool.query(
+    `SELECT * FROM release_windows
+     WHERE project_id = $1 AND company_id = $2
+     ORDER BY start_date DESC`,
+    [projectId, companyId],
+  );
+  return rows;
+}
+
+export async function updateReleaseWindow(id: number, companyId: number, data: {
+  name?: string;
+  startDate?: string;
+  endDate?: string;
+  status?: string;
+}): Promise<any | null> {
+  const pool = getPool();
+  const sets: string[] = [];
+  const vals: any[] = [];
+  let idx = 1;
+  if (data.name !== undefined) { sets.push(`name = $${idx++}`); vals.push(data.name); }
+  if (data.startDate !== undefined) { sets.push(`start_date = $${idx++}`); vals.push(data.startDate); }
+  if (data.endDate !== undefined) { sets.push(`end_date = $${idx++}`); vals.push(data.endDate); }
+  if (data.status !== undefined) { sets.push(`status = $${idx++}`); vals.push(data.status); }
+  if (sets.length === 0) return null;
+  sets.push(`updated_at = NOW()`);
+  vals.push(id, companyId);
+  const { rows } = await pool.query(
+    `UPDATE release_windows SET ${sets.join(', ')} WHERE id = $${idx++} AND company_id = $${idx} RETURNING *`,
+    vals,
+  );
+  return rows[0] || null;
+}
+
+export async function deleteReleaseWindow(id: number, companyId: number): Promise<boolean> {
+  const pool = getPool();
+  const { rowCount } = await pool.query(
+    `DELETE FROM release_windows WHERE id = $1 AND company_id = $2`,
+    [id, companyId],
+  );
+  return (rowCount ?? 0) > 0;
 }

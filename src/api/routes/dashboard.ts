@@ -125,21 +125,25 @@ export function createDashboardRouter(): Router {
 
   // ─── Stats ──────────────────────────────────────────────────
 
-  /** GET /api/dashboard/stats/overview?period=7d */
+  /** GET /api/dashboard/stats/overview?period=7d&projectId=1 */
   router.get('/stats/overview', async (req: Request, res: Response) => {
     try {
       const period = (req.query.period as string) || '7d';
       const days = period === '30d' ? 30 : period === '90d' ? 90 : 7;
       const cid = (req as any).companyId;
+      const pid = req.query.projectId ? parseInt(req.query.projectId as string, 10) : null;
       const pool = getPool();
 
       const since = new Date(Date.now() - days * 86400000);
       const prevSince = new Date(since.getTime() - days * 86400000);
 
+      // Build project filter clause
+      const pidClause = pid ? `AND project_id = ${pid}` : '';
+
       // Current period executions
       const execRes = await pool.query(
         `SELECT status, healing_attempted FROM test_executions
-         WHERE created_at >= $1 AND ($2::int IS NULL OR company_id = $2)`,
+         WHERE created_at >= $1 AND ($2::int IS NULL OR company_id = $2) ${pidClause}`,
         [since, cid],
       );
       const executions = execRes.rows;
@@ -150,7 +154,7 @@ export function createDashboardRouter(): Router {
       // Current period actions
       const actRes = await pool.query(
         `SELECT healing_strategy FROM healing_actions
-         WHERE created_at >= $1 AND ($2::int IS NULL OR company_id = $2)`,
+         WHERE created_at >= $1 AND ($2::int IS NULL OR company_id = $2) ${pidClause}`,
         [since, cid],
       );
       const actions = actRes.rows;
@@ -168,7 +172,7 @@ export function createDashboardRouter(): Router {
       // Previous period
       const prevExecRes = await pool.query(
         `SELECT status, healing_attempted FROM test_executions
-         WHERE created_at >= $1 AND created_at < $2 AND ($3::int IS NULL OR company_id = $3)`,
+         WHERE created_at >= $1 AND created_at < $2 AND ($3::int IS NULL OR company_id = $3) ${pidClause}`,
         [prevSince, since, cid],
       );
       const prevExec = prevExecRes.rows;
@@ -178,7 +182,7 @@ export function createDashboardRouter(): Router {
 
       const prevActRes = await pool.query(
         `SELECT healing_strategy FROM healing_actions
-         WHERE created_at >= $1 AND created_at < $2 AND ($3::int IS NULL OR company_id = $3)`,
+         WHERE created_at >= $1 AND created_at < $2 AND ($3::int IS NULL OR company_id = $3) ${pidClause}`,
         [prevSince, since, cid],
       );
       const prevActions = prevActRes.rows;
@@ -200,6 +204,7 @@ export function createDashboardRouter(): Router {
         },
         prevRuns: prevTotal,
         prevSuccessRate: Math.round(prevSuccessRate * 10) / 10,
+        projectId: pid,
       });
     } catch (err) {
       logger.error(MOD, 'stats/overview failed', { error: err });
@@ -207,18 +212,20 @@ export function createDashboardRouter(): Router {
     }
   });
 
-  /** GET /api/dashboard/stats/trend?period=7d */
+  /** GET /api/dashboard/stats/trend?period=7d&projectId=1 */
   router.get('/stats/trend', async (req: Request, res: Response) => {
     try {
       const period = (req.query.period as string) || '7d';
       const days = period === '30d' ? 30 : period === '90d' ? 90 : 7;
       const cid = (req as any).companyId;
+      const pid = req.query.projectId ? parseInt(req.query.projectId as string, 10) : null;
       const pool = getPool();
       const since = new Date(Date.now() - days * 86400000);
+      const pidClause = pid ? `AND project_id = ${pid}` : '';
 
       const { rows } = await pool.query(
         `SELECT status, healing_attempted, created_at FROM test_executions
-         WHERE created_at >= $1 AND ($2::int IS NULL OR company_id = $2)
+         WHERE created_at >= $1 AND ($2::int IS NULL OR company_id = $2) ${pidClause}
          ORDER BY created_at ASC`,
         [since, cid],
       );
@@ -246,18 +253,20 @@ export function createDashboardRouter(): Router {
     }
   });
 
-  /** GET /api/dashboard/stats/strategies?period=7d */
+  /** GET /api/dashboard/stats/strategies?period=7d&projectId=1 */
   router.get('/stats/strategies', async (req: Request, res: Response) => {
     try {
       const period = (req.query.period as string) || '7d';
       const days = period === '30d' ? 30 : period === '90d' ? 90 : 7;
       const cid = (req as any).companyId;
+      const pid = req.query.projectId ? parseInt(req.query.projectId as string, 10) : null;
       const pool = getPool();
       const since = new Date(Date.now() - days * 86400000);
+      const pidClause = pid ? `AND project_id = ${pid}` : '';
 
       const { rows } = await pool.query(
         `SELECT healing_strategy FROM healing_actions
-         WHERE created_at >= $1 AND ($2::int IS NULL OR company_id = $2)`,
+         WHERE created_at >= $1 AND ($2::int IS NULL OR company_id = $2) ${pidClause}`,
         [since, cid],
       );
 
@@ -313,18 +322,20 @@ export function createDashboardRouter(): Router {
     }
   });
 
-  /** GET /api/dashboard/stats/cost-savings?period=7d */
+  /** GET /api/dashboard/stats/cost-savings?period=7d&projectId=1 */
   router.get('/stats/cost-savings', async (req: Request, res: Response) => {
     try {
       const period = (req.query.period as string) || '7d';
       const days = period === '30d' ? 30 : period === '90d' ? 90 : 7;
       const cid = (req as any).companyId;
+      const pid = req.query.projectId ? parseInt(req.query.projectId as string, 10) : null;
       const pool = getPool();
       const since = new Date(Date.now() - days * 86400000);
+      const pidClause = pid ? `AND project_id = ${pid}` : '';
 
       const { rows } = await pool.query(
         `SELECT ai_tokens_used FROM healing_actions
-         WHERE created_at >= $1 AND ($2::int IS NULL OR company_id = $2)`,
+         WHERE created_at >= $1 AND ($2::int IS NULL OR company_id = $2) ${pidClause}`,
         [since, cid],
       );
 
