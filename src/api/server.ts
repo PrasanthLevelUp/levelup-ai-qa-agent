@@ -60,6 +60,7 @@ import { createCIWebhookRouter } from './routes/ci-webhooks';
 import { createUsersRouter } from './routes/users';
 import { createHealingPRRouter } from './routes/healing-pr';
 import { createGitHubRouter } from './routes/github';
+import { createIntelligenceRouter } from './routes/intelligence';
 import { notifyRca } from '../integrations/slack';
 import { createRcaTicket } from '../integrations/jira';
 import cookieParser from 'cookie-parser';
@@ -180,6 +181,7 @@ export function createServer(): express.Application {
   app.use('/api/healings', authMiddleware, companyMiddleware, createHealingPRRouter());
   app.use('/api/users', authMiddleware, companyMiddleware, createUsersRouter());
   app.use('/api/github', authMiddleware, companyMiddleware, createGitHubRouter());
+  app.use('/api/intelligence', authMiddleware, companyMiddleware, createIntelligenceRouter());
 
   // List all jobs
   app.get('/api/jobs', authMiddleware, (_req, res) => {

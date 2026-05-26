@@ -907,6 +907,82 @@ async function initSchema(client: PoolClient): Promise<void> {
     await safeExec(client, idx.match(/idx_\w+/)![0], idx);
   }
 
+  // ─── Phase 11: Application Intelligence ───────────────────────
+  console.log('🔧 [DB] Phase 11: Application Intelligence...');
+
+  await safeExec(client, 'application_profiles', `CREATE TABLE IF NOT EXISTS application_profiles (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    base_url VARCHAR(500) NOT NULL,
+    app_fingerprint VARCHAR(100),
+    crawl_data JSONB NOT NULL DEFAULT '{}',
+    auth_required BOOLEAN DEFAULT false,
+    auth_config JSONB,
+    crawled_at TIMESTAMPTZ DEFAULT NOW(),
+    expires_at TIMESTAMPTZ DEFAULT (NOW() + INTERVAL '30 days'),
+    page_count INTEGER DEFAULT 0,
+    total_elements INTEGER DEFAULT 0,
+    total_forms INTEGER DEFAULT 0,
+    total_interactive INTEGER DEFAULT 0,
+    status VARCHAR(20) DEFAULT 'fresh' CHECK (status IN ('fresh','expiring','expired','crawling','error')),
+    error_message TEXT,
+    company_id INTEGER REFERENCES companies(id),
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(base_url, COALESCE(company_id, 0))
+  )`);
+  await safeExec(client, 'idx_app_profiles_base_url',
+    `CREATE INDEX IF NOT EXISTS idx_app_profiles_base_url ON application_profiles(base_url)`);
+  await safeExec(client, 'idx_app_profiles_company',
+    `CREATE INDEX IF NOT EXISTS idx_app_profiles_company ON application_profiles(company_id)`);
+  await safeExec(client, 'idx_app_profiles_status',
+    `CREATE INDEX IF NOT EXISTS idx_app_profiles_status ON application_profiles(status)`);
+  await safeExec(client, 'idx_app_profiles_expires',
+    `CREATE INDEX IF NOT EXISTS idx_app_profiles_expires ON application_profiles(expires_at)`);
+
+  await safeExec(client, 'page_snapshots', `CREATE TABLE IF NOT EXISTS page_snapshots (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    profile_id UUID REFERENCES application_profiles(id) ON DELETE CASCADE,
+    page_url VARCHAR(500) NOT NULL,
+    page_title VARCHAR(500),
+    page_type VARCHAR(50),
+    dom_structure JSONB DEFAULT '{}',
+    selectors JSONB DEFAULT '{}',
+    elements_count INTEGER DEFAULT 0,
+    forms_count INTEGER DEFAULT 0,
+    interactive_count INTEGER DEFAULT 0,
+    screenshot_key VARCHAR(500),
+    crawled_at TIMESTAMPTZ DEFAULT NOW()
+  )`);
+  await safeExec(client, 'idx_page_snapshots_profile',
+    `CREATE INDEX IF NOT EXISTS idx_page_snapshots_profile ON page_snapshots(profile_id)`);
+  await safeExec(client, 'idx_page_snapshots_url',
+    `CREATE INDEX IF NOT EXISTS idx_page_snapshots_url ON page_snapshots(page_url)`);
+
+  await safeExec(client, 'selector_patterns', `CREATE TABLE IF NOT EXISTS selector_patterns (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    pattern_type VARCHAR(50) NOT NULL CHECK (pattern_type IN (
+      'login_form','navigation','data_table','search_form','modal_dialog',
+      'dropdown_menu','pagination','file_upload','date_picker','accordion',
+      'tabs','toast_notification','card_layout','sidebar','breadcrumb'
+    )),
+    pattern_name VARCHAR(200),
+    selectors JSONB NOT NULL DEFAULT '[]',
+    element_signatures JSONB DEFAULT '{}',
+    confidence_score FLOAT DEFAULT 0.5,
+    usage_count INTEGER DEFAULT 0,
+    success_rate FLOAT DEFAULT 0.0,
+    last_used_at TIMESTAMPTZ,
+    company_id INTEGER REFERENCES companies(id),
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+  )`);
+  await safeExec(client, 'idx_selector_patterns_type',
+    `CREATE INDEX IF NOT EXISTS idx_selector_patterns_type ON selector_patterns(pattern_type)`);
+  await safeExec(client, 'idx_selector_patterns_company',
+    `CREATE INDEX IF NOT EXISTS idx_selector_patterns_company ON selector_patterns(company_id)`);
+  await safeExec(client, 'idx_selector_patterns_confidence',
+    `CREATE INDEX IF NOT EXISTS idx_selector_patterns_confidence ON selector_patterns(confidence_score DESC)`);
+
   console.log('🔧 [DB] Seeding plans & roles...');
   await seedDefaultPlans(client);
   await seedDefaultRoles(client);
@@ -5236,4 +5312,283 @@ export async function deleteReleaseWindow(id: number, companyId: number): Promis
     [id, companyId],
   );
   return (rowCount ?? 0) > 0;
+}
+
+
+
+/* -------------------------------------------------------------------------- */
+/*  Application Intelligence — Profile CRUD                                   */
+/* -------------------------------------------------------------------------- */
+
+export interface ApplicationProfile {
+  id: string;
+  base_url: string;
+  app_fingerprint: string | null;
+  crawl_data: any;
+  auth_required: boolean;
+  auth_config: any | null;
+  crawled_at: string;
+  expires_at: string;
+  page_count: number;
+  total_elements: number;
+  total_forms: number;
+  total_interactive: number;
+  status: 'fresh' | 'expiring' | 'expired' | 'crawling' | 'error';
+  error_message: string | null;
+  company_id: number | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export async function getProfileByUrl(baseUrl: string, companyId?: number): Promise<ApplicationProfile | null> {
+  const pool = getPool();
+  const { rows } = await pool.query(
+    `SELECT * FROM application_profiles
+     WHERE base_url = $1 AND COALESCE(company_id, 0) = COALESCE($2, 0)
+     LIMIT 1`,
+    [baseUrl, companyId ?? null],
+  );
+  return rows[0] || null;
+}
+
+export async function getProfileById(id: string): Promise<ApplicationProfile | null> {
+  const pool = getPool();
+  const { rows } = await pool.query(`SELECT * FROM application_profiles WHERE id = $1`, [id]);
+  return rows[0] || null;
+}
+
+export async function listProfiles(companyId?: number, opts?: { status?: string; limit?: number; offset?: number }): Promise<{ profiles: ApplicationProfile[]; total: number }> {
+  const pool = getPool();
+  const conditions: string[] = [];
+  const vals: any[] = [];
+  let idx = 1;
+
+  if (companyId !== undefined) {
+    conditions.push(`COALESCE(company_id, 0) = $${idx++}`);
+    vals.push(companyId ?? 0);
+  }
+  if (opts?.status) {
+    conditions.push(`status = $${idx++}`);
+    vals.push(opts.status);
+  }
+
+  const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+  const limit = opts?.limit || 50;
+  const offset = opts?.offset || 0;
+
+  const [dataRes, countRes] = await Promise.all([
+    pool.query(
+      `SELECT * FROM application_profiles ${where} ORDER BY crawled_at DESC LIMIT $${idx++} OFFSET $${idx++}`,
+      [...vals, limit, offset],
+    ),
+    pool.query(
+      `SELECT COUNT(*)::int AS total FROM application_profiles ${where}`,
+      vals,
+    ),
+  ]);
+
+  return { profiles: dataRes.rows, total: countRes.rows[0]?.total || 0 };
+}
+
+export async function upsertProfile(data: {
+  baseUrl: string;
+  appFingerprint?: string;
+  crawlData: any;
+  authRequired?: boolean;
+  authConfig?: any;
+  pageCount?: number;
+  totalElements?: number;
+  totalForms?: number;
+  totalInteractive?: number;
+  status?: string;
+  errorMessage?: string;
+  ttlDays?: number;
+}, companyId?: number): Promise<ApplicationProfile> {
+  const pool = getPool();
+  const ttl = data.ttlDays || 30;
+  const { rows } = await pool.query(
+    `INSERT INTO application_profiles
+       (base_url, app_fingerprint, crawl_data, auth_required, auth_config,
+        crawled_at, expires_at, page_count, total_elements, total_forms,
+        total_interactive, status, error_message, company_id)
+     VALUES ($1, $2, $3, $4, $5, NOW(), NOW() + ($6 || ' days')::INTERVAL,
+             $7, $8, $9, $10, $11, $12, $13)
+     ON CONFLICT (base_url, COALESCE(company_id, 0)) DO UPDATE SET
+       app_fingerprint = EXCLUDED.app_fingerprint,
+       crawl_data = EXCLUDED.crawl_data,
+       auth_required = EXCLUDED.auth_required,
+       auth_config = EXCLUDED.auth_config,
+       crawled_at = NOW(),
+       expires_at = NOW() + ($6 || ' days')::INTERVAL,
+       page_count = EXCLUDED.page_count,
+       total_elements = EXCLUDED.total_elements,
+       total_forms = EXCLUDED.total_forms,
+       total_interactive = EXCLUDED.total_interactive,
+       status = EXCLUDED.status,
+       error_message = EXCLUDED.error_message,
+       updated_at = NOW()
+     RETURNING *`,
+    [
+      data.baseUrl,
+      data.appFingerprint || null,
+      JSON.stringify(data.crawlData),
+      data.authRequired ?? false,
+      data.authConfig ? JSON.stringify(data.authConfig) : null,
+      String(ttl),
+      data.pageCount ?? 0,
+      data.totalElements ?? 0,
+      data.totalForms ?? 0,
+      data.totalInteractive ?? 0,
+      data.status || 'fresh',
+      data.errorMessage || null,
+      companyId ?? null,
+    ],
+  );
+  return rows[0];
+}
+
+export async function updateProfileStatus(id: string, status: string, errorMessage?: string): Promise<void> {
+  const pool = getPool();
+  await pool.query(
+    `UPDATE application_profiles SET status = $1, error_message = $2, updated_at = NOW() WHERE id = $3`,
+    [status, errorMessage || null, id],
+  );
+}
+
+export async function deleteProfile(id: string, companyId?: number): Promise<boolean> {
+  const pool = getPool();
+  const { rowCount } = await pool.query(
+    `DELETE FROM application_profiles WHERE id = $1 AND COALESCE(company_id, 0) = COALESCE($2, 0)`,
+    [id, companyId ?? null],
+  );
+  return (rowCount ?? 0) > 0;
+}
+
+export async function invalidateProfile(baseUrl: string, companyId?: number): Promise<void> {
+  const pool = getPool();
+  await pool.query(
+    `UPDATE application_profiles SET status = 'expired', updated_at = NOW()
+     WHERE base_url = $1 AND COALESCE(company_id, 0) = COALESCE($2, 0)`,
+    [baseUrl, companyId ?? null],
+  );
+}
+
+export async function refreshExpiredProfiles(): Promise<number> {
+  const pool = getPool();
+  const { rowCount } = await pool.query(
+    `UPDATE application_profiles SET status = 'expired', updated_at = NOW()
+     WHERE status = 'fresh' AND expires_at < NOW()`,
+  );
+  return rowCount ?? 0;
+}
+
+/* -------------------------------------------------------------------------- */
+/*  Application Intelligence — Page Snapshots CRUD                            */
+/* -------------------------------------------------------------------------- */
+
+export async function upsertPageSnapshot(data: {
+  profileId: string;
+  pageUrl: string;
+  pageTitle?: string;
+  pageType?: string;
+  domStructure?: any;
+  selectors?: any;
+  elementsCount?: number;
+  formsCount?: number;
+  interactiveCount?: number;
+  screenshotKey?: string;
+}): Promise<any> {
+  const pool = getPool();
+  const { rows } = await pool.query(
+    `INSERT INTO page_snapshots
+       (profile_id, page_url, page_title, page_type, dom_structure, selectors,
+        elements_count, forms_count, interactive_count, screenshot_key, crawled_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
+     ON CONFLICT DO NOTHING
+     RETURNING *`,
+    [
+      data.profileId,
+      data.pageUrl,
+      data.pageTitle || null,
+      data.pageType || null,
+      JSON.stringify(data.domStructure || {}),
+      JSON.stringify(data.selectors || {}),
+      data.elementsCount ?? 0,
+      data.formsCount ?? 0,
+      data.interactiveCount ?? 0,
+      data.screenshotKey || null,
+    ],
+  );
+  return rows[0];
+}
+
+export async function getPageSnapshots(profileId: string): Promise<any[]> {
+  const pool = getPool();
+  const { rows } = await pool.query(
+    `SELECT * FROM page_snapshots WHERE profile_id = $1 ORDER BY crawled_at DESC`,
+    [profileId],
+  );
+  return rows;
+}
+
+export async function deletePageSnapshots(profileId: string): Promise<void> {
+  const pool = getPool();
+  await pool.query(`DELETE FROM page_snapshots WHERE profile_id = $1`, [profileId]);
+}
+
+/* -------------------------------------------------------------------------- */
+/*  Application Intelligence — Selector Patterns CRUD                         */
+/* -------------------------------------------------------------------------- */
+
+export async function upsertSelectorPattern(data: {
+  patternType: string;
+  patternName?: string;
+  selectors: any;
+  elementSignatures?: any;
+  confidenceScore?: number;
+}, companyId?: number): Promise<any> {
+  const pool = getPool();
+  const { rows } = await pool.query(
+    `INSERT INTO selector_patterns
+       (pattern_type, pattern_name, selectors, element_signatures, confidence_score, company_id)
+     VALUES ($1, $2, $3, $4, $5, $6)
+     RETURNING *`,
+    [
+      data.patternType,
+      data.patternName || null,
+      JSON.stringify(data.selectors),
+      JSON.stringify(data.elementSignatures || {}),
+      data.confidenceScore ?? 0.5,
+      companyId ?? null,
+    ],
+  );
+  return rows[0];
+}
+
+export async function findMatchingPatterns(patternType: string, companyId?: number): Promise<any[]> {
+  const pool = getPool();
+  const { rows } = await pool.query(
+    `SELECT * FROM selector_patterns
+     WHERE pattern_type = $1 AND (company_id IS NULL OR COALESCE(company_id, 0) = COALESCE($2, 0))
+     ORDER BY confidence_score DESC, success_rate DESC
+     LIMIT 10`,
+    [patternType, companyId ?? null],
+  );
+  return rows;
+}
+
+export async function incrementPatternUsage(id: string, success: boolean): Promise<void> {
+  const pool = getPool();
+  await pool.query(
+    `UPDATE selector_patterns SET
+       usage_count = usage_count + 1,
+       success_rate = CASE
+         WHEN $2 THEN (success_rate * usage_count + 1.0) / (usage_count + 1)
+         ELSE (success_rate * usage_count) / (usage_count + 1)
+       END,
+       last_used_at = NOW(),
+       updated_at = NOW()
+     WHERE id = $1`,
+    [id, success],
+  );
 }

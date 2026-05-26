@@ -36,9 +36,13 @@ import {
 import * as path from 'path';
 import * as os from 'os';
 import * as fs from 'fs';
+import { CrawlOrchestrator } from '../../intelligence/crawl-orchestrator';
+import { PatternMatcher } from '../../intelligence/pattern-matcher';
 
 export function createScriptGenRouter(): Router {
   const router = Router();
+  const crawlOrchestrator = new CrawlOrchestrator();
+  const patternMatcher = new PatternMatcher();
 
   /* ── Generate Test Scripts ──────────────────────────────── */
   router.post('/generate', async (req: Request, res: Response) => {
@@ -56,6 +60,7 @@ export function createScriptGenRouter(): Router {
         knowledgeItemIds,
         authConfig: rawAuthConfig,
         additionalUrls,
+        forceFreshCrawl,
       } = req.body;
 
       if (!url || typeof url !== 'string') {
@@ -141,6 +146,14 @@ export function createScriptGenRouter(): Router {
         }
       }
 
+      // ── Application Intelligence: check cache before crawling ──
+      const crawlDecision = await crawlOrchestrator.decideCrawlStrategy(url, companyId, {
+        forceFreshCrawl: forceFreshCrawl ?? false,
+        authConfig: sanitizedAuthConfig,
+      });
+
+      console.log(`[ScriptGen] Crawl decision: usedCache=${crawlDecision.usedCache}, reason="${crawlDecision.reason}" (${crawlDecision.decisionTimeMs}ms)`);
+
       const config: GenerationConfig = {
         url,
         instructions: instructions || undefined,
@@ -156,10 +169,28 @@ export function createScriptGenRouter(): Router {
         ...(Array.isArray(additionalUrls) && additionalUrls.length > 0
           ? { additionalUrls: additionalUrls.filter((u: any) => typeof u === 'string').slice(0, 10) }
           : {}),
+        // Pass cached crawl data to engine if available
+        ...(crawlDecision.usedCache && crawlDecision.crawlData
+          ? { cachedCrawlData: crawlDecision.crawlData }
+          : {}),
       };
 
       const engine = new ScriptGenEngine();
       const result: GenerationResult = await engine.generate(config);
+
+      // Save crawl data to profile if a fresh crawl was performed
+      if (!crawlDecision.usedCache && result.rawCrawlData) {
+        try {
+          await crawlOrchestrator.saveCrawlResult(url, result.rawCrawlData, companyId, {
+            authConfig: sanitizedAuthConfig,
+          });
+          // Learn patterns from the crawl
+          await patternMatcher.learnPatterns(result.rawCrawlData, companyId);
+          console.log(`[ScriptGen] Profile saved + patterns learned for: ${url}`);
+        } catch (profileErr: any) {
+          console.warn(`[ScriptGen] Could not save profile (non-blocking): ${profileErr.message}`);
+        }
+      }
 
       const generationTimeMs = Date.now() - startTime;
 
@@ -217,6 +248,13 @@ export function createScriptGenRouter(): Router {
               cookieCount: result.authResult.cookieNames?.length ?? 0,
             },
           } : {}),
+          // Application Intelligence metadata
+          intelligence: {
+            profileCacheUsed: crawlDecision.usedCache,
+            crawlDecisionReason: crawlDecision.reason,
+            crawlDecisionTimeMs: crawlDecision.decisionTimeMs,
+            profileId: crawlDecision.profile?.id ?? null,
+          },
         },
       });
     } catch (err: any) {
