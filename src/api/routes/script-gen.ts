@@ -54,6 +54,8 @@ export function createScriptGenRouter(): Router {
         maxPages,
         repoId,
         knowledgeItemIds,
+        authConfig: rawAuthConfig,
+        additionalUrls,
       } = req.body;
 
       if (!url || typeof url !== 'string') {
@@ -61,6 +63,27 @@ export function createScriptGenRouter(): Router {
       }
 
       console.log(`[ScriptGen] Starting generation for: ${url}`);
+
+      // ── Sanitize & validate auth config (NEVER log credentials) ──
+      let sanitizedAuthConfig: import('../../script-gen/auth-engine').AuthConfig | undefined;
+      if (rawAuthConfig && typeof rawAuthConfig === 'object') {
+        const { loginUrl, username, password } = rawAuthConfig;
+        if (!username || !password) {
+          return res.status(400).json({
+            success: false,
+            error: 'authConfig requires both username and password',
+          });
+        }
+        sanitizedAuthConfig = {
+          loginUrl: typeof loginUrl === 'string' ? loginUrl : undefined,
+          credentials: {
+            username: String(username),
+            password: String(password),
+          },
+        };
+        // Log that auth is enabled but NEVER log credential values
+        console.log(`[ScriptGen] Authentication enabled — loginUrl: ${sanitizedAuthConfig.loginUrl ?? '(auto-detect)'}`);
+      }
       const companyId = (req as any).companyId as number | undefined;
 
       // Auto-load repository intelligence if repoId provided
@@ -128,7 +151,10 @@ export function createScriptGenRouter(): Router {
         maxPages: maxPages ?? 3,
         repoIntelligence,
         knowledgeContext,
-        repoProfile,
+        ...(sanitizedAuthConfig ? { authConfig: sanitizedAuthConfig } : {}),
+        ...(Array.isArray(additionalUrls) && additionalUrls.length > 0
+          ? { additionalUrls: additionalUrls.filter((u: any) => typeof u === 'string').slice(0, 10) }
+          : {}),
       };
 
       const engine = new ScriptGenEngine();
@@ -178,6 +204,18 @@ export function createScriptGenRouter(): Router {
           stats: result.stats,
           generationTimeMs,
           errors: result.errors,
+          // Auth metadata — never includes credential values
+          ...(result.authResult ? {
+            authentication: {
+              attempted: true,
+              success: result.authResult.success,
+              strategy: result.authResult.strategy,
+              message: result.authResult.message,
+              captchaDetected: result.authResult.captchaDetected,
+              rateLimited: result.authResult.rateLimited,
+              cookieCount: result.authResult.cookieNames?.length ?? 0,
+            },
+          } : {}),
         },
       });
     } catch (err: any) {
