@@ -18,6 +18,7 @@
  */
 
 import { logger } from '../utils/logger';
+import { AuthEngine, type AuthConfig, type AuthResult } from './auth-engine';
 
 const MOD = 'page-crawler';
 
@@ -34,6 +35,14 @@ export interface CrawlConfig {
   followLinks?: boolean;     // follow same-origin links
   maxPages?: number;         // max pages to crawl (default 5)
   viewport?: { width: number; height: number };
+
+  /** Optional authentication config — enables authenticated crawling. */
+  authConfig?: AuthConfig;
+  /**
+   * Additional URLs to crawl post-authentication (e.g. admin pages).
+   * These are crawled in the SAME browser context (session preserved).
+   */
+  additionalUrls?: string[];
 }
 
 export interface PageElement {
@@ -104,6 +113,8 @@ export interface CrawlResult {
   interactiveElements: number;
   crawlTimeMs: number;
   errors: string[];
+  /** Present when authentication was attempted. */
+  authResult?: AuthResult;
 }
 
 export interface MultiPageCrawlResult {
@@ -410,11 +421,19 @@ const EXTRACT_NAV_LINKS_SCRIPT = `
 /* -------------------------------------------------------------------------- */
 
 export class PageCrawler {
-  private config: Required<CrawlConfig>;
+  private config: CrawlConfig & {
+    maxDepth: number;
+    timeout: number;
+    waitAfterLoad: number;
+    captureScreenshot: boolean;
+    followLinks: boolean;
+    maxPages: number;
+    viewport: { width: number; height: number };
+  };
 
   constructor(config: CrawlConfig) {
     this.config = {
-      url: config.url,
+      ...config,
       maxDepth: config.maxDepth ?? 1,
       timeout: Math.min(config.timeout ?? 15000, 30000), // cap at 30s
       waitAfterLoad: Math.min(config.waitAfterLoad ?? 2000, 5000),
@@ -460,12 +479,43 @@ export class PageCrawler {
       await page.route('**/*.{mp4,webm,ogg,mp3,wav,flac}', (route: any) => route.abort());
       await page.route('**/*.{woff,woff2,ttf,eot}', (route: any) => route.abort());
 
-      // Navigate
-      logger.info(MOD, 'Crawling page', { url: this.config.url });
-      await page.goto(this.config.url, {
-        waitUntil: 'domcontentloaded',
-        timeout: this.config.timeout,
-      });
+      // ─── Authenticated crawling ──────────────────────────────────
+      let authResult: AuthResult | undefined;
+      if (this.config.authConfig) {
+        const authEngine = new AuthEngine();
+        authResult = await authEngine.authenticate(
+          page, context, this.config.authConfig, this.config.url,
+        );
+        logger.info(MOD, 'Auth attempt completed', {
+          success: authResult.success,
+          strategy: authResult.strategy,
+          durationMs: authResult.durationMs,
+          captcha: authResult.captchaDetected,
+        });
+
+        if (authResult.success) {
+          // Navigate to the actual target URL (may differ from login URL)
+          const currentUrl = page.url();
+          if (currentUrl !== this.config.url) {
+            logger.info(MOD, 'Navigating to target URL after auth', { url: this.config.url });
+            await page.goto(this.config.url, {
+              waitUntil: 'domcontentloaded',
+              timeout: this.config.timeout,
+            });
+          }
+        } else {
+          // Auth failed — crawl what we can (best-effort)
+          errors.push(`Authentication failed: ${authResult.message}`);
+          logger.warn(MOD, 'Auth failed, continuing with public crawl', { error: authResult.message });
+        }
+      } else {
+        // ─── Standard public crawl (existing behaviour) ──────────────
+        logger.info(MOD, 'Crawling page', { url: this.config.url });
+        await page.goto(this.config.url, {
+          waitUntil: 'domcontentloaded',
+          timeout: this.config.timeout,
+        });
+      }
 
       // Wait for SPA frameworks to render — first try networkidle, fall back to fixed delay
       try {
@@ -602,11 +652,138 @@ export class PageCrawler {
         screenshotBase64,
         crawlTimeMs,
         errors,
+        authResult,
       };
     } catch (error) {
       if (browser) try { await browser.close(); } catch { /* ignore */ }
       throw new Error(`Crawl failed for ${this.config.url}: ${(error as Error).message}`);
     }
+  }
+
+  /**
+   * Session-aware authenticated multi-page crawl.
+   *
+   * Authenticates once, then crawls the target URL plus all additionalUrls
+   * in the SAME browser context (preserving session cookies).
+   */
+  async crawlAuthenticatedMultiPage(): Promise<MultiPageCrawlResult> {
+    if (!this.config.authConfig) {
+      return this.crawlMultiPage();
+    }
+
+    const startTime = Date.now();
+    const pages: CrawlResult[] = [];
+    let browser: any = null;
+
+    try {
+      const pw = await import('playwright');
+      browser = await pw.chromium.launch({
+        headless: true,
+        args: ['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
+      });
+      const context = await browser.newContext({
+        viewport: this.config.viewport,
+        userAgent: 'LevelUpAI-Crawler/1.0 (Test Automation)',
+        javaScriptEnabled: true,
+        ignoreHTTPSErrors: true,
+      });
+      context.setDefaultTimeout(this.config.timeout);
+      context.setDefaultNavigationTimeout(this.config.timeout);
+
+      const page = await context.newPage();
+      await page.route('**/*.{mp4,webm,ogg,mp3,wav,flac}', (route: any) => route.abort());
+      await page.route('**/*.{woff,woff2,ttf,eot}', (route: any) => route.abort());
+
+      // Authenticate once
+      const authEngine = new AuthEngine();
+      const authResult = await authEngine.authenticate(
+        page, context, this.config.authConfig, this.config.url,
+      );
+
+      if (!authResult.success) {
+        logger.warn(MOD, 'Auth failed for multi-page crawl', { error: authResult.message });
+      }
+
+      // Crawl target URL + additional URLs in the same session
+      const urlsToVisit = [this.config.url, ...(this.config.additionalUrls || [])];
+      for (const crawlUrl of urlsToVisit) {
+        if (pages.length >= this.config.maxPages) break;
+        const urlVal = validateUrl(crawlUrl);
+        if (!urlVal.valid) continue;
+        try {
+          const pageResult = await this.crawlPageInContext(page, crawlUrl, pages.length === 0);
+          pageResult.authResult = authResult;
+          pages.push(pageResult);
+        } catch (e) {
+          logger.warn(MOD, 'Session crawl page failed', { url: crawlUrl, error: (e as Error).message });
+        }
+      }
+
+      await context.close();
+      await browser.close();
+      browser = null;
+
+      return {
+        pages,
+        navigationGraph: pages.slice(1).map((p, i) => ({
+          from: pages[0]?.url || '', to: p.url, linkText: `Page ${i + 2}`,
+        })),
+        totalCrawlTimeMs: Date.now() - startTime,
+      };
+    } catch (error) {
+      if (browser) try { await browser.close(); } catch { /* ignore */ }
+      throw new Error(`Authenticated multi-page crawl failed: ${(error as Error).message}`);
+    }
+  }
+
+  /** Extract DOM from a page using an existing (session-aware) page instance. */
+  private async crawlPageInContext(page: any, url: string, captureScreenshot: boolean): Promise<CrawlResult> {
+    const startTime = Date.now();
+    const errors: string[] = [];
+
+    logger.info(MOD, 'Crawling page in session', { url });
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: this.config.timeout });
+    try { await page.waitForLoadState('networkidle', { timeout: Math.min(this.config.timeout, 10000) }); } catch { /* SPA */ }
+    await page.waitForTimeout(this.config.waitAfterLoad);
+
+    const title = await page.title();
+    const finalUrl = page.url();
+    let metaDescription: string | undefined;
+    try { metaDescription = await page.$eval('meta[name="description"]', (el: any) => el.getAttribute('content')).catch(() => undefined); } catch { /* */ }
+
+    let elements: PageElement[] = [];
+    try { const raw = await page.evaluate(EXTRACT_ELEMENTS_SCRIPT); elements = Array.isArray(raw) ? raw : []; } catch (e) { errors.push(`Element extraction: ${(e as Error).message}`); }
+
+    let formInfos: any[] = [];
+    try { const raw = await page.evaluate(EXTRACT_FORMS_SCRIPT); formInfos = Array.isArray(raw) ? raw : []; } catch (e) { errors.push(`Form extraction: ${(e as Error).message}`); }
+    const forms: FormInfo[] = formInfos.map(fi => {
+      const fields = elements.filter(el => el.formIndex === fi.index);
+      const submitButton = fields.find(el => el.tag === 'button' || (el.tag === 'input' && el.type === 'submit'));
+      return { ...fi, fields, submitButton };
+    });
+
+    let headings: { level: number; text: string }[] = [];
+    try { const raw = await page.evaluate(EXTRACT_HEADINGS_SCRIPT); headings = Array.isArray(raw) ? raw : []; } catch { /* */ }
+    let navigationLinks: NavigationLink[] = [];
+    try { const raw = await page.evaluate(EXTRACT_NAV_LINKS_SCRIPT); navigationLinks = Array.isArray(raw) ? raw : []; } catch { /* */ }
+
+    const buttons = elements.filter(el => el.tag === 'button' || el.role === 'button' || (el.tag === 'input' && el.type === 'submit'));
+    const inputs = elements.filter(el => el.tag === 'input' || el.tag === 'textarea' || el.tag === 'select');
+    let htmlSnapshot = '';
+    try { const full = await page.content(); htmlSnapshot = full.substring(0, 50000); } catch { /* */ }
+
+    let screenshot: Buffer | undefined;
+    let screenshotBase64: string | undefined;
+    if (captureScreenshot) {
+      try { screenshot = await page.screenshot({ type: 'png', fullPage: false }); screenshotBase64 = screenshot!.toString('base64'); } catch { /* */ }
+    }
+
+    const interactiveElements = elements.filter(el => el.visible).length;
+    const partial: Partial<CrawlResult> = {
+      url, finalUrl, title, metaDescription, elements, forms, navigationLinks, buttons, inputs, headings, htmlSnapshot, totalElements: elements.length, interactiveElements,
+    };
+    const { type: pageType, confidence: pageTypeConfidence } = detectPageType(partial);
+    return { ...partial as CrawlResult, pageType, pageTypeConfidence, screenshot, screenshotBase64, crawlTimeMs: Date.now() - startTime, errors };
   }
 
   /**

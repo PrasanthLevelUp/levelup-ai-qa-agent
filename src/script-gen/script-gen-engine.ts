@@ -20,6 +20,7 @@
 
 import OpenAI from 'openai';
 import { PageCrawler, type CrawlResult, type CrawlConfig, type PageElement } from './page-crawler';
+import type { AuthConfig, AuthResult } from './auth-engine';
 import { WorkflowMapper, type WorkflowMap, type WorkflowFlow, type WorkflowStep, type WorkflowAction } from './workflow-mapper';
 import { SelectorQualityEngine, type ScoredSelector } from './selector-quality-engine';
 import { AssertionEngine, type GeneratedAssertion } from './assertion-engine';
@@ -108,6 +109,8 @@ export interface GenerationResult {
     model: string;
   };
   errors: string[];
+  /** Present when authentication was attempted */
+  authResult?: AuthResult;
 }
 
 export interface GeneratedFile {
@@ -130,6 +133,10 @@ export interface GenerationConfig {
   framework?: 'playwright';   // future: cypress, selenium
   repoIntelligence?: string;  // injected from Repository Intelligence Engine
   knowledgeContext?: string;   // injected from App Knowledge via KnowledgeOptimizer
+  /** Authentication config for crawling behind login walls */
+  authConfig?: AuthConfig;
+  /** Additional URLs to crawl in the same authenticated session */
+  additionalUrls?: string[];
 }
 
 /* -------------------------------------------------------------------------- */
@@ -161,19 +168,57 @@ export class ScriptGenEngine {
 
     logger.info(MOD, 'Starting script generation', { url: config.url });
 
-    // ─── Step 1: Crawl page(s) ────────────────────────────────────
-    const crawler = new PageCrawler({
+    // ─── Step 1: Crawl page(s) — with optional authentication ────
+    const crawlConfig: CrawlConfig = {
       url: config.url,
       followLinks: config.followLinks ?? false,
       maxPages: config.maxPages ?? 3,
       captureScreenshot: true,
-    });
+      authConfig: config.authConfig,
+      additionalUrls: config.additionalUrls,
+    };
+    const crawler = new PageCrawler(crawlConfig);
 
     let crawlResult: CrawlResult;
+    let authResult: AuthResult | undefined;
+    const useAuthMultiPage = !!(config.authConfig && config.additionalUrls?.length);
+
     try {
-      crawlResult = await crawler.crawl();
+      if (useAuthMultiPage) {
+        // Authenticated multi-page crawl: login once, crawl all URLs in same session
+        logger.info(MOD, 'Using authenticated multi-page crawl', {
+          primaryUrl: config.url,
+          additionalUrls: config.additionalUrls!.length,
+        });
+        const multiResult = await crawler.crawlAuthenticatedMultiPage();
+        // Use first page as primary, merge elements from additional pages
+        crawlResult = multiResult.pages[0]!;
+        authResult = crawlResult.authResult;
+        for (let i = 1; i < multiResult.pages.length; i++) {
+          const extra = multiResult.pages[i]!;
+          crawlResult.elements.push(...(extra.elements || []));
+          crawlResult.forms.push(...(extra.forms || []));
+          crawlResult.buttons.push(...(extra.buttons || []));
+          crawlResult.inputs.push(...(extra.inputs || []));
+          crawlResult.navigationLinks.push(...(extra.navigationLinks || []));
+          crawlResult.errors.push(...(extra.errors || []));
+        }
+      } else {
+        // Standard crawl (may include single-page auth if authConfig is set)
+        crawlResult = await crawler.crawl();
+        authResult = crawlResult.authResult;
+      }
     } catch (e) {
       throw new Error(`Crawl failed: ${(e as Error).message}`);
+    }
+
+    if (authResult) {
+      logger.info(MOD, 'Authentication result', {
+        success: authResult.success,
+        strategy: authResult.strategy,
+        cookieCount: authResult.cookieNames?.length ?? 0,
+        captchaDetected: authResult.captchaDetected,
+      });
     }
 
     // Defensive: ensure crawl result arrays are never undefined
@@ -189,6 +234,7 @@ export class ScriptGenEngine {
       pageType: crawlResult.pageType,
       elements: crawlResult.elements.length,
       forms: crawlResult.forms.length,
+      authenticated: !!authResult?.success,
     });
 
     // ─── Step 2: Build workflow map ───────────────────────────────
@@ -242,6 +288,7 @@ export class ScriptGenEngine {
         model: this.model,
       },
       errors,
+      ...(authResult ? { authResult } : {}),
     };
 
     logger.info(MOD, 'Script generation complete', result.stats);
