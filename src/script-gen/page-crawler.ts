@@ -467,6 +467,13 @@ export class PageCrawler {
         timeout: this.config.timeout,
       });
 
+      // Wait for SPA frameworks to render — first try networkidle, fall back to fixed delay
+      try {
+        await page.waitForLoadState('networkidle', { timeout: Math.min(this.config.timeout, 10000) });
+      } catch {
+        // networkidle timeout is non-fatal; SPA may keep polling
+      }
+
       // Wait for dynamic content
       await page.waitForTimeout(this.config.waitAfterLoad);
 
@@ -486,7 +493,8 @@ export class PageCrawler {
       // Elements
       let elements: PageElement[] = [];
       try {
-        elements = await page.evaluate(EXTRACT_ELEMENTS_SCRIPT);
+        const rawElements = await page.evaluate(EXTRACT_ELEMENTS_SCRIPT);
+        elements = Array.isArray(rawElements) ? rawElements : [];
       } catch (e) {
         errors.push(`Element extraction failed: ${(e as Error).message}`);
       }
@@ -494,7 +502,8 @@ export class PageCrawler {
       // Forms
       let formInfos: Array<{ index: number; action?: string; method?: string; id?: string; name?: string }> = [];
       try {
-        formInfos = await page.evaluate(EXTRACT_FORMS_SCRIPT);
+        const rawForms = await page.evaluate(EXTRACT_FORMS_SCRIPT);
+        formInfos = Array.isArray(rawForms) ? rawForms : [];
       } catch (e) {
         errors.push(`Form extraction failed: ${(e as Error).message}`);
       }
@@ -513,13 +522,15 @@ export class PageCrawler {
       // Headings
       let headings: { level: number; text: string }[] = [];
       try {
-        headings = await page.evaluate(EXTRACT_HEADINGS_SCRIPT);
+        const rawHeadings = await page.evaluate(EXTRACT_HEADINGS_SCRIPT);
+        headings = Array.isArray(rawHeadings) ? rawHeadings : [];
       } catch { /* ignore */ }
 
       // Navigation links
       let navigationLinks: NavigationLink[] = [];
       try {
-        navigationLinks = await page.evaluate(EXTRACT_NAV_LINKS_SCRIPT);
+        const rawNavLinks = await page.evaluate(EXTRACT_NAV_LINKS_SCRIPT);
+        navigationLinks = Array.isArray(rawNavLinks) ? rawNavLinks : [];
       } catch { /* ignore */ }
 
       // Filter element categories
