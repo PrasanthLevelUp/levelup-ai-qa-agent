@@ -57,6 +57,7 @@ import { createKnowledgeRouter } from './routes/knowledge';
 import { createDashboardRouter } from './routes/dashboard';
 import { createProjectsRouter } from './routes/projects';
 import { createCIWebhookRouter } from './routes/ci-webhooks';
+import { createUsersRouter } from './routes/users';
 import { createHealingPRRouter } from './routes/healing-pr';
 import { notifyRca } from '../integrations/slack';
 import { createRcaTicket } from '../integrations/jira';
@@ -176,6 +177,7 @@ export function createServer(): express.Application {
   app.use('/api/dashboard', authMiddleware, companyMiddleware, createDashboardRouter());
   app.use('/api/projects', authMiddleware, companyMiddleware, createProjectsRouter());
   app.use('/api/healings', authMiddleware, companyMiddleware, createHealingPRRouter());
+  app.use('/api/users', authMiddleware, companyMiddleware, createUsersRouter());
 
   // List all jobs
   app.get('/api/jobs', authMiddleware, (_req, res) => {
