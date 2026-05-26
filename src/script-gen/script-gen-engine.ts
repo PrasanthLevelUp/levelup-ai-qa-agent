@@ -176,6 +176,15 @@ export class ScriptGenEngine {
       throw new Error(`Crawl failed: ${(e as Error).message}`);
     }
 
+    // Defensive: ensure crawl result arrays are never undefined
+    crawlResult.elements = crawlResult.elements || [];
+    crawlResult.forms = crawlResult.forms || [];
+    crawlResult.buttons = crawlResult.buttons || [];
+    crawlResult.inputs = crawlResult.inputs || [];
+    crawlResult.headings = crawlResult.headings || [];
+    crawlResult.navigationLinks = crawlResult.navigationLinks || [];
+    crawlResult.errors = crawlResult.errors || [];
+
     logger.info(MOD, 'Crawl complete', {
       pageType: crawlResult.pageType,
       elements: crawlResult.elements.length,
