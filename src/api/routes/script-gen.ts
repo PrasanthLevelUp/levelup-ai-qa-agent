@@ -147,10 +147,11 @@ export function createScriptGenRouter(): Router {
       }
 
       // ── Application Intelligence: check cache before crawling ──
+      const projectId = (req as any).projectId as number | undefined;
       const crawlDecision = await crawlOrchestrator.decideCrawlStrategy(url, companyId, {
         forceFreshCrawl: forceFreshCrawl ?? false,
         authConfig: sanitizedAuthConfig,
-      });
+      }, projectId);
 
       console.log(`[ScriptGen] Crawl decision: usedCache=${crawlDecision.usedCache}, reason="${crawlDecision.reason}" (${crawlDecision.decisionTimeMs}ms)`);
 
@@ -183,9 +184,9 @@ export function createScriptGenRouter(): Router {
         try {
           await crawlOrchestrator.saveCrawlResult(url, result.rawCrawlData, companyId, {
             authConfig: sanitizedAuthConfig,
-          });
-          // Learn patterns from the crawl
-          await patternMatcher.learnPatterns(result.rawCrawlData, companyId);
+          }, projectId);
+          // Learn patterns from the crawl (project-scoped)
+          await patternMatcher.learnPatterns(result.rawCrawlData, companyId, projectId);
           console.log(`[ScriptGen] Profile saved + patterns learned for: ${url}`);
         } catch (profileErr: any) {
           console.warn(`[ScriptGen] Could not save profile (non-blocking): ${profileErr.message}`);
@@ -220,9 +221,9 @@ export function createScriptGenRouter(): Router {
         generation_time_ms: generationTimeMs,
         files_generated: result.generatedFiles.map((f: GeneratedFile) => ({ path: f.path, size: f.content.length, type: f.type })),
         negative_tests_included: config.includeNegativeTests,
-      }, companyId);
+      }, companyId, projectId);
 
-      console.log(`[ScriptGen] ✅ Generation complete — ID ${scriptId}, ${result.generatedFiles.length} files, ${generationTimeMs}ms`);
+      console.log(`[ScriptGen] ✅ Generation complete — ID ${scriptId}, ${result.generatedFiles.length} files, ${generationTimeMs}ms, project=${projectId || 'none'}`);
 
       res.json({
         success: true,

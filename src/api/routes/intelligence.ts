@@ -22,7 +22,7 @@ import { ProfileService } from '../../intelligence/profile-service';
 import { CrawlOrchestrator } from '../../intelligence/crawl-orchestrator';
 import { SelectorHealingEngine } from '../../intelligence/healing-engine';
 import { PatternMatcher } from '../../intelligence/pattern-matcher';
-import { findMatchingPatterns } from '../../db/postgres';
+import { findMatchingPatterns, migrateDataToDefaultProjects, getProjectStats } from '../../db/postgres';
 
 export function createIntelligenceRouter(): Router {
   const router = Router();
@@ -32,18 +32,19 @@ export function createIntelligenceRouter(): Router {
   const patternMatcher = new PatternMatcher();
 
   /* ══════════════════════════════════════════════════════════════════
-   *  PROFILE MANAGEMENT
+   *  PROFILE MANAGEMENT (project-scoped via x-project-id header)
    * ══════════════════════════════════════════════════════════════════ */
 
-  /** List all application profiles */
+  /** List all application profiles (filtered by project if x-project-id set) */
   router.get('/profiles', async (req: Request, res: Response) => {
     try {
       const companyId = (req as any).companyId;
+      const projectId = (req as any).projectId as number | undefined;
       const status = req.query.status as string | undefined;
       const limit = parseInt(String(req.query.limit || '50'), 10);
       const offset = parseInt(String(req.query.offset || '0'), 10);
 
-      const result = await profileService.listProfiles(companyId, { status, limit, offset });
+      const result = await profileService.listProfiles(companyId, { status, limit, offset, projectId });
       res.json({ success: true, data: result.profiles, total: result.total });
     } catch (err) {
       res.status(500).json({ success: false, error: (err as Error).message });
@@ -54,10 +55,11 @@ export function createIntelligenceRouter(): Router {
   router.get('/profiles/status', async (req: Request, res: Response) => {
     try {
       const companyId = (req as any).companyId;
+      const projectId = (req as any).projectId as number | undefined;
       const url = String(req.query.url || '');
       if (!url) return res.status(400).json({ success: false, error: 'url query parameter required' });
 
-      const status = await profileService.getProfileStatus(url, companyId);
+      const status = await profileService.getProfileStatus(url, companyId, projectId);
       res.json({ success: true, data: status });
     } catch (err) {
       res.status(500).json({ success: false, error: (err as Error).message });
@@ -79,10 +81,11 @@ export function createIntelligenceRouter(): Router {
   router.post('/profiles/invalidate', async (req: Request, res: Response) => {
     try {
       const companyId = (req as any).companyId;
+      const projectId = (req as any).projectId as number | undefined;
       const { url } = req.body;
       if (!url) return res.status(400).json({ success: false, error: 'url is required' });
 
-      await profileService.invalidateProfile(url, companyId);
+      await profileService.invalidateProfile(url, companyId, projectId);
       res.json({ success: true, message: 'Profile invalidated — next generation will re-crawl' });
     } catch (err) {
       res.status(500).json({ success: false, error: (err as Error).message });
@@ -165,12 +168,13 @@ export function createIntelligenceRouter(): Router {
    *  PATTERN RECOGNITION (Phase 3 Foundation)
    * ══════════════════════════════════════════════════════════════════ */
 
-  /** List learned patterns */
+  /** List learned patterns (project-scoped + shared) */
   router.get('/patterns', async (req: Request, res: Response) => {
     try {
       const companyId = (req as any).companyId;
+      const projectId = (req as any).projectId as number | undefined;
       const type = String(req.query.type || 'login_form');
-      const patterns = await findMatchingPatterns(type || 'login_form', companyId);
+      const patterns = await findMatchingPatterns(type || 'login_form', companyId, projectId);
       res.json({ success: true, data: patterns });
     } catch (err) {
       res.status(500).json({ success: false, error: (err as Error).message });
@@ -181,14 +185,15 @@ export function createIntelligenceRouter(): Router {
   router.post('/patterns/detect', async (req: Request, res: Response) => {
     try {
       const companyId = (req as any).companyId;
+      const projectId = (req as any).projectId as number | undefined;
       const { crawlData } = req.body;
       if (!crawlData) {
         return res.status(400).json({ success: false, error: 'crawlData is required' });
       }
 
       const detected = patternMatcher.detectPatterns(crawlData);
-      // Store learned patterns
-      const stored = await patternMatcher.learnPatterns(crawlData, companyId);
+      // Store learned patterns (project-scoped)
+      const stored = await patternMatcher.learnPatterns(crawlData, companyId, projectId);
 
       res.json({
         success: true,
@@ -197,6 +202,35 @@ export function createIntelligenceRouter(): Router {
           storedCount: stored,
         },
       });
+    } catch (err) {
+      res.status(500).json({ success: false, error: (err as Error).message });
+    }
+  });
+
+  /* ══════════════════════════════════════════════════════════════════
+   *  MULTI-PROJECT MANAGEMENT
+   * ══════════════════════════════════════════════════════════════════ */
+
+  /** Migrate orphaned data to default projects */
+  router.post('/migrate', async (_req: Request, res: Response) => {
+    try {
+      const result = await migrateDataToDefaultProjects();
+      res.json({ success: true, data: result });
+    } catch (err) {
+      res.status(500).json({ success: false, error: (err as Error).message });
+    }
+  });
+
+  /** Get project-scoped stats */
+  router.get('/project-stats', async (req: Request, res: Response) => {
+    try {
+      const companyId = (req as any).companyId;
+      const projectId = (req as any).projectId as number | undefined;
+      if (!projectId) {
+        return res.status(400).json({ success: false, error: 'x-project-id header is required' });
+      }
+      const stats = await getProjectStats(projectId, companyId);
+      res.json({ success: true, data: stats });
     } catch (err) {
       res.status(500).json({ success: false, error: (err as Error).message });
     }
