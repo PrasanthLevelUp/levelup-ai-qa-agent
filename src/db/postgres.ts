@@ -4334,6 +4334,25 @@ const KNOWLEDGE_STATUSES = ['draft','active','archived'] as const;
 const KNOWLEDGE_PRIORITIES = ['low','medium','high','critical'] as const;
 const RELATIONSHIP_TYPES = ['depends_on','related_to','implements','blocks','duplicates'] as const;
 
+// ---- Knowledge: backward-compat helper ----
+// Cache whether project_id column exists on knowledge_items to avoid
+// 500 errors when the migration hasn't run yet in production.
+let _kiHasProjectId: boolean | null = null;
+async function knowledgeHasProjectId(): Promise<boolean> {
+  if (_kiHasProjectId !== null) return _kiHasProjectId;
+  try {
+    const pool = getPool();
+    const r = await pool.query(
+      `SELECT 1 FROM information_schema.columns
+       WHERE table_name = 'knowledge_items' AND column_name = 'project_id'`
+    );
+    _kiHasProjectId = (r.rowCount ?? 0) > 0;
+  } catch {
+    _kiHasProjectId = false;
+  }
+  return _kiHasProjectId;
+}
+
 // ---- Knowledge Items CRUD ----
 
 export async function createKnowledgeItem(data: {
@@ -4342,27 +4361,40 @@ export async function createKnowledgeItem(data: {
   status?: string; priority?: string; createdBy?: string;
 }): Promise<any> {
   const pool = getPool();
-  const r = await pool.query(
-    `INSERT INTO knowledge_items
-       (company_id, project_id, category, title, description, metadata, tags, related_modules,
-        status, priority, created_by)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
-     RETURNING *`,
-    [
-      data.companyId || null,
-      data.projectId || null,
-      data.category,
-      data.title,
-      data.description,
-      JSON.stringify(data.metadata || {}),
-      data.tags || [],
-      data.relatedModules || [],
-      data.status || 'active',
-      data.priority || 'medium',
-      data.createdBy || null,
-    ]
-  );
-  return r.rows[0];
+  const hasProjectCol = await knowledgeHasProjectId();
+
+  if (hasProjectCol) {
+    const r = await pool.query(
+      `INSERT INTO knowledge_items
+         (company_id, project_id, category, title, description, metadata, tags, related_modules,
+          status, priority, created_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+       RETURNING *`,
+      [
+        data.companyId || null, data.projectId || null, data.category, data.title,
+        data.description, JSON.stringify(data.metadata || {}), data.tags || [],
+        data.relatedModules || [], data.status || 'active', data.priority || 'medium',
+        data.createdBy || null,
+      ]
+    );
+    return r.rows[0];
+  } else {
+    // Legacy: project_id column not yet added
+    const r = await pool.query(
+      `INSERT INTO knowledge_items
+         (company_id, category, title, description, metadata, tags, related_modules,
+          status, priority, created_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+       RETURNING *`,
+      [
+        data.companyId || null, data.category, data.title,
+        data.description, JSON.stringify(data.metadata || {}), data.tags || [],
+        data.relatedModules || [], data.status || 'active', data.priority || 'medium',
+        data.createdBy || null,
+      ]
+    );
+    return r.rows[0];
+  }
 }
 
 export async function updateKnowledgeItem(id: number, companyId: number | undefined, data: {
@@ -4422,12 +4454,13 @@ export async function listKnowledgeItems(opts: {
   limit?: number; offset?: number; sortBy?: string; sortDir?: string;
 }): Promise<{ items: any[]; total: number }> {
   const pool = getPool();
+  const hasProjectCol = await knowledgeHasProjectId();
   const conds: string[] = [];
   const params: any[] = [];
   let idx = 1;
 
   if (opts.companyId) { conds.push(`company_id = $${idx}`); params.push(opts.companyId); idx++; }
-  if (opts.projectId) { conds.push(`COALESCE(project_id, 0) = $${idx}`); params.push(opts.projectId); idx++; }
+  if (opts.projectId && hasProjectCol) { conds.push(`COALESCE(project_id, 0) = $${idx}`); params.push(opts.projectId); idx++; }
   if (opts.category) { conds.push(`category = $${idx}`); params.push(opts.category); idx++; }
   if (opts.status) { conds.push(`status = $${idx}`); params.push(opts.status); idx++; }
   if (opts.priority) { conds.push(`priority = $${idx}`); params.push(opts.priority); idx++; }
@@ -4470,11 +4503,12 @@ export async function listKnowledgeItems(opts: {
 
 export async function searchKnowledgeItems(query: string, companyId?: number, limit = 20, projectId?: number): Promise<any[]> {
   const pool = getPool();
+  const hasProjectCol = await knowledgeHasProjectId();
   const params: any[] = [query, limit];
   let extraFilter = '';
   let pIdx = 3;
   if (companyId) { params.push(companyId); extraFilter += ` AND company_id = $${pIdx++}`; }
-  if (projectId) { params.push(projectId); extraFilter += ` AND COALESCE(project_id, 0) = $${pIdx++}`; }
+  if (projectId && hasProjectCol) { params.push(projectId); extraFilter += ` AND COALESCE(project_id, 0) = $${pIdx++}`; }
 
   const r = await pool.query(
     `SELECT *, ts_rank(
@@ -4501,11 +4535,12 @@ export async function getKnowledgeStats(companyId?: number, projectId?: number):
   recentCount: number; tagCloud: Array<{ tag: string; count: number }>;
 }> {
   const pool = getPool();
+  const hasProjectCol = await knowledgeHasProjectId();
   const conds: string[] = [];
   const params: any[] = [];
   let idx = 1;
   if (companyId) { conds.push(`company_id = $${idx++}`); params.push(companyId); }
-  if (projectId) { conds.push(`COALESCE(project_id, 0) = $${idx++}`); params.push(projectId); }
+  if (projectId && hasProjectCol) { conds.push(`COALESCE(project_id, 0) = $${idx++}`); params.push(projectId); }
   const cond = conds.length ? `WHERE ${conds.join(' AND ')}` : '';
 
   const totalR = await pool.query(`SELECT COUNT(*) as c FROM knowledge_items ${cond}`, params);
@@ -4548,11 +4583,12 @@ export async function getKnowledgeStats(companyId?: number, projectId?: number):
 
 export async function getKnowledgeTags(companyId?: number, projectId?: number): Promise<string[]> {
   const pool = getPool();
+  const hasProjectCol = await knowledgeHasProjectId();
   const conds: string[] = [];
   const params: any[] = [];
   let idx = 1;
   if (companyId) { conds.push(`company_id = $${idx++}`); params.push(companyId); }
-  if (projectId) { conds.push(`COALESCE(project_id, 0) = $${idx++}`); params.push(projectId); }
+  if (projectId && hasProjectCol) { conds.push(`COALESCE(project_id, 0) = $${idx++}`); params.push(projectId); }
   const cond = conds.length ? `WHERE ${conds.join(' AND ')}` : '';
   const r = await pool.query(
     `SELECT DISTINCT unnest(tags) as tag FROM knowledge_items ${cond} ORDER BY tag`, params
@@ -4564,11 +4600,12 @@ export async function getKnowledgeTags(companyId?: number, projectId?: number): 
 
 export async function getKnowledgeCategoryDistribution(companyId?: number, projectId?: number): Promise<Array<{category: string; count: number; active: number}>> {
   const pool = getPool();
+  const hasProjectCol = await knowledgeHasProjectId();
   const conds: string[] = [];
   const params: any[] = [];
   let idx = 1;
   if (companyId) { conds.push(`company_id = $${idx++}`); params.push(companyId); }
-  if (projectId) { conds.push(`COALESCE(project_id, 0) = $${idx++}`); params.push(projectId); }
+  if (projectId && hasProjectCol) { conds.push(`COALESCE(project_id, 0) = $${idx++}`); params.push(projectId); }
   const cond = conds.length ? `WHERE ${conds.join(' AND ')}` : '';
   const r = await pool.query(
     `SELECT category,
@@ -4650,6 +4687,7 @@ export async function suggestKnowledgeItems(opts: {
   limit?: number;
 }): Promise<any[]> {
   const pool = getPool();
+  const hasProjectCol = await knowledgeHasProjectId();
   const limit = opts.limit || 10;
   const params: any[] = [];
   let paramIdx = 0;
@@ -4664,7 +4702,7 @@ export async function suggestKnowledgeItems(opts: {
     params.push(opts.companyId);
   }
 
-  if (opts.projectId) {
+  if (opts.projectId && hasProjectCol) {
     paramIdx++;
     conditions.push(`COALESCE(project_id, 0) = $${paramIdx}`);
     params.push(opts.projectId);
