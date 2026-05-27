@@ -211,9 +211,10 @@ export function createRepoIntelligenceRouter(): Router {
       const companyId = (req as any).companyId as number | undefined;
       const profile = await getRepositoryContext(repoId, companyId);
       if (!profile) {
-        return res.status(404).json({ success: false, error: 'Repository context not found' });
+        // Return 200 with exists:false instead of 404 — unscanned repos are expected, not errors
+        return res.json({ success: true, exists: false, profile: null });
       }
-      return res.json({ success: true, profile });
+      return res.json({ success: true, exists: true, profile });
     } catch (err: any) {
       return res.status(500).json({ success: false, error: err.message });
     }
