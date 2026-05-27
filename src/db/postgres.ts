@@ -983,6 +983,41 @@ async function initSchema(client: PoolClient): Promise<void> {
   await safeExec(client, 'idx_selector_patterns_confidence',
     `CREATE INDEX IF NOT EXISTS idx_selector_patterns_confidence ON selector_patterns(confidence_score DESC)`);
 
+  // ─── Phase 12: Multi-Project Isolation ──────────────────────────
+  console.log('🔧 [DB] Phase 12: Multi-Project Isolation...');
+
+  // Add project_id to intelligence tables
+  await safeExec(client, 'phase12_project_id_alters', `DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='application_profiles' AND column_name='project_id') THEN
+      ALTER TABLE application_profiles ADD COLUMN project_id INTEGER REFERENCES projects(id) ON DELETE SET NULL;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='page_snapshots' AND column_name='project_id') THEN
+      ALTER TABLE page_snapshots ADD COLUMN project_id INTEGER REFERENCES projects(id) ON DELETE SET NULL;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='selector_patterns' AND column_name='project_id') THEN
+      ALTER TABLE selector_patterns ADD COLUMN project_id INTEGER REFERENCES projects(id) ON DELETE SET NULL;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='selector_patterns' AND column_name='is_shared') THEN
+      ALTER TABLE selector_patterns ADD COLUMN is_shared BOOLEAN DEFAULT false;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='application_profiles' AND column_name='settings') THEN
+      ALTER TABLE application_profiles ADD COLUMN settings JSONB DEFAULT '{}';
+    END IF;
+  END $$`);
+
+  await safeExec(client, 'idx_app_profiles_project',
+    `CREATE INDEX IF NOT EXISTS idx_app_profiles_project ON application_profiles(project_id)`);
+  await safeExec(client, 'idx_page_snapshots_project',
+    `CREATE INDEX IF NOT EXISTS idx_page_snapshots_project ON page_snapshots(project_id)`);
+  await safeExec(client, 'idx_selector_patterns_project',
+    `CREATE INDEX IF NOT EXISTS idx_selector_patterns_project ON selector_patterns(project_id)`);
+  await safeExec(client, 'idx_selector_patterns_shared',
+    `CREATE INDEX IF NOT EXISTS idx_selector_patterns_shared ON selector_patterns(is_shared) WHERE is_shared = true`);
+
+  // Composite unique: one profile per URL per project (or per company if no project)
+  await safeExec(client, 'uq_app_profile_url_project',
+    `CREATE UNIQUE INDEX IF NOT EXISTS uq_app_profile_url_project ON application_profiles(base_url, COALESCE(project_id, 0), COALESCE(company_id, 0))`);
+
   console.log('🔧 [DB] Seeding plans & roles...');
   await seedDefaultPlans(client);
   await seedDefaultRoles(client);
@@ -2592,13 +2627,13 @@ export interface GeneratedScriptRecord {
   created_at?: string;
 }
 
-export async function logGeneratedScript(data: GeneratedScriptRecord, companyId?: number): Promise<number> {
+export async function logGeneratedScript(data: GeneratedScriptRecord, companyId?: number, projectId?: number): Promise<number> {
   const result = await getPool().query(
     `INSERT INTO generated_scripts
       (url, page_type, workflow_graph, instructions, script_content, test_plan,
        validation_status, reliability_score, review_score, review_issues,
-       tokens_used, model, generation_time_ms, files_generated, negative_tests_included, company_id)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+       tokens_used, model, generation_time_ms, files_generated, negative_tests_included, company_id, project_id)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
     RETURNING id`,
     [
       data.url,
@@ -2617,6 +2652,7 @@ export async function logGeneratedScript(data: GeneratedScriptRecord, companyId?
       data.files_generated ? JSON.stringify(data.files_generated) : null,
       data.negative_tests_included ?? false,
       companyId ?? null,
+      projectId ?? null,
     ],
   );
   return result.rows[0].id;
@@ -5340,8 +5376,19 @@ export interface ApplicationProfile {
   updated_at: string;
 }
 
-export async function getProfileByUrl(baseUrl: string, companyId?: number): Promise<ApplicationProfile | null> {
+export async function getProfileByUrl(baseUrl: string, companyId?: number, projectId?: number): Promise<ApplicationProfile | null> {
   const pool = getPool();
+  if (projectId) {
+    const { rows } = await pool.query(
+      `SELECT * FROM application_profiles
+       WHERE base_url = $1 AND COALESCE(company_id, 0) = COALESCE($2, 0)
+         AND COALESCE(project_id, 0) = $3
+       LIMIT 1`,
+      [baseUrl, companyId ?? null, projectId],
+    );
+    if (rows[0]) return rows[0];
+  }
+  // Fallback: company-level lookup (backward compat)
   const { rows } = await pool.query(
     `SELECT * FROM application_profiles
      WHERE base_url = $1 AND COALESCE(company_id, 0) = COALESCE($2, 0)
@@ -5357,7 +5404,7 @@ export async function getProfileById(id: string): Promise<ApplicationProfile | n
   return rows[0] || null;
 }
 
-export async function listProfiles(companyId?: number, opts?: { status?: string; limit?: number; offset?: number }): Promise<{ profiles: ApplicationProfile[]; total: number }> {
+export async function listProfiles(companyId?: number, opts?: { status?: string; limit?: number; offset?: number; projectId?: number }): Promise<{ profiles: ApplicationProfile[]; total: number }> {
   const pool = getPool();
   const conditions: string[] = [];
   const vals: any[] = [];
@@ -5366,6 +5413,10 @@ export async function listProfiles(companyId?: number, opts?: { status?: string;
   if (companyId !== undefined) {
     conditions.push(`COALESCE(company_id, 0) = $${idx++}`);
     vals.push(companyId ?? 0);
+  }
+  if (opts?.projectId) {
+    conditions.push(`COALESCE(project_id, 0) = $${idx++}`);
+    vals.push(opts.projectId);
   }
   if (opts?.status) {
     conditions.push(`status = $${idx++}`);
@@ -5403,6 +5454,7 @@ export async function upsertProfile(data: {
   status?: string;
   errorMessage?: string;
   ttlDays?: number;
+  projectId?: number;
 }, companyId?: number): Promise<ApplicationProfile> {
   const pool = getPool();
   const ttl = data.ttlDays || 30;
@@ -5410,9 +5462,9 @@ export async function upsertProfile(data: {
     `INSERT INTO application_profiles
        (base_url, app_fingerprint, crawl_data, auth_required, auth_config,
         crawled_at, expires_at, page_count, total_elements, total_forms,
-        total_interactive, status, error_message, company_id)
+        total_interactive, status, error_message, company_id, project_id)
      VALUES ($1, $2, $3, $4, $5, NOW(), NOW() + ($6 || ' days')::INTERVAL,
-             $7, $8, $9, $10, $11, $12, $13)
+             $7, $8, $9, $10, $11, $12, $13, $14)
      ON CONFLICT (base_url, COALESCE(company_id, 0)) DO UPDATE SET
        app_fingerprint = EXCLUDED.app_fingerprint,
        crawl_data = EXCLUDED.crawl_data,
@@ -5426,6 +5478,7 @@ export async function upsertProfile(data: {
        total_interactive = EXCLUDED.total_interactive,
        status = EXCLUDED.status,
        error_message = EXCLUDED.error_message,
+       project_id = COALESCE(EXCLUDED.project_id, application_profiles.project_id),
        updated_at = NOW()
      RETURNING *`,
     [
@@ -5442,6 +5495,7 @@ export async function upsertProfile(data: {
       data.status || 'fresh',
       data.errorMessage || null,
       companyId ?? null,
+      data.projectId ?? null,
     ],
   );
   return rows[0];
@@ -5464,13 +5518,21 @@ export async function deleteProfile(id: string, companyId?: number): Promise<boo
   return (rowCount ?? 0) > 0;
 }
 
-export async function invalidateProfile(baseUrl: string, companyId?: number): Promise<void> {
+export async function invalidateProfile(baseUrl: string, companyId?: number, projectId?: number): Promise<void> {
   const pool = getPool();
-  await pool.query(
-    `UPDATE application_profiles SET status = 'expired', updated_at = NOW()
-     WHERE base_url = $1 AND COALESCE(company_id, 0) = COALESCE($2, 0)`,
-    [baseUrl, companyId ?? null],
-  );
+  if (projectId) {
+    await pool.query(
+      `UPDATE application_profiles SET status = 'expired', updated_at = NOW()
+       WHERE base_url = $1 AND COALESCE(company_id, 0) = COALESCE($2, 0) AND COALESCE(project_id, 0) = $3`,
+      [baseUrl, companyId ?? null, projectId],
+    );
+  } else {
+    await pool.query(
+      `UPDATE application_profiles SET status = 'expired', updated_at = NOW()
+       WHERE base_url = $1 AND COALESCE(company_id, 0) = COALESCE($2, 0)`,
+      [baseUrl, companyId ?? null],
+    );
+  }
 }
 
 export async function refreshExpiredProfiles(): Promise<number> {
@@ -5546,12 +5608,14 @@ export async function upsertSelectorPattern(data: {
   selectors: any;
   elementSignatures?: any;
   confidenceScore?: number;
+  projectId?: number;
+  isShared?: boolean;
 }, companyId?: number): Promise<any> {
   const pool = getPool();
   const { rows } = await pool.query(
     `INSERT INTO selector_patterns
-       (pattern_type, pattern_name, selectors, element_signatures, confidence_score, company_id)
-     VALUES ($1, $2, $3, $4, $5, $6)
+       (pattern_type, pattern_name, selectors, element_signatures, confidence_score, company_id, project_id, is_shared)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
      RETURNING *`,
     [
       data.patternType,
@@ -5560,13 +5624,28 @@ export async function upsertSelectorPattern(data: {
       JSON.stringify(data.elementSignatures || {}),
       data.confidenceScore ?? 0.5,
       companyId ?? null,
+      data.projectId ?? null,
+      data.isShared ?? false,
     ],
   );
   return rows[0];
 }
 
-export async function findMatchingPatterns(patternType: string, companyId?: number): Promise<any[]> {
+export async function findMatchingPatterns(patternType: string, companyId?: number, projectId?: number): Promise<any[]> {
   const pool = getPool();
+  // Project-scoped patterns + shared patterns within the same company
+  if (projectId) {
+    const { rows } = await pool.query(
+      `SELECT * FROM selector_patterns
+       WHERE pattern_type = $1
+         AND (company_id IS NULL OR COALESCE(company_id, 0) = COALESCE($2, 0))
+         AND (COALESCE(project_id, 0) = $3 OR is_shared = true)
+       ORDER BY confidence_score DESC, success_rate DESC
+       LIMIT 10`,
+      [patternType, companyId ?? null, projectId],
+    );
+    return rows;
+  }
   const { rows } = await pool.query(
     `SELECT * FROM selector_patterns
      WHERE pattern_type = $1 AND (company_id IS NULL OR COALESCE(company_id, 0) = COALESCE($2, 0))
@@ -5591,4 +5670,121 @@ export async function incrementPatternUsage(id: string, success: boolean): Promi
      WHERE id = $1`,
     [id, success],
   );
+}
+
+
+
+/* -------------------------------------------------------------------------- */
+/*  Multi-Project Isolation — Migration & Validation                          */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Migrate existing data to default project.
+ * For each company, finds or creates a "Default Project" and assigns all
+ * orphaned records (project_id IS NULL) to it.
+ */
+export async function migrateDataToDefaultProjects(): Promise<{
+  companiesProcessed: number;
+  profilesMigrated: number;
+  patternsMigrated: number;
+}> {
+  const pool = getPool();
+  let companiesProcessed = 0;
+  let profilesMigrated = 0;
+  let patternsMigrated = 0;
+
+  // Find all companies that have orphaned intelligence data
+  const { rows: companies } = await pool.query(
+    `SELECT DISTINCT COALESCE(company_id, 1) AS cid FROM application_profiles WHERE project_id IS NULL
+     UNION
+     SELECT DISTINCT COALESCE(company_id, 1) AS cid FROM selector_patterns WHERE project_id IS NULL`,
+  );
+
+  for (const row of companies) {
+    const companyId = row.cid;
+
+    // Find or create default project for this company
+    const { rows: existing } = await pool.query(
+      `SELECT id FROM projects WHERE company_id = $1 ORDER BY created_at ASC LIMIT 1`,
+      [companyId],
+    );
+
+    let projectId: number;
+    if (existing.length > 0) {
+      projectId = existing[0].id;
+    } else {
+      const { rows: created } = await pool.query(
+        `INSERT INTO projects (company_id, name, description)
+         VALUES ($1, 'Default Project', 'Auto-created during migration')
+         ON CONFLICT (company_id, name) DO UPDATE SET updated_at = NOW()
+         RETURNING id`,
+        [companyId],
+      );
+      projectId = created[0].id;
+    }
+
+    // Migrate application_profiles
+    const r1 = await pool.query(
+      `UPDATE application_profiles SET project_id = $1 WHERE COALESCE(company_id, 1) = $2 AND project_id IS NULL`,
+      [projectId, companyId],
+    );
+    profilesMigrated += r1.rowCount ?? 0;
+
+    // Migrate page_snapshots via their profile
+    await pool.query(
+      `UPDATE page_snapshots SET project_id = $1
+       WHERE project_id IS NULL AND profile_id IN (
+         SELECT id FROM application_profiles WHERE COALESCE(company_id, 1) = $2
+       )`,
+      [projectId, companyId],
+    );
+
+    // Migrate selector_patterns
+    const r2 = await pool.query(
+      `UPDATE selector_patterns SET project_id = $1 WHERE COALESCE(company_id, 1) = $2 AND project_id IS NULL`,
+      [projectId, companyId],
+    );
+    patternsMigrated += r2.rowCount ?? 0;
+
+    companiesProcessed++;
+  }
+
+  return { companiesProcessed, profilesMigrated, patternsMigrated };
+}
+
+/**
+ * Validate that a project exists and belongs to the given company.
+ * Returns the project row or null.
+ */
+export async function validateProjectAccess(projectId: number, companyId: number): Promise<any | null> {
+  const pool = getPool();
+  const { rows } = await pool.query(
+    `SELECT * FROM projects WHERE id = $1 AND company_id = $2 AND is_active = true`,
+    [projectId, companyId],
+  );
+  return rows[0] || null;
+}
+
+/**
+ * Get project summary stats (profiles, patterns, repos, scripts count).
+ */
+export async function getProjectStats(projectId: number, companyId: number): Promise<{
+  profileCount: number;
+  patternCount: number;
+  repoCount: number;
+  scriptCount: number;
+}> {
+  const pool = getPool();
+  const [profiles, patterns, repos, scripts] = await Promise.all([
+    pool.query(`SELECT COUNT(*)::int AS c FROM application_profiles WHERE project_id = $1 AND COALESCE(company_id, 0) = $2`, [projectId, companyId]),
+    pool.query(`SELECT COUNT(*)::int AS c FROM selector_patterns WHERE project_id = $1 AND COALESCE(company_id, 0) = $2`, [projectId, companyId]),
+    pool.query(`SELECT COUNT(*)::int AS c FROM repositories WHERE project_id = $1 AND company_id = $2`, [projectId, companyId]),
+    pool.query(`SELECT COUNT(*)::int AS c FROM generated_scripts WHERE project_id = $1 AND COALESCE(company_id, 0) = $2`, [projectId, companyId]),
+  ]);
+  return {
+    profileCount: profiles.rows[0]?.c || 0,
+    patternCount: patterns.rows[0]?.c || 0,
+    repoCount: repos.rows[0]?.c || 0,
+    scriptCount: scripts.rows[0]?.c || 0,
+  };
 }

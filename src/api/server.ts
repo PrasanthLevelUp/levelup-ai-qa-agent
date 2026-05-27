@@ -10,6 +10,7 @@ import * as fs from 'fs';
 
 import { authMiddleware } from './middleware/auth';
 import { companyMiddleware } from './middleware/company';
+import { projectContextMiddleware } from './middleware/project-context';
 import { errorHandler } from './middleware/error-handler';
 import { createHealRouter } from './routes/heal';
 import { createStatusRouter } from './routes/status';
@@ -161,7 +162,7 @@ export function createServer(): express.Application {
   app.use('/api/repos', authMiddleware, companyMiddleware, createReposRouter(repoManager));
   app.use('/api/rca', authMiddleware, companyMiddleware, createRCARouter());
   app.use('/api/pr', authMiddleware, companyMiddleware, createPRRouter());
-  app.use('/api/scripts', authMiddleware, companyMiddleware, createScriptGenRouter());
+  app.use('/api/scripts', authMiddleware, companyMiddleware, projectContextMiddleware, createScriptGenRouter());
   app.use('/api/notifications', authMiddleware, companyMiddleware, createNotificationsRouter());
   app.use('/api/dom', authMiddleware, companyMiddleware, createDomMemoryRouter());
   app.use('/api/learning', authMiddleware, companyMiddleware, createLearningRouter());
@@ -177,11 +178,11 @@ export function createServer(): express.Application {
   app.use('/api/repo-intelligence', authMiddleware, companyMiddleware, createRepoIntelligenceRouter());
   app.use('/api/knowledge', authMiddleware, companyMiddleware, createKnowledgeRouter());
   app.use('/api/dashboard', authMiddleware, companyMiddleware, createDashboardRouter());
-  app.use('/api/projects', authMiddleware, companyMiddleware, createProjectsRouter());
+  app.use('/api/projects', authMiddleware, companyMiddleware, projectContextMiddleware, createProjectsRouter());
   app.use('/api/healings', authMiddleware, companyMiddleware, createHealingPRRouter());
   app.use('/api/users', authMiddleware, companyMiddleware, createUsersRouter());
   app.use('/api/github', authMiddleware, companyMiddleware, createGitHubRouter());
-  app.use('/api/intelligence', authMiddleware, companyMiddleware, createIntelligenceRouter());
+  app.use('/api/intelligence', authMiddleware, companyMiddleware, projectContextMiddleware, createIntelligenceRouter());
 
   // List all jobs
   app.get('/api/jobs', authMiddleware, (_req, res) => {

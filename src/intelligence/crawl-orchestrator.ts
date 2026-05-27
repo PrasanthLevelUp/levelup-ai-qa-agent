@@ -64,12 +64,13 @@ export class CrawlOrchestrator {
     baseUrl: string,
     companyId?: number,
     config?: OrchestratorConfig,
+    projectId?: number,
   ): Promise<CrawlDecision> {
     const start = Date.now();
 
     // Force fresh crawl requested
     if (config?.forceFreshCrawl) {
-      logger.info(MOD, 'Force fresh crawl requested', { url: baseUrl });
+      logger.info(MOD, 'Force fresh crawl requested', { url: baseUrl, projectId });
       return {
         usedCache: false,
         profile: null,
@@ -79,8 +80,8 @@ export class CrawlOrchestrator {
       };
     }
 
-    // Check for existing profile
-    const profile = await this.profileService.getOrCreateProfile(baseUrl, companyId);
+    // Check for existing profile (project-scoped)
+    const profile = await this.profileService.getOrCreateProfile(baseUrl, companyId, projectId);
 
     if (!profile) {
       logger.info(MOD, 'No cached profile found — fresh crawl needed', { url: baseUrl });
@@ -141,6 +142,7 @@ export class CrawlOrchestrator {
     crawlResult: any,
     companyId?: number,
     config?: OrchestratorConfig,
+    projectId?: number,
   ): Promise<ApplicationProfile> {
     const input: SaveProfileInput = {
       baseUrl,
@@ -172,10 +174,11 @@ export class CrawlOrchestrator {
       }],
     };
 
-    const profile = await this.profileService.saveProfile(input, companyId);
+    const profile = await this.profileService.saveProfile(input, companyId, projectId);
     logger.info(MOD, 'Crawl result saved to profile', {
       profileId: profile.id,
       url: baseUrl,
+      projectId,
     });
 
     return profile;

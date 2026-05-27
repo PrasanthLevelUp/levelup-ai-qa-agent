@@ -24,6 +24,8 @@ import {
   listReleaseWindows,
   updateReleaseWindow,
   deleteReleaseWindow,
+  getProjectStats,
+  migrateDataToDefaultProjects,
 } from '../../db/postgres';
 
 const MOD = 'projects-route';
@@ -229,6 +231,38 @@ export function createProjectsRouter(): Router {
     } catch (err: any) {
       logger.error(MOD, 'Failed to delete repository', { error: err.message });
       res.status(500).json({ error: 'Failed to delete repository' });
+    }
+  });
+
+  // ─── Project Stats ─────────────────────────────────────────────
+
+  // GET /api/projects/:id/stats — get project resource counts
+  router.get('/:id/stats', async (req: Request, res: Response) => {
+    try {
+      const companyId = (req as any).companyId;
+      const projectId = parseInt(req.params['id'] as string, 10);
+      if (isNaN(projectId)) {
+        res.status(400).json({ error: 'Invalid project ID' });
+        return;
+      }
+      const stats = await getProjectStats(projectId, companyId);
+      res.json({ stats });
+    } catch (err: any) {
+      logger.error(MOD, 'Failed to get project stats', { error: err.message });
+      res.status(500).json({ error: 'Failed to get project stats' });
+    }
+  });
+
+  // ─── Data Migration ──────────────────────────────────────────
+
+  // POST /api/projects/migrate — Migrate orphaned data to default projects
+  router.post('/migrate', async (_req: Request, res: Response) => {
+    try {
+      const result = await migrateDataToDefaultProjects();
+      res.json({ success: true, ...result });
+    } catch (err: any) {
+      logger.error(MOD, 'Migration failed', { error: err.message });
+      res.status(500).json({ error: 'Migration failed' });
     }
   });
 

@@ -75,9 +75,10 @@ export class ProfileService {
   async getOrCreateProfile(
     baseUrl: string,
     companyId?: number,
+    projectId?: number,
   ): Promise<ApplicationProfile | null> {
     const normalizedUrl = this.normalizeUrl(baseUrl);
-    const profile = await getProfileByUrl(normalizedUrl, companyId);
+    const profile = await getProfileByUrl(normalizedUrl, companyId, projectId);
     if (!profile) return null;
 
     // Auto-mark expired profiles
@@ -101,7 +102,7 @@ export class ProfileService {
   /**
    * Save crawl results as an application profile with page snapshots.
    */
-  async saveProfile(input: SaveProfileInput, companyId?: number): Promise<ApplicationProfile> {
+  async saveProfile(input: SaveProfileInput, companyId?: number, projectId?: number): Promise<ApplicationProfile> {
     const normalizedUrl = this.normalizeUrl(input.baseUrl);
     const fingerprint = this.computeFingerprint(input.crawlData);
 
@@ -109,6 +110,7 @@ export class ProfileService {
       url: normalizedUrl,
       fingerprint,
       pages: input.pages?.length ?? 0,
+      projectId,
     });
 
     const profile = await upsertProfile({
@@ -123,6 +125,7 @@ export class ProfileService {
       totalInteractive: input.totalInteractive ?? 0,
       status: 'fresh',
       ttlDays: input.ttlDays ?? 30,
+      projectId,
     }, companyId);
 
     // Save page snapshots
@@ -151,18 +154,18 @@ export class ProfileService {
   /**
    * Force-invalidate a profile so next generation triggers a fresh crawl.
    */
-  async invalidateProfile(baseUrl: string, companyId?: number): Promise<void> {
+  async invalidateProfile(baseUrl: string, companyId?: number, projectId?: number): Promise<void> {
     const normalizedUrl = this.normalizeUrl(baseUrl);
-    await dbInvalidateProfile(normalizedUrl, companyId);
-    logger.info(MOD, 'Profile invalidated', { url: normalizedUrl });
+    await dbInvalidateProfile(normalizedUrl, companyId, projectId);
+    logger.info(MOD, 'Profile invalidated', { url: normalizedUrl, projectId });
   }
 
   /**
    * Get detailed profile status for a URL.
    */
-  async getProfileStatus(baseUrl: string, companyId?: number): Promise<ProfileStatusResult> {
+  async getProfileStatus(baseUrl: string, companyId?: number, projectId?: number): Promise<ProfileStatusResult> {
     const normalizedUrl = this.normalizeUrl(baseUrl);
-    const profile = await getProfileByUrl(normalizedUrl, companyId);
+    const profile = await getProfileByUrl(normalizedUrl, companyId, projectId);
 
     if (!profile) {
       return { status: 'not_exists', profile: null, ageMs: null, expiresInMs: null, pageCount: 0 };
@@ -197,7 +200,7 @@ export class ProfileService {
   /**
    * List all profiles for a company.
    */
-  async listProfiles(companyId?: number, opts?: { status?: string; limit?: number; offset?: number }) {
+  async listProfiles(companyId?: number, opts?: { status?: string; limit?: number; offset?: number; projectId?: number }) {
     return listProfiles(companyId, opts);
   }
 

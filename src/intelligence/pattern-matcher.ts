@@ -266,7 +266,7 @@ export class PatternMatcher {
   /**
    * Store detected patterns in the database for future use.
    */
-  async learnPatterns(crawlData: any, companyId?: number): Promise<number> {
+  async learnPatterns(crawlData: any, companyId?: number, projectId?: number): Promise<number> {
     const detected = this.detectPatterns(crawlData);
     let stored = 0;
 
@@ -275,6 +275,7 @@ export class PatternMatcher {
         await upsertSelectorPattern({
           patternType: pattern.type,
           patternName: `${pattern.type}_auto_${Date.now()}`,
+          projectId,
           selectors: pattern.selectors,
           elementSignatures: pattern.elementSignatures,
           confidenceScore: pattern.confidence,
@@ -292,8 +293,8 @@ export class PatternMatcher {
   /**
    * Find patterns matching a given type from the knowledge database.
    */
-  async findPatterns(patternType: PatternType, companyId?: number): Promise<PatternMatch[]> {
-    const rows = await findMatchingPatterns(patternType, companyId);
+  async findPatterns(patternType: PatternType, companyId?: number, projectId?: number): Promise<PatternMatch[]> {
+    const rows = await findMatchingPatterns(patternType, companyId, projectId);
     return rows.map(row => ({
       patternId: row.id,
       patternType: row.pattern_type,
