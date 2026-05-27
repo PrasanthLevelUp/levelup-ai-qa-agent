@@ -176,7 +176,7 @@ export function createServer(): express.Application {
   app.use('/api/billing', authMiddleware, companyMiddleware, createBillingRouter());
   app.use('/api/keys', authMiddleware, companyMiddleware, apiKeysRouter);
   app.use('/api/repo-intelligence', authMiddleware, companyMiddleware, createRepoIntelligenceRouter());
-  app.use('/api/knowledge', authMiddleware, companyMiddleware, createKnowledgeRouter());
+  app.use('/api/knowledge', authMiddleware, companyMiddleware, projectContextMiddleware, createKnowledgeRouter());
   app.use('/api/dashboard', authMiddleware, companyMiddleware, createDashboardRouter());
   app.use('/api/projects', authMiddleware, companyMiddleware, projectContextMiddleware, createProjectsRouter());
   app.use('/api/healings', authMiddleware, companyMiddleware, createHealingPRRouter());
