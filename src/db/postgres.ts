@@ -1026,7 +1026,7 @@ async function initSchema(client: PoolClient): Promise<void> {
 
   // Composite unique: one profile per URL per project (or per company if no project)
   await safeExec(client, 'uq_app_profile_url_project',
-    `CREATE UNIQUE INDEX IF NOT EXISTS uq_app_profile_url_project ON application_profiles(base_url, COALESCE(project_id, 0), COALESCE(company_id, 0))`);
+    `CREATE UNIQUE INDEX IF NOT EXISTS uq_app_profile_url_project ON application_profiles(base_url, COALESCE(project_id, -1), COALESCE(company_id, 0))`);
 
   console.log('🔧 [DB] Seeding plans & roles...');
   await seedDefaultPlans(client);
@@ -4460,7 +4460,7 @@ export async function listKnowledgeItems(opts: {
   let idx = 1;
 
   if (opts.companyId) { conds.push(`company_id = $${idx}`); params.push(opts.companyId); idx++; }
-  if (opts.projectId && hasProjectCol) { conds.push(`COALESCE(project_id, 0) = $${idx}`); params.push(opts.projectId); idx++; }
+  if (opts.projectId && hasProjectCol) { conds.push(`project_id = $${idx}`); params.push(opts.projectId); idx++; }
   if (opts.category) { conds.push(`category = $${idx}`); params.push(opts.category); idx++; }
   if (opts.status) { conds.push(`status = $${idx}`); params.push(opts.status); idx++; }
   if (opts.priority) { conds.push(`priority = $${idx}`); params.push(opts.priority); idx++; }
@@ -4508,7 +4508,7 @@ export async function searchKnowledgeItems(query: string, companyId?: number, li
   let extraFilter = '';
   let pIdx = 3;
   if (companyId) { params.push(companyId); extraFilter += ` AND company_id = $${pIdx++}`; }
-  if (projectId && hasProjectCol) { params.push(projectId); extraFilter += ` AND COALESCE(project_id, 0) = $${pIdx++}`; }
+  if (projectId && hasProjectCol) { params.push(projectId); extraFilter += ` AND project_id = $${pIdx++}`; }
 
   const r = await pool.query(
     `SELECT *, ts_rank(
@@ -4540,7 +4540,7 @@ export async function getKnowledgeStats(companyId?: number, projectId?: number):
   const params: any[] = [];
   let idx = 1;
   if (companyId) { conds.push(`company_id = $${idx++}`); params.push(companyId); }
-  if (projectId && hasProjectCol) { conds.push(`COALESCE(project_id, 0) = $${idx++}`); params.push(projectId); }
+  if (projectId && hasProjectCol) { conds.push(`project_id = $${idx++}`); params.push(projectId); }
   const cond = conds.length ? `WHERE ${conds.join(' AND ')}` : '';
 
   const totalR = await pool.query(`SELECT COUNT(*) as c FROM knowledge_items ${cond}`, params);
@@ -4588,7 +4588,7 @@ export async function getKnowledgeTags(companyId?: number, projectId?: number): 
   const params: any[] = [];
   let idx = 1;
   if (companyId) { conds.push(`company_id = $${idx++}`); params.push(companyId); }
-  if (projectId && hasProjectCol) { conds.push(`COALESCE(project_id, 0) = $${idx++}`); params.push(projectId); }
+  if (projectId && hasProjectCol) { conds.push(`project_id = $${idx++}`); params.push(projectId); }
   const cond = conds.length ? `WHERE ${conds.join(' AND ')}` : '';
   const r = await pool.query(
     `SELECT DISTINCT unnest(tags) as tag FROM knowledge_items ${cond} ORDER BY tag`, params
@@ -4605,7 +4605,7 @@ export async function getKnowledgeCategoryDistribution(companyId?: number, proje
   const params: any[] = [];
   let idx = 1;
   if (companyId) { conds.push(`company_id = $${idx++}`); params.push(companyId); }
-  if (projectId && hasProjectCol) { conds.push(`COALESCE(project_id, 0) = $${idx++}`); params.push(projectId); }
+  if (projectId && hasProjectCol) { conds.push(`project_id = $${idx++}`); params.push(projectId); }
   const cond = conds.length ? `WHERE ${conds.join(' AND ')}` : '';
   const r = await pool.query(
     `SELECT category,
@@ -4704,7 +4704,7 @@ export async function suggestKnowledgeItems(opts: {
 
   if (opts.projectId && hasProjectCol) {
     paramIdx++;
-    conditions.push(`COALESCE(project_id, 0) = $${paramIdx}`);
+    conditions.push(`project_id = $${paramIdx}`);
     params.push(opts.projectId);
   }
 
@@ -5452,7 +5452,7 @@ export async function getProfileByUrl(baseUrl: string, companyId?: number, proje
     const { rows } = await pool.query(
       `SELECT * FROM application_profiles
        WHERE base_url = $1 AND COALESCE(company_id, 0) = COALESCE($2, 0)
-         AND COALESCE(project_id, 0) = $3
+         AND project_id = $3
        LIMIT 1`,
       [baseUrl, companyId ?? null, projectId],
     );
@@ -5485,7 +5485,7 @@ export async function listProfiles(companyId?: number, opts?: { status?: string;
     vals.push(companyId ?? 0);
   }
   if (opts?.projectId) {
-    conditions.push(`COALESCE(project_id, 0) = $${idx++}`);
+    conditions.push(`project_id = $${idx++}`);
     vals.push(opts.projectId);
   }
   if (opts?.status) {
@@ -5593,7 +5593,7 @@ export async function invalidateProfile(baseUrl: string, companyId?: number, pro
   if (projectId) {
     await pool.query(
       `UPDATE application_profiles SET status = 'expired', updated_at = NOW()
-       WHERE base_url = $1 AND COALESCE(company_id, 0) = COALESCE($2, 0) AND COALESCE(project_id, 0) = $3`,
+       WHERE base_url = $1 AND COALESCE(company_id, 0) = COALESCE($2, 0) AND project_id = $3`,
       [baseUrl, companyId ?? null, projectId],
     );
   } else {
@@ -5709,7 +5709,7 @@ export async function findMatchingPatterns(patternType: string, companyId?: numb
       `SELECT * FROM selector_patterns
        WHERE pattern_type = $1
          AND (company_id IS NULL OR COALESCE(company_id, 0) = COALESCE($2, 0))
-         AND (COALESCE(project_id, 0) = $3 OR is_shared = true)
+         AND (project_id = $3 OR is_shared = true)
        ORDER BY confidence_score DESC, success_rate DESC
        LIMIT 10`,
       [patternType, companyId ?? null, projectId],
