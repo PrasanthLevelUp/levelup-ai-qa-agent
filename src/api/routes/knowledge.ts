@@ -41,8 +41,21 @@ export function createKnowledgeRouter(): Router {
       const projectId = (req as any).projectId;
       const {
         category, status, priority, tags, module: mod,
-        search, limit, offset, sortBy, sortDir,
+        search, limit, offset, page,
+        sortBy, sort_by, sortDir, sort_dir,
       } = req.query;
+
+      // Support both camelCase and snake_case sort params
+      const effectiveSortBy = (sortBy || sort_by) as string | undefined;
+      const effectiveSortDir = (sortDir || sort_dir) as string | undefined;
+
+      // Support page-based pagination (convert page to offset)
+      const parsedLimit = limit ? parseInt(String(limit), 10) : undefined;
+      let parsedOffset = offset ? parseInt(String(offset), 10) : undefined;
+      if (page && !offset) {
+        const pageNum = parseInt(String(page), 10);
+        if (pageNum > 1) parsedOffset = (pageNum - 1) * (parsedLimit || 50);
+      }
 
       const result = await listKnowledgeItems({
         companyId,
@@ -53,10 +66,10 @@ export function createKnowledgeRouter(): Router {
         tags: tags ? (Array.isArray(tags) ? tags as string[] : [tags as string]) : undefined,
         module: mod as string,
         search: search as string,
-        limit: limit ? parseInt(String(limit), 10) : undefined,
-        offset: offset ? parseInt(String(offset), 10) : undefined,
-        sortBy: sortBy as string,
-        sortDir: sortDir as string,
+        limit: parsedLimit,
+        offset: parsedOffset,
+        sortBy: effectiveSortBy,
+        sortDir: effectiveSortDir,
       });
 
       return res.json(result);
