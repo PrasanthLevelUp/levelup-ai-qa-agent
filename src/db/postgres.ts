@@ -1019,6 +1019,36 @@ async function initSchema(client: PoolClient): Promise<void> {
     `CREATE INDEX IF NOT EXISTS idx_selector_patterns_project ON selector_patterns(project_id)`);
   await safeExec(client, 'idx_selector_patterns_shared',
     `CREATE INDEX IF NOT EXISTS idx_selector_patterns_shared ON selector_patterns(is_shared) WHERE is_shared = true`);
+  // Fix: if project_id was accidentally created as UUID on any table, convert to INTEGER.
+  // projects.id is SERIAL (integer), so all project_id FK columns must also be integer.
+  await safeExec(client, 'fix_uuid_project_id_columns', `DO $$ BEGIN
+    -- knowledge_items
+    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='knowledge_items' AND column_name='project_id' AND data_type='uuid') THEN
+      ALTER TABLE knowledge_items DROP COLUMN project_id;
+      ALTER TABLE knowledge_items ADD COLUMN project_id INTEGER REFERENCES projects(id) ON DELETE SET NULL;
+    END IF;
+    -- knowledge_relationships
+    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='knowledge_relationships' AND column_name='project_id' AND data_type='uuid') THEN
+      ALTER TABLE knowledge_relationships DROP COLUMN project_id;
+      ALTER TABLE knowledge_relationships ADD COLUMN project_id INTEGER REFERENCES projects(id) ON DELETE SET NULL;
+    END IF;
+    -- application_profiles
+    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='application_profiles' AND column_name='project_id' AND data_type='uuid') THEN
+      ALTER TABLE application_profiles DROP COLUMN project_id;
+      ALTER TABLE application_profiles ADD COLUMN project_id INTEGER REFERENCES projects(id) ON DELETE SET NULL;
+    END IF;
+    -- page_snapshots
+    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='page_snapshots' AND column_name='project_id' AND data_type='uuid') THEN
+      ALTER TABLE page_snapshots DROP COLUMN project_id;
+      ALTER TABLE page_snapshots ADD COLUMN project_id INTEGER REFERENCES projects(id) ON DELETE SET NULL;
+    END IF;
+    -- selector_patterns
+    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='selector_patterns' AND column_name='project_id' AND data_type='uuid') THEN
+      ALTER TABLE selector_patterns DROP COLUMN project_id;
+      ALTER TABLE selector_patterns ADD COLUMN project_id INTEGER REFERENCES projects(id) ON DELETE SET NULL;
+    END IF;
+  END $$`);
+
   await safeExec(client, 'idx_ki_project',
     `CREATE INDEX IF NOT EXISTS idx_ki_project ON knowledge_items(project_id)`);
   await safeExec(client, 'idx_kr_project',
@@ -4335,22 +4365,36 @@ const KNOWLEDGE_PRIORITIES = ['low','medium','high','critical'] as const;
 const RELATIONSHIP_TYPES = ['depends_on','related_to','implements','blocks','duplicates'] as const;
 
 // ---- Knowledge: backward-compat helper ----
-// Cache whether project_id column exists on knowledge_items to avoid
-// 500 errors when the migration hasn't run yet in production.
-let _kiHasProjectId: boolean | null = null;
+// Cache whether project_id column exists AND is integer-compatible on
+// knowledge_items to avoid 500 errors from type mismatches or missing columns.
+let _kiProjectIdStatus: 'unknown' | 'integer' | 'unsupported' = 'unknown';
 async function knowledgeHasProjectId(): Promise<boolean> {
-  if (_kiHasProjectId !== null) return _kiHasProjectId;
+  if (_kiProjectIdStatus !== 'unknown') return _kiProjectIdStatus === 'integer';
   try {
     const pool = getPool();
     const r = await pool.query(
-      `SELECT 1 FROM information_schema.columns
+      `SELECT data_type FROM information_schema.columns
        WHERE table_name = 'knowledge_items' AND column_name = 'project_id'`
     );
-    _kiHasProjectId = (r.rowCount ?? 0) > 0;
+    if ((r.rowCount ?? 0) === 0) {
+      _kiProjectIdStatus = 'unsupported'; // column doesn't exist
+    } else {
+      const dtype = (r.rows[0].data_type || '').toLowerCase();
+      // Only enable filtering if the column is integer-compatible
+      // (integer, bigint, smallint, serial, etc.)
+      if (dtype.includes('int') || dtype === 'serial' || dtype === 'bigserial') {
+        _kiProjectIdStatus = 'integer';
+      } else {
+        // Column exists but is UUID or other incompatible type — skip filtering
+        // to avoid "invalid input syntax for type uuid" errors
+        console.warn(`[Knowledge] project_id column is ${dtype}, expected integer — skipping project filtering`);
+        _kiProjectIdStatus = 'unsupported';
+      }
+    }
   } catch {
-    _kiHasProjectId = false;
+    _kiProjectIdStatus = 'unsupported';
   }
-  return _kiHasProjectId;
+  return _kiProjectIdStatus === 'integer';
 }
 
 // ---- Knowledge Items CRUD ----
