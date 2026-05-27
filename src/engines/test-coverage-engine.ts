@@ -101,12 +101,22 @@ export interface EnterpriseKnowledgeItem {
   metadata?: Record<string, any>;
 }
 
+export interface RepositoryIntelligence {
+  repoId: string;
+  techStack?: string[];
+  architecture?: Record<string, any>;
+  patterns?: string[];
+  testingFrameworks?: string[];
+  summary?: string;
+}
+
 export interface KnowledgeContext {
   modules?: Array<{ name: string; workflows?: string; businessRules?: string; apis?: string; }>;
   historicalBugs?: string[];
   existingTestCases?: string[];
   automationCoverage?: string[];
   enterpriseKnowledge?: EnterpriseKnowledgeItem[];
+  repositoryContext?: RepositoryIntelligence;
 }
 
 /* ------------------------------------------------------------------ */
@@ -174,6 +184,30 @@ IMPORTANT: Use the above company-specific knowledge to:
 5. Avoid duplicating existing automation/manual test coverage`;
   }
 
+  /* ---- Build Repository Intelligence Block ---- */
+  private buildRepoIntelligenceBlock(knowledge?: KnowledgeContext): string {
+    if (!knowledge?.repositoryContext) return '';
+    const rc = knowledge.repositoryContext;
+    const parts: string[] = [];
+
+    if (rc.summary) parts.push(`Summary: ${rc.summary}`);
+    if (rc.techStack?.length) parts.push(`Tech Stack: ${rc.techStack.join(', ')}`);
+    if (rc.testingFrameworks?.length) parts.push(`Testing Frameworks: ${rc.testingFrameworks.join(', ')}`);
+    if (rc.patterns?.length) parts.push(`Code Patterns: ${rc.patterns.join(', ')}`);
+    if (rc.architecture && Object.keys(rc.architecture).length > 0) {
+      parts.push(`Architecture: ${JSON.stringify(rc.architecture)}`);
+    }
+
+    if (parts.length === 0) return '';
+
+    return `\n\nREPOSITORY INTELLIGENCE (analyzed from codebase):\n${parts.join('\n')}
+
+Use this repository context to:
+1. Align test scenarios with the actual tech stack and patterns used
+2. Reference appropriate testing frameworks for test automation suggestions
+3. Consider architectural boundaries and service interactions`;
+  }
+
   /* ---- Phase 2: Requirement Understanding ---- */
   async analyzeRequirement(
     input: RequirementInput,
@@ -185,6 +219,7 @@ IMPORTANT: Use the above company-specific knowledge to:
         ).join('\n')}\n\nHistorical Bugs: ${(knowledge.historicalBugs || []).join('; ') || 'None'}\nExisting Tests: ${(knowledge.existingTestCases || []).join('; ') || 'None'}`
       : '';
     const enterpriseBlock = this.buildEnterpriseKnowledgeBlock(knowledge, input);
+    const repoBlock = this.buildRepoIntelligenceBlock(knowledge);
 
     const prompt = `You are a senior QA architect analyzing a software requirement.
 
@@ -195,7 +230,7 @@ ${input.acceptanceCriteria ? `Acceptance Criteria: ${input.acceptanceCriteria}` 
 ${input.businessFlow ? `Business Flow: ${input.businessFlow}` : ''}
 ${input.module ? `Module: ${input.module}` : ''}
 ${input.apiDocs ? `API Documentation: ${input.apiDocs}` : ''}
-${input.releaseNotes ? `Release Notes: ${input.releaseNotes}` : ''}${knowledgeBlock}${enterpriseBlock}
+${input.releaseNotes ? `Release Notes: ${input.releaseNotes}` : ''}${knowledgeBlock}${enterpriseBlock}${repoBlock}
 
 Analyze this requirement and return a JSON object with:
 - featureType: string (e.g. "authentication", "payment", "search", "data_entry", "reporting")
@@ -244,6 +279,7 @@ Return ONLY valid JSON, no markdown fences.`;
       ? `\nExisting test coverage: ${knowledge.existingTestCases.join('; ')}`
       : '';
     const enterpriseBlock = this.buildEnterpriseKnowledgeBlock(knowledge, input);
+    const repoBlock = this.buildRepoIntelligenceBlock(knowledge);
 
     // Build per-type coverage expectations
     const coverageExpectations = coverageTypes.map(ct => {
@@ -285,7 +321,7 @@ Feature Type: ${analysis.featureType}
 Risk Level: ${analysis.riskLevel}
 Impacted Modules: ${analysis.impactedModules.join(', ')}
 Workflow: ${analysis.workflowSteps.join(' → ')}
-User Roles: ${analysis.userRolesAffected.join(', ')}${knowledgeBugs}${knowledgeTests}${enterpriseBlock}
+User Roles: ${analysis.userRolesAffected.join(', ')}${knowledgeBugs}${knowledgeTests}${enterpriseBlock}${repoBlock}
 
 COVERAGE TYPES REQUESTED (${numTypes} types): ${coverageTypes.join(', ')}
 
@@ -361,6 +397,7 @@ Return ONLY valid JSON. Generate comprehensive coverage — this is for a produc
       ? `\nExisting Test Cases: ${knowledge.existingTestCases.join('; ')}`
       : '';
     const enterpriseBlock = this.buildEnterpriseKnowledgeBlock(knowledge, input);
+    const repoBlock = this.buildRepoIntelligenceBlock(knowledge);
 
     const prompt = `You are a QA coverage analyst. Analyze the following test scenarios for a requirement and identify COVERAGE GAPS — things that should be tested but are NOT covered.
 
@@ -370,7 +407,7 @@ Description: ${input.description}
 Feature Type: ${analysis.featureType}
 Risk Level: ${analysis.riskLevel}
 Workflow: ${analysis.workflowSteps.join(' → ')}
-Impacted Modules: ${analysis.impactedModules.join(', ')}${existingCoverage}${enterpriseBlock}
+Impacted Modules: ${analysis.impactedModules.join(', ')}${existingCoverage}${enterpriseBlock}${repoBlock}
 
 CURRENT SCENARIOS:
 ${scenarios.map((s, i) => `${i + 1}. [${s.coverageType}] ${s.scenario}`).join('\n')}

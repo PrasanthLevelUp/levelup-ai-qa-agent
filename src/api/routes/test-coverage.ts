@@ -28,6 +28,7 @@ import {
   getTestCoverageStats,
   getKnowledgeItem,
   getRepository,
+  getRepositoryContext,
 } from '../../db/postgres';
 
 const MOD = 'test-coverage-routes';
@@ -48,6 +49,8 @@ export function createTestCoverageRouter(): Router {
         title, description, jiraId, businessFlow, acceptanceCriteria,
         apiDocs, releaseNotes, module: mod, coverageTypes,
         knowledgeItemIds,
+        useRepoIntelligence, repoId,
+        includeCoverageGaps,
       } = req.body;
 
       if (!title || !description) {
@@ -108,6 +111,31 @@ export function createTestCoverageRouter(): Router {
         }
       }
 
+      // Fetch repository intelligence context if requested
+      let repoContextUsed: any = null;
+      if (useRepoIntelligence && repoId) {
+        try {
+          const profile = await getRepositoryContext(repoId, companyId);
+          if (profile) {
+            repoContextUsed = { repoId, profile };
+            // Merge repo context into knowledge for the AI engine
+            knowledge.repositoryContext = {
+              repoId,
+              techStack: (profile as any).techStack || [],
+              architecture: (profile as any).architecture || {},
+              patterns: (profile as any).patterns || [],
+              testingFrameworks: (profile as any).testingFrameworks || [],
+              summary: (profile as any).summary || '',
+            };
+            logger.info(MOD, 'Repository intelligence loaded', { repoId });
+          } else {
+            logger.warn(MOD, 'No repository context found for repoId', { repoId });
+          }
+        } catch (repoErr: any) {
+          logger.warn(MOD, 'Could not load repository context', { repoId, error: repoErr.message });
+        }
+      }
+
       const input: RequirementInput = {
         title, description, jiraId, businessFlow,
         acceptanceCriteria, apiDocs, releaseNotes, module: mod,
@@ -116,6 +144,7 @@ export function createTestCoverageRouter(): Router {
       logger.info(MOD, 'Calling AI engine for test coverage generation', {
         knowledgeModules: knowledge.modules?.length || 0,
         enterpriseKnowledge: knowledge.enterpriseKnowledge?.length || 0,
+        repositoryContext: repoContextUsed ? true : false,
       });
       const result = await getEngine().generateFullCoverage(input, selectedTypes, knowledge);
       logger.info(MOD, 'AI engine returned', {
@@ -130,6 +159,9 @@ export function createTestCoverageRouter(): Router {
         coverageTypes: selectedTypes,
         knowledgeItemIds: knowledgeItemsUsed.map((ki: any) => ki.id),
         knowledgeItemTitles: knowledgeItemsUsed.map((ki: any) => ki.title),
+        useRepoIntelligence: !!repoContextUsed,
+        repoId: repoContextUsed ? repoId : undefined,
+        includeCoverageGaps: includeCoverageGaps !== false, // default true
       };
 
       let reqId: number;
