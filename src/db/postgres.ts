@@ -1003,6 +1003,12 @@ async function initSchema(client: PoolClient): Promise<void> {
     IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='application_profiles' AND column_name='settings') THEN
       ALTER TABLE application_profiles ADD COLUMN settings JSONB DEFAULT '{}';
     END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='knowledge_items' AND column_name='project_id') THEN
+      ALTER TABLE knowledge_items ADD COLUMN project_id INTEGER REFERENCES projects(id) ON DELETE SET NULL;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='knowledge_relationships' AND column_name='project_id') THEN
+      ALTER TABLE knowledge_relationships ADD COLUMN project_id INTEGER REFERENCES projects(id) ON DELETE SET NULL;
+    END IF;
   END $$`);
 
   await safeExec(client, 'idx_app_profiles_project',
@@ -1013,6 +1019,10 @@ async function initSchema(client: PoolClient): Promise<void> {
     `CREATE INDEX IF NOT EXISTS idx_selector_patterns_project ON selector_patterns(project_id)`);
   await safeExec(client, 'idx_selector_patterns_shared',
     `CREATE INDEX IF NOT EXISTS idx_selector_patterns_shared ON selector_patterns(is_shared) WHERE is_shared = true`);
+  await safeExec(client, 'idx_ki_project',
+    `CREATE INDEX IF NOT EXISTS idx_ki_project ON knowledge_items(project_id)`);
+  await safeExec(client, 'idx_kr_project',
+    `CREATE INDEX IF NOT EXISTS idx_kr_project ON knowledge_relationships(project_id)`);
 
   // Composite unique: one profile per URL per project (or per company if no project)
   await safeExec(client, 'uq_app_profile_url_project',
@@ -4327,19 +4337,20 @@ const RELATIONSHIP_TYPES = ['depends_on','related_to','implements','blocks','dup
 // ---- Knowledge Items CRUD ----
 
 export async function createKnowledgeItem(data: {
-  companyId?: number; category: string; title: string; description: string;
+  companyId?: number; projectId?: number; category: string; title: string; description: string;
   metadata?: any; tags?: string[]; relatedModules?: string[];
   status?: string; priority?: string; createdBy?: string;
 }): Promise<any> {
   const pool = getPool();
   const r = await pool.query(
     `INSERT INTO knowledge_items
-       (company_id, category, title, description, metadata, tags, related_modules,
+       (company_id, project_id, category, title, description, metadata, tags, related_modules,
         status, priority, created_by)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
      RETURNING *`,
     [
       data.companyId || null,
+      data.projectId || null,
       data.category,
       data.title,
       data.description,
@@ -4406,7 +4417,7 @@ export async function deleteKnowledgeItem(id: number, companyId?: number): Promi
 }
 
 export async function listKnowledgeItems(opts: {
-  companyId?: number; category?: string; status?: string; priority?: string;
+  companyId?: number; projectId?: number; category?: string; status?: string; priority?: string;
   tags?: string[]; module?: string; search?: string;
   limit?: number; offset?: number; sortBy?: string; sortDir?: string;
 }): Promise<{ items: any[]; total: number }> {
@@ -4416,6 +4427,7 @@ export async function listKnowledgeItems(opts: {
   let idx = 1;
 
   if (opts.companyId) { conds.push(`company_id = $${idx}`); params.push(opts.companyId); idx++; }
+  if (opts.projectId) { conds.push(`COALESCE(project_id, 0) = $${idx}`); params.push(opts.projectId); idx++; }
   if (opts.category) { conds.push(`category = $${idx}`); params.push(opts.category); idx++; }
   if (opts.status) { conds.push(`status = $${idx}`); params.push(opts.status); idx++; }
   if (opts.priority) { conds.push(`priority = $${idx}`); params.push(opts.priority); idx++; }
@@ -4456,11 +4468,13 @@ export async function listKnowledgeItems(opts: {
 
 // ---- Full-text search ----
 
-export async function searchKnowledgeItems(query: string, companyId?: number, limit = 20): Promise<any[]> {
+export async function searchKnowledgeItems(query: string, companyId?: number, limit = 20, projectId?: number): Promise<any[]> {
   const pool = getPool();
   const params: any[] = [query, limit];
-  let companyFilter = '';
-  if (companyId) { params.push(companyId); companyFilter = `AND company_id = $3`; }
+  let extraFilter = '';
+  let pIdx = 3;
+  if (companyId) { params.push(companyId); extraFilter += ` AND company_id = $${pIdx++}`; }
+  if (projectId) { params.push(projectId); extraFilter += ` AND COALESCE(project_id, 0) = $${pIdx++}`; }
 
   const r = await pool.query(
     `SELECT *, ts_rank(
@@ -4471,7 +4485,7 @@ export async function searchKnowledgeItems(query: string, companyId?: number, li
      WHERE to_tsvector('english', coalesce(title,'') || ' ' || coalesce(description,''))
            @@ plainto_tsquery('english', $1)
        AND status != 'archived'
-       ${companyFilter}
+       ${extraFilter}
      ORDER BY rank DESC
      LIMIT $2`,
     params
@@ -4481,14 +4495,18 @@ export async function searchKnowledgeItems(query: string, companyId?: number, li
 
 // ---- Knowledge Statistics ----
 
-export async function getKnowledgeStats(companyId?: number): Promise<{
+export async function getKnowledgeStats(companyId?: number, projectId?: number): Promise<{
   total: number; byCategory: Record<string, number>;
   byStatus: Record<string, number>; byPriority: Record<string, number>;
   recentCount: number; tagCloud: Array<{ tag: string; count: number }>;
 }> {
   const pool = getPool();
-  const cond = companyId ? 'WHERE company_id = $1' : '';
-  const params = companyId ? [companyId] : [];
+  const conds: string[] = [];
+  const params: any[] = [];
+  let idx = 1;
+  if (companyId) { conds.push(`company_id = $${idx++}`); params.push(companyId); }
+  if (projectId) { conds.push(`COALESCE(project_id, 0) = $${idx++}`); params.push(projectId); }
+  const cond = conds.length ? `WHERE ${conds.join(' AND ')}` : '';
 
   const totalR = await pool.query(`SELECT COUNT(*) as c FROM knowledge_items ${cond}`, params);
   const total = parseInt(totalR.rows[0].c, 10);
@@ -4511,9 +4529,8 @@ export async function getKnowledgeStats(companyId?: number): Promise<{
   const byPriority: Record<string, number> = {};
   prioR.rows.forEach((r: any) => { byPriority[r.priority] = parseInt(r.c, 10); });
 
-  const recentCond = companyId
-    ? `WHERE company_id = $1 AND created_at > NOW() - INTERVAL '7 days'`
-    : `WHERE created_at > NOW() - INTERVAL '7 days'`;
+  const recentParts = [...conds, `created_at > NOW() - INTERVAL '7 days'`];
+  const recentCond = `WHERE ${recentParts.join(' AND ')}`;
   const recentR = await pool.query(`SELECT COUNT(*) as c FROM knowledge_items ${recentCond}`, params);
   const recentCount = parseInt(recentR.rows[0].c, 10);
 
@@ -4529,10 +4546,14 @@ export async function getKnowledgeStats(companyId?: number): Promise<{
 
 // ---- Get all unique tags ----
 
-export async function getKnowledgeTags(companyId?: number): Promise<string[]> {
+export async function getKnowledgeTags(companyId?: number, projectId?: number): Promise<string[]> {
   const pool = getPool();
-  const cond = companyId ? 'WHERE company_id = $1' : '';
-  const params = companyId ? [companyId] : [];
+  const conds: string[] = [];
+  const params: any[] = [];
+  let idx = 1;
+  if (companyId) { conds.push(`company_id = $${idx++}`); params.push(companyId); }
+  if (projectId) { conds.push(`COALESCE(project_id, 0) = $${idx++}`); params.push(projectId); }
+  const cond = conds.length ? `WHERE ${conds.join(' AND ')}` : '';
   const r = await pool.query(
     `SELECT DISTINCT unnest(tags) as tag FROM knowledge_items ${cond} ORDER BY tag`, params
   );
@@ -4541,10 +4562,14 @@ export async function getKnowledgeTags(companyId?: number): Promise<string[]> {
 
 // ---- Get category distribution ----
 
-export async function getKnowledgeCategoryDistribution(companyId?: number): Promise<Array<{category: string; count: number; active: number}>> {
+export async function getKnowledgeCategoryDistribution(companyId?: number, projectId?: number): Promise<Array<{category: string; count: number; active: number}>> {
   const pool = getPool();
-  const cond = companyId ? 'WHERE company_id = $1' : '';
-  const params = companyId ? [companyId] : [];
+  const conds: string[] = [];
+  const params: any[] = [];
+  let idx = 1;
+  if (companyId) { conds.push(`company_id = $${idx++}`); params.push(companyId); }
+  if (projectId) { conds.push(`COALESCE(project_id, 0) = $${idx++}`); params.push(projectId); }
+  const cond = conds.length ? `WHERE ${conds.join(' AND ')}` : '';
   const r = await pool.query(
     `SELECT category,
             COUNT(*) as total,
@@ -4618,6 +4643,7 @@ export async function deleteKnowledgeRelationship(id: number, companyId?: number
  */
 export async function suggestKnowledgeItems(opts: {
   companyId?: number;
+  projectId?: number;
   module?: string;
   searchTerm?: string;
   category?: string;
@@ -4636,6 +4662,12 @@ export async function suggestKnowledgeItems(opts: {
     paramIdx++;
     conditions.push(`company_id = $${paramIdx}`);
     params.push(opts.companyId);
+  }
+
+  if (opts.projectId) {
+    paramIdx++;
+    conditions.push(`COALESCE(project_id, 0) = $${paramIdx}`);
+    params.push(opts.projectId);
   }
 
   if (opts.category) {

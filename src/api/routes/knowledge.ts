@@ -38,6 +38,7 @@ export function createKnowledgeRouter(): Router {
   router.get('/', async (req: Request, res: Response) => {
     try {
       const companyId = (req as any).companyId;
+      const projectId = (req as any).projectId;
       const {
         category, status, priority, tags, module: mod,
         search, limit, offset, sortBy, sortDir,
@@ -45,6 +46,7 @@ export function createKnowledgeRouter(): Router {
 
       const result = await listKnowledgeItems({
         companyId,
+        projectId,
         category: category as string,
         status: (status as string) || undefined,
         priority: priority as string,
@@ -68,7 +70,8 @@ export function createKnowledgeRouter(): Router {
   router.get('/stats', async (req: Request, res: Response) => {
     try {
       const companyId = (req as any).companyId;
-      const stats = await getKnowledgeStats(companyId);
+      const projectId = (req as any).projectId;
+      const stats = await getKnowledgeStats(companyId, projectId);
       return res.json(stats);
     } catch (err: any) {
       logger.error(MOD, 'Failed to get knowledge stats', { error: err.message });
@@ -80,18 +83,18 @@ export function createKnowledgeRouter(): Router {
   router.get('/suggest', async (req: Request, res: Response) => {
     try {
       const companyId = (req as any).companyId;
+      const projectId = (req as any).projectId;
       const module = req.query.module ? String(req.query.module).trim() : undefined;
       const searchTerm = req.query.searchTerm ? String(req.query.searchTerm).trim() : undefined;
       const category = req.query.category ? String(req.query.category).trim() : undefined;
       const limit = req.query.limit ? parseInt(String(req.query.limit), 10) : 10;
 
       if (!module && !searchTerm && !category) {
-        // Return recent high-priority items as default suggestions
-        const items = await suggestKnowledgeItems({ companyId, limit });
+        const items = await suggestKnowledgeItems({ companyId, projectId, limit });
         return res.json(items);
       }
 
-      const items = await suggestKnowledgeItems({ companyId, module, searchTerm, category, limit });
+      const items = await suggestKnowledgeItems({ companyId, projectId, module, searchTerm, category, limit });
       return res.json(items);
     } catch (err: any) {
       logger.error(MOD, 'Suggest failed', { error: err.message });
@@ -103,10 +106,11 @@ export function createKnowledgeRouter(): Router {
   router.get('/search', async (req: Request, res: Response) => {
     try {
       const companyId = (req as any).companyId;
+      const projectId = (req as any).projectId;
       const q = String(req.query.q || '').trim();
       if (!q) return res.json([]);
       const limit = req.query.limit ? parseInt(String(req.query.limit), 10) : 20;
-      const results = await searchKnowledgeItems(q, companyId, limit);
+      const results = await searchKnowledgeItems(q, companyId, limit, projectId);
       return res.json(results);
     } catch (err: any) {
       logger.error(MOD, 'Search failed', { error: err.message });
@@ -118,7 +122,8 @@ export function createKnowledgeRouter(): Router {
   router.get('/tags', async (req: Request, res: Response) => {
     try {
       const companyId = (req as any).companyId;
-      const tags = await getKnowledgeTags(companyId);
+      const projectId = (req as any).projectId;
+      const tags = await getKnowledgeTags(companyId, projectId);
       return res.json(tags);
     } catch (err: any) {
       return res.status(500).json({ error: 'Failed to get tags', details: err.message });
@@ -129,7 +134,8 @@ export function createKnowledgeRouter(): Router {
   router.get('/categories', async (req: Request, res: Response) => {
     try {
       const companyId = (req as any).companyId;
-      const dist = await getKnowledgeCategoryDistribution(companyId);
+      const projectId = (req as any).projectId;
+      const dist = await getKnowledgeCategoryDistribution(companyId, projectId);
       return res.json(dist);
     } catch (err: any) {
       return res.status(500).json({ error: 'Failed to get categories', details: err.message });
@@ -158,6 +164,7 @@ export function createKnowledgeRouter(): Router {
   router.post('/', async (req: Request, res: Response) => {
     try {
       const companyId = (req as any).companyId;
+      const projectId = (req as any).projectId;
       const { category, title, description, metadata, tags, relatedModules, status, priority, createdBy } = req.body;
 
       // Validation
@@ -176,6 +183,7 @@ export function createKnowledgeRouter(): Router {
 
       const item = await createKnowledgeItem({
         companyId,
+        projectId,
         category: category.trim(),
         title: title.trim(),
         description: description.trim(),
