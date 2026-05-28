@@ -62,6 +62,8 @@ import { createUsersRouter } from './routes/users';
 import { createHealingPRRouter } from './routes/healing-pr';
 import { createGitHubRouter } from './routes/github';
 import { createIntelligenceRouter } from './routes/intelligence';
+import { createCredentialsRouter } from './routes/credentials';
+import { sessionMiddleware } from './middleware/session';
 import { notifyRca } from '../integrations/slack';
 import { createRcaTicket } from '../integrations/jira';
 import cookieParser from 'cookie-parser';
@@ -155,34 +157,36 @@ export function createServer(): express.Application {
   // Auth routes — no API key required (uses cookie-based JWT)
   app.use('/api/auth', createAuthRouter());
 
-  // Authenticated routes (API key)
-  app.use('/api/heal', authMiddleware, companyMiddleware, createHealRouter(jobQueue, repoManager));
-  app.use('/api/status', authMiddleware, companyMiddleware, createStatusRouter(jobQueue));
-  app.use('/api/reports', authMiddleware, companyMiddleware, createReportsRouter(jobQueue));
-  app.use('/api/repos', authMiddleware, companyMiddleware, createReposRouter(repoManager));
-  app.use('/api/rca', authMiddleware, companyMiddleware, createRCARouter());
-  app.use('/api/pr', authMiddleware, companyMiddleware, createPRRouter());
-  app.use('/api/scripts', authMiddleware, companyMiddleware, projectContextMiddleware, createScriptGenRouter());
-  app.use('/api/notifications', authMiddleware, companyMiddleware, createNotificationsRouter());
-  app.use('/api/dom', authMiddleware, companyMiddleware, createDomMemoryRouter());
-  app.use('/api/learning', authMiddleware, companyMiddleware, createLearningRouter());
-  app.use('/api/companies', authMiddleware, createCompaniesRouter());
-  app.use('/api/similarity', authMiddleware, companyMiddleware, createSimilarityRouter());
-  app.use('/api/release-risk', authMiddleware, companyMiddleware, createReleaseRiskRouter());
-  app.use('/api/release-signoff', authMiddleware, companyMiddleware, createReleaseSignoffRouter());
-  app.use('/api/rca-intelligence', authMiddleware, companyMiddleware, createRCAIntelligenceRouter());
-  app.use('/api/roi', authMiddleware, companyMiddleware, createROIRouter());
-  app.use('/api/test-coverage', authMiddleware, companyMiddleware, createTestCoverageRouter());
-  app.use('/api/billing', authMiddleware, companyMiddleware, createBillingRouter());
-  app.use('/api/keys', authMiddleware, companyMiddleware, apiKeysRouter);
-  app.use('/api/repo-intelligence', authMiddleware, companyMiddleware, createRepoIntelligenceRouter());
-  app.use('/api/knowledge', authMiddleware, companyMiddleware, projectContextMiddleware, createKnowledgeRouter());
-  app.use('/api/dashboard', authMiddleware, companyMiddleware, createDashboardRouter());
-  app.use('/api/projects', authMiddleware, companyMiddleware, projectContextMiddleware, createProjectsRouter());
-  app.use('/api/healings', authMiddleware, companyMiddleware, createHealingPRRouter());
-  app.use('/api/users', authMiddleware, companyMiddleware, createUsersRouter());
-  app.use('/api/github', authMiddleware, companyMiddleware, createGitHubRouter());
-  app.use('/api/intelligence', authMiddleware, companyMiddleware, projectContextMiddleware, createIntelligenceRouter());
+  // Authenticated routes (API key + company + session resolution)
+  // sessionMiddleware resolves userId from JWT cookie (non-blocking)
+  app.use('/api/heal', authMiddleware, companyMiddleware, sessionMiddleware, createHealRouter(jobQueue, repoManager));
+  app.use('/api/status', authMiddleware, companyMiddleware, sessionMiddleware, createStatusRouter(jobQueue));
+  app.use('/api/reports', authMiddleware, companyMiddleware, sessionMiddleware, createReportsRouter(jobQueue));
+  app.use('/api/repos', authMiddleware, companyMiddleware, sessionMiddleware, createReposRouter(repoManager));
+  app.use('/api/rca', authMiddleware, companyMiddleware, sessionMiddleware, createRCARouter());
+  app.use('/api/pr', authMiddleware, companyMiddleware, sessionMiddleware, createPRRouter());
+  app.use('/api/scripts', authMiddleware, companyMiddleware, sessionMiddleware, projectContextMiddleware, createScriptGenRouter());
+  app.use('/api/notifications', authMiddleware, companyMiddleware, sessionMiddleware, createNotificationsRouter());
+  app.use('/api/dom', authMiddleware, companyMiddleware, sessionMiddleware, createDomMemoryRouter());
+  app.use('/api/learning', authMiddleware, companyMiddleware, sessionMiddleware, createLearningRouter());
+  app.use('/api/companies', authMiddleware, sessionMiddleware, createCompaniesRouter());
+  app.use('/api/similarity', authMiddleware, companyMiddleware, sessionMiddleware, createSimilarityRouter());
+  app.use('/api/release-risk', authMiddleware, companyMiddleware, sessionMiddleware, createReleaseRiskRouter());
+  app.use('/api/release-signoff', authMiddleware, companyMiddleware, sessionMiddleware, createReleaseSignoffRouter());
+  app.use('/api/rca-intelligence', authMiddleware, companyMiddleware, sessionMiddleware, createRCAIntelligenceRouter());
+  app.use('/api/roi', authMiddleware, companyMiddleware, sessionMiddleware, createROIRouter());
+  app.use('/api/test-coverage', authMiddleware, companyMiddleware, sessionMiddleware, createTestCoverageRouter());
+  app.use('/api/billing', authMiddleware, companyMiddleware, sessionMiddleware, createBillingRouter());
+  app.use('/api/keys', authMiddleware, companyMiddleware, sessionMiddleware, apiKeysRouter);
+  app.use('/api/repo-intelligence', authMiddleware, companyMiddleware, sessionMiddleware, createRepoIntelligenceRouter());
+  app.use('/api/knowledge', authMiddleware, companyMiddleware, sessionMiddleware, projectContextMiddleware, createKnowledgeRouter());
+  app.use('/api/dashboard', authMiddleware, companyMiddleware, sessionMiddleware, createDashboardRouter());
+  app.use('/api/projects', authMiddleware, companyMiddleware, sessionMiddleware, projectContextMiddleware, createProjectsRouter());
+  app.use('/api/healings', authMiddleware, companyMiddleware, sessionMiddleware, createHealingPRRouter());
+  app.use('/api/users', authMiddleware, companyMiddleware, sessionMiddleware, createUsersRouter());
+  app.use('/api/github', authMiddleware, companyMiddleware, sessionMiddleware, createGitHubRouter());
+  app.use('/api/intelligence', authMiddleware, companyMiddleware, sessionMiddleware, projectContextMiddleware, createIntelligenceRouter());
+  app.use('/api/credentials', authMiddleware, companyMiddleware, sessionMiddleware, createCredentialsRouter());
 
   // List all jobs
   app.get('/api/jobs', authMiddleware, (_req, res) => {

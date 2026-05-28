@@ -1058,6 +1058,79 @@ async function initSchema(client: PoolClient): Promise<void> {
   await safeExec(client, 'uq_app_profile_url_project',
     `CREATE UNIQUE INDEX IF NOT EXISTS uq_app_profile_url_project ON application_profiles(base_url, COALESCE(project_id, -1), COALESCE(company_id, 0))`);
 
+  // ─── Phase 13: Security Hardening ─────────────────────────────
+  console.log('🔧 [DB] Phase 13: Security Hardening...');
+
+  await safeExec(client, 'user_credentials', `CREATE TABLE IF NOT EXISTS user_credentials (
+    id              SERIAL PRIMARY KEY,
+    user_id         INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    company_id      INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+    credential_type VARCHAR(50) NOT NULL,
+    label           VARCHAR(255) DEFAULT 'default',
+    encrypted_value TEXT NOT NULL,
+    iv              VARCHAR(32) NOT NULL,
+    auth_tag        VARCHAR(32) NOT NULL,
+    metadata        JSONB DEFAULT '{}',
+    is_company_default BOOLEAN DEFAULT false,
+    expires_at      TIMESTAMPTZ,
+    last_used_at    TIMESTAMPTZ,
+    last_rotated_at TIMESTAMPTZ,
+    is_active       BOOLEAN DEFAULT true,
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(user_id, company_id, credential_type, label)
+  )`);
+  await safeExec(client, 'idx_user_creds_user',
+    `CREATE INDEX IF NOT EXISTS idx_user_creds_user ON user_credentials(user_id)`);
+  await safeExec(client, 'idx_user_creds_company',
+    `CREATE INDEX IF NOT EXISTS idx_user_creds_company ON user_credentials(company_id)`);
+  await safeExec(client, 'idx_user_creds_type',
+    `CREATE INDEX IF NOT EXISTS idx_user_creds_type ON user_credentials(credential_type)`);
+  await safeExec(client, 'idx_user_creds_active',
+    `CREATE INDEX IF NOT EXISTS idx_user_creds_active ON user_credentials(is_active) WHERE is_active = true`);
+
+  await safeExec(client, 'user_roles', `CREATE TABLE IF NOT EXISTS user_roles (
+    id         SERIAL PRIMARY KEY,
+    user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+    role_id    INTEGER NOT NULL REFERENCES roles(id),
+    granted_by INTEGER REFERENCES users(id),
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(user_id, company_id)
+  )`);
+  await safeExec(client, 'idx_user_roles_user',
+    `CREATE INDEX IF NOT EXISTS idx_user_roles_user ON user_roles(user_id)`);
+  await safeExec(client, 'idx_user_roles_company',
+    `CREATE INDEX IF NOT EXISTS idx_user_roles_company ON user_roles(company_id)`);
+
+  // Add created_by to resource tables
+  await safeExec(client, 'phase13_created_by_alters', `DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='generated_scripts' AND column_name='created_by') THEN
+      ALTER TABLE generated_scripts ADD COLUMN created_by INTEGER REFERENCES users(id);
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='test_requirements' AND column_name='created_by') THEN
+      ALTER TABLE test_requirements ADD COLUMN created_by INTEGER REFERENCES users(id);
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='knowledge_items' AND column_name='created_by') THEN
+      ALTER TABLE knowledge_items ADD COLUMN created_by INTEGER REFERENCES users(id);
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='project_contexts' AND column_name='created_by') THEN
+      ALTER TABLE project_contexts ADD COLUMN created_by INTEGER REFERENCES users(id);
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='pr_automations' AND column_name='created_by') THEN
+      ALTER TABLE pr_automations ADD COLUMN created_by INTEGER REFERENCES users(id);
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='webhook_configs' AND column_name='created_by') THEN
+      ALTER TABLE webhook_configs ADD COLUMN created_by INTEGER REFERENCES users(id);
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='rca_analyses' AND column_name='created_by') THEN
+      ALTER TABLE rca_analyses ADD COLUMN created_by INTEGER REFERENCES users(id);
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='audit_logs' AND column_name='company_id') THEN
+      ALTER TABLE audit_logs ADD COLUMN company_id INTEGER REFERENCES companies(id);
+    END IF;
+  END $$`);
+
   console.log('🔧 [DB] Seeding plans & roles...');
   await seedDefaultPlans(client);
   await seedDefaultRoles(client);
@@ -3011,10 +3084,13 @@ export async function upsertNotificationConfig(data: {
   return result.rows[0];
 }
 
-export async function deleteNotificationConfig(id: number): Promise<boolean> {
+export async function deleteNotificationConfig(id: number, companyId?: number): Promise<boolean> {
+  const cfAnd = companyId ? `AND company_id = $2` : '';
+  const params: any[] = [id];
+  if (companyId) params.push(companyId);
   const result = await getPool().query(
-    `DELETE FROM notification_configs WHERE id = $1`,
-    [id],
+    `DELETE FROM notification_configs WHERE id = $1 ${cfAnd}`,
+    params,
   );
   return (result.rowCount ?? 0) > 0;
 }
@@ -5901,4 +5977,253 @@ export async function getProjectStats(projectId: number, companyId: number): Pro
     repoCount: repos.rows[0]?.c || 0,
     scriptCount: scripts.rows[0]?.c || 0,
   };
+}
+
+
+
+/* ========================================================================== */
+/*  User Credentials — Encrypted, Per-User Credential Storage                 */
+/* ========================================================================== */
+
+export interface UserCredentialRow {
+  id: number;
+  user_id: number;
+  company_id: number;
+  credential_type: string;
+  label: string;
+  encrypted_value: string;
+  iv: string;
+  auth_tag: string;
+  metadata: Record<string, any>;
+  is_company_default: boolean;
+  expires_at: string | null;
+  last_used_at: string | null;
+  last_rotated_at: string | null;
+  is_active: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+/**
+ * Store an encrypted credential for a user.
+ */
+export async function createUserCredential(data: {
+  user_id: number;
+  company_id: number;
+  credential_type: string;
+  label?: string;
+  encrypted_value: string;
+  iv: string;
+  auth_tag: string;
+  metadata?: Record<string, any>;
+  is_company_default?: boolean;
+  expires_at?: Date | null;
+}): Promise<UserCredentialRow> {
+  const pool = getPool();
+  const result = await pool.query(
+    `INSERT INTO user_credentials
+     (user_id, company_id, credential_type, label, encrypted_value, iv, auth_tag, metadata, is_company_default, expires_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+     ON CONFLICT (user_id, company_id, credential_type, label)
+     DO UPDATE SET
+       encrypted_value = EXCLUDED.encrypted_value,
+       iv = EXCLUDED.iv,
+       auth_tag = EXCLUDED.auth_tag,
+       metadata = EXCLUDED.metadata,
+       is_company_default = EXCLUDED.is_company_default,
+       expires_at = EXCLUDED.expires_at,
+       updated_at = NOW()
+     RETURNING *`,
+    [
+      data.user_id, data.company_id, data.credential_type,
+      data.label || 'default',
+      data.encrypted_value, data.iv, data.auth_tag,
+      JSON.stringify(data.metadata || {}),
+      data.is_company_default || false,
+      data.expires_at || null,
+    ],
+  );
+  return result.rows[0];
+}
+
+/**
+ * Get a user's credential by type. Returns the encrypted row (caller decrypts).
+ * Falls back to company default if user has no personal credential.
+ */
+export async function getUserCredential(
+  userId: number,
+  companyId: number,
+  credentialType: string,
+): Promise<UserCredentialRow | null> {
+  const pool = getPool();
+
+  // 1. Try user's personal credential
+  const personal = await pool.query(
+    `SELECT * FROM user_credentials
+     WHERE user_id = $1 AND company_id = $2 AND credential_type = $3
+       AND is_active = true
+     ORDER BY created_at DESC LIMIT 1`,
+    [userId, companyId, credentialType],
+  );
+  if (personal.rows.length > 0) return personal.rows[0];
+
+  // 2. Fallback to company default
+  const companyDefault = await pool.query(
+    `SELECT * FROM user_credentials
+     WHERE company_id = $1 AND credential_type = $2
+       AND is_company_default = true AND is_active = true
+     ORDER BY created_at DESC LIMIT 1`,
+    [companyId, credentialType],
+  );
+  return companyDefault.rows[0] || null;
+}
+
+/**
+ * List all credentials for a user in a company (metadata only, not encrypted values).
+ */
+export async function listUserCredentials(
+  userId: number,
+  companyId: number,
+): Promise<Array<Omit<UserCredentialRow, 'encrypted_value' | 'iv' | 'auth_tag'>>> {
+  const pool = getPool();
+  const result = await pool.query(
+    `SELECT id, user_id, company_id, credential_type, label, metadata,
+            is_company_default, expires_at, last_used_at, last_rotated_at,
+            is_active, created_at, updated_at
+     FROM user_credentials
+     WHERE user_id = $1 AND company_id = $2 AND is_active = true
+     ORDER BY credential_type, created_at DESC`,
+    [userId, companyId],
+  );
+  return result.rows;
+}
+
+/**
+ * List all credentials of a specific type for a company (admin view).
+ */
+export async function listCompanyCredentials(
+  companyId: number,
+  credentialType?: string,
+): Promise<Array<Omit<UserCredentialRow, 'encrypted_value' | 'iv' | 'auth_tag'> & { username?: string }>> {
+  const pool = getPool();
+  const typeFilter = credentialType ? 'AND uc.credential_type = $2' : '';
+  const params: any[] = [companyId];
+  if (credentialType) params.push(credentialType);
+
+  const result = await pool.query(
+    `SELECT uc.id, uc.user_id, uc.company_id, uc.credential_type, uc.label,
+            uc.metadata, uc.is_company_default, uc.expires_at, uc.last_used_at,
+            uc.last_rotated_at, uc.is_active, uc.created_at, uc.updated_at,
+            u.username
+     FROM user_credentials uc
+     LEFT JOIN users u ON u.id = uc.user_id
+     WHERE uc.company_id = $1 AND uc.is_active = true ${typeFilter}
+     ORDER BY uc.credential_type, uc.created_at DESC`,
+    params,
+  );
+  return result.rows;
+}
+
+/**
+ * Delete (soft-deactivate) a user credential.
+ */
+export async function deactivateUserCredential(
+  credentialId: number,
+  userId: number,
+  companyId: number,
+): Promise<boolean> {
+  const pool = getPool();
+  const result = await pool.query(
+    `UPDATE user_credentials SET is_active = false, updated_at = NOW()
+     WHERE id = $1 AND user_id = $2 AND company_id = $3`,
+    [credentialId, userId, companyId],
+  );
+  return (result.rowCount ?? 0) > 0;
+}
+
+/**
+ * Update last_used_at timestamp for a credential (for audit trail).
+ */
+export async function touchCredentialUsage(credentialId: number): Promise<void> {
+  const pool = getPool();
+  await pool.query(
+    `UPDATE user_credentials SET last_used_at = NOW() WHERE id = $1`,
+    [credentialId],
+  );
+}
+
+/* ========================================================================== */
+/*  User Roles — RBAC Support                                                  */
+/* ========================================================================== */
+
+export interface UserRoleRow {
+  id: number;
+  user_id: number;
+  company_id: number;
+  role_id: number;
+  role_name?: string;
+  role_slug?: string;
+  permissions?: Record<string, string[]>;
+  granted_by: number | null;
+  created_at: string;
+}
+
+/**
+ * Get a user's role for a specific company.
+ */
+export async function getUserRole(
+  userId: number,
+  companyId: number,
+): Promise<UserRoleRow | null> {
+  const pool = getPool();
+  const result = await pool.query(
+    `SELECT ur.*, r.name as role_name, r.slug as role_slug, r.permissions
+     FROM user_roles ur
+     JOIN roles r ON r.id = ur.role_id
+     WHERE ur.user_id = $1 AND ur.company_id = $2`,
+    [userId, companyId],
+  );
+  return result.rows[0] || null;
+}
+
+/**
+ * Assign a role to a user in a company.
+ */
+export async function assignUserRole(data: {
+  user_id: number;
+  company_id: number;
+  role_id: number;
+  granted_by?: number;
+}): Promise<UserRoleRow> {
+  const pool = getPool();
+  const result = await pool.query(
+    `INSERT INTO user_roles (user_id, company_id, role_id, granted_by)
+     VALUES ($1, $2, $3, $4)
+     ON CONFLICT (user_id, company_id)
+     DO UPDATE SET role_id = EXCLUDED.role_id, granted_by = EXCLUDED.granted_by
+     RETURNING *`,
+    [data.user_id, data.company_id, data.role_id, data.granted_by || null],
+  );
+  return result.rows[0];
+}
+
+/**
+ * Check if a user has a specific permission.
+ */
+export async function hasPermission(
+  userId: number,
+  companyId: number,
+  resource: string,
+  action: string,
+): Promise<boolean> {
+  const role = await getUserRole(userId, companyId);
+  if (!role || !role.permissions) return false;
+
+  // Wildcard: admin has all permissions
+  if (role.permissions['*']?.includes('*')) return true;
+
+  const resourcePerms = role.permissions[resource];
+  if (!resourcePerms) return false;
+
+  return resourcePerms.includes(action) || resourcePerms.includes('*');
 }
