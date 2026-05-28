@@ -123,7 +123,8 @@ router.delete('/config/:id', async (req: Request, res: Response) => {
       return;
     }
 
-    const deleted = await deleteNotificationConfig(id);
+    const cid = (req as any).companyId as number | undefined;
+    const deleted = await deleteNotificationConfig(id, cid);
     if (!deleted) {
       res.status(404).json({ success: false, error: 'Not found' });
       return;
