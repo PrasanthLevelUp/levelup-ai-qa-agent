@@ -1223,6 +1223,16 @@ async function migrateDefaultCompany(client: PoolClient): Promise<void> {
     await safeExec(client, idx.match(/idx_\w+/)?.[0] || 'project_index', idx);
   }
 
+  // ── Script history: add deleted_at for soft deletes ──
+  console.log('🔧 [DB] Migration: Adding script history columns...');
+  await safeExec(client, 'gs_deleted_at', `DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='generated_scripts' AND column_name='deleted_at') THEN
+      ALTER TABLE generated_scripts ADD COLUMN deleted_at TIMESTAMPTZ;
+    END IF;
+  END $$`);
+  await safeExec(client, 'idx_gs_company_project',
+    `CREATE INDEX IF NOT EXISTS idx_gs_company_project ON generated_scripts(company_id, project_id) WHERE deleted_at IS NULL`);
+
   // ── Add release cycle + repo role columns ──
   console.log('🔧 [DB] Migration: Adding release cycle columns...');
   await safeExec(client, 'release_cycle_alters', `DO $$ BEGIN
@@ -2788,22 +2798,71 @@ export async function logGeneratedScript(data: GeneratedScriptRecord, companyId?
   return result.rows[0].id;
 }
 
-export async function getGeneratedScript(id: number, companyId?: number): Promise<GeneratedScriptRecord | null> {
-  const cfAnd = companyId ? `AND company_id = ${companyId}` : '';
+export async function getGeneratedScript(id: number, companyId?: number, projectId?: number): Promise<GeneratedScriptRecord | null> {
+  const conditions = ['id = $1', 'deleted_at IS NULL'];
+  const params: any[] = [id];
+  if (companyId) { conditions.push(`company_id = $${params.length + 1}`); params.push(companyId); }
+  if (projectId) { conditions.push(`(project_id = $${params.length + 1} OR project_id IS NULL)`); params.push(projectId); }
   const result = await getPool().query(
-    `SELECT * FROM generated_scripts WHERE id = $1 ${cfAnd}`,
-    [id],
+    `SELECT * FROM generated_scripts WHERE ${conditions.join(' AND ')}`,
+    params,
   );
   return result.rows[0] ?? null;
 }
 
-export async function getRecentScripts(limit = 20, companyId?: number): Promise<GeneratedScriptRecord[]> {
-  const cf = companyId ? `WHERE company_id = ${companyId}` : '';
+export async function getRecentScripts(limit = 20, companyId?: number, projectId?: number): Promise<GeneratedScriptRecord[]> {
+  const conditions = ['deleted_at IS NULL'];
+  const params: any[] = [];
+  if (companyId) { conditions.push(`company_id = $${params.length + 1}`); params.push(companyId); }
+  if (projectId) { conditions.push(`(project_id = $${params.length + 1} OR project_id IS NULL)`); params.push(projectId); }
+  params.push(limit);
   const result = await getPool().query(
-    `SELECT * FROM generated_scripts ${cf} ORDER BY created_at DESC LIMIT $1`,
-    [limit],
+    `SELECT * FROM generated_scripts WHERE ${conditions.join(' AND ')} ORDER BY created_at DESC LIMIT $${params.length}`,
+    params,
   );
   return result.rows;
+}
+
+/** Paginated script history with project filtering */
+export async function getScriptHistory(
+  companyId: number,
+  opts: { projectId?: number; limit?: number; offset?: number; sortBy?: string; sortOrder?: string } = {},
+): Promise<{ records: any[]; total: number }> {
+  const { projectId, limit = 50, offset = 0, sortBy = 'created_at', sortOrder = 'DESC' } = opts;
+  const allowedSorts: Record<string, string> = { created_at: 'created_at', reliability_score: 'reliability_score', url: 'url' };
+  const col = allowedSorts[sortBy] || 'created_at';
+  const dir = sortOrder === 'ASC' ? 'ASC' : 'DESC';
+
+  const conditions = ['company_id = $1', 'deleted_at IS NULL'];
+  const params: any[] = [companyId];
+  if (projectId) { conditions.push(`(project_id = $${params.length + 1} OR project_id IS NULL)`); params.push(projectId); }
+
+  const where = conditions.join(' AND ');
+  const countR = await getPool().query(`SELECT COUNT(*)::int AS c FROM generated_scripts WHERE ${where}`, params);
+  const total = countR.rows[0]?.c || 0;
+
+  const dataR = await getPool().query(
+    `SELECT id, url, page_type, validation_status, reliability_score, tokens_used, model,
+            generation_time_ms, files_generated, negative_tests_included, created_at, project_id
+     FROM generated_scripts WHERE ${where}
+     ORDER BY ${col} ${dir}
+     LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
+    [...params, limit, offset],
+  );
+
+  return { records: dataR.rows, total };
+}
+
+/** Soft-delete a generated script */
+export async function softDeleteScript(id: number, companyId: number, projectId?: number): Promise<boolean> {
+  const conditions = ['id = $1', 'company_id = $2', 'deleted_at IS NULL'];
+  const params: any[] = [id, companyId];
+  if (projectId) { conditions.push(`(project_id = $${params.length + 1} OR project_id IS NULL)`); params.push(projectId); }
+  const result = await getPool().query(
+    `UPDATE generated_scripts SET deleted_at = NOW() WHERE ${conditions.join(' AND ')} RETURNING id`,
+    params,
+  );
+  return (result.rowCount ?? 0) > 0;
 }
 
 export async function updateScriptReview(
