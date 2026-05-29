@@ -1310,6 +1310,23 @@ async function migrateDefaultCompany(client: PoolClient): Promise<void> {
   await safeExec(client, 'idx_gen_cases_scenario',
     `CREATE INDEX IF NOT EXISTS idx_gen_cases_scenario ON generated_test_cases(scenario_id)`);
 
+  await safeExec(client, 'test_case_export_history', `CREATE TABLE IF NOT EXISTS test_case_export_history (
+    id SERIAL PRIMARY KEY,
+    company_id INTEGER REFERENCES companies(id),
+    project_id INTEGER REFERENCES projects(id) ON DELETE SET NULL,
+    user_id INTEGER REFERENCES users(id),
+    requirement_id INTEGER REFERENCES test_requirements(id) ON DELETE SET NULL,
+    format VARCHAR(20) NOT NULL,
+    total_scenarios INTEGER DEFAULT 0,
+    total_cases INTEGER DEFAULT 0,
+    included_gaps BOOLEAN DEFAULT false,
+    file_size_bytes INTEGER DEFAULT 0,
+    export_time_ms INTEGER DEFAULT 0,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+  )`);
+  await safeExec(client, 'idx_export_history_company',
+    `CREATE INDEX IF NOT EXISTS idx_export_history_company ON test_case_export_history(company_id, project_id)`);
+
   await safeExec(client, 'application_knowledge', `CREATE TABLE IF NOT EXISTS application_knowledge (
     id SERIAL PRIMARY KEY,
     module VARCHAR(200) NOT NULL,
@@ -1400,72 +1417,6 @@ async function migrateDefaultCompany(client: PoolClient): Promise<void> {
   for (const sql of migrations) {
     await safeExec(client, 'migration_alter', sql);
   }
-
-  // ── Phase 14: Test Case Export Features ─────────────────────────
-  console.log('🔧 [DB] Migration: Test Case Export tables...');
-
-  // Add coverage gap preferences to test_requirements
-  await safeExec(client, 'test_req_coverage_gaps',
-    `ALTER TABLE test_requirements ADD COLUMN IF NOT EXISTS coverage_gaps_included BOOLEAN DEFAULT false`);
-  await safeExec(client, 'test_req_export_prefs',
-    `ALTER TABLE test_requirements ADD COLUMN IF NOT EXISTS export_preferences JSONB DEFAULT '{}'`);
-
-  // Export history table
-  await safeExec(client, 'test_case_export_history', `CREATE TABLE IF NOT EXISTS test_case_export_history (
-    id SERIAL PRIMARY KEY,
-    company_id INTEGER NOT NULL REFERENCES companies(id),
-    project_id INTEGER REFERENCES projects(id) ON DELETE SET NULL,
-    user_id INTEGER NOT NULL,
-    requirement_id INTEGER REFERENCES test_requirements(id) ON DELETE SET NULL,
-    format VARCHAR(50) NOT NULL,
-    total_scenarios INTEGER DEFAULT 0,
-    included_gaps BOOLEAN DEFAULT false,
-    file_size_bytes BIGINT DEFAULT 0,
-    export_time_ms INTEGER DEFAULT 0,
-    created_at TIMESTAMPTZ DEFAULT NOW()
-  )`);
-  await safeExec(client, 'idx_export_history_company',
-    `CREATE INDEX IF NOT EXISTS idx_export_history_company ON test_case_export_history(company_id)`);
-  await safeExec(client, 'idx_export_history_project',
-    `CREATE INDEX IF NOT EXISTS idx_export_history_project ON test_case_export_history(project_id)`);
-  await safeExec(client, 'idx_export_history_created',
-    `CREATE INDEX IF NOT EXISTS idx_export_history_created ON test_case_export_history(created_at DESC)`);
-  await safeExec(client, 'idx_export_history_user',
-    `CREATE INDEX IF NOT EXISTS idx_export_history_user ON test_case_export_history(user_id)`);
-
-  // Template versions table
-  await safeExec(client, 'test_case_template_versions', `CREATE TABLE IF NOT EXISTS test_case_template_versions (
-    id SERIAL PRIMARY KEY,
-    version VARCHAR(20) NOT NULL UNIQUE,
-    schema JSONB NOT NULL,
-    is_active BOOLEAN DEFAULT true,
-    created_at TIMESTAMPTZ DEFAULT NOW()
-  )`);
-
-  // Seed v1.0.0 template schema
-  await safeExec(client, 'seed_template_v1', `INSERT INTO test_case_template_versions (version, schema, is_active)
-    VALUES (
-      '1.0.0',
-      '${JSON.stringify({
-        version: '1.0.0',
-        columns: [
-          { key: 'testCaseId', header: 'TC ID', width: 15, required: true },
-          { key: 'scenario', header: 'Scenario', width: 40, required: true },
-          { key: 'priority', header: 'Priority', width: 12, required: true },
-          { key: 'category', header: 'Category', width: 20, required: true },
-          { key: 'preconditions', header: 'Preconditions', width: 30 },
-          { key: 'testSteps', header: 'Test Steps', width: 50, required: true },
-          { key: 'expectedResult', header: 'Expected Result', width: 40, required: true },
-          { key: 'testData', header: 'Test Data', width: 30 },
-          { key: 'coverageType', header: 'Coverage Type', width: 15, required: true },
-          { key: 'tags', header: 'Tags', width: 20 },
-          { key: 'automationStatus', header: 'Automation Status', width: 18 },
-          { key: 'createdAt', header: 'Created', width: 20 },
-        ],
-      }).replace(/'/g, "''")}'::jsonb,
-      true
-    )
-    ON CONFLICT (version) DO NOTHING`);
 
   console.log('✅ [DB] migrateDefaultCompany complete');
 }
@@ -4695,7 +4646,7 @@ export async function listKnowledgeItems(opts: {
   const sortCol = allowedSorts[opts.sortBy || 'updated_at'] || 'updated_at';
   const sortDir = opts.sortDir === 'asc' ? 'ASC' : 'DESC';
 
-  const countR = await pool.query(`SELECT COUNT(*) as c FROM knowledge_items ${whereClause}`, params);
+  const countR = await pool!.query(`SELECT COUNT(*) as c FROM knowledge_items ${whereClause}`, params);
   const total = parseInt(countR.rows[0].c, 10);
 
   const limit = Math.min(opts.limit || 50, 200);
@@ -6323,114 +6274,88 @@ export async function hasPermission(
   return resourcePerms.includes(action) || resourcePerms.includes('*');
 }
 
+// ── Test Case Export helpers ──
 
-
-/* ========================================================================== */
-/*  Test-Case Export — DB helpers                                              */
-/* ========================================================================== */
-
-/**
- * Log a completed export to test_case_export_history.
- */
 export async function logExport(data: {
-  company_id: number;
-  project_id?: number | null;
-  user_id?: number | null;
-  requirement_id: number;
+  companyId: number;
+  projectId?: number;
+  userId?: number;
+  requirementId?: number;
   format: string;
-  total_scenarios: number;
-  included_gaps: number;
-  file_size_bytes: number;
-  export_time_ms: number;
-}): Promise<{ id: number }> {
-  const pool = getPool();
-  const result = await pool.query(
+  totalScenarios: number;
+  totalCases: number;
+  includedGaps: boolean;
+  fileSizeBytes: number;
+  exportTimeMs: number;
+}): Promise<any> {
+  const result = await pool!.query(
     `INSERT INTO test_case_export_history
-       (company_id, project_id, user_id, requirement_id, format,
-        total_scenarios, included_gaps, file_size_bytes, export_time_ms)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-     RETURNING id`,
+       (company_id, project_id, user_id, requirement_id, format, total_scenarios, total_cases, included_gaps, file_size_bytes, export_time_ms)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+     RETURNING *`,
     [
-      data.company_id,
-      data.project_id ?? null,
-      data.user_id ?? null,
-      data.requirement_id,
+      data.companyId,
+      data.projectId ?? null,
+      data.userId ?? null,
+      data.requirementId ?? null,
       data.format,
-      data.total_scenarios,
-      data.included_gaps,
-      data.file_size_bytes,
-      data.export_time_ms,
-    ],
+      data.totalScenarios,
+      data.totalCases,
+      data.includedGaps,
+      data.fileSizeBytes,
+      data.exportTimeMs,
+    ]
   );
   return result.rows[0];
 }
 
-/**
- * Fetch export history for a requirement (most recent first).
- */
 export async function getExportHistory(
-  requirementId: number,
+  companyId: number,
+  projectId?: number,
   limit = 20,
-): Promise<any[]> {
-  const pool = getPool();
-  const result = await pool.query(
-    `SELECT * FROM test_case_export_history
-     WHERE requirement_id = $1
-     ORDER BY created_at DESC
-     LIMIT $2`,
-    [requirementId, limit],
+  offset = 0,
+): Promise<{ records: any[]; total: number }> {
+  const conditions = ['eh.company_id = $1'];
+  const params: any[] = [companyId];
+
+  if (projectId) {
+    conditions.push(`eh.project_id = $${params.length + 1}`);
+    params.push(projectId);
+  }
+
+  const where = conditions.join(' AND ');
+
+  const countR = await pool!.query(
+    `SELECT COUNT(*) as c FROM test_case_export_history eh WHERE ${where}`,
+    params,
   );
-  return result.rows;
+
+  const dataR = await pool!.query(
+    `SELECT eh.*, tr.title as requirement_title
+     FROM test_case_export_history eh
+     LEFT JOIN test_requirements tr ON eh.requirement_id = tr.id
+     WHERE ${where}
+     ORDER BY eh.created_at DESC
+     LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
+    [...params, limit, offset],
+  );
+
+  return { records: dataR.rows, total: parseInt(countR.rows[0].c, 10) };
 }
 
-/**
- * Update the coverage-gap inclusion preference for a requirement.
- */
 export async function updateCoverageGapPreference(
   requirementId: number,
   includeGaps: boolean,
-): Promise<void> {
-  const pool = getPool();
-  await pool.query(
+  companyId: number,
+): Promise<boolean> {
+  // Store gap preference in the requirement's analysis JSONB field
+  const result = await pool!.query(
     `UPDATE test_requirements
-     SET coverage_gaps_included = $2, updated_at = NOW()
-     WHERE id = $1`,
-    [requirementId, includeGaps],
+     SET analysis = COALESCE(analysis, '{}'::jsonb) || jsonb_build_object('include_coverage_gaps', $1::boolean),
+         updated_at = NOW()
+     WHERE id = $2 AND company_id = $3
+     RETURNING id`,
+    [includeGaps, requirementId, companyId],
   );
-}
-
-/**
- * Save / update export preferences JSON for a requirement.
- */
-export async function updateExportPreferences(
-  requirementId: number,
-  preferences: Record<string, unknown>,
-): Promise<void> {
-  const pool = getPool();
-  await pool.query(
-    `UPDATE test_requirements
-     SET export_preferences = $2, updated_at = NOW()
-     WHERE id = $1`,
-    [requirementId, JSON.stringify(preferences)],
-  );
-}
-
-/**
- * Get the currently active template version row.
- */
-export async function getActiveTemplateVersion(): Promise<{
-  id: number;
-  version: string;
-  schema: any[];
-  is_active: boolean;
-  created_at: string;
-} | null> {
-  const pool = getPool();
-  const result = await pool.query(
-    `SELECT * FROM test_case_template_versions
-     WHERE is_active = true
-     ORDER BY created_at DESC
-     LIMIT 1`,
-  );
-  return result.rows[0] || null;
+  return (result.rowCount ?? 0) > 0;
 }
