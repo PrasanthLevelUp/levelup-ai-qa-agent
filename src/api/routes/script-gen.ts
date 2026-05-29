@@ -1,11 +1,15 @@
 /**
  * Script Generation API Routes
  *
- * POST /api/scripts/generate          — Generate test scripts for a URL
- * GET  /api/scripts/recent             — List recent generations
- * GET  /api/scripts/:id                — Get specific generated script
- * POST /api/scripts/:id/review         — Trigger AI review on existing generation
- * POST /api/scripts/:id/export         — Export as project directory
+ * POST   /api/scripts/generate          — Generate test scripts for a URL
+ * GET    /api/scripts/history            — Paginated script history (project-filtered)
+ * GET    /api/scripts/recent             — List recent generations (project-filtered)
+ * GET    /api/scripts/:id/download       — Download script content as file
+ * GET    /api/scripts/:id                — Get specific generated script (project-filtered)
+ * DELETE /api/scripts/:id                — Soft-delete a script (project-filtered)
+ * POST   /api/scripts/:id/review         — Trigger AI review on existing generation
+ * POST   /api/scripts/:id/export         — Export as project directory
+ * POST   /api/scripts/:id/push           — Push to GitHub repository
  */
 
 import { Router, type Request, type Response } from 'express';
@@ -13,6 +17,8 @@ import {
   logGeneratedScript,
   getGeneratedScript,
   getRecentScripts,
+  getScriptHistory,
+  softDeleteScript,
   updateScriptReview,
   logDomSnapshot,
   logSelectorScores,
@@ -264,12 +270,36 @@ export function createScriptGenRouter(): Router {
     }
   });
 
-  /* ── Recent Generations ─────────────────────────────────── */
+  /* ── Paginated Script History (project-filtered) ──────── */
+  router.get('/history', async (req: Request, res: Response) => {
+    try {
+      const companyId = (req as any).companyId as number;
+      const projectId = (req as any).projectId as number | undefined;
+      const limit = Math.min(parseInt(req.query.limit as string) || 50, 200);
+      const offset = parseInt(req.query.offset as string) || 0;
+      const sortBy = (req.query.sortBy as string) || 'created_at';
+      const sortOrder = (req.query.sortOrder as string) || 'DESC';
+
+      const { records, total } = await getScriptHistory(companyId, { projectId, limit, offset, sortBy, sortOrder });
+
+      res.json({
+        success: true,
+        data: records,
+        pagination: { total, limit, offset, hasMore: offset + limit < total },
+      });
+    } catch (err: any) {
+      console.error('[ScriptGen] history error:', err);
+      res.status(500).json({ success: false, error: 'Failed to fetch script history', details: err.message });
+    }
+  });
+
+  /* ── Recent Generations (project-filtered) ───────────────── */
   router.get('/recent', async (req: Request, res: Response) => {
     try {
       const cid = (req as any).companyId;
+      const pid = (req as any).projectId as number | undefined;
       const limit = Math.min(parseInt(req.query.limit as string) || 20, 100);
-      const scripts = await getRecentScripts(limit, cid);
+      const scripts = await getRecentScripts(limit, cid, pid);
       res.json({ success: true, data: scripts, count: scripts.length });
     } catch (err: any) {
       console.error('[ScriptGen] recent error:', err);
@@ -277,15 +307,44 @@ export function createScriptGenRouter(): Router {
     }
   });
 
-  /* ── Get Specific Script ────────────────────────────────── */
-  router.get('/:id', async (req: Request, res: Response) => {
+  /* ── Download Script Content ─────────────────────────────── */
+  router.get('/:id/download', async (req: Request, res: Response) => {
     try {
-      const cid = (req as any).companyId;
+      const companyId = (req as any).companyId as number;
+      const projectId = (req as any).projectId as number | undefined;
       const id = parseInt(req.params.id as string);
       if (isNaN(id)) {
         return res.status(400).json({ success: false, error: 'Invalid script ID' });
       }
-      const script = await getGeneratedScript(id, cid);
+      const script = await getGeneratedScript(id, companyId, projectId);
+      if (!script) {
+        return res.status(404).json({ success: false, error: 'Script not found' });
+      }
+      const code = script.script_content || '';
+      if (!code) {
+        return res.status(404).json({ success: false, error: 'Script content not found' });
+      }
+      const safeName = (script.url || 'test').replace(/[^a-zA-Z0-9_-]/g, '_').substring(0, 50);
+      const filename = `${safeName}_${new Date().toISOString().split('T')[0]}.spec.ts`;
+      res.setHeader('Content-Type', 'text/plain');
+      res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+      res.send(code);
+    } catch (err: any) {
+      console.error('[ScriptGen] download error:', err);
+      res.status(500).json({ success: false, error: 'Failed to download script', details: err.message });
+    }
+  });
+
+  /* ── Get Specific Script (project-filtered) ──────────────── */
+  router.get('/:id', async (req: Request, res: Response) => {
+    try {
+      const cid = (req as any).companyId;
+      const pid = (req as any).projectId as number | undefined;
+      const id = parseInt(req.params.id as string);
+      if (isNaN(id)) {
+        return res.status(400).json({ success: false, error: 'Invalid script ID' });
+      }
+      const script = await getGeneratedScript(id, cid, pid);
       if (!script) {
         return res.status(404).json({ success: false, error: 'Script not found' });
       }
@@ -293,6 +352,26 @@ export function createScriptGenRouter(): Router {
     } catch (err: any) {
       console.error('[ScriptGen] get error:', err);
       res.status(500).json({ success: false, error: err.message });
+    }
+  });
+
+  /* ── Soft Delete Script (project-filtered) ───────────────── */
+  router.delete('/:id', async (req: Request, res: Response) => {
+    try {
+      const companyId = (req as any).companyId as number;
+      const projectId = (req as any).projectId as number | undefined;
+      const id = parseInt(req.params.id as string);
+      if (isNaN(id)) {
+        return res.status(400).json({ success: false, error: 'Invalid script ID' });
+      }
+      const deleted = await softDeleteScript(id, companyId, projectId);
+      if (!deleted) {
+        return res.status(404).json({ success: false, error: 'Script not found or already deleted' });
+      }
+      res.json({ success: true, message: 'Script deleted successfully' });
+    } catch (err: any) {
+      console.error('[ScriptGen] delete error:', err);
+      res.status(500).json({ success: false, error: 'Failed to delete script', details: err.message });
     }
   });
 
