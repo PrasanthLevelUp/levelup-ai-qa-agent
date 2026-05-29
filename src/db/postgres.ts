@@ -3937,7 +3937,8 @@ export async function getTestRequirements(companyId?: number, projectId?: number
   const conditions: string[] = [];
   const params: any[] = [];
   if (companyId) { params.push(companyId); conditions.push(`company_id = $${params.length}`); }
-  if (projectId) { params.push(projectId); conditions.push(`project_id = $${params.length}`); }
+  // Include records with matching project_id OR NULL project_id (legacy data)
+  if (projectId) { params.push(projectId); conditions.push(`(project_id = $${params.length} OR project_id IS NULL)`); }
   const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
   const r = await pool.query(
     `SELECT tr.*, 
@@ -4095,19 +4096,19 @@ export async function getTestCoverageStats(companyId?: number, projectId?: numbe
   priorityBreakdown: Record<string, number>;
 }> {
   const pool = getPool();
-  // Build conditions for test_requirements (which has both company_id and project_id)
+  // Build conditions — include NULL project_id for backward compatibility with legacy data
   const reqConditions: string[] = ['1=1'];
   const params: any[] = [];
   if (companyId) { params.push(companyId); reqConditions.push(`company_id = $${params.length}`); }
-  if (projectId) { params.push(projectId); reqConditions.push(`project_id = $${params.length}`); }
+  if (projectId) { params.push(projectId); reqConditions.push(`(project_id = $${params.length} OR project_id IS NULL)`); }
   const reqWhere = reqConditions.join(' AND ');
 
-  // For scenarios/cases, join through test_requirements to filter by project
+  // For scenarios/cases, join through test_requirements to filter by project (including NULL)
   const scenJoin = projectId
     ? `JOIN test_requirements tr ON gs.requirement_id = tr.id`
     : '';
   const scenCond = projectId
-    ? `AND tr.project_id = $${params.indexOf(projectId) + 1}`
+    ? `AND (tr.project_id = $${params.indexOf(projectId) + 1} OR tr.project_id IS NULL)`
     : '';
   const companyCond = companyId
     ? `AND gs.company_id = $${params.indexOf(companyId) + 1}`
@@ -5912,11 +5913,13 @@ export async function migrateDataToDefaultProjects(): Promise<{
   let profilesMigrated = 0;
   let patternsMigrated = 0;
 
-  // Find all companies that have orphaned intelligence data
+  // Find all companies that have orphaned intelligence data (includes test_requirements)
   const { rows: companies } = await pool.query(
     `SELECT DISTINCT COALESCE(company_id, 1) AS cid FROM application_profiles WHERE project_id IS NULL
      UNION
-     SELECT DISTINCT COALESCE(company_id, 1) AS cid FROM selector_patterns WHERE project_id IS NULL`,
+     SELECT DISTINCT COALESCE(company_id, 1) AS cid FROM selector_patterns WHERE project_id IS NULL
+     UNION
+     SELECT DISTINCT COALESCE(company_id, 1) AS cid FROM test_requirements WHERE project_id IS NULL`,
   );
 
   for (const row of companies) {
@@ -5964,6 +5967,12 @@ export async function migrateDataToDefaultProjects(): Promise<{
       [projectId, companyId],
     );
     patternsMigrated += r2.rowCount ?? 0;
+
+    // Migrate test_requirements (legacy test cases without project assignment)
+    await pool.query(
+      `UPDATE test_requirements SET project_id = $1 WHERE COALESCE(company_id, 1) = $2 AND project_id IS NULL`,
+      [projectId, companyId],
+    );
 
     companiesProcessed++;
   }
