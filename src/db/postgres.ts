@@ -1310,6 +1310,23 @@ async function migrateDefaultCompany(client: PoolClient): Promise<void> {
   await safeExec(client, 'idx_gen_cases_scenario',
     `CREATE INDEX IF NOT EXISTS idx_gen_cases_scenario ON generated_test_cases(scenario_id)`);
 
+  await safeExec(client, 'test_case_export_history', `CREATE TABLE IF NOT EXISTS test_case_export_history (
+    id SERIAL PRIMARY KEY,
+    company_id INTEGER REFERENCES companies(id),
+    project_id INTEGER REFERENCES projects(id) ON DELETE SET NULL,
+    user_id INTEGER REFERENCES users(id),
+    requirement_id INTEGER REFERENCES test_requirements(id) ON DELETE SET NULL,
+    format VARCHAR(20) NOT NULL,
+    total_scenarios INTEGER DEFAULT 0,
+    total_cases INTEGER DEFAULT 0,
+    included_gaps BOOLEAN DEFAULT false,
+    file_size_bytes INTEGER DEFAULT 0,
+    export_time_ms INTEGER DEFAULT 0,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+  )`);
+  await safeExec(client, 'idx_export_history_company',
+    `CREATE INDEX IF NOT EXISTS idx_export_history_company ON test_case_export_history(company_id, project_id)`);
+
   await safeExec(client, 'application_knowledge', `CREATE TABLE IF NOT EXISTS application_knowledge (
     id SERIAL PRIMARY KEY,
     module VARCHAR(200) NOT NULL,
@@ -4629,7 +4646,7 @@ export async function listKnowledgeItems(opts: {
   const sortCol = allowedSorts[opts.sortBy || 'updated_at'] || 'updated_at';
   const sortDir = opts.sortDir === 'asc' ? 'ASC' : 'DESC';
 
-  const countR = await pool.query(`SELECT COUNT(*) as c FROM knowledge_items ${whereClause}`, params);
+  const countR = await pool!.query(`SELECT COUNT(*) as c FROM knowledge_items ${whereClause}`, params);
   const total = parseInt(countR.rows[0].c, 10);
 
   const limit = Math.min(opts.limit || 50, 200);
@@ -6255,4 +6272,90 @@ export async function hasPermission(
   if (!resourcePerms) return false;
 
   return resourcePerms.includes(action) || resourcePerms.includes('*');
+}
+
+// ── Test Case Export helpers ──
+
+export async function logExport(data: {
+  companyId: number;
+  projectId?: number;
+  userId?: number;
+  requirementId?: number;
+  format: string;
+  totalScenarios: number;
+  totalCases: number;
+  includedGaps: boolean;
+  fileSizeBytes: number;
+  exportTimeMs: number;
+}): Promise<any> {
+  const result = await pool!.query(
+    `INSERT INTO test_case_export_history
+       (company_id, project_id, user_id, requirement_id, format, total_scenarios, total_cases, included_gaps, file_size_bytes, export_time_ms)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+     RETURNING *`,
+    [
+      data.companyId,
+      data.projectId ?? null,
+      data.userId ?? null,
+      data.requirementId ?? null,
+      data.format,
+      data.totalScenarios,
+      data.totalCases,
+      data.includedGaps,
+      data.fileSizeBytes,
+      data.exportTimeMs,
+    ]
+  );
+  return result.rows[0];
+}
+
+export async function getExportHistory(
+  companyId: number,
+  projectId?: number,
+  limit = 20,
+  offset = 0,
+): Promise<{ records: any[]; total: number }> {
+  const conditions = ['eh.company_id = $1'];
+  const params: any[] = [companyId];
+
+  if (projectId) {
+    conditions.push(`eh.project_id = $${params.length + 1}`);
+    params.push(projectId);
+  }
+
+  const where = conditions.join(' AND ');
+
+  const countR = await pool!.query(
+    `SELECT COUNT(*) as c FROM test_case_export_history eh WHERE ${where}`,
+    params,
+  );
+
+  const dataR = await pool!.query(
+    `SELECT eh.*, tr.title as requirement_title
+     FROM test_case_export_history eh
+     LEFT JOIN test_requirements tr ON eh.requirement_id = tr.id
+     WHERE ${where}
+     ORDER BY eh.created_at DESC
+     LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
+    [...params, limit, offset],
+  );
+
+  return { records: dataR.rows, total: parseInt(countR.rows[0].c, 10) };
+}
+
+export async function updateCoverageGapPreference(
+  requirementId: number,
+  includeGaps: boolean,
+  companyId: number,
+): Promise<boolean> {
+  // Store gap preference in the requirement's analysis JSONB field
+  const result = await pool!.query(
+    `UPDATE test_requirements
+     SET analysis = COALESCE(analysis, '{}'::jsonb) || jsonb_build_object('include_coverage_gaps', $1::boolean),
+         updated_at = NOW()
+     WHERE id = $2 AND company_id = $3
+     RETURNING id`,
+    [includeGaps, requirementId, companyId],
+  );
+  return (result.rowCount ?? 0) > 0;
 }

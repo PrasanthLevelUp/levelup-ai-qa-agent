@@ -29,13 +29,19 @@ import {
   getKnowledgeItem,
   getRepository,
   getRepositoryContext,
+  logExport,
+  getExportHistory,
+  updateCoverageGapPreference,
 } from '../../db/postgres';
+import { ExportService } from '../../services/export-service';
+import { TemplateService } from '../../services/template-service';
 
 const MOD = 'test-coverage-routes';
 
 export function createTestCoverageRouter(): Router {
   const router = Router();
   let engine: TestCoverageEngine | null = null;
+  const exportService = new ExportService();
 
   function getEngine(): TestCoverageEngine {
     if (!engine) engine = new TestCoverageEngine();
@@ -490,6 +496,202 @@ export function createTestCoverageRouter(): Router {
         error: 'Failed to generate scripts and create PR',
         details: err.message,
       });
+    }
+  });
+
+  /* ---- POST /export — Export test cases to Excel/CSV/Jira/TestRail ---- */
+  router.post('/export', async (req: Request, res: Response) => {
+    try {
+      const companyId = (req as any).companyId;
+      const projectId = (req as any).projectId;
+      const userId = (req as any).userId;
+
+      const {
+        requirementId,
+        format = 'excel',
+        includeGaps = false,
+      } = req.body;
+
+      if (!requirementId) {
+        return res.status(400).json({ error: 'requirementId is required' });
+      }
+
+      const validFormats = ['excel', 'csv', 'jira', 'testrail'];
+      if (!validFormats.includes(format)) {
+        return res.status(400).json({
+          error: `Invalid format. Must be one of: ${validFormats.join(', ')}`,
+        });
+      }
+
+      const startTime = Date.now();
+
+      // Fetch requirement
+      const requirement = await getTestRequirement(requirementId, companyId);
+      if (!requirement) {
+        return res.status(404).json({ error: 'Requirement not found' });
+      }
+
+      // Fetch scenarios and cases
+      const scenarios = await getTestScenarios(requirementId);
+      const testCases = await getTestCasesByRequirement(requirementId);
+
+      if (!scenarios.length && !testCases.length) {
+        return res.status(404).json({
+          error: 'No test scenarios or cases found for this requirement',
+        });
+      }
+
+      const requirementInfo = {
+        id: requirement.id,
+        title: requirement.title,
+        description: requirement.description || '',
+        module: requirement.module,
+        risk_level: requirement.risk_level,
+        created_at: requirement.created_at?.toISOString?.() || String(requirement.created_at || ''),
+      };
+
+      const exportOptions = {
+        format: format as 'excel' | 'csv' | 'jira' | 'testrail',
+        includeGaps,
+        includeMetadata: true,
+      };
+
+      let fileBuffer: Buffer | string;
+      let contentType: string;
+      let fileExtension: string;
+
+      if (format === 'csv') {
+        fileBuffer = await exportService.exportToCSV(testCases, exportOptions);
+        contentType = 'text/csv';
+        fileExtension = 'csv';
+      } else {
+        // excel, jira, testrail all produce xlsx
+        fileBuffer = await exportService.exportToExcel(testCases, requirementInfo, exportOptions);
+        contentType = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+        fileExtension = 'xlsx';
+      }
+
+      const exportTimeMs = Date.now() - startTime;
+      const fileSizeBytes = Buffer.byteLength(
+        typeof fileBuffer === 'string' ? Buffer.from(fileBuffer) : fileBuffer,
+      );
+
+      // Log the export
+      try {
+        await logExport({
+          companyId,
+          projectId,
+          userId,
+          requirementId,
+          format,
+          totalScenarios: scenarios.length,
+          totalCases: testCases.length,
+          includedGaps: includeGaps,
+          fileSizeBytes,
+          exportTimeMs,
+        });
+      } catch (logErr: any) {
+        logger.warn(MOD, 'Failed to log export history', { error: logErr.message });
+      }
+
+      const safeName = requirement.title
+        .replace(/[^a-zA-Z0-9_-]/g, '_')
+        .substring(0, 50);
+      const fileName = `test-cases_${safeName}_${Date.now()}.${fileExtension}`;
+
+      res.setHeader('Content-Type', contentType);
+      res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+      res.setHeader('X-Export-Time-Ms', String(exportTimeMs));
+      res.setHeader('X-Total-Scenarios', String(scenarios.length));
+      res.setHeader('X-Total-Cases', String(testCases.length));
+
+      return res.send(typeof fileBuffer === 'string' ? Buffer.from(fileBuffer) : fileBuffer);
+    } catch (err: any) {
+      logger.error(MOD, 'Export failed', { error: err.message });
+      return res.status(500).json({ error: 'Export failed', details: err.message });
+    }
+  });
+
+  /* ---- GET /template — Download sample test case template ---- */
+  router.get('/template', async (req: Request, res: Response) => {
+    try {
+      const format = (req.query.format as string) || 'excel';
+
+      if (format === 'csv') {
+        const csv = await TemplateService.generateCSVTemplate();
+        res.setHeader('Content-Type', 'text/csv');
+        res.setHeader('Content-Disposition', 'attachment; filename="test-case-template.csv"');
+        return res.send(Buffer.from(csv));
+      }
+
+      const buffer = await TemplateService.generateExcelTemplate();
+      res.setHeader(
+        'Content-Type',
+        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      );
+      res.setHeader('Content-Disposition', 'attachment; filename="test-case-template.xlsx"');
+      return res.send(buffer);
+    } catch (err: any) {
+      logger.error(MOD, 'Template generation failed', { error: err.message });
+      return res.status(500).json({ error: 'Template generation failed', details: err.message });
+    }
+  });
+
+  /* ---- PATCH /requirements/:id/gaps — Update coverage gap inclusion preference ---- */
+  router.patch('/requirements/:id/gaps', async (req: Request, res: Response) => {
+    try {
+      const companyId = (req as any).companyId;
+      const requirementId = parseInt(String(req.params.id), 10);
+
+      if (isNaN(requirementId)) {
+        return res.status(400).json({ error: 'Invalid requirement ID' });
+      }
+
+      const { includeGaps } = req.body;
+      if (typeof includeGaps !== 'boolean') {
+        return res.status(400).json({ error: 'includeGaps must be a boolean' });
+      }
+
+      const updated = await updateCoverageGapPreference(requirementId, includeGaps, companyId);
+      if (!updated) {
+        return res.status(404).json({ error: 'Requirement not found' });
+      }
+
+      return res.json({
+        success: true,
+        requirementId,
+        includeGaps,
+        message: `Coverage gap preference ${includeGaps ? 'enabled' : 'disabled'}`,
+      });
+    } catch (err: any) {
+      logger.error(MOD, 'Update gap preference failed', { error: err.message });
+      return res.status(500).json({ error: 'Failed to update gap preference', details: err.message });
+    }
+  });
+
+  /* ---- GET /export-history — Paginated export history ---- */
+  router.get('/export-history', async (req: Request, res: Response) => {
+    try {
+      const companyId = (req as any).companyId;
+      const projectId = (req as any).projectId;
+      const limit = Math.min(parseInt(req.query.limit as string, 10) || 20, 100);
+      const offset = parseInt(req.query.offset as string, 10) || 0;
+
+      const { records, total } = await getExportHistory(companyId, projectId, limit, offset);
+
+      return res.json({
+        success: true,
+        data: records,
+        pagination: {
+          total,
+          limit,
+          offset,
+          hasMore: offset + limit < total,
+        },
+      });
+    } catch (err: any) {
+      logger.error(MOD, 'Get export history failed', { error: err.message });
+      return res.status(500).json({ error: 'Failed to fetch export history', details: err.message });
     }
   });
 
