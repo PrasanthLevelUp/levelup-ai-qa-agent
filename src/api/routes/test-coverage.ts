@@ -62,7 +62,8 @@ export function createTestCoverageRouter(): Router {
         : ['positive', 'negative', 'edge_cases'];
 
       const companyId = (req as any).companyId;
-      logger.info(MOD, 'Generate request', { title, companyId, coverageTypes: selectedTypes, knowledgeItemIds });
+      const projectId = (req as any).projectId;
+      logger.info(MOD, 'Generate request', { title, companyId, projectId, coverageTypes: selectedTypes, knowledgeItemIds });
 
       // Fetch app knowledge for context (legacy application_knowledge table)
       let knowledge: KnowledgeContext = { modules: [], historicalBugs: [] };
@@ -173,6 +174,7 @@ export function createTestCoverageRouter(): Router {
           riskLevel: result.requirementAnalysis.riskLevel,
           analysis: analysisWithKnowledge,
           companyId,
+          projectId,
         });
         logger.info(MOD, 'Requirement persisted', { reqId });
       } catch (dbErr: any) {
@@ -265,9 +267,10 @@ export function createTestCoverageRouter(): Router {
   router.get('/requirements', async (req: Request, res: Response) => {
     try {
       const companyId = (req as any).companyId;
-      logger.info(MOD, 'Fetching requirements', { companyId });
-      const reqs = await getTestRequirements(companyId);
-      logger.info(MOD, 'Requirements fetched', { count: reqs.length, companyId });
+      const projectId = (req as any).projectId;
+      logger.info(MOD, 'Fetching requirements', { companyId, projectId });
+      const reqs = await getTestRequirements(companyId, projectId);
+      logger.info(MOD, 'Requirements fetched', { count: reqs.length, companyId, projectId });
       return res.json(reqs);
     } catch (err: any) {
       logger.error(MOD, 'Failed to fetch requirements', { error: err.message });
@@ -307,7 +310,8 @@ export function createTestCoverageRouter(): Router {
   router.get('/stats', async (req: Request, res: Response) => {
     try {
       const companyId = (req as any).companyId;
-      const stats = await getTestCoverageStats(companyId);
+      const projectId = (req as any).projectId;
+      const stats = await getTestCoverageStats(companyId, projectId);
       return res.json(stats);
     } catch (err: any) {
       return res.status(500).json({ error: 'Failed to fetch stats', details: err.message });

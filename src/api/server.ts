@@ -175,7 +175,7 @@ export function createServer(): express.Application {
   app.use('/api/release-signoff', authMiddleware, companyMiddleware, sessionMiddleware, createReleaseSignoffRouter());
   app.use('/api/rca-intelligence', authMiddleware, companyMiddleware, sessionMiddleware, createRCAIntelligenceRouter());
   app.use('/api/roi', authMiddleware, companyMiddleware, sessionMiddleware, createROIRouter());
-  app.use('/api/test-coverage', authMiddleware, companyMiddleware, sessionMiddleware, createTestCoverageRouter());
+  app.use('/api/test-coverage', authMiddleware, companyMiddleware, sessionMiddleware, projectContextMiddleware, createTestCoverageRouter());
   app.use('/api/billing', authMiddleware, companyMiddleware, sessionMiddleware, createBillingRouter());
   app.use('/api/keys', authMiddleware, companyMiddleware, sessionMiddleware, apiKeysRouter);
   app.use('/api/repo-intelligence', authMiddleware, companyMiddleware, sessionMiddleware, createRepoIntelligenceRouter());

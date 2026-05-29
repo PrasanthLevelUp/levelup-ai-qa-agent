@@ -3915,26 +3915,30 @@ export async function createTestRequirement(data: {
   title: string; description: string; jiraId?: string; businessFlow?: string;
   acceptanceCriteria?: string; apiDocs?: string; releaseNotes?: string;
   module?: string; featureType?: string; riskLevel?: string; analysis?: any;
-  companyId?: number;
+  companyId?: number; projectId?: number;
 }): Promise<number> {
   const pool = getPool();
   const r = await pool.query(
     `INSERT INTO test_requirements
        (title, description, jira_id, business_flow, acceptance_criteria, api_docs,
-        release_notes, module, feature_type, risk_level, analysis, company_id)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING id`,
+        release_notes, module, feature_type, risk_level, analysis, company_id, project_id)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING id`,
     [data.title, data.description, data.jiraId || null, data.businessFlow || null,
      data.acceptanceCriteria || null, data.apiDocs || null, data.releaseNotes || null,
      data.module || null, data.featureType || null, data.riskLevel || 'medium',
-     data.analysis ? JSON.stringify(data.analysis) : null, data.companyId || null]
+     data.analysis ? JSON.stringify(data.analysis) : null, data.companyId || null,
+     data.projectId || null]
   );
   return r.rows[0].id;
 }
 
-export async function getTestRequirements(companyId?: number): Promise<any[]> {
+export async function getTestRequirements(companyId?: number, projectId?: number): Promise<any[]> {
   const pool = getPool();
-  const where = companyId ? 'WHERE company_id = $1' : '';
-  const params = companyId ? [companyId] : [];
+  const conditions: string[] = [];
+  const params: any[] = [];
+  if (companyId) { params.push(companyId); conditions.push(`company_id = $${params.length}`); }
+  if (projectId) { params.push(projectId); conditions.push(`project_id = $${params.length}`); }
+  const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
   const r = await pool.query(
     `SELECT tr.*, 
        (SELECT COUNT(*) FROM generated_test_scenarios WHERE requirement_id = tr.id) as scenario_count,
@@ -4085,27 +4089,52 @@ export async function deleteApplicationKnowledge(id: number): Promise<boolean> {
 }
 
 // ---- Coverage Stats ----
-export async function getTestCoverageStats(companyId?: number): Promise<{
+export async function getTestCoverageStats(companyId?: number, projectId?: number): Promise<{
   totalRequirements: number; totalScenarios: number; totalTestCases: number;
   automationReadyCount: number; coverageTypeBreakdown: Record<string, number>;
   priorityBreakdown: Record<string, number>;
 }> {
   const pool = getPool();
-  const cond = companyId ? 'AND company_id = $1' : '';
-  const params = companyId ? [companyId] : [];
+  // Build conditions for test_requirements (which has both company_id and project_id)
+  const reqConditions: string[] = ['1=1'];
+  const params: any[] = [];
+  if (companyId) { params.push(companyId); reqConditions.push(`company_id = $${params.length}`); }
+  if (projectId) { params.push(projectId); reqConditions.push(`project_id = $${params.length}`); }
+  const reqWhere = reqConditions.join(' AND ');
 
-  const reqR = await pool.query(`SELECT COUNT(*) as c FROM test_requirements WHERE 1=1 ${cond}`, params);
-  const scenR = await pool.query(`SELECT COUNT(*) as c FROM generated_test_scenarios WHERE 1=1 ${cond}`, params);
+  // For scenarios/cases, join through test_requirements to filter by project
+  const scenJoin = projectId
+    ? `JOIN test_requirements tr ON gs.requirement_id = tr.id`
+    : '';
+  const scenCond = projectId
+    ? `AND tr.project_id = $${params.indexOf(projectId) + 1}`
+    : '';
+  const companyCond = companyId
+    ? `AND gs.company_id = $${params.indexOf(companyId) + 1}`
+    : '';
+
+  const reqR = await pool.query(`SELECT COUNT(*) as c FROM test_requirements WHERE ${reqWhere}`, params);
+  const scenR = await pool.query(
+    `SELECT COUNT(*) as c FROM generated_test_scenarios gs ${scenJoin} WHERE 1=1 ${companyCond} ${scenCond}`, params
+  );
   const caseR = await pool.query(
-    `SELECT COUNT(*) as c, COUNT(*) FILTER (WHERE automation_ready = true) as auto_ready
-     FROM generated_test_cases WHERE 1=1 ${cond}`, params
+    `SELECT COUNT(*) as c, COUNT(*) FILTER (WHERE gc.automation_ready = true) as auto_ready
+     FROM generated_test_cases gc
+     JOIN generated_test_scenarios gs ON gc.scenario_id = gs.id
+     ${projectId ? 'JOIN test_requirements tr ON gs.requirement_id = tr.id' : ''}
+     WHERE 1=1 ${companyId ? `AND gc.company_id = $${params.indexOf(companyId) + 1}` : ''} ${scenCond}`, params
   );
 
   const coverageR = await pool.query(
-    `SELECT coverage_type, COUNT(*) as c FROM generated_test_scenarios WHERE 1=1 ${cond} GROUP BY coverage_type`, params
+    `SELECT gs.coverage_type, COUNT(*) as c FROM generated_test_scenarios gs ${scenJoin}
+     WHERE 1=1 ${companyCond} ${scenCond} GROUP BY gs.coverage_type`, params
   );
   const priorityR = await pool.query(
-    `SELECT priority, COUNT(*) as c FROM generated_test_cases WHERE 1=1 ${cond} GROUP BY priority`, params
+    `SELECT gc.priority, COUNT(*) as c FROM generated_test_cases gc
+     JOIN generated_test_scenarios gs ON gc.scenario_id = gs.id
+     ${projectId ? 'JOIN test_requirements tr ON gs.requirement_id = tr.id' : ''}
+     WHERE 1=1 ${companyId ? `AND gc.company_id = $${params.indexOf(companyId) + 1}` : ''} ${scenCond}
+     GROUP BY gc.priority`, params
   );
 
   const coverageTypeBreakdown: Record<string, number> = {};
