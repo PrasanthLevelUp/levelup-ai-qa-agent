@@ -1058,6 +1058,28 @@ async function initSchema(client: PoolClient): Promise<void> {
   await safeExec(client, 'uq_app_profile_url_project',
     `CREATE UNIQUE INDEX IF NOT EXISTS uq_app_profile_url_project ON application_profiles(base_url, COALESCE(project_id, -1), COALESCE(company_id, 0))`);
 
+  // Drop the old (base_url, company_id) constraint that conflicts with the
+  // project-scoped unique index above — the new index fully supersedes it.
+  await safeExec(client, 'drop_old_app_profiles_unique', `DO $$ BEGIN
+    IF EXISTS (
+      SELECT 1 FROM pg_constraint
+      WHERE conrelid = 'application_profiles'::regclass
+        AND contype = 'u'
+        AND conname LIKE '%base_url%'
+        AND array_length(conkey, 1) = 2
+    ) THEN
+      ALTER TABLE application_profiles DROP CONSTRAINT IF EXISTS application_profiles_base_url_coalesce_key;
+    END IF;
+  END $$`);
+
+  // Add intelligence_metadata JSONB column to generated_scripts for tracking
+  // what intelligence sources were used during script generation
+  await safeExec(client, 'gs_intelligence_metadata', `DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='generated_scripts' AND column_name='intelligence_metadata') THEN
+      ALTER TABLE generated_scripts ADD COLUMN intelligence_metadata JSONB;
+    END IF;
+  END $$`);
+
   // ─── Phase 13: Security Hardening ─────────────────────────────
   console.log('🔧 [DB] Phase 13: Security Hardening...');
 
@@ -2765,6 +2787,22 @@ export interface GeneratedScriptRecord {
   files_generated?: any;
   negative_tests_included?: boolean;
   created_at?: string;
+  /** Tracks what intelligence sources were used during generation */
+  intelligence_metadata?: {
+    repoIntelligenceUsed: boolean;
+    repoId?: string;
+    repoFramework?: string;
+    repoTestPattern?: string;
+    repoHelperCount?: number;        // from helperFunctions.length
+    repoPageObjectCount?: number;    // from pageObjects.length
+    adaptiveCodegenUsed?: boolean;
+    adaptiveMode?: string;
+    knowledgeItemsUsed?: number;
+    knowledgeItemIds?: number[];
+    profileCacheUsed?: boolean;
+    crawlDecisionReason?: string;
+    profileId?: string;
+  };
 }
 
 export async function logGeneratedScript(data: GeneratedScriptRecord, companyId?: number, projectId?: number): Promise<number> {
@@ -2772,8 +2810,9 @@ export async function logGeneratedScript(data: GeneratedScriptRecord, companyId?
     `INSERT INTO generated_scripts
       (url, page_type, workflow_graph, instructions, script_content, test_plan,
        validation_status, reliability_score, review_score, review_issues,
-       tokens_used, model, generation_time_ms, files_generated, negative_tests_included, company_id, project_id)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
+       tokens_used, model, generation_time_ms, files_generated, negative_tests_included,
+       company_id, project_id, intelligence_metadata)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
     RETURNING id`,
     [
       data.url,
@@ -2793,6 +2832,7 @@ export async function logGeneratedScript(data: GeneratedScriptRecord, companyId?
       data.negative_tests_included ?? false,
       companyId ?? null,
       projectId ?? null,
+      data.intelligence_metadata ? JSON.stringify(data.intelligence_metadata) : null,
     ],
   );
   return result.rows[0].id;
@@ -5762,6 +5802,10 @@ export async function upsertProfile(data: {
 }, companyId?: number): Promise<ApplicationProfile> {
   const pool = getPool();
   const ttl = data.ttlDays || 30;
+
+  // Use the project-scoped unique index (uq_app_profile_url_project) for upsert.
+  // This correctly handles per-project profiles instead of conflicting on the
+  // older (base_url, company_id) constraint which ignores project_id.
   const { rows } = await pool.query(
     `INSERT INTO application_profiles
        (base_url, app_fingerprint, crawl_data, auth_required, auth_config,
@@ -5769,7 +5813,7 @@ export async function upsertProfile(data: {
         total_interactive, status, error_message, company_id, project_id)
      VALUES ($1, $2, $3, $4, $5, NOW(), NOW() + ($6 || ' days')::INTERVAL,
              $7, $8, $9, $10, $11, $12, $13, $14)
-     ON CONFLICT (base_url, COALESCE(company_id, 0)) DO UPDATE SET
+     ON CONFLICT (base_url, COALESCE(project_id, -1), COALESCE(company_id, 0)) DO UPDATE SET
        app_fingerprint = EXCLUDED.app_fingerprint,
        crawl_data = EXCLUDED.crawl_data,
        auth_required = EXCLUDED.auth_required,
@@ -5782,7 +5826,6 @@ export async function upsertProfile(data: {
        total_interactive = EXCLUDED.total_interactive,
        status = EXCLUDED.status,
        error_message = EXCLUDED.error_message,
-       project_id = COALESCE(EXCLUDED.project_id, application_profiles.project_id),
        updated_at = NOW()
      RETURNING *`,
     [
@@ -5802,6 +5845,7 @@ export async function upsertProfile(data: {
       data.projectId ?? null,
     ],
   );
+  console.log(`[DB] upsertProfile: ${data.baseUrl} → id=${rows[0]?.id}, project=${data.projectId ?? 'none'}, company=${companyId ?? 'none'}`);
   return rows[0];
 }
 

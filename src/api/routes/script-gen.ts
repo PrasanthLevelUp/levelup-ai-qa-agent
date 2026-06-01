@@ -101,13 +101,18 @@ export function createScriptGenRouter(): Router {
       let repoIntelligence: string | undefined;
       let repoProfile: import('../../context/types').RepositoryProfile | undefined;
       if (repoId) {
+        console.log(`[ScriptGen] 🔍 Loading repository intelligence for repoId=${repoId}...`);
         const profile = await getRepositoryContext(repoId, companyId);
         if (profile) {
           const { buildAIPromptContext } = await import('../../context/prompt-builder');
           repoIntelligence = buildAIPromptContext(profile);
           repoProfile = profile; // pass structured profile for adaptive code generation
-          console.log(`[ScriptGen] Loaded repo intelligence for ${repoId}: ${profile.framework}, pattern=${profile.testPattern}`);
+          console.log(`[ScriptGen] ✅ Repo intelligence loaded — framework=${profile.framework}, lang=${profile.language}, pattern=${profile.testPattern}, helpers=${profile.helperFunctions?.length ?? 0}, pageObjects=${profile.pageObjects?.length ?? 0}, fixtures=${profile.fixtures?.length ?? 0}`);
+        } else {
+          console.log(`[ScriptGen] ⚠️ No repository context found for repoId=${repoId} (company=${companyId ?? 'none'})`);
         }
+      } else {
+        console.log(`[ScriptGen] ℹ️ No repoId provided — skipping repository intelligence`);
       }
 
       // Load and optimize App Knowledge if knowledgeItemIds provided
@@ -208,7 +213,26 @@ export function createScriptGenRouter(): Router {
       // Determine validation status
       const validationStatus = validationReport.overallScore >= 80 ? 'passed' : 'needs_review';
 
-      // Persist to DB
+      // Build intelligence metadata — tracks every intelligence source used
+      const intelligenceMetadata = {
+        repoIntelligenceUsed: !!repoIntelligence,
+        repoId: repoId ?? undefined,
+        repoFramework: repoProfile?.framework,
+        repoTestPattern: repoProfile?.testPattern,
+        repoHelperCount: repoProfile?.helperFunctions?.length ?? 0,
+        repoPageObjectCount: repoProfile?.pageObjects?.length ?? 0,
+        adaptiveCodegenUsed: !!repoProfile,
+        adaptiveMode: repoProfile ? (repoProfile.pageObjects?.length ? 'pom' : 'flat') : undefined,
+        knowledgeItemsUsed: knowledgeItemsUsed.length,
+        knowledgeItemIds: knowledgeItemsUsed.map((ki: any) => ki.id),
+        profileCacheUsed: crawlDecision.usedCache,
+        crawlDecisionReason: crawlDecision.reason,
+        profileId: crawlDecision.profile?.id ?? undefined,
+      };
+
+      console.log(`[ScriptGen] 📊 Intelligence summary: repoIntel=${intelligenceMetadata.repoIntelligenceUsed} (${intelligenceMetadata.repoFramework ?? 'n/a'}), knowledge=${intelligenceMetadata.knowledgeItemsUsed} items, cache=${intelligenceMetadata.profileCacheUsed}, adaptive=${intelligenceMetadata.adaptiveCodegenUsed} (${intelligenceMetadata.adaptiveMode ?? 'n/a'})`);
+
+      // Persist to DB (now includes intelligence_metadata)
       const scriptId = await logGeneratedScript({
         url: config.url,
         page_type: result.testPlan?.pageType || 'unknown',
@@ -227,6 +251,7 @@ export function createScriptGenRouter(): Router {
         generation_time_ms: generationTimeMs,
         files_generated: result.generatedFiles.map((f: GeneratedFile) => ({ path: f.path, size: f.content.length, type: f.type })),
         negative_tests_included: config.includeNegativeTests,
+        intelligence_metadata: intelligenceMetadata,
       }, companyId, projectId);
 
       console.log(`[ScriptGen] ✅ Generation complete — ID ${scriptId}, ${result.generatedFiles.length} files, ${generationTimeMs}ms, project=${projectId || 'none'}`);
@@ -255,12 +280,25 @@ export function createScriptGenRouter(): Router {
               cookieCount: result.authResult.cookieNames?.length ?? 0,
             },
           } : {}),
-          // Application Intelligence metadata
+          // Full intelligence metadata — what sources powered this generation
           intelligence: {
             profileCacheUsed: crawlDecision.usedCache,
             crawlDecisionReason: crawlDecision.reason,
             crawlDecisionTimeMs: crawlDecision.decisionTimeMs,
             profileId: crawlDecision.profile?.id ?? null,
+            // Repository intelligence details
+            repoIntelligenceUsed: !!repoIntelligence,
+            repoId: repoId ?? null,
+            repoFramework: repoProfile?.framework ?? null,
+            repoTestPattern: repoProfile?.testPattern ?? null,
+            repoHelperCount: repoProfile?.helperFunctions?.length ?? 0,
+            repoPageObjectCount: repoProfile?.pageObjects?.length ?? 0,
+            // Adaptive codegen details
+            adaptiveCodegenUsed: !!repoProfile,
+            adaptiveMode: repoProfile ? (repoProfile.pageObjects?.length ? 'pom' : 'flat') : null,
+            // Knowledge items used
+            knowledgeItemsUsed: knowledgeItemsUsed.length,
+            knowledgeItemIds: knowledgeItemsUsed.map((ki: any) => ki.id),
           },
         },
       });
