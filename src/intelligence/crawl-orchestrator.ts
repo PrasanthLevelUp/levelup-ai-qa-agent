@@ -81,7 +81,28 @@ export class CrawlOrchestrator {
     }
 
     // Check for existing profile (project-scoped)
-    const profile = await this.profileService.getOrCreateProfile(baseUrl, companyId, projectId);
+    // Wrapped in try-catch: if the application_profiles table doesn't exist yet
+    // (e.g. migration hasn't run), script generation should still work via fresh crawl.
+    let profile: ApplicationProfile | null = null;
+    try {
+      profile = await this.profileService.getOrCreateProfile(baseUrl, companyId, projectId);
+    } catch (profileErr: any) {
+      const isTableMissing = profileErr?.message?.includes('application_profiles') || profileErr?.code === '42P01';
+      logger.warn(MOD, 'Profile lookup failed (non-blocking)', {
+        url: baseUrl,
+        error: profileErr.message,
+        isTableMissing,
+      });
+      return {
+        usedCache: false,
+        profile: null,
+        crawlData: null,
+        decisionTimeMs: Date.now() - start,
+        reason: isTableMissing
+          ? 'application_profiles table not yet created — proceeding with fresh crawl'
+          : `Profile lookup error: ${profileErr.message} — proceeding with fresh crawl`,
+      };
+    }
 
     if (!profile) {
       logger.info(MOD, 'No cached profile found — fresh crawl needed', { url: baseUrl });
@@ -143,7 +164,7 @@ export class CrawlOrchestrator {
     companyId?: number,
     config?: OrchestratorConfig,
     projectId?: number,
-  ): Promise<ApplicationProfile> {
+  ): Promise<ApplicationProfile | null> {
     const input: SaveProfileInput = {
       baseUrl,
       crawlData: crawlResult,
@@ -174,27 +195,43 @@ export class CrawlOrchestrator {
       }],
     };
 
-    const profile = await this.profileService.saveProfile(input, companyId, projectId);
-    logger.info(MOD, 'Crawl result saved to profile', {
-      profileId: profile.id,
-      url: baseUrl,
-      projectId,
-    });
-
-    return profile;
+    try {
+      const profile = await this.profileService.saveProfile(input, companyId, projectId);
+      logger.info(MOD, 'Crawl result saved to profile', {
+        profileId: profile.id,
+        url: baseUrl,
+        projectId,
+      });
+      return profile;
+    } catch (saveErr: any) {
+      // Non-blocking: if application_profiles table doesn't exist, log and continue
+      logger.warn(MOD, 'Could not save crawl result to profile (non-blocking)', {
+        url: baseUrl,
+        error: saveErr.message,
+      });
+      return null;
+    }
   }
 
   /**
    * Mark a profile as currently being crawled (for long-running crawls).
    */
   async markCrawling(profileId: string): Promise<void> {
-    await updateProfileStatus(profileId, 'crawling');
+    try {
+      await updateProfileStatus(profileId, 'crawling');
+    } catch (err: any) {
+      logger.warn(MOD, 'Could not mark profile as crawling (non-blocking)', { profileId, error: err.message });
+    }
   }
 
   /**
    * Mark a profile crawl as failed.
    */
   async markCrawlError(profileId: string, error: string): Promise<void> {
-    await updateProfileStatus(profileId, 'error', error);
+    try {
+      await updateProfileStatus(profileId, 'error', error);
+    } catch (err: any) {
+      logger.warn(MOD, 'Could not mark profile error (non-blocking)', { profileId, error: err.message });
+    }
   }
 }
