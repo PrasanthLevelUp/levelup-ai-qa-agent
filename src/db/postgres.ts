@@ -5723,18 +5723,26 @@ export async function listProfiles(companyId?: number, opts?: { status?: string;
   const limit = opts?.limit || 50;
   const offset = opts?.offset || 0;
 
-  const [dataRes, countRes] = await Promise.all([
-    pool.query(
-      `SELECT * FROM application_profiles ${where} ORDER BY crawled_at DESC LIMIT $${idx++} OFFSET $${idx++}`,
-      [...vals, limit, offset],
-    ),
-    pool.query(
-      `SELECT COUNT(*)::int AS total FROM application_profiles ${where}`,
-      vals,
-    ),
-  ]);
+  try {
+    const [dataRes, countRes] = await Promise.all([
+      pool.query(
+        `SELECT * FROM application_profiles ${where} ORDER BY crawled_at DESC LIMIT $${idx++} OFFSET $${idx++}`,
+        [...vals, limit, offset],
+      ),
+      pool.query(
+        `SELECT COUNT(*)::int AS total FROM application_profiles ${where}`,
+        vals,
+      ),
+    ]);
 
-  return { profiles: dataRes.rows, total: countRes.rows[0]?.total || 0 };
+    return { profiles: dataRes.rows, total: countRes.rows[0]?.total || 0 };
+  } catch (err: any) {
+    // Return empty list if table doesn't exist yet (migration pending)
+    if (err?.code === '42P01' || err?.message?.includes('does not exist')) {
+      return { profiles: [], total: 0 };
+    }
+    throw err;
+  }
 }
 
 export async function upsertProfile(data: {
@@ -6071,18 +6079,24 @@ export async function getProjectStats(projectId: number, companyId: number): Pro
   scriptCount: number;
 }> {
   const pool = getPool();
-  const [profiles, patterns, repos, scripts] = await Promise.all([
-    pool.query(`SELECT COUNT(*)::int AS c FROM application_profiles WHERE project_id = $1 AND COALESCE(company_id, 0) = $2`, [projectId, companyId]),
-    pool.query(`SELECT COUNT(*)::int AS c FROM selector_patterns WHERE project_id = $1 AND COALESCE(company_id, 0) = $2`, [projectId, companyId]),
-    pool.query(`SELECT COUNT(*)::int AS c FROM repositories WHERE project_id = $1 AND company_id = $2`, [projectId, companyId]),
-    pool.query(`SELECT COUNT(*)::int AS c FROM generated_scripts WHERE project_id = $1 AND COALESCE(company_id, 0) = $2`, [projectId, companyId]),
-  ]);
-  return {
-    profileCount: profiles.rows[0]?.c || 0,
-    patternCount: patterns.rows[0]?.c || 0,
-    repoCount: repos.rows[0]?.c || 0,
-    scriptCount: scripts.rows[0]?.c || 0,
+  // Each query is individually wrapped so missing tables (e.g. application_profiles,
+  // selector_patterns) don't crash the entire stats endpoint.
+  const safeCount = async (sql: string, params: any[]): Promise<number> => {
+    try {
+      const { rows } = await pool.query(sql, params);
+      return rows[0]?.c || 0;
+    } catch {
+      return 0;
+    }
   };
+
+  const [profileCount, patternCount, repoCount, scriptCount] = await Promise.all([
+    safeCount(`SELECT COUNT(*)::int AS c FROM application_profiles WHERE project_id = $1 AND COALESCE(company_id, 0) = $2`, [projectId, companyId]),
+    safeCount(`SELECT COUNT(*)::int AS c FROM selector_patterns WHERE project_id = $1 AND COALESCE(company_id, 0) = $2`, [projectId, companyId]),
+    safeCount(`SELECT COUNT(*)::int AS c FROM repositories WHERE project_id = $1 AND company_id = $2`, [projectId, companyId]),
+    safeCount(`SELECT COUNT(*)::int AS c FROM generated_scripts WHERE project_id = $1 AND COALESCE(company_id, 0) = $2`, [projectId, companyId]),
+  ]);
+  return { profileCount, patternCount, repoCount, scriptCount };
 }
 
 
