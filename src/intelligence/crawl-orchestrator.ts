@@ -196,7 +196,9 @@ export class CrawlOrchestrator {
     };
 
     try {
+      console.log(`[CrawlOrchestrator] 💾 Saving profile for ${baseUrl} (project=${projectId ?? 'none'}, company=${companyId ?? 'none'}, elements=${input.totalElements}, forms=${input.totalForms})`);
       const profile = await this.profileService.saveProfile(input, companyId, projectId);
+      console.log(`[CrawlOrchestrator] ✅ Profile saved: id=${profile.id}, status=${profile.status}`);
       logger.info(MOD, 'Crawl result saved to profile', {
         profileId: profile.id,
         url: baseUrl,
@@ -205,6 +207,7 @@ export class CrawlOrchestrator {
       return profile;
     } catch (saveErr: any) {
       // Non-blocking: if application_profiles table doesn't exist, log and continue
+      console.error(`[CrawlOrchestrator] ❌ Profile save failed for ${baseUrl}: ${saveErr.message}`);
       logger.warn(MOD, 'Could not save crawl result to profile (non-blocking)', {
         url: baseUrl,
         error: saveErr.message,
