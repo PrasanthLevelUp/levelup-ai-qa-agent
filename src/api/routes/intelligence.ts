@@ -22,7 +22,7 @@ import { ProfileService } from '../../intelligence/profile-service';
 import { CrawlOrchestrator } from '../../intelligence/crawl-orchestrator';
 import { SelectorHealingEngine } from '../../intelligence/healing-engine';
 import { PatternMatcher } from '../../intelligence/pattern-matcher';
-import { findMatchingPatterns, migrateDataToDefaultProjects, getProjectStats } from '../../db/postgres';
+import { findMatchingPatterns, migrateDataToDefaultProjects, getProjectStats, listProfiles, listRepositories, getKnowledgeStats } from '../../db/postgres';
 
 export function createIntelligenceRouter(): Router {
   const router = Router();
@@ -231,6 +231,89 @@ export function createIntelligenceRouter(): Router {
       }
       const stats = await getProjectStats(projectId, companyId);
       res.json({ success: true, data: stats });
+    } catch (err) {
+      res.status(500).json({ success: false, error: (err as Error).message });
+    }
+  });
+
+  /* ══════════════════════════════════════════════════════════════════
+   *  VERIFY INTELLIGENCE SETUP — one-call health check
+   * ══════════════════════════════════════════════════════════════════ */
+
+  /** Check what intelligence sources are available for the current project */
+  router.get('/verify', async (req: Request, res: Response) => {
+    try {
+      const companyId = (req as any).companyId as number;
+      const projectId = (req as any).projectId as number | undefined;
+
+      // 1. Repository Intelligence
+      let repositoryConnected = false;
+      let repositoryName: string | null = null;
+      let detectedFramework: string | null = null;
+      let patternsCount = 0;
+      let helpersCount = 0;
+      let pageObjectsCount = 0;
+      let repoId: string | null = null;
+
+      if (projectId) {
+        try {
+          const repos = await listRepositories(projectId, companyId);
+          if (repos.length > 0) {
+            const repo = repos[0]; // primary repo
+            repositoryConnected = true;
+            repositoryName = repo.full_name || repo.name || null;
+            repoId = repo.id?.toString() || null;
+            // Try to get scan results
+            if (repo.scan_results) {
+              const scan = typeof repo.scan_results === 'string' ? JSON.parse(repo.scan_results) : repo.scan_results;
+              detectedFramework = scan?.framework || scan?.testingFramework || null;
+              patternsCount = scan?.patterns?.length ?? scan?.testPatterns?.length ?? 0;
+              helpersCount = scan?.helpers?.length ?? scan?.helperFunctions?.length ?? 0;
+              pageObjectsCount = scan?.pageObjects?.length ?? 0;
+            }
+          }
+        } catch { /* repos table might not exist */ }
+      }
+
+      // 2. Application Profiles
+      let profilesCount = 0;
+      let freshProfilesCount = 0;
+      try {
+        const profiles = await listProfiles(companyId, { projectId, limit: 100 });
+        profilesCount = profiles.total;
+        freshProfilesCount = profiles.profiles.filter(p => p.status === 'fresh').length;
+      } catch { /* table might not exist */ }
+
+      // 3. App Knowledge
+      let appKnowledgeCount = 0;
+      let knowledgeCategories = 0;
+      try {
+        const kStats = await getKnowledgeStats(companyId, projectId);
+        appKnowledgeCount = kStats.total;
+        knowledgeCategories = Object.keys(kStats.byCategory || {}).length;
+      } catch { /* table might not exist */ }
+
+      res.json({
+        success: true,
+        data: {
+          // Repository Intelligence
+          repositoryConnected,
+          repositoryName,
+          repoId,
+          detectedFramework,
+          patternsCount,
+          helpersCount,
+          pageObjectsCount,
+          // Application Profiles
+          profilesCount,
+          freshProfilesCount,
+          // App Knowledge
+          appKnowledgeCount,
+          knowledgeCategories,
+          // Overall readiness
+          overallScore: (repositoryConnected ? 33 : 0) + (profilesCount > 0 ? 33 : 0) + (appKnowledgeCount > 0 ? 34 : 0),
+        },
+      });
     } catch (err) {
       res.status(500).json({ success: false, error: (err as Error).message });
     }
