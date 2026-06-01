@@ -2843,7 +2843,8 @@ export async function getScriptHistory(
 
   const dataR = await getPool().query(
     `SELECT id, url, page_type, validation_status, reliability_score, tokens_used, model,
-            generation_time_ms, files_generated, negative_tests_included, created_at, project_id
+            generation_time_ms, files_generated, negative_tests_included, created_at, project_id,
+            script_content, instructions
      FROM generated_scripts WHERE ${where}
      ORDER BY ${col} ${dir}
      LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
