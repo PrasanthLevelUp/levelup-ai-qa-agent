@@ -14,6 +14,7 @@ import {
   getProfileById,
   listProfiles,
   upsertProfile,
+  updateProfile as dbUpdateProfile,
   updateProfileStatus,
   deleteProfile as dbDeleteProfile,
   invalidateProfile as dbInvalidateProfile,
@@ -212,6 +213,67 @@ export class ProfileService {
     if (!profile) return null;
     const pages = await getPageSnapshots(id);
     return { ...profile, pages };
+  }
+
+  /**
+   * Update editable / rich-schema fields of a profile (name, description,
+   * business flows, URL patterns, form fields, custom metadata, notes, tags,
+   * and the screenshots array). Company-scoped to prevent cross-tenant edits.
+   */
+  async updateProfile(
+    id: string,
+    companyId: number | undefined,
+    updates: {
+      name?: string;
+      description?: string;
+      screenshots?: any[];
+      businessFlows?: any[];
+      urlPatterns?: any;
+      formFields?: any[];
+      customMetadata?: any;
+      notes?: string;
+      tags?: string[];
+    },
+  ): Promise<ApplicationProfile | null> {
+    return dbUpdateProfile(id, companyId, updates);
+  }
+
+  /**
+   * Append a screenshot descriptor to a profile's screenshots array.
+   * Returns the updated profile, or null if not found / not owned.
+   */
+  async addScreenshot(
+    id: string,
+    companyId: number | undefined,
+    screenshot: { url: string; filename?: string; caption?: string; uploadedAt?: string },
+  ): Promise<ApplicationProfile | null> {
+    const profile = await getProfileById(id);
+    if (!profile) return null;
+    if (companyId !== undefined && (profile.company_id ?? 0) !== (companyId ?? 0)) return null;
+    const existing = Array.isArray((profile as any).screenshots) ? (profile as any).screenshots : [];
+    const next = [...existing, { uploadedAt: new Date().toISOString(), ...screenshot }];
+    return dbUpdateProfile(id, companyId, { screenshots: next });
+  }
+
+  /**
+   * Remove a screenshot at the given index from a profile's screenshots array.
+   * Returns { profile, removed } — `removed` is the descriptor that was deleted
+   * (so the caller can unlink the file), or null if index was out of range.
+   */
+  async removeScreenshot(
+    id: string,
+    companyId: number | undefined,
+    index: number,
+  ): Promise<{ profile: ApplicationProfile | null; removed: any } | null> {
+    const profile = await getProfileById(id);
+    if (!profile) return null;
+    if (companyId !== undefined && (profile.company_id ?? 0) !== (companyId ?? 0)) return null;
+    const existing = Array.isArray((profile as any).screenshots) ? (profile as any).screenshots : [];
+    if (index < 0 || index >= existing.length) return { profile, removed: null };
+    const removed = existing[index];
+    const next = existing.filter((_: any, i: number) => i !== index);
+    const updated = await dbUpdateProfile(id, companyId, { screenshots: next });
+    return { profile: updated, removed };
   }
 
   /**

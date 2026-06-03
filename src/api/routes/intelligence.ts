@@ -18,11 +18,51 @@
  */
 
 import { Router, type Request, type Response } from 'express';
+import * as path from 'path';
+import * as fs from 'fs';
+import multer from 'multer';
 import { ProfileService } from '../../intelligence/profile-service';
 import { CrawlOrchestrator } from '../../intelligence/crawl-orchestrator';
 import { SelectorHealingEngine } from '../../intelligence/healing-engine';
 import { PatternMatcher } from '../../intelligence/pattern-matcher';
 import { findMatchingPatterns, migrateDataToDefaultProjects, getProjectStats, listProfiles, listRepositories, getKnowledgeStats } from '../../db/postgres';
+
+/* ──────────────────────────────────────────────────────────────────────────
+ *  Screenshot upload configuration (multer → local disk)
+ *
+ *  NOTE: On platforms with an ephemeral filesystem (e.g. Railway), files
+ *  written to local disk do NOT persist across deploys/restarts. The DB stores
+ *  the screenshot descriptor (url/filename/caption) so the record survives, but
+ *  the binary should be migrated to durable object storage (S3/GCS) for prod.
+ *  The upload dir is overridable via PROFILE_UPLOAD_DIR.
+ * ──────────────────────────────────────────────────────────────────────── */
+export const PROFILE_SCREENSHOT_DIR =
+  process.env.PROFILE_UPLOAD_DIR || path.join(process.cwd(), 'uploads', 'profile-screenshots');
+
+try {
+  fs.mkdirSync(PROFILE_SCREENSHOT_DIR, { recursive: true });
+} catch {
+  /* directory creation is best-effort; multer will surface errors at runtime */
+}
+
+const screenshotStorage = multer.diskStorage({
+  destination: (_req, _file, cb) => cb(null, PROFILE_SCREENSHOT_DIR),
+  filename: (req, file, cb) => {
+    const profileId = String((req.params as any).id || 'unknown').replace(/[^a-zA-Z0-9_-]/g, '');
+    const ext = (path.extname(file.originalname) || '.png').toLowerCase();
+    const unique = `${Date.now()}-${Math.round(Math.random() * 1e9)}`;
+    cb(null, `${profileId}-${unique}${ext}`);
+  },
+});
+
+const screenshotUpload = multer({
+  storage: screenshotStorage,
+  limits: { fileSize: 10 * 1024 * 1024 }, // 10 MB
+  fileFilter: (_req, file, cb) => {
+    if (/^image\/(png|jpe?g|gif|webp)$/i.test(file.mimetype)) cb(null, true);
+    else cb(new Error('Only PNG, JPG, GIF, or WEBP image files are allowed'));
+  },
+});
 
 export function createIntelligenceRouter(): Router {
   const router = Router();
@@ -99,6 +139,101 @@ export function createIntelligenceRouter(): Router {
       const deleted = await profileService.deleteProfile(String(req.params.id), companyId);
       if (!deleted) return res.status(404).json({ success: false, error: 'Profile not found' });
       res.json({ success: true, message: 'Profile deleted' });
+    } catch (err) {
+      res.status(500).json({ success: false, error: (err as Error).message });
+    }
+  });
+
+  /**
+   * Update editable / rich-schema fields of a profile.
+   * Accepts any subset of: name, description, businessFlows, urlPatterns,
+   * formFields, customMetadata, notes, tags, screenshots.
+   */
+  router.put('/profiles/:id', async (req: Request, res: Response) => {
+    try {
+      const companyId = (req as any).companyId;
+      const b = req.body || {};
+      const updates: Record<string, unknown> = {};
+      if (b.name !== undefined) updates.name = b.name;
+      if (b.description !== undefined) updates.description = b.description;
+      if (b.businessFlows !== undefined) updates.businessFlows = b.businessFlows;
+      if (b.urlPatterns !== undefined) updates.urlPatterns = b.urlPatterns;
+      if (b.formFields !== undefined) updates.formFields = b.formFields;
+      if (b.customMetadata !== undefined) updates.customMetadata = b.customMetadata;
+      if (b.notes !== undefined) updates.notes = b.notes;
+      if (b.tags !== undefined) updates.tags = b.tags;
+      if (b.screenshots !== undefined) updates.screenshots = b.screenshots;
+
+      if (Object.keys(updates).length === 0) {
+        return res.status(400).json({ success: false, error: 'No updatable fields provided' });
+      }
+
+      const updated = await profileService.updateProfile(String(req.params.id), companyId, updates);
+      if (!updated) return res.status(404).json({ success: false, error: 'Profile not found' });
+      res.json({ success: true, data: updated });
+    } catch (err) {
+      res.status(500).json({ success: false, error: (err as Error).message });
+    }
+  });
+
+  /**
+   * Upload a screenshot for a profile (multipart/form-data, field name "screenshot").
+   * Stores the file on disk and appends a descriptor to the profile's screenshots array.
+   */
+  router.post(
+    '/profiles/:id/screenshots',
+    screenshotUpload.single('screenshot'),
+    async (req: Request, res: Response) => {
+      const file = (req as any).file as Express.Multer.File | undefined;
+      try {
+        const companyId = (req as any).companyId;
+        if (!file) return res.status(400).json({ success: false, error: 'No screenshot file uploaded (field name: "screenshot")' });
+
+        const descriptor = {
+          url: `/uploads/profile-screenshots/${file.filename}`,
+          filename: file.filename,
+          originalName: file.originalname,
+          size: file.size,
+          mimeType: file.mimetype,
+          caption: (req.body && req.body.caption) || undefined,
+          uploadedAt: new Date().toISOString(),
+        };
+
+        const updated = await profileService.addScreenshot(String(req.params.id), companyId, descriptor);
+        if (!updated) {
+          // Profile not found / not owned — clean up the orphaned file.
+          fs.unlink(file.path, () => {});
+          return res.status(404).json({ success: false, error: 'Profile not found' });
+        }
+        res.status(201).json({ success: true, data: { profile: updated, screenshot: descriptor } });
+      } catch (err) {
+        if (file) fs.unlink(file.path, () => {});
+        res.status(500).json({ success: false, error: (err as Error).message });
+      }
+    },
+  );
+
+  /** Delete a screenshot from a profile by its array index (and unlink the file). */
+  router.delete('/profiles/:id/screenshots/:index', async (req: Request, res: Response) => {
+    try {
+      const companyId = (req as any).companyId;
+      const index = parseInt(String(req.params.index), 10);
+      if (Number.isNaN(index) || index < 0) {
+        return res.status(400).json({ success: false, error: 'Invalid screenshot index' });
+      }
+
+      const result = await profileService.removeScreenshot(String(req.params.id), companyId, index);
+      if (!result) return res.status(404).json({ success: false, error: 'Profile not found' });
+      if (result.removed === null) {
+        return res.status(404).json({ success: false, error: 'Screenshot index out of range' });
+      }
+
+      // Best-effort unlink of the underlying file.
+      const fname = result.removed && result.removed.filename;
+      if (fname) {
+        fs.unlink(path.join(PROFILE_SCREENSHOT_DIR, String(fname)), () => {});
+      }
+      res.json({ success: true, data: result.profile });
     } catch (err) {
       res.status(500).json({ success: false, error: (err as Error).message });
     }

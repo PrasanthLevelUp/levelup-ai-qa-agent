@@ -93,6 +93,11 @@ export function createServer(): express.Application {
   app.use(express.json({ limit: '10mb' }));
   app.use(cookieParser());
 
+  // Serve uploaded profile screenshots statically.
+  // NOTE: local disk is ephemeral on Railway — see intelligence router for caveat.
+  const uploadsDir = process.env.UPLOADS_DIR || path.join(process.cwd(), 'uploads');
+  app.use('/uploads', express.static(uploadsDir));
+
   // Request logging
   app.use((req, _res, next) => {
     logger.info(MOD, `${req.method} ${req.path}`, {

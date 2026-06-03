@@ -206,11 +206,22 @@ export class CrawlOrchestrator {
       });
       return profile;
     } catch (saveErr: any) {
-      // Non-blocking: if application_profiles table doesn't exist, log and continue
-      console.error(`[CrawlOrchestrator] ❌ Profile save failed for ${baseUrl}: ${saveErr.message}`);
+      // Non-blocking: if application_profiles table doesn't exist, log and continue.
+      // Surface full Postgres error detail (code + constraint) so silent failures such as
+      // an ON CONFLICT / unique-index mismatch are diagnosable from the logs.
+      console.error(
+        `[CrawlOrchestrator] ❌ Profile save failed for ${baseUrl}: ${saveErr.message}` +
+          (saveErr.code ? ` [code=${saveErr.code}]` : '') +
+          (saveErr.constraint ? ` [constraint=${saveErr.constraint}]` : ''),
+      );
       logger.warn(MOD, 'Could not save crawl result to profile (non-blocking)', {
         url: baseUrl,
+        companyId,
+        projectId,
         error: saveErr.message,
+        code: saveErr.code,
+        constraint: saveErr.constraint,
+        detail: saveErr.detail,
       });
       return null;
     }

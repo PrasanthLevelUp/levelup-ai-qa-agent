@@ -928,8 +928,13 @@ async function initSchema(client: PoolClient): Promise<void> {
     company_id INTEGER REFERENCES companies(id),
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW(),
-    UNIQUE(base_url, COALESCE(company_id, 0))
+    UNIQUE(base_url, company_id)
   )`);
+  // NOTE: A previous version used `UNIQUE(base_url, COALESCE(company_id, 0))` here, which is
+  // INVALID SQL — PostgreSQL does not allow expressions in table-level UNIQUE constraints. That
+  // syntax error caused the entire CREATE TABLE to fail on fresh databases, so application_profiles
+  // was never created and no profiles could ever be saved. The real per-project uniqueness is
+  // enforced by the expression index `uq_app_profile_url_project` created later in Phase 12.
   await safeExec(client, 'idx_app_profiles_base_url',
     `CREATE INDEX IF NOT EXISTS idx_app_profiles_base_url ON application_profiles(base_url)`);
   await safeExec(client, 'idx_app_profiles_company',
@@ -1079,6 +1084,25 @@ async function initSchema(client: PoolClient): Promise<void> {
       ALTER TABLE generated_scripts ADD COLUMN intelligence_metadata JSONB;
     END IF;
   END $$`);
+
+  // ─── Rich Application Profiles ────────────────────────────────
+  // Extend application_profiles with human-curated / rich intelligence fields:
+  // screenshots, business flows, URL patterns, form fields, custom metadata,
+  // notes and tags. All additive (IF NOT EXISTS) so they are safe to re-run.
+  await safeExec(client, 'app_profiles_rich_columns', `
+    ALTER TABLE application_profiles
+      ADD COLUMN IF NOT EXISTS name VARCHAR(255),
+      ADD COLUMN IF NOT EXISTS description TEXT,
+      ADD COLUMN IF NOT EXISTS screenshots JSONB DEFAULT '[]',
+      ADD COLUMN IF NOT EXISTS business_flows JSONB DEFAULT '[]',
+      ADD COLUMN IF NOT EXISTS url_patterns JSONB DEFAULT '{}',
+      ADD COLUMN IF NOT EXISTS form_fields JSONB DEFAULT '[]',
+      ADD COLUMN IF NOT EXISTS custom_metadata JSONB DEFAULT '{}',
+      ADD COLUMN IF NOT EXISTS notes TEXT,
+      ADD COLUMN IF NOT EXISTS tags VARCHAR(255)[]
+  `);
+  await safeExec(client, 'idx_app_profiles_tags',
+    `CREATE INDEX IF NOT EXISTS idx_app_profiles_tags ON application_profiles USING GIN(tags)`);
 
   // ─── Phase 13: Security Hardening ─────────────────────────────
   console.log('🔧 [DB] Phase 13: Security Hardening...');
@@ -5708,8 +5732,19 @@ export interface ApplicationProfile {
   status: 'fresh' | 'expiring' | 'expired' | 'crawling' | 'error';
   error_message: string | null;
   company_id: number | null;
+  project_id?: number | null;
   created_at: string;
   updated_at: string;
+  // ── Rich profile fields (additive; may be undefined on older rows) ──
+  name?: string | null;
+  description?: string | null;
+  screenshots?: any[] | null;
+  business_flows?: any[] | null;
+  url_patterns?: any | null;
+  form_fields?: any[] | null;
+  custom_metadata?: any | null;
+  notes?: string | null;
+  tags?: string[] | null;
 }
 
 export async function getProfileByUrl(baseUrl: string, companyId?: number, projectId?: number): Promise<ApplicationProfile | null> {
@@ -5799,6 +5834,16 @@ export async function upsertProfile(data: {
   errorMessage?: string;
   ttlDays?: number;
   projectId?: number;
+  // ── Rich profile fields (optional; preserved on update when omitted) ──
+  name?: string;
+  description?: string;
+  screenshots?: any[];
+  businessFlows?: any[];
+  urlPatterns?: any;
+  formFields?: any[];
+  customMetadata?: any;
+  notes?: string;
+  tags?: string[];
 }, companyId?: number): Promise<ApplicationProfile> {
   const pool = getPool();
   const ttl = data.ttlDays || 30;
@@ -5806,13 +5851,18 @@ export async function upsertProfile(data: {
   // Use the project-scoped unique index (uq_app_profile_url_project) for upsert.
   // This correctly handles per-project profiles instead of conflicting on the
   // older (base_url, company_id) constraint which ignores project_id.
+  // Rich fields use COALESCE(EXCLUDED.x, existing) so an automated crawl that
+  // doesn't supply them never wipes human-curated data.
   const { rows } = await pool.query(
     `INSERT INTO application_profiles
        (base_url, app_fingerprint, crawl_data, auth_required, auth_config,
         crawled_at, expires_at, page_count, total_elements, total_forms,
-        total_interactive, status, error_message, company_id, project_id)
+        total_interactive, status, error_message, company_id, project_id,
+        name, description, screenshots, business_flows, url_patterns,
+        form_fields, custom_metadata, notes, tags)
      VALUES ($1, $2, $3, $4, $5, NOW(), NOW() + ($6 || ' days')::INTERVAL,
-             $7, $8, $9, $10, $11, $12, $13, $14)
+             $7, $8, $9, $10, $11, $12, $13, $14,
+             $15, $16, $17, $18, $19, $20, $21, $22, $23)
      ON CONFLICT (base_url, COALESCE(project_id, -1), COALESCE(company_id, 0)) DO UPDATE SET
        app_fingerprint = EXCLUDED.app_fingerprint,
        crawl_data = EXCLUDED.crawl_data,
@@ -5826,6 +5876,15 @@ export async function upsertProfile(data: {
        total_interactive = EXCLUDED.total_interactive,
        status = EXCLUDED.status,
        error_message = EXCLUDED.error_message,
+       name = COALESCE(EXCLUDED.name, application_profiles.name),
+       description = COALESCE(EXCLUDED.description, application_profiles.description),
+       screenshots = COALESCE(EXCLUDED.screenshots, application_profiles.screenshots),
+       business_flows = COALESCE(EXCLUDED.business_flows, application_profiles.business_flows),
+       url_patterns = COALESCE(EXCLUDED.url_patterns, application_profiles.url_patterns),
+       form_fields = COALESCE(EXCLUDED.form_fields, application_profiles.form_fields),
+       custom_metadata = COALESCE(EXCLUDED.custom_metadata, application_profiles.custom_metadata),
+       notes = COALESCE(EXCLUDED.notes, application_profiles.notes),
+       tags = COALESCE(EXCLUDED.tags, application_profiles.tags),
        updated_at = NOW()
      RETURNING *`,
     [
@@ -5843,10 +5902,83 @@ export async function upsertProfile(data: {
       data.errorMessage || null,
       companyId ?? null,
       data.projectId ?? null,
+      data.name || null,
+      data.description || null,
+      data.screenshots ? JSON.stringify(data.screenshots) : null,
+      data.businessFlows ? JSON.stringify(data.businessFlows) : null,
+      data.urlPatterns ? JSON.stringify(data.urlPatterns) : null,
+      data.formFields ? JSON.stringify(data.formFields) : null,
+      data.customMetadata ? JSON.stringify(data.customMetadata) : null,
+      data.notes || null,
+      data.tags && data.tags.length > 0 ? data.tags : null,
     ],
   );
   console.log(`[DB] upsertProfile: ${data.baseUrl} → id=${rows[0]?.id}, project=${data.projectId ?? 'none'}, company=${companyId ?? 'none'}`);
   return rows[0];
+}
+
+/**
+ * Partial update of an application profile's editable / rich fields.
+ * Only fields explicitly provided are updated. Returns the updated profile,
+ * or null if it doesn't exist (or doesn't belong to the given company).
+ */
+export async function updateProfile(
+  id: string,
+  companyId: number | undefined,
+  updates: {
+    name?: string;
+    description?: string;
+    screenshots?: any[];
+    businessFlows?: any[];
+    urlPatterns?: any;
+    formFields?: any[];
+    customMetadata?: any;
+    notes?: string;
+    tags?: string[];
+  },
+): Promise<ApplicationProfile | null> {
+  const pool = getPool();
+  const sets: string[] = [];
+  const vals: any[] = [];
+  let idx = 1;
+
+  const addJson = (col: string, value: any) => {
+    sets.push(`${col} = $${idx++}`);
+    vals.push(value === undefined || value === null ? null : JSON.stringify(value));
+  };
+
+  if (updates.name !== undefined) { sets.push(`name = $${idx++}`); vals.push(updates.name); }
+  if (updates.description !== undefined) { sets.push(`description = $${idx++}`); vals.push(updates.description); }
+  if (updates.notes !== undefined) { sets.push(`notes = $${idx++}`); vals.push(updates.notes); }
+  if (updates.tags !== undefined) {
+    sets.push(`tags = $${idx++}`);
+    vals.push(updates.tags && updates.tags.length > 0 ? updates.tags : null);
+  }
+  if (updates.screenshots !== undefined) addJson('screenshots', updates.screenshots);
+  if (updates.businessFlows !== undefined) addJson('business_flows', updates.businessFlows);
+  if (updates.urlPatterns !== undefined) addJson('url_patterns', updates.urlPatterns);
+  if (updates.formFields !== undefined) addJson('form_fields', updates.formFields);
+  if (updates.customMetadata !== undefined) addJson('custom_metadata', updates.customMetadata);
+
+  if (sets.length === 0) {
+    return getProfileById(id);
+  }
+
+  sets.push(`updated_at = NOW()`);
+  vals.push(id);
+  const idParam = `$${idx++}`;
+
+  let whereCompany = '';
+  if (companyId !== undefined) {
+    whereCompany = ` AND COALESCE(company_id, 0) = COALESCE($${idx++}, 0)`;
+    vals.push(companyId);
+  }
+
+  const { rows } = await pool.query(
+    `UPDATE application_profiles SET ${sets.join(', ')} WHERE id = ${idParam}${whereCompany} RETURNING *`,
+    vals,
+  );
+  return rows[0] || null;
 }
 
 export async function updateProfileStatus(id: string, status: string, errorMessage?: string): Promise<void> {
