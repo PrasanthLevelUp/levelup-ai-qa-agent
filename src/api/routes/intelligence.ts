@@ -25,7 +25,8 @@ import { ProfileService } from '../../intelligence/profile-service';
 import { CrawlOrchestrator } from '../../intelligence/crawl-orchestrator';
 import { SelectorHealingEngine } from '../../intelligence/healing-engine';
 import { PatternMatcher } from '../../intelligence/pattern-matcher';
-import { findMatchingPatterns, migrateDataToDefaultProjects, getProjectStats, listProfiles, listRepositories, getKnowledgeStats, upsertProfile } from '../../db/postgres';
+import { findMatchingPatterns, migrateDataToDefaultProjects, getProjectStats, listProfiles, listRepositories, getKnowledgeStats, upsertProfile, getPool } from '../../db/postgres';
+import { IntelligenceHealthService } from '../../services/intelligence-health-service';
 
 /* ──────────────────────────────────────────────────────────────────────────
  *  Screenshot upload configuration (multer → local disk)
@@ -491,6 +492,50 @@ export function createIntelligenceRouter(): Router {
       });
     } catch (err) {
       res.status(500).json({ success: false, error: (err as Error).message });
+    }
+  });
+
+  /* ══════════════════════════════════════════════════════════════════
+   *  INTELLIGENCE HEALTH SCORE & RECOMMENDATIONS
+   * ══════════════════════════════════════════════════════════════════ */
+
+  /**
+   * GET /api/intelligence/health
+   * Full intelligence health report — per-source scores, overall score,
+   * actionable recommendations and usage statistics for the current
+   * company/project scope.
+   */
+  router.get('/health', async (req: Request, res: Response) => {
+    try {
+      const companyId = (req as any).companyId as number;
+      const projectId = (req as any).projectId as number | undefined;
+
+      const healthService = new IntelligenceHealthService(getPool());
+      const health = await healthService.calculateHealth(companyId, projectId);
+
+      res.json({ success: true, data: health });
+    } catch (error) {
+      console.error('Intelligence health check error:', error);
+      res.status(500).json({ success: false, error: 'Failed to calculate intelligence health' });
+    }
+  });
+
+  /**
+   * GET /api/intelligence/stats
+   * Intelligence usage statistics only (subset of /health).
+   */
+  router.get('/stats', async (req: Request, res: Response) => {
+    try {
+      const companyId = (req as any).companyId as number;
+      const projectId = (req as any).projectId as number | undefined;
+
+      const healthService = new IntelligenceHealthService(getPool());
+      const health = await healthService.calculateHealth(companyId, projectId);
+
+      res.json({ success: true, data: health.stats });
+    } catch (error) {
+      console.error('Intelligence stats error:', error);
+      res.status(500).json({ success: false, error: 'Failed to get intelligence stats' });
     }
   });
 
