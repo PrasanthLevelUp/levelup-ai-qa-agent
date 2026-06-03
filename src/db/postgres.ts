@@ -5,6 +5,7 @@
 
 import { Pool, type PoolClient } from 'pg';
 import { logger } from '../utils/logger';
+import { RTM_STATEMENTS, RTM_TABLES, applyRtmSchema } from './rtm-schema';
 
 const MOD = 'postgres';
 
@@ -111,6 +112,8 @@ const REQUIRED_TABLES = [
   'projects', 'repositories',
   // Webhooks
   'webhook_configs', 'webhook_events', 'release_windows',
+  // RTM (Requirements Traceability Matrix)
+  ...RTM_TABLES,
 ];
 
 export async function initDb(): Promise<void> {
@@ -1184,6 +1187,17 @@ async function initSchema(client: PoolClient): Promise<void> {
   // Ensure default company exists and backfill orphaned data
   console.log('🔧 [DB] Running migrations...');
   await migrateDefaultCompany(client);
+
+  // ─── Phase RTM: Requirements Traceability Matrix ────────────────
+  // Applied after migrateDefaultCompany so that prerequisite columns
+  // (e.g. generated_scripts.deleted_at / project_id) already exist before
+  // the RTM coverage function & triggers reference them. Each statement is
+  // idempotent and routed through the same safeExec runner so a per-env
+  // failure degrades gracefully instead of aborting startup.
+  console.log('🔧 [DB] Phase RTM: Requirements Traceability Matrix...');
+  for (const stmt of RTM_STATEMENTS) {
+    await run(stmt.label, stmt.sql);
+  }
 
   console.log(`✅ [DB] initSchema complete (${ok} ok, ${fail} errors)`);
 }
@@ -6608,4 +6622,426 @@ export async function updateCoverageGapPreference(
     [includeGaps, requirementId, companyId],
   );
   return (result.rowCount ?? 0) > 0;
+}
+
+
+
+/* ========================================================================== */
+/*  Requirements Traceability Matrix (RTM) — Sprint 1 helpers                 */
+/* ========================================================================== */
+
+export interface RtmRequirement {
+  id: string;
+  company_id: number;
+  project_id: number | null;
+  requirement_id: string;
+  title: string;
+  description: string | null;
+  category: string | null;
+  priority: string;
+  acceptance_criteria: string | null;
+  status: string;
+  tags: string[] | null;
+  created_by: number | null;
+  created_at: string;
+  updated_at: string;
+  deleted_at: string | null;
+  metadata: Record<string, any>;
+  coverage_percentage: number;
+}
+
+/**
+ * Generate the next sequential human-readable requirement ID (REQ-001, REQ-002, …)
+ * scoped to a company (and project when provided). Uses the max existing numeric
+ * suffix so it is robust to gaps and survives >999 (zero-pads to a minimum of 3).
+ */
+export async function generateRequirementId(
+  companyId: number,
+  projectId?: number | null,
+): Promise<string> {
+  const pool = getPool();
+  const params: any[] = [companyId];
+  let projectClause = '';
+  if (projectId !== undefined && projectId !== null) {
+    params.push(projectId);
+    projectClause = ' AND project_id = $2';
+  }
+  const result = await pool.query(
+    `SELECT COALESCE(
+        MAX(NULLIF(regexp_replace(requirement_id, '\\D', '', 'g'), '')::int),
+        0
+      ) AS max_num
+     FROM requirements
+     WHERE company_id = $1${projectClause} AND deleted_at IS NULL`,
+    params,
+  );
+  const next = (result.rows[0]?.max_num ?? 0) + 1;
+  return `REQ-${String(next).padStart(3, '0')}`;
+}
+
+/** Create a new requirement (auto-generates its REQ-xxx identifier). */
+export async function createRequirement(data: {
+  companyId: number;
+  projectId?: number | null;
+  title: string;
+  description?: string | null;
+  category?: string | null;
+  priority?: string | null;
+  acceptanceCriteria?: string | null;
+  status?: string | null;
+  tags?: string[] | null;
+  createdBy?: number | null;
+  metadata?: Record<string, any> | null;
+}): Promise<RtmRequirement> {
+  const pool = getPool();
+  const requirementId = await generateRequirementId(data.companyId, data.projectId ?? null);
+  const result = await pool.query(
+    `INSERT INTO requirements
+       (company_id, project_id, requirement_id, title, description, category,
+        priority, acceptance_criteria, status, tags, created_by, metadata)
+     VALUES ($1, $2, $3, $4, $5, $6,
+             COALESCE($7, 'Medium'), $8, COALESCE($9, 'Not Tested'), $10, $11,
+             COALESCE($12, '{}'::jsonb))
+     RETURNING *`,
+    [
+      data.companyId,
+      data.projectId ?? null,
+      requirementId,
+      data.title,
+      data.description ?? null,
+      data.category ?? null,
+      data.priority ?? null,
+      data.acceptanceCriteria ?? null,
+      data.status ?? null,
+      data.tags ?? null,
+      data.createdBy ?? null,
+      data.metadata ? JSON.stringify(data.metadata) : null,
+    ],
+  );
+  return result.rows[0];
+}
+
+/**
+ * List requirements for a company with optional project / filter scoping.
+ * Returns the rows (with live coverage counts) plus the total matching count.
+ */
+export async function getRequirements(params: {
+  companyId: number;
+  projectId?: number | null;
+  category?: string;
+  priority?: string;
+  status?: string;
+  search?: string;
+  limit?: number;
+  offset?: number;
+}): Promise<{ requirements: any[]; total: number }> {
+  const pool = getPool();
+  const where: string[] = ['r.company_id = $1', 'r.deleted_at IS NULL'];
+  const values: any[] = [params.companyId];
+  let i = 2;
+
+  if (params.projectId !== undefined && params.projectId !== null) {
+    where.push(`(r.project_id = $${i} OR r.project_id IS NULL)`);
+    values.push(params.projectId);
+    i++;
+  }
+  if (params.category) {
+    where.push(`r.category = $${i}`);
+    values.push(params.category);
+    i++;
+  }
+  if (params.priority) {
+    where.push(`r.priority = $${i}`);
+    values.push(params.priority);
+    i++;
+  }
+  if (params.status) {
+    where.push(`r.status = $${i}`);
+    values.push(params.status);
+    i++;
+  }
+  if (params.search) {
+    where.push(`(r.title ILIKE $${i} OR r.description ILIKE $${i} OR r.requirement_id ILIKE $${i})`);
+    values.push(`%${params.search}%`);
+    i++;
+  }
+
+  const whereSql = where.join(' AND ');
+
+  // Total count (without pagination)
+  const countResult = await pool.query(
+    `SELECT COUNT(*)::int AS total FROM requirements r WHERE ${whereSql}`,
+    values,
+  );
+  const total = countResult.rows[0]?.total ?? 0;
+
+  const limit = Math.min(Math.max(params.limit ?? 50, 1), 500);
+  const offset = Math.max(params.offset ?? 0, 0);
+  const limitParam = i;
+  const offsetParam = i + 1;
+  values.push(limit, offset);
+
+  const result = await pool.query(
+    `SELECT
+        r.*,
+        COUNT(DISTINCT tc.id)::int AS test_case_count,
+        COUNT(DISTINCT gs.id)::int AS script_count,
+        COUNT(DISTINCT te.id)::int AS execution_count
+     FROM requirements r
+     LEFT JOIN generated_test_cases tc ON tc.requirement_id = r.id
+     LEFT JOIN generated_scripts gs ON gs.test_case_id = tc.id AND gs.deleted_at IS NULL
+     LEFT JOIN rtm_test_executions te ON te.requirement_id = r.id
+     WHERE ${whereSql}
+     GROUP BY r.id
+     ORDER BY r.created_at DESC
+     LIMIT $${limitParam} OFFSET $${offsetParam}`,
+    values,
+  );
+
+  return { requirements: result.rows, total };
+}
+
+/** Fetch a single requirement (with live coverage counts) by UUID. */
+export async function getRequirement(
+  id: string,
+  companyId: number,
+): Promise<any | null> {
+  const pool = getPool();
+  const result = await pool.query(
+    `SELECT
+        r.*,
+        COUNT(DISTINCT tc.id)::int AS test_case_count,
+        COUNT(DISTINCT gs.id)::int AS script_count,
+        COUNT(DISTINCT te.id)::int AS execution_count
+     FROM requirements r
+     LEFT JOIN generated_test_cases tc ON tc.requirement_id = r.id
+     LEFT JOIN generated_scripts gs ON gs.test_case_id = tc.id AND gs.deleted_at IS NULL
+     LEFT JOIN rtm_test_executions te ON te.requirement_id = r.id
+     WHERE r.id = $1 AND r.company_id = $2 AND r.deleted_at IS NULL
+     GROUP BY r.id`,
+    [id, companyId],
+  );
+  return result.rows[0] ?? null;
+}
+
+/** Update mutable fields of a requirement. Returns the updated row or null. */
+export async function updateRequirement(
+  id: string,
+  companyId: number,
+  data: {
+    title?: string;
+    description?: string | null;
+    category?: string | null;
+    priority?: string;
+    acceptanceCriteria?: string | null;
+    status?: string;
+    tags?: string[] | null;
+    metadata?: Record<string, any> | null;
+  },
+): Promise<any | null> {
+  const pool = getPool();
+  const sets: string[] = [];
+  const values: any[] = [];
+  let i = 1;
+
+  const fieldMap: Record<string, string> = {
+    title: 'title',
+    description: 'description',
+    category: 'category',
+    priority: 'priority',
+    acceptanceCriteria: 'acceptance_criteria',
+    status: 'status',
+    tags: 'tags',
+  };
+
+  for (const [key, column] of Object.entries(fieldMap)) {
+    if ((data as any)[key] !== undefined) {
+      sets.push(`${column} = $${i}`);
+      values.push((data as any)[key]);
+      i++;
+    }
+  }
+  if (data.metadata !== undefined) {
+    sets.push(`metadata = $${i}`);
+    values.push(data.metadata ? JSON.stringify(data.metadata) : '{}');
+    i++;
+  }
+
+  if (sets.length === 0) {
+    // Nothing to update — return the current row.
+    return getRequirement(id, companyId);
+  }
+
+  sets.push('updated_at = NOW()');
+  values.push(id, companyId);
+
+  const result = await pool.query(
+    `UPDATE requirements
+     SET ${sets.join(', ')}
+     WHERE id = $${i} AND company_id = $${i + 1} AND deleted_at IS NULL
+     RETURNING *`,
+    values,
+  );
+  return result.rows[0] ?? null;
+}
+
+/** Soft-delete a requirement. Returns true if a row was affected. */
+export async function deleteRequirement(
+  id: string,
+  companyId: number,
+): Promise<boolean> {
+  const pool = getPool();
+  const result = await pool.query(
+    `UPDATE requirements
+     SET deleted_at = NOW(), updated_at = NOW()
+     WHERE id = $1 AND company_id = $2 AND deleted_at IS NULL`,
+    [id, companyId],
+  );
+  return (result.rowCount ?? 0) > 0;
+}
+
+/**
+ * Coverage detail for a single requirement: the requirement itself, its linked
+ * test cases (+ their scripts) and recent RTM executions.
+ */
+export async function getRequirementCoverage(
+  requirementId: string,
+  companyId: number,
+): Promise<any | null> {
+  const pool = getPool();
+  const requirement = await getRequirement(requirementId, companyId);
+  if (!requirement) return null;
+
+  const testCases = await pool.query(
+    `SELECT tc.*,
+            COUNT(DISTINCT gs.id)::int AS script_count
+     FROM generated_test_cases tc
+     LEFT JOIN generated_scripts gs ON gs.test_case_id = tc.id AND gs.deleted_at IS NULL
+     WHERE tc.requirement_id = $1
+     GROUP BY tc.id
+     ORDER BY tc.id DESC`,
+    [requirementId],
+  );
+
+  const executions = await pool.query(
+    `SELECT id, status, execution_time_ms, error_message, environment, executed_at
+     FROM rtm_test_executions
+     WHERE requirement_id = $1
+     ORDER BY executed_at DESC
+     LIMIT 25`,
+    [requirementId],
+  );
+
+  return {
+    requirement,
+    coverage_percentage: requirement.coverage_percentage,
+    status: requirement.status,
+    test_cases: testCases.rows,
+    executions: executions.rows,
+  };
+}
+
+/**
+ * Aggregate coverage summary for a company (optionally scoped to a project).
+ * Powers RTM dashboard tiles.
+ */
+export async function getCoverageSummary(
+  companyId: number,
+  projectId?: number | null,
+): Promise<{
+  total: number;
+  covered: number;
+  not_covered: number;
+  passed: number;
+  failed: number;
+  in_progress: number;
+  not_tested: number;
+  avg_coverage: number;
+}> {
+  const pool = getPool();
+  const values: any[] = [companyId];
+  let projectClause = '';
+  if (projectId !== undefined && projectId !== null) {
+    values.push(projectId);
+    projectClause = ' AND (project_id = $2 OR project_id IS NULL)';
+  }
+  const result = await pool.query(
+    `SELECT
+        COUNT(*)::int AS total,
+        COUNT(*) FILTER (WHERE coverage_percentage > 0)::int AS covered,
+        COUNT(*) FILTER (WHERE coverage_percentage = 0)::int AS not_covered,
+        COUNT(*) FILTER (WHERE status = 'Passed')::int AS passed,
+        COUNT(*) FILTER (WHERE status = 'Failed')::int AS failed,
+        COUNT(*) FILTER (WHERE status = 'In Progress')::int AS in_progress,
+        COUNT(*) FILTER (WHERE status = 'Not Tested')::int AS not_tested,
+        COALESCE(ROUND(AVG(coverage_percentage))::int, 0) AS avg_coverage
+     FROM requirements
+     WHERE company_id = $1 AND deleted_at IS NULL${projectClause}`,
+    values,
+  );
+  const row = result.rows[0] ?? {};
+  return {
+    total: row.total ?? 0,
+    covered: row.covered ?? 0,
+    not_covered: row.not_covered ?? 0,
+    passed: row.passed ?? 0,
+    failed: row.failed ?? 0,
+    in_progress: row.in_progress ?? 0,
+    not_tested: row.not_tested ?? 0,
+    avg_coverage: row.avg_coverage ?? 0,
+  };
+}
+
+/**
+ * Recompute coverage_percentage / status for a single requirement on demand
+ * (the triggers keep this fresh automatically, but this is useful for backfills
+ * or manual recalculation). Returns the refreshed row or null.
+ */
+export async function recalculateRequirementCoverage(
+  id: string,
+  companyId: number,
+): Promise<any | null> {
+  const pool = getPool();
+  await pool.query(
+    `UPDATE requirements r
+     SET
+       coverage_percentage = sub.cov,
+       status = sub.stat,
+       updated_at = NOW()
+     FROM (
+       SELECT
+         CASE
+           WHEN COUNT(DISTINCT te.id) > 0 THEN 100
+           WHEN COUNT(DISTINCT gs.id) > 0 THEN 66
+           WHEN COUNT(DISTINCT tc.id) > 0 THEN 33
+           ELSE 0
+         END AS cov,
+         CASE
+           WHEN COUNT(DISTINCT te.id) FILTER (WHERE te.status = 'passed') > 0 THEN 'Passed'
+           WHEN COUNT(DISTINCT te.id) FILTER (WHERE te.status = 'failed') > 0 THEN 'Failed'
+           WHEN COUNT(DISTINCT gs.id) > 0 THEN 'In Progress'
+           ELSE 'Not Tested'
+         END AS stat
+       FROM requirements req
+       LEFT JOIN generated_test_cases tc ON tc.requirement_id = req.id
+       LEFT JOIN generated_scripts gs ON gs.test_case_id = tc.id AND gs.deleted_at IS NULL
+       LEFT JOIN rtm_test_executions te ON te.requirement_id = req.id
+       WHERE req.id = $1
+     ) sub
+     WHERE r.id = $1 AND r.company_id = $2 AND r.deleted_at IS NULL`,
+    [id, companyId],
+  );
+  return getRequirement(id, companyId);
+}
+
+/**
+ * Run the RTM schema statements programmatically (on-demand migration).
+ * Idempotent; safe to call repeatedly. Failures are logged, not thrown.
+ */
+export async function runRTMMigration(): Promise<{ ok: number; fail: number }> {
+  const result = await applyRtmSchema(getPool(), (label, err) => {
+    logger.error(MOD, `RTM migration statement failed: ${label}`, { error: err.message });
+  });
+  logger.info(MOD, `RTM migration complete (${result.ok} ok, ${result.fail} errors)`);
+  return result;
 }
