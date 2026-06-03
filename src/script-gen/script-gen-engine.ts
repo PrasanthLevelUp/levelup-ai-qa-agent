@@ -138,6 +138,8 @@ export interface GenerationConfig {
   framework?: 'playwright';   // future: cypress, selenium
   repoIntelligence?: string;  // injected from Repository Intelligence Engine
   knowledgeContext?: string;   // injected from App Knowledge via KnowledgeOptimizer
+  /** Additional fused intelligence (flaky/DOM/learning/similarity/RCA) from IntelligenceFusionService */
+  fusionContext?: string;
   /** Structured repository profile for adaptive code generation */
   repoProfile?: import('../context/types').RepositoryProfile;
   /** Authentication config for crawling behind login walls */
@@ -424,6 +426,7 @@ ${(() => {
   console.log('[ScriptGenEngine] ℹ️ No repository intelligence available for this generation');
   return '';
 })()}
+${config.fusionContext ? `\n--- FUSED INTELLIGENCE ---\nAdditional intelligence from across the platform. Use it to improve reliability:\n\n${config.fusionContext}\n--- END FUSED INTELLIGENCE ---` : ''}
 
 Generate comprehensive test flows covering all detected functionality.`;
 
