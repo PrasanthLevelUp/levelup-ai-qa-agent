@@ -2810,6 +2810,8 @@ export async function updatePRStatus(prId: number, status: string, mergedAt?: st
 export interface GeneratedScriptRecord {
   id?: number;
   url: string;
+  /** RTM link — the generated_test_cases.id this script implements (optional). */
+  test_case_id?: number | null;
   page_type?: string;
   workflow_graph?: any;
   instructions?: string;
@@ -2846,14 +2848,15 @@ export interface GeneratedScriptRecord {
 export async function logGeneratedScript(data: GeneratedScriptRecord, companyId?: number, projectId?: number): Promise<number> {
   const result = await getPool().query(
     `INSERT INTO generated_scripts
-      (url, page_type, workflow_graph, instructions, script_content, test_plan,
+      (url, test_case_id, page_type, workflow_graph, instructions, script_content, test_plan,
        validation_status, reliability_score, review_score, review_issues,
        tokens_used, model, generation_time_ms, files_generated, negative_tests_included,
        company_id, project_id, intelligence_metadata)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
     RETURNING id`,
     [
       data.url,
+      data.test_case_id ?? null,
       data.page_type ?? null,
       data.workflow_graph ? JSON.stringify(data.workflow_graph) : null,
       data.instructions ?? null,
@@ -7044,4 +7047,309 @@ export async function runRTMMigration(): Promise<{ ok: number; fail: number }> {
   });
   logger.info(MOD, `RTM migration complete (${result.ok} ok, ${result.fail} errors)`);
   return result;
+}
+
+
+
+/* ════════════════════════════════════════════════════════════════════════
+ * RTM Sprint 3 — Traceability link management
+ * ════════════════════════════════════════════════════════════════════════
+ * Helpers that wire the REAL tables together:
+ *   requirements (UUID)  ──<  generated_test_cases.requirement_id (UUID)
+ *   generated_test_cases (INT) ──<  generated_scripts.test_case_id (INT)
+ *   + a denormalised `traceability_links` audit table for fast querying.
+ *
+ * The coverage triggers (rtm-schema.ts) keep requirements.coverage_percentage /
+ * status fresh automatically whenever a test case gains a requirement_id, a
+ * script is linked to such a test case, or an rtm_test_execution lands.
+ */
+
+export type TraceabilityLinkType =
+  | 'requirement_to_testcase'
+  | 'testcase_to_script'
+  | 'requirement_to_script'
+  | 'script_to_execution';
+
+/**
+ * Insert a traceability link, de-duplicating on the meaningful tuple so repeated
+ * calls (e.g. re-linking, re-generating a script) don't pile up identical rows.
+ * Returns the existing or newly-created link row.
+ */
+export async function createTraceabilityLink(data: {
+  companyId: number;
+  projectId?: number | null;
+  requirementId?: string | null;
+  testCaseId?: number | null;
+  scriptId?: number | null;
+  executionId?: string | null;
+  linkType: TraceabilityLinkType;
+  createdBy?: number | null;
+  metadata?: Record<string, any> | null;
+}): Promise<any> {
+  const pool = getPool();
+  // De-dupe: same company + link_type + the same referenced ids (NULL-safe).
+  const existing = await pool.query(
+    `SELECT * FROM traceability_links
+     WHERE company_id = $1
+       AND link_type = $2
+       AND requirement_id IS NOT DISTINCT FROM $3
+       AND test_case_id IS NOT DISTINCT FROM $4
+       AND script_id IS NOT DISTINCT FROM $5
+       AND execution_id IS NOT DISTINCT FROM $6
+     LIMIT 1`,
+    [
+      data.companyId,
+      data.linkType,
+      data.requirementId ?? null,
+      data.testCaseId ?? null,
+      data.scriptId ?? null,
+      data.executionId ?? null,
+    ],
+  );
+  if (existing.rows[0]) return existing.rows[0];
+
+  const result = await pool.query(
+    `INSERT INTO traceability_links
+       (company_id, project_id, requirement_id, test_case_id, script_id,
+        execution_id, link_type, created_by, metadata)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, COALESCE($9, '{}'::jsonb))
+     RETURNING *`,
+    [
+      data.companyId,
+      data.projectId ?? null,
+      data.requirementId ?? null,
+      data.testCaseId ?? null,
+      data.scriptId ?? null,
+      data.executionId ?? null,
+      data.linkType,
+      data.createdBy ?? null,
+      data.metadata ? JSON.stringify(data.metadata) : null,
+    ],
+  );
+  return result.rows[0];
+}
+
+/** Fetch a single traceability link (company-scoped). */
+export async function getTraceabilityLink(id: string, companyId: number): Promise<any | null> {
+  const result = await getPool().query(
+    `SELECT * FROM traceability_links WHERE id = $1 AND company_id = $2`,
+    [id, companyId],
+  );
+  return result.rows[0] ?? null;
+}
+
+/**
+ * Delete a traceability link (company-scoped). If it is a requirement→test-case
+ * link, also clear generated_test_cases.requirement_id so coverage recomputes.
+ * Returns the deleted link row, or null if not found.
+ */
+export async function deleteTraceabilityLink(id: string, companyId: number): Promise<any | null> {
+  const pool = getPool();
+  const link = await getTraceabilityLink(id, companyId);
+  if (!link) return null;
+
+  await pool.query(`DELETE FROM traceability_links WHERE id = $1 AND company_id = $2`, [id, companyId]);
+
+  if (link.link_type === 'requirement_to_testcase' && link.test_case_id != null) {
+    await pool.query(
+      `UPDATE generated_test_cases SET requirement_id = NULL WHERE id = $1 AND company_id = $2`,
+      [link.test_case_id, companyId],
+    );
+  }
+  return link;
+}
+
+/**
+ * Link an existing generated test case to a requirement.
+ *  - validates both belong to the company (requirement also not soft-deleted)
+ *  - sets generated_test_cases.requirement_id (fires the coverage trigger)
+ *  - records a requirement_to_testcase link
+ * Returns a discriminated result so the route can map to the right HTTP code.
+ */
+export async function linkTestCaseToRequirement(params: {
+  testCaseId: number;
+  requirementId: string;
+  companyId: number;
+  projectId?: number | null;
+  userId?: number | null;
+}): Promise<{ status: 'ok' | 'requirement_not_found' | 'test_case_not_found'; link?: any }> {
+  const pool = getPool();
+
+  const reqCheck = await pool.query(
+    `SELECT id FROM requirements
+     WHERE id = $1 AND company_id = $2 AND deleted_at IS NULL`,
+    [params.requirementId, params.companyId],
+  );
+  if (reqCheck.rows.length === 0) return { status: 'requirement_not_found' };
+
+  const tcCheck = await pool.query(
+    `SELECT id FROM generated_test_cases WHERE id = $1 AND company_id = $2`,
+    [params.testCaseId, params.companyId],
+  );
+  if (tcCheck.rows.length === 0) return { status: 'test_case_not_found' };
+
+  // Set the FK on the test case (this is what the coverage trigger reads).
+  await pool.query(
+    `UPDATE generated_test_cases SET requirement_id = $1 WHERE id = $2 AND company_id = $3`,
+    [params.requirementId, params.testCaseId, params.companyId],
+  );
+
+  const link = await createTraceabilityLink({
+    companyId: params.companyId,
+    projectId: params.projectId ?? null,
+    requirementId: params.requirementId,
+    testCaseId: params.testCaseId,
+    linkType: 'requirement_to_testcase',
+    createdBy: params.userId ?? null,
+  });
+
+  return { status: 'ok', link };
+}
+
+/**
+ * Bulk-link freshly generated test cases to a requirement (used by the
+ * test-case generation flow). Returns the number of test cases linked.
+ * Best-effort: invalid requirement → 0 links, never throws.
+ */
+export async function linkTestCasesToRequirement(params: {
+  testCaseIds: number[];
+  requirementId: string;
+  companyId: number;
+  projectId?: number | null;
+  userId?: number | null;
+}): Promise<number> {
+  if (!params.testCaseIds?.length) return 0;
+  const pool = getPool();
+
+  const reqCheck = await pool.query(
+    `SELECT id FROM requirements WHERE id = $1 AND company_id = $2 AND deleted_at IS NULL`,
+    [params.requirementId, params.companyId],
+  );
+  if (reqCheck.rows.length === 0) return 0;
+
+  let linked = 0;
+  for (const tcId of params.testCaseIds) {
+    try {
+      const upd = await pool.query(
+        `UPDATE generated_test_cases SET requirement_id = $1 WHERE id = $2 AND company_id = $3`,
+        [params.requirementId, tcId, params.companyId],
+      );
+      if ((upd.rowCount ?? 0) > 0) {
+        await createTraceabilityLink({
+          companyId: params.companyId,
+          projectId: params.projectId ?? null,
+          requirementId: params.requirementId,
+          testCaseId: tcId,
+          linkType: 'requirement_to_testcase',
+          createdBy: params.userId ?? null,
+        });
+        linked++;
+      }
+    } catch {
+      // best-effort — keep going
+    }
+  }
+  return linked;
+}
+
+/** Remove the requirement link from a test case (clears FK + deletes links). */
+export async function unlinkTestCaseFromRequirement(
+  testCaseId: number,
+  companyId: number,
+): Promise<boolean> {
+  const pool = getPool();
+  const upd = await pool.query(
+    `UPDATE generated_test_cases SET requirement_id = NULL WHERE id = $1 AND company_id = $2`,
+    [testCaseId, companyId],
+  );
+  await pool.query(
+    `DELETE FROM traceability_links
+     WHERE company_id = $1 AND test_case_id = $2 AND link_type = 'requirement_to_testcase'`,
+    [companyId, testCaseId],
+  );
+  return (upd.rowCount ?? 0) > 0;
+}
+
+/**
+ * Auto-create traceability links for a freshly generated script.
+ * Given a script that targets a test case, this:
+ *   - ensures generated_scripts.test_case_id is set (fires the script coverage trigger)
+ *   - records a testcase_to_script link
+ *   - resolves the requirement via the test case and records a requirement_to_script link
+ * Best-effort and defensive: never throws (so it can't break script generation).
+ * Returns the resolved requirementId (or null).
+ */
+export async function autoLinkScriptTraceability(params: {
+  scriptId: number;
+  testCaseId: number;
+  companyId: number;
+  projectId?: number | null;
+  userId?: number | null;
+}): Promise<{ requirementId: string | null }> {
+  const pool = getPool();
+  try {
+    // Make sure the script points at the test case (idempotent).
+    await pool.query(
+      `UPDATE generated_scripts SET test_case_id = $1 WHERE id = $2 AND company_id = $3`,
+      [params.testCaseId, params.scriptId, params.companyId],
+    );
+
+    await createTraceabilityLink({
+      companyId: params.companyId,
+      projectId: params.projectId ?? null,
+      testCaseId: params.testCaseId,
+      scriptId: params.scriptId,
+      linkType: 'testcase_to_script',
+      createdBy: params.userId ?? null,
+    });
+
+    const reqRow = await pool.query(
+      `SELECT requirement_id FROM generated_test_cases WHERE id = $1 AND company_id = $2`,
+      [params.testCaseId, params.companyId],
+    );
+    const requirementId: string | null = reqRow.rows[0]?.requirement_id ?? null;
+
+    if (requirementId) {
+      await createTraceabilityLink({
+        companyId: params.companyId,
+        projectId: params.projectId ?? null,
+        requirementId,
+        scriptId: params.scriptId,
+        linkType: 'requirement_to_script',
+        createdBy: params.userId ?? null,
+      });
+    }
+    return { requirementId };
+  } catch (err: any) {
+    logger.warn(MOD, 'autoLinkScriptTraceability failed (non-fatal)', {
+      scriptId: params.scriptId,
+      testCaseId: params.testCaseId,
+      error: err?.message,
+    });
+    return { requirementId: null };
+  }
+}
+
+/**
+ * List all traceability links for a requirement (company-scoped), grouped by
+ * type. Returns null if the requirement does not exist for this company.
+ */
+export async function getTraceabilityForRequirement(
+  requirementId: string,
+  companyId: number,
+): Promise<{ requirement_id: string; links: any[] } | null> {
+  const pool = getPool();
+  const reqCheck = await pool.query(
+    `SELECT id FROM requirements WHERE id = $1 AND company_id = $2 AND deleted_at IS NULL`,
+    [requirementId, companyId],
+  );
+  if (reqCheck.rows.length === 0) return null;
+
+  const links = await pool.query(
+    `SELECT * FROM traceability_links
+     WHERE company_id = $1 AND requirement_id = $2
+     ORDER BY created_at ASC`,
+    [companyId, requirementId],
+  );
+  return { requirement_id: requirementId, links: links.rows };
 }
