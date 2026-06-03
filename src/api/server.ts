@@ -50,6 +50,7 @@ import { createRCAIntelligenceRouter } from './routes/rca-intelligence';
 import { createTestCoverageRouter } from './routes/test-coverage';
 import { createRequirementsRouter } from './routes/requirements';
 import { createRtmRouter } from './routes/rtm';
+import { createTraceabilityRouter } from './routes/traceability';
 import { createROIRouter } from './routes/roi';
 import { createBillingRouter } from './routes/billing';
 import { createIngestRouter } from './routes/ingest';
@@ -185,6 +186,7 @@ export function createServer(): express.Application {
   app.use('/api/test-coverage', authMiddleware, companyMiddleware, sessionMiddleware, projectContextMiddleware, createTestCoverageRouter());
   app.use('/api/requirements', authMiddleware, companyMiddleware, sessionMiddleware, projectContextMiddleware, createRequirementsRouter());
   app.use('/api/rtm', authMiddleware, companyMiddleware, sessionMiddleware, projectContextMiddleware, createRtmRouter());
+  app.use('/api/traceability', authMiddleware, companyMiddleware, sessionMiddleware, projectContextMiddleware, createTraceabilityRouter());
   app.use('/api/billing', authMiddleware, companyMiddleware, sessionMiddleware, createBillingRouter());
   app.use('/api/keys', authMiddleware, companyMiddleware, sessionMiddleware, apiKeysRouter);
   app.use('/api/repo-intelligence', authMiddleware, companyMiddleware, sessionMiddleware, createRepoIntelligenceRouter());

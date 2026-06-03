@@ -25,6 +25,7 @@ import {
   logWorkflowMaps,
   logProjectExport,
   getKnowledgeItem,
+  autoLinkScriptTraceability,
 } from '../../db/postgres';
 import { ScriptGenEngine, type GenerationConfig, type GenerationResult, type GeneratedFile } from '../../script-gen/script-gen-engine';
 import { getRepositoryContext } from '../../db/postgres';
@@ -69,6 +70,7 @@ export function createScriptGenRouter(): Router {
         authConfig: rawAuthConfig,
         additionalUrls,
         forceFreshCrawl,
+        testCaseId,
       } = req.body;
 
       if (!url || typeof url !== 'string') {
@@ -264,6 +266,7 @@ export function createScriptGenRouter(): Router {
       // Persist to DB (now includes intelligence_metadata)
       const scriptId = await logGeneratedScript({
         url: config.url,
+        test_case_id: testCaseId != null ? Number(testCaseId) : null,
         page_type: result.testPlan?.pageType || 'unknown',
         workflow_graph: null,
         instructions: config.instructions,
@@ -284,6 +287,22 @@ export function createScriptGenRouter(): Router {
       }, companyId, projectId);
 
       console.log(`[ScriptGen] ✅ Generation complete — ID ${scriptId}, ${result.generatedFiles.length} files, ${generationTimeMs}ms, project=${projectId || 'none'}`);
+
+      // RTM: auto-link the script to its test case (and the resolved requirement).
+      // Best-effort — never let traceability failures break script generation.
+      if (testCaseId != null && companyId != null) {
+        try {
+          await autoLinkScriptTraceability({
+            scriptId,
+            testCaseId: Number(testCaseId),
+            companyId,
+            projectId: projectId ?? null,
+            userId: (req as any).userId ?? null,
+          });
+        } catch (linkErr: any) {
+          console.warn(`[ScriptGen] ⚠️ Traceability auto-link failed (non-fatal): ${linkErr?.message}`);
+        }
+      }
 
       res.json({
         success: true,
