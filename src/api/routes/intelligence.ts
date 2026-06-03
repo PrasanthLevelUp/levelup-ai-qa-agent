@@ -25,7 +25,7 @@ import { ProfileService } from '../../intelligence/profile-service';
 import { CrawlOrchestrator } from '../../intelligence/crawl-orchestrator';
 import { SelectorHealingEngine } from '../../intelligence/healing-engine';
 import { PatternMatcher } from '../../intelligence/pattern-matcher';
-import { findMatchingPatterns, migrateDataToDefaultProjects, getProjectStats, listProfiles, listRepositories, getKnowledgeStats } from '../../db/postgres';
+import { findMatchingPatterns, migrateDataToDefaultProjects, getProjectStats, listProfiles, listRepositories, getKnowledgeStats, upsertProfile } from '../../db/postgres';
 
 /* ──────────────────────────────────────────────────────────────────────────
  *  Screenshot upload configuration (multer → local disk)
@@ -86,6 +86,46 @@ export function createIntelligenceRouter(): Router {
 
       const result = await profileService.listProfiles(companyId, { status, limit, offset, projectId });
       res.json({ success: true, data: result.profiles, total: result.total });
+    } catch (err) {
+      res.status(500).json({ success: false, error: (err as Error).message });
+    }
+  });
+
+  /**
+   * Manually create a human-curated application profile (no crawl required).
+   * Only base_url is mandatory; all rich fields are optional. Re-using the same
+   * base_url within a project upserts (preserving any crawl-supplied data).
+   */
+  router.post('/profiles', async (req: Request, res: Response) => {
+    try {
+      const companyId = (req as any).companyId;
+      const projectId = (req as any).projectId as number | undefined;
+      const b = req.body || {};
+      const baseUrl = String(b.baseUrl || b.base_url || '').trim();
+      if (!baseUrl) {
+        return res.status(400).json({ success: false, error: 'baseUrl is required' });
+      }
+
+      const profile = await upsertProfile(
+        {
+          baseUrl,
+          crawlData: {},
+          status: 'fresh',
+          name: b.name,
+          description: b.description,
+          businessFlows: b.businessFlows,
+          urlPatterns: b.urlPatterns,
+          formFields: b.formFields,
+          customMetadata: b.customMetadata,
+          notes: b.notes,
+          tags: b.tags,
+          screenshots: b.screenshots,
+          projectId,
+        },
+        companyId,
+      );
+
+      res.status(201).json({ success: true, data: profile });
     } catch (err) {
       res.status(500).json({ success: false, error: (err as Error).message });
     }
