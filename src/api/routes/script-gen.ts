@@ -44,11 +44,13 @@ import * as os from 'os';
 import * as fs from 'fs';
 import { CrawlOrchestrator } from '../../intelligence/crawl-orchestrator';
 import { PatternMatcher } from '../../intelligence/pattern-matcher';
+import { IntelligenceFusionService } from '../../services/intelligence-fusion-service';
 
 export function createScriptGenRouter(): Router {
   const router = Router();
   const crawlOrchestrator = new CrawlOrchestrator();
   const patternMatcher = new PatternMatcher();
+  const fusionService = new IntelligenceFusionService();
 
   /* ── Generate Test Scripts ──────────────────────────────── */
   router.post('/generate', async (req: Request, res: Response) => {
@@ -166,6 +168,27 @@ export function createScriptGenRouter(): Router {
 
       console.log(`[ScriptGen] Crawl decision: usedCache=${crawlDecision.usedCache}, reason="${crawlDecision.reason}" (${crawlDecision.decisionTimeMs}ms)`);
 
+      // ── Multi-Intelligence Fusion: gather ALL intelligence sources + compute confidence ──
+      let fusion: import('../../services/intelligence-fusion-service').FusedIntelligence | undefined;
+      let fusionContext: string | undefined;
+      if (companyId !== undefined && companyId !== null) {
+        try {
+          fusion = await fusionService.fuseIntelligenceForScriptGen({
+            companyId: companyId as number,
+            projectId,
+            repositoryId: repoId,
+            targetUrl: url,
+            testScenario: instructions || undefined,
+            preloadedRepoProfile: repoProfile,
+            knowledgeItemsCount: knowledgeItemsUsed.length,
+          });
+          fusionContext = fusionService.buildFusionContext(fusion) || undefined;
+          console.log(`[ScriptGen] 🔮 Fusion confidence=${fusion.confidenceScore}/100, sources=[${fusion.fusionMetadata.sourcesUsed.join(', ')}]`);
+        } catch (fusionErr: any) {
+          console.warn(`[ScriptGen] Fusion non-blocking error: ${fusionErr.message}`);
+        }
+      }
+
       const config: GenerationConfig = {
         url,
         instructions: instructions || undefined,
@@ -176,6 +199,7 @@ export function createScriptGenRouter(): Router {
         maxPages: maxPages ?? 3,
         repoIntelligence,
         knowledgeContext,
+        ...(fusionContext ? { fusionContext } : {}),
         ...(repoProfile ? { repoProfile } : {}),
         ...(sanitizedAuthConfig ? { authConfig: sanitizedAuthConfig } : {}),
         ...(Array.isArray(additionalUrls) && additionalUrls.length > 0
@@ -228,6 +252,11 @@ export function createScriptGenRouter(): Router {
         profileCacheUsed: crawlDecision.usedCache,
         crawlDecisionReason: crawlDecision.reason,
         profileId: crawlDecision.profile?.id ?? undefined,
+        // Multi-intelligence fusion
+        fusionConfidenceScore: fusion?.confidenceScore,
+        fusionSourcesUsed: fusion?.fusionMetadata.sourcesUsed ?? [],
+        fusionMissingCritical: fusion?.fusionMetadata.missingCritical ?? [],
+        fusionWarnings: fusion?.fusionMetadata.warnings ?? [],
       };
 
       console.log(`[ScriptGen] 📊 Intelligence summary: repoIntel=${intelligenceMetadata.repoIntelligenceUsed} (${intelligenceMetadata.repoFramework ?? 'n/a'}), knowledge=${intelligenceMetadata.knowledgeItemsUsed} items, cache=${intelligenceMetadata.profileCacheUsed}, adaptive=${intelligenceMetadata.adaptiveCodegenUsed} (${intelligenceMetadata.adaptiveMode ?? 'n/a'})`);
@@ -299,6 +328,12 @@ export function createScriptGenRouter(): Router {
             // Knowledge items used
             knowledgeItemsUsed: knowledgeItemsUsed.length,
             knowledgeItemIds: knowledgeItemsUsed.map((ki: any) => ki.id),
+            // Multi-intelligence fusion — overall confidence + per-source breakdown
+            confidenceScore: fusion?.confidenceScore ?? null,
+            sourcesUsed: fusion?.fusionMetadata.sourcesUsed ?? [],
+            missingCritical: fusion?.fusionMetadata.missingCritical ?? [],
+            warnings: fusion?.fusionMetadata.warnings ?? [],
+            recommendation: fusion ? IntelligenceFusionService.recommendationFor(fusion.confidenceScore) : null,
           },
         },
       });
