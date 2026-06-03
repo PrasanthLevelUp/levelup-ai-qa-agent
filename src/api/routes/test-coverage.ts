@@ -32,6 +32,7 @@ import {
   logExport,
   getExportHistory,
   updateCoverageGapPreference,
+  linkTestCasesToRequirement,
 } from '../../db/postgres';
 import { ExportService } from '../../services/export-service';
 import { TemplateService } from '../../services/template-service';
@@ -57,6 +58,7 @@ export function createTestCoverageRouter(): Router {
         knowledgeItemIds,
         useRepoIntelligence, repoId,
         includeCoverageGaps,
+        requirementId,
       } = req.body;
 
       if (!title || !description) {
@@ -211,6 +213,7 @@ export function createTestCoverageRouter(): Router {
       if (result.testCases.length > 0 && scenarioIds.length > 0) {
         const scenariosWithType = result.scenarios.map((s, i) => ({ ...s, dbId: scenarioIds[i], index: i }));
         let insertedCases = 0;
+        const insertedTestCaseIds: number[] = [];
         for (const tc of result.testCases) {
           try {
             // 1. Use scenarioIndex if provided by AI (most reliable)
@@ -233,7 +236,7 @@ export function createTestCoverageRouter(): Router {
               matchingScenario = scenariosWithType[0];
             }
 
-            await insertTestCases(matchingScenario.dbId, [{
+            const newIds = await insertTestCases(matchingScenario.dbId, [{
               title: tc.title,
               preconditions: tc.preconditions || '',
               steps: tc.steps || [],
@@ -246,12 +249,31 @@ export function createTestCoverageRouter(): Router {
               automationComplexity: tc.automationComplexity || 'medium',
               selectorAvailability: tc.selectorAvailability || 'unknown',
             }], companyId);
+            insertedTestCaseIds.push(...newIds);
             insertedCases++;
           } catch (tcErr: any) {
             logger.error(MOD, 'Failed to persist test case', { title: tc.title, error: tcErr.message });
           }
         }
         logger.info(MOD, 'Test cases persisted', { inserted: insertedCases, total: result.testCases.length });
+
+        // RTM: if an existing requirement was supplied, link the freshly
+        // generated test cases to it so coverage updates automatically.
+        // Best-effort — never let traceability failures break generation.
+        if (requirementId && insertedTestCaseIds.length > 0) {
+          try {
+            const linked = await linkTestCasesToRequirement({
+              testCaseIds: insertedTestCaseIds,
+              requirementId: String(requirementId),
+              companyId,
+              projectId: projectId ?? null,
+              userId: (req as any).userId ?? null,
+            });
+            logger.info(MOD, 'Linked generated test cases to requirement', { requirementId, linked });
+          } catch (linkErr: any) {
+            logger.error(MOD, 'Failed to link test cases to requirement', { requirementId, error: linkErr.message });
+          }
+        }
       }
 
       return res.json({
