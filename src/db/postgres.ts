@@ -23,6 +23,14 @@ export interface TestExecution {
   duration_ms?: number;
   healing_attempted?: boolean;
   healing_succeeded?: boolean;
+  /**
+   * Write-path attribution (Phase 2). Optional — when omitted the row is left
+   * NULL and the DB triggers stamp the project's current sprint / default
+   * environment (provided project_id is set). Explicit values are respected.
+   */
+  project_id?: number | null;
+  environment_id?: number | null;
+  sprint_id?: number | null;
 }
 
 export interface HealingAction {
@@ -38,6 +46,14 @@ export interface HealingAction {
   validation_status?: 'approved' | 'rejected' | 'reverted';
   validation_reason?: string;
   patch_path?: string;
+  /**
+   * Write-path attribution (Phase 2). Optional — NULL lets the DB triggers
+   * stamp the project's current sprint / default environment when project_id is
+   * known; explicit values are respected.
+   */
+  project_id?: number | null;
+  environment_id?: number | null;
+  sprint_id?: number | null;
 }
 
 export interface LearnedPattern {
@@ -1964,8 +1980,8 @@ export async function updateCompany(id: number, data: { name?: string; is_active
 export async function logExecution(data: TestExecution, companyId?: number): Promise<number> {
   const result = await getPool().query(
     `INSERT INTO test_executions
-      (test_name, status, error_message, screenshot_path, github_commit_sha, duration_ms, healing_attempted, healing_succeeded, company_id)
-    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+      (test_name, status, error_message, screenshot_path, github_commit_sha, duration_ms, healing_attempted, healing_succeeded, company_id, project_id, environment_id, sprint_id)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
     RETURNING id`,
     [
       data.test_name,
@@ -1977,6 +1993,9 @@ export async function logExecution(data: TestExecution, companyId?: number): Pro
       data.healing_attempted ?? false,
       data.healing_succeeded ?? false,
       companyId ?? null,
+      data.project_id ?? null,
+      data.environment_id ?? null,
+      data.sprint_id ?? null,
     ],
   );
   return result.rows[0].id;
@@ -2016,8 +2035,9 @@ export async function logHealing(data: HealingAction, companyId?: number): Promi
   const result = await getPool().query(
     `INSERT INTO healing_actions
       (test_execution_id, test_name, failed_locator, healed_locator, healing_strategy, ai_tokens_used,
-       success, confidence, error_context, validation_status, validation_reason, patch_path, company_id)
-    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+       success, confidence, error_context, validation_status, validation_reason, patch_path, company_id,
+       project_id, environment_id, sprint_id)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
     RETURNING id`,
     [
       data.test_execution_id,
@@ -2033,6 +2053,9 @@ export async function logHealing(data: HealingAction, companyId?: number): Promi
       data.validation_reason ?? null,
       data.patch_path ?? null,
       companyId ?? null,
+      data.project_id ?? null,
+      data.environment_id ?? null,
+      data.sprint_id ?? null,
     ],
   );
   return result.rows[0].id;
@@ -2292,6 +2315,14 @@ export interface RCARecord {
   healing_strategy?: string;
   error_message?: string;
   created_at?: string;
+  /**
+   * Write-path attribution (Phase 2). Optional — NULL lets the DB triggers
+   * stamp the project's current sprint / default environment when project_id is
+   * known; explicit values are respected.
+   */
+  project_id?: number | null;
+  environment_id?: number | null;
+  sprint_id?: number | null;
 }
 
 export async function logRCA(data: RCARecord, companyId?: number): Promise<number> {
@@ -2300,8 +2331,9 @@ export async function logRCA(data: RCARecord, companyId?: number): Promise<numbe
       (test_execution_id, job_id, test_name, root_cause, classification, severity,
        confidence, suggested_fix, affected_component, is_flaky, flaky_reason,
        summary, technical_details, tokens_used, model, analysis_time_ms,
-       healing_attempted, healing_succeeded, healed_locator, healing_strategy, error_message, company_id)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
+       healing_attempted, healing_succeeded, healed_locator, healing_strategy, error_message, company_id,
+       project_id, environment_id, sprint_id)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)
     RETURNING id`,
     [
       data.test_execution_id,
@@ -2326,6 +2358,9 @@ export async function logRCA(data: RCARecord, companyId?: number): Promise<numbe
       data.healing_strategy ?? null,
       data.error_message ?? null,
       companyId ?? null,
+      data.project_id ?? null,
+      data.environment_id ?? null,
+      data.sprint_id ?? null,
     ],
   );
   return result.rows[0].id;
@@ -2870,6 +2905,13 @@ export interface GeneratedScriptRecord {
   files_generated?: any;
   negative_tests_included?: boolean;
   created_at?: string;
+  /**
+   * Write-path attribution (Phase 2). Optional — NULL lets the DB triggers
+   * stamp the project's current sprint / default environment when project_id is
+   * known; explicit values are respected. (project_id is passed separately.)
+   */
+  environment_id?: number | null;
+  sprint_id?: number | null;
   /** Tracks what intelligence sources were used during generation */
   intelligence_metadata?: {
     repoIntelligenceUsed: boolean;
@@ -2894,8 +2936,8 @@ export async function logGeneratedScript(data: GeneratedScriptRecord, companyId?
       (url, test_case_id, page_type, workflow_graph, instructions, script_content, test_plan,
        validation_status, reliability_score, review_score, review_issues,
        tokens_used, model, generation_time_ms, files_generated, negative_tests_included,
-       company_id, project_id, intelligence_metadata)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
+       company_id, project_id, intelligence_metadata, environment_id, sprint_id)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
     RETURNING id`,
     [
       data.url,
@@ -2917,6 +2959,8 @@ export async function logGeneratedScript(data: GeneratedScriptRecord, companyId?
       companyId ?? null,
       projectId ?? null,
       data.intelligence_metadata ? JSON.stringify(data.intelligence_metadata) : null,
+      data.environment_id ?? null,
+      data.sprint_id ?? null,
     ],
   );
   return result.rows[0].id;
@@ -6847,16 +6891,24 @@ export async function createRequirement(data: {
   tags?: string[] | null;
   createdBy?: number | null;
   metadata?: Record<string, any> | null;
+  /**
+   * Write-path attribution (Phase 2). Optional — NULL lets the DB triggers
+   * stamp the project's current sprint / default environment when project_id is
+   * known; explicit values are respected.
+   */
+  environmentId?: number | null;
+  sprintId?: number | null;
 }): Promise<RtmRequirement> {
   const pool = getPool();
   const requirementId = await generateRequirementId(data.companyId, data.projectId ?? null);
   const result = await pool.query(
     `INSERT INTO requirements
        (company_id, project_id, requirement_id, title, description, category,
-        priority, acceptance_criteria, status, tags, created_by, metadata)
+        priority, acceptance_criteria, status, tags, created_by, metadata,
+        environment_id, sprint_id)
      VALUES ($1, $2, $3, $4, $5, $6,
              COALESCE($7, 'Medium'), $8, COALESCE($9, 'Not Tested'), $10, $11,
-             COALESCE($12, '{}'::jsonb))
+             COALESCE($12, '{}'::jsonb), $13, $14)
      RETURNING *`,
     [
       data.companyId,
@@ -6871,6 +6923,8 @@ export async function createRequirement(data: {
       data.tags ?? null,
       data.createdBy ?? null,
       data.metadata ? JSON.stringify(data.metadata) : null,
+      data.environmentId ?? null,
+      data.sprintId ?? null,
     ],
   );
   return result.rows[0];

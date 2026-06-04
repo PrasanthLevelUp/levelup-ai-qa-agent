@@ -68,6 +68,30 @@ export async function contextMiddleware(
 }
 
 /**
+ * Write-path helper: read the active environment / sprint context for a request
+ * so record-creation handlers can stamp new rows with attribution.
+ *
+ * Prefers the values resolved+validated by `contextMiddleware`
+ * ((req as any).environmentId / .sprintId); falls back to parsing the raw
+ * headers / query params when the middleware did not run (e.g. a route that is
+ * not behind contextMiddleware but still wants best-effort attribution).
+ *
+ * Always backward compatible — returns `undefined` for anything not present, so
+ * callers pass `?? null` and let the DB triggers fill project defaults.
+ */
+export function getContextFromRequest(
+  req: Request,
+): { environmentId?: number; sprintId?: number } {
+  const environmentId =
+    ((req as any).environmentId as number | undefined) ??
+    parseId(req.headers['x-environment-id'] ?? req.query?.['environment_id'] ?? req.query?.['environmentId']);
+  const sprintId =
+    ((req as any).sprintId as number | undefined) ??
+    parseId(req.headers['x-sprint-id'] ?? req.query?.['sprint_id'] ?? req.query?.['sprintId']);
+  return { environmentId, sprintId };
+}
+
+/**
  * Query helper: append `environment_id` / `sprint_id` equality filters to a
  * parameterised WHERE clause when the request carries that context. Returns the
  * extra SQL fragment and the params to push. Backward compatible — emits nothing
