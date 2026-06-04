@@ -2403,10 +2403,14 @@ export interface FlakyTestSummary {
   affected_components: string[];
 }
 
-export async function getFlakyTests(companyId?: number): Promise<FlakyTestSummary[]> {
+export async function getFlakyTests(companyId?: number, projectId?: number): Promise<FlakyTestSummary[]> {
   const pool = getPool();
-  const cf = companyId ? `WHERE company_id = ${companyId}` : '';
-  const cfAnd = companyId ? `AND company_id = ${companyId}` : '';
+  const pid = projectId && Number.isInteger(projectId) ? projectId : 0;
+  const pfClause = pid ? `(project_id = ${pid} OR project_id IS NULL)` : '';
+  // Compose WHERE/AND clauses combining company + project scoping.
+  const aggConds = [companyId ? `company_id = ${companyId}` : '', pfClause].filter(Boolean);
+  const cf = aggConds.length ? `WHERE ${aggConds.join(' AND ')}` : '';
+  const cfAnd = (companyId ? ` AND company_id = ${companyId}` : '') + (pfClause ? ` AND ${pfClause}` : '');
   const result = await pool.query(`
     WITH flaky_agg AS (
       SELECT
@@ -3667,42 +3671,46 @@ export interface ReleaseRiskInputData {
   }>;
 }
 
-export async function getReleaseRiskData(days: number = 30, companyId?: number): Promise<ReleaseRiskInputData> {
+export async function getReleaseRiskData(days: number = 30, companyId?: number, projectId?: number): Promise<ReleaseRiskInputData> {
   const p = getPool();
   const cfAnd = companyId ? `AND company_id = ${companyId}` : '';
+  // Project scoping: include rows for this project OR rows with no project assigned (backward compat).
+  // projectId is a validated integer (from projectContextMiddleware), safe to interpolate.
+  const pid = projectId && Number.isInteger(projectId) ? projectId : 0;
+  const pfAnd = pid ? `AND (project_id = ${pid} OR project_id IS NULL)` : '';
 
   const interval = `${days} days`;
 
   // Healing metrics (within time window)
   const [healTotal, healFailed, healLowConf, healAvgConf] = await Promise.all([
-    p.query(`SELECT COUNT(*) AS c FROM healing_actions WHERE created_at >= NOW() - INTERVAL '${interval}' ${cfAnd}`),
-    p.query(`SELECT COUNT(*) AS c FROM healing_actions WHERE success = false AND created_at >= NOW() - INTERVAL '${interval}' ${cfAnd}`),
-    p.query(`SELECT COUNT(*) AS c FROM healing_actions WHERE confidence < 0.5 AND confidence > 0 AND created_at >= NOW() - INTERVAL '${interval}' ${cfAnd}`),
-    p.query(`SELECT COALESCE(AVG(confidence), 0) AS avg FROM healing_actions WHERE created_at >= NOW() - INTERVAL '${interval}' ${cfAnd}`),
+    p.query(`SELECT COUNT(*) AS c FROM healing_actions WHERE created_at >= NOW() - INTERVAL '${interval}' ${cfAnd} ${pfAnd}`),
+    p.query(`SELECT COUNT(*) AS c FROM healing_actions WHERE success = false AND created_at >= NOW() - INTERVAL '${interval}' ${cfAnd} ${pfAnd}`),
+    p.query(`SELECT COUNT(*) AS c FROM healing_actions WHERE confidence < 0.5 AND confidence > 0 AND created_at >= NOW() - INTERVAL '${interval}' ${cfAnd} ${pfAnd}`),
+    p.query(`SELECT COALESCE(AVG(confidence), 0) AS avg FROM healing_actions WHERE created_at >= NOW() - INTERVAL '${interval}' ${cfAnd} ${pfAnd}`),
   ]);
 
   // Execution metrics
   const [execTotal, execFailed, execUnhealed] = await Promise.all([
-    p.query(`SELECT COUNT(*) AS c FROM test_executions WHERE created_at >= NOW() - INTERVAL '${interval}' ${cfAnd}`),
-    p.query(`SELECT COUNT(*) AS c FROM test_executions WHERE status IN ('failed', 'timedOut') AND created_at >= NOW() - INTERVAL '${interval}' ${cfAnd}`),
-    p.query(`SELECT COUNT(*) AS c FROM test_executions WHERE healing_attempted = true AND healing_succeeded = false AND created_at >= NOW() - INTERVAL '${interval}' ${cfAnd}`),
+    p.query(`SELECT COUNT(*) AS c FROM test_executions WHERE created_at >= NOW() - INTERVAL '${interval}' ${cfAnd} ${pfAnd}`),
+    p.query(`SELECT COUNT(*) AS c FROM test_executions WHERE status IN ('failed', 'timedOut') AND created_at >= NOW() - INTERVAL '${interval}' ${cfAnd} ${pfAnd}`),
+    p.query(`SELECT COUNT(*) AS c FROM test_executions WHERE healing_attempted = true AND healing_succeeded = false AND created_at >= NOW() - INTERVAL '${interval}' ${cfAnd} ${pfAnd}`),
   ]);
 
   // RCA severity distribution
   const [rcaTotal, rcaFlaky, rcaCritical, rcaHigh, rcaMedium] = await Promise.all([
-    p.query(`SELECT COUNT(*) AS c FROM rca_analyses WHERE created_at >= NOW() - INTERVAL '${interval}' ${cfAnd}`),
-    p.query(`SELECT COUNT(*) AS c FROM rca_analyses WHERE is_flaky = true AND created_at >= NOW() - INTERVAL '${interval}' ${cfAnd}`),
-    p.query(`SELECT COUNT(*) AS c FROM rca_analyses WHERE severity = 'critical' AND created_at >= NOW() - INTERVAL '${interval}' ${cfAnd}`),
-    p.query(`SELECT COUNT(*) AS c FROM rca_analyses WHERE severity = 'high' AND created_at >= NOW() - INTERVAL '${interval}' ${cfAnd}`),
-    p.query(`SELECT COUNT(*) AS c FROM rca_analyses WHERE severity = 'medium' AND created_at >= NOW() - INTERVAL '${interval}' ${cfAnd}`),
+    p.query(`SELECT COUNT(*) AS c FROM rca_analyses WHERE created_at >= NOW() - INTERVAL '${interval}' ${cfAnd} ${pfAnd}`),
+    p.query(`SELECT COUNT(*) AS c FROM rca_analyses WHERE is_flaky = true AND created_at >= NOW() - INTERVAL '${interval}' ${cfAnd} ${pfAnd}`),
+    p.query(`SELECT COUNT(*) AS c FROM rca_analyses WHERE severity = 'critical' AND created_at >= NOW() - INTERVAL '${interval}' ${cfAnd} ${pfAnd}`),
+    p.query(`SELECT COUNT(*) AS c FROM rca_analyses WHERE severity = 'high' AND created_at >= NOW() - INTERVAL '${interval}' ${cfAnd} ${pfAnd}`),
+    p.query(`SELECT COUNT(*) AS c FROM rca_analyses WHERE severity = 'medium' AND created_at >= NOW() - INTERVAL '${interval}' ${cfAnd} ${pfAnd}`),
   ]);
 
   // Trend: recent 7 days vs previous 7 days
   const [recentExec, recentFail, prevExec, prevFail] = await Promise.all([
-    p.query(`SELECT COUNT(*) AS c FROM test_executions WHERE created_at >= NOW() - INTERVAL '7 days' ${cfAnd}`),
-    p.query(`SELECT COUNT(*) AS c FROM test_executions WHERE status IN ('failed', 'timedOut') AND created_at >= NOW() - INTERVAL '7 days' ${cfAnd}`),
-    p.query(`SELECT COUNT(*) AS c FROM test_executions WHERE created_at >= NOW() - INTERVAL '14 days' AND created_at < NOW() - INTERVAL '7 days' ${cfAnd}`),
-    p.query(`SELECT COUNT(*) AS c FROM test_executions WHERE status IN ('failed', 'timedOut') AND created_at >= NOW() - INTERVAL '14 days' AND created_at < NOW() - INTERVAL '7 days' ${cfAnd}`),
+    p.query(`SELECT COUNT(*) AS c FROM test_executions WHERE created_at >= NOW() - INTERVAL '7 days' ${cfAnd} ${pfAnd}`),
+    p.query(`SELECT COUNT(*) AS c FROM test_executions WHERE status IN ('failed', 'timedOut') AND created_at >= NOW() - INTERVAL '7 days' ${cfAnd} ${pfAnd}`),
+    p.query(`SELECT COUNT(*) AS c FROM test_executions WHERE created_at >= NOW() - INTERVAL '14 days' AND created_at < NOW() - INTERVAL '7 days' ${cfAnd} ${pfAnd}`),
+    p.query(`SELECT COUNT(*) AS c FROM test_executions WHERE status IN ('failed', 'timedOut') AND created_at >= NOW() - INTERVAL '14 days' AND created_at < NOW() - INTERVAL '7 days' ${cfAnd} ${pfAnd}`),
   ]);
 
   const recentTotal = parseInt(recentExec.rows[0].c, 10);
@@ -3720,7 +3728,7 @@ export async function getReleaseRiskData(days: number = 30, companyId?: number):
       COUNT(CASE WHEN r.severity = 'critical' THEN 1 END) AS critical_rcas
     FROM rca_analyses r
     LEFT JOIN test_executions te ON r.test_execution_id = te.id
-    WHERE r.created_at >= NOW() - INTERVAL '${interval}' ${cfAnd.replace('company_id', 'r.company_id')}
+    WHERE r.created_at >= NOW() - INTERVAL '${interval}' ${cfAnd.replace('company_id', 'r.company_id')} ${pfAnd.replace(/project_id/g, 'r.project_id')}
     GROUP BY r.affected_component
     ORDER BY failures DESC
     LIMIT 20
@@ -3751,7 +3759,7 @@ export async function getReleaseRiskData(days: number = 30, companyId?: number):
   };
 }
 
-export async function getRiskTrend(days: number = 30, companyId?: number): Promise<Array<{
+export async function getRiskTrend(days: number = 30, companyId?: number, projectId?: number): Promise<Array<{
   date: string;
   riskScore: number;
   failureRate: number;
@@ -3760,6 +3768,8 @@ export async function getRiskTrend(days: number = 30, companyId?: number): Promi
 }>> {
   const p = getPool();
   const cfAnd = companyId ? `AND company_id = ${companyId}` : '';
+  const pid = projectId && Number.isInteger(projectId) ? projectId : 0;
+  const pfAnd = pid ? `AND (project_id = ${pid} OR project_id IS NULL)` : '';
 
   const result = await p.query(`
     SELECT
@@ -3768,7 +3778,7 @@ export async function getRiskTrend(days: number = 30, companyId?: number): Promi
       COUNT(CASE WHEN te.status IN ('failed', 'timedOut') THEN 1 END) AS failures,
       COUNT(CASE WHEN te.healing_attempted = true AND te.healing_succeeded = false THEN 1 END) AS unhealed
     FROM test_executions te
-    WHERE te.created_at >= NOW() - INTERVAL '${days} days' ${cfAnd.replace('company_id', 'te.company_id')}
+    WHERE te.created_at >= NOW() - INTERVAL '${days} days' ${cfAnd.replace('company_id', 'te.company_id')} ${pfAnd.replace(/project_id/g, 'te.project_id')}
     GROUP BY DATE(te.created_at)
     ORDER BY date ASC
   `);
@@ -3777,7 +3787,7 @@ export async function getRiskTrend(days: number = 30, companyId?: number): Promi
   const flakyRes = await p.query(`
     SELECT DATE(created_at) AS date, COUNT(*) AS flaky
     FROM rca_analyses
-    WHERE is_flaky = true AND created_at >= NOW() - INTERVAL '${days} days' ${cfAnd}
+    WHERE is_flaky = true AND created_at >= NOW() - INTERVAL '${days} days' ${cfAnd} ${pfAnd}
     GROUP BY DATE(created_at)
   `);
   const flakyMap = new Map<string, number>();
