@@ -16,6 +16,60 @@ import { logger } from '../../utils/logger';
 
 const MOD = 'dashboard-api';
 
+/**
+ * Resolve the analytics time window for a stats request (Phase 2: context-aware).
+ *
+ * Precedence:
+ *   1. Explicit sprint window — `startDate` + `endDate` query params (ISO dates).
+ *      Sent by the frontend when a Sprint (WHEN) is the active filter. The
+ *      "previous" comparison window is the equally-sized span immediately before.
+ *   2. Legacy rolling window — `period` (7d/30d/90d) → trailing N days from now.
+ *
+ * This is fully backward-compatible: requests without startDate/endDate behave
+ * exactly as before. `until` is `now` for the legacy path, so adding an upper
+ * `created_at < until` bound does not change legacy results.
+ */
+interface StatsWindow {
+  since: Date;
+  until: Date;
+  prevSince: Date;
+  prevUntil: Date;
+  /** Human label for logging/debugging. */
+  label: string;
+}
+
+function resolveWindow(req: Request): StatsWindow {
+  const startQ = (req.query.startDate as string) || '';
+  const endQ = (req.query.endDate as string) || '';
+
+  if (startQ && endQ) {
+    const since = new Date(startQ);
+    const until = new Date(endQ);
+    if (!isNaN(since.getTime()) && !isNaN(until.getTime()) && until.getTime() > since.getTime()) {
+      const span = until.getTime() - since.getTime();
+      return {
+        since,
+        until,
+        prevSince: new Date(since.getTime() - span),
+        prevUntil: since,
+        label: `sprint ${startQ}→${endQ}`,
+      };
+    }
+  }
+
+  const period = (req.query.period as string) || '7d';
+  const days = period === '30d' ? 30 : period === '90d' ? 90 : 7;
+  const now = new Date();
+  const since = new Date(now.getTime() - days * 86400000);
+  return {
+    since,
+    until: now,
+    prevSince: new Date(since.getTime() - days * 86400000),
+    prevUntil: since,
+    label: `${days}d`,
+  };
+}
+
 export function createDashboardRouter(): Router {
   const router = Router();
 
@@ -130,34 +184,30 @@ export function createDashboardRouter(): Router {
   /** GET /api/dashboard/stats/overview?period=7d&projectId=1 */
   router.get('/stats/overview', async (req: Request, res: Response) => {
     try {
-      const period = (req.query.period as string) || '7d';
-      const days = period === '30d' ? 30 : period === '90d' ? 90 : 7;
+      const { since, until, prevSince } = resolveWindow(req);
       const cid = (req as any).companyId;
       const pid = req.query.projectId ? parseInt(req.query.projectId as string, 10) : null;
       const pool = getPool();
 
-      const since = new Date(Date.now() - days * 86400000);
-      const prevSince = new Date(since.getTime() - days * 86400000);
-
       // Build project filter clause
       const pidClause = pid ? `AND project_id = ${pid}` : '';
 
-      // Current period executions
+      // Current period executions (within [since, until))
       const execRes = await pool.query(
         `SELECT status, healing_attempted FROM test_executions
-         WHERE created_at >= $1 AND ($2::int IS NULL OR company_id = $2) ${pidClause}`,
-        [since, cid],
+         WHERE created_at >= $1 AND created_at < $3 AND ($2::int IS NULL OR company_id = $2) ${pidClause}`,
+        [since, cid, until],
       );
       const executions = execRes.rows;
       const totalRuns = executions.length;
       const healed = executions.filter((e: any) => e.status === 'healed').length;
       const healingAttempted = executions.filter((e: any) => e.healing_attempted).length;
 
-      // Current period actions
+      // Current period actions (within [since, until))
       const actRes = await pool.query(
         `SELECT healing_strategy FROM healing_actions
-         WHERE created_at >= $1 AND ($2::int IS NULL OR company_id = $2) ${pidClause}`,
-        [since, cid],
+         WHERE created_at >= $1 AND created_at < $3 AND ($2::int IS NULL OR company_id = $2) ${pidClause}`,
+        [since, cid, until],
       );
       const actions = actRes.rows;
       const nonAi = actions.filter((a: any) => a.healing_strategy !== 'ai').length;
@@ -165,10 +215,14 @@ export function createDashboardRouter(): Router {
       const successRate = healingAttempted > 0 ? Math.round((healed / healingAttempted) * 1000) / 10 : 0;
       const aiCallsSaved = totalActions > 0 ? Math.round((nonAi / totalActions) * 1000) / 10 : 0;
 
-      // Token usage
+      // Token usage (within [since, until])
       const sinceStr = since.toISOString().split('T')[0];
+      const untilStr = until.toISOString().split('T')[0];
       const tokRes = await pool.query(`SELECT tokens_used, date FROM token_usage`);
-      const filteredTokens = tokRes.rows.filter((t: any) => (t.date || '') >= sinceStr);
+      const filteredTokens = tokRes.rows.filter((t: any) => {
+        const d = t.date || '';
+        return d >= sinceStr && d <= untilStr;
+      });
       const totalTokens = filteredTokens.reduce((sum: number, t: any) => sum + (t.tokens_used ?? 0), 0);
 
       // Previous period
@@ -217,19 +271,17 @@ export function createDashboardRouter(): Router {
   /** GET /api/dashboard/stats/trend?period=7d&projectId=1 */
   router.get('/stats/trend', async (req: Request, res: Response) => {
     try {
-      const period = (req.query.period as string) || '7d';
-      const days = period === '30d' ? 30 : period === '90d' ? 90 : 7;
+      const { since, until } = resolveWindow(req);
       const cid = (req as any).companyId;
       const pid = req.query.projectId ? parseInt(req.query.projectId as string, 10) : null;
       const pool = getPool();
-      const since = new Date(Date.now() - days * 86400000);
       const pidClause = pid ? `AND project_id = ${pid}` : '';
 
       const { rows } = await pool.query(
         `SELECT status, healing_attempted, created_at FROM test_executions
-         WHERE created_at >= $1 AND ($2::int IS NULL OR company_id = $2) ${pidClause}
+         WHERE created_at >= $1 AND created_at < $3 AND ($2::int IS NULL OR company_id = $2) ${pidClause}
          ORDER BY created_at ASC`,
-        [since, cid],
+        [since, cid, until],
       );
 
       const byDate: Record<string, { total: number; healed: number; attempted: number }> = {};
@@ -258,18 +310,16 @@ export function createDashboardRouter(): Router {
   /** GET /api/dashboard/stats/strategies?period=7d&projectId=1 */
   router.get('/stats/strategies', async (req: Request, res: Response) => {
     try {
-      const period = (req.query.period as string) || '7d';
-      const days = period === '30d' ? 30 : period === '90d' ? 90 : 7;
+      const { since, until } = resolveWindow(req);
       const cid = (req as any).companyId;
       const pid = req.query.projectId ? parseInt(req.query.projectId as string, 10) : null;
       const pool = getPool();
-      const since = new Date(Date.now() - days * 86400000);
       const pidClause = pid ? `AND project_id = ${pid}` : '';
 
       const { rows } = await pool.query(
         `SELECT healing_strategy FROM healing_actions
-         WHERE created_at >= $1 AND ($2::int IS NULL OR company_id = $2) ${pidClause}`,
-        [since, cid],
+         WHERE created_at >= $1 AND created_at < $3 AND ($2::int IS NULL OR company_id = $2) ${pidClause}`,
+        [since, cid, until],
       );
 
       const counts: Record<string, number> = {};
@@ -327,18 +377,16 @@ export function createDashboardRouter(): Router {
   /** GET /api/dashboard/stats/cost-savings?period=7d&projectId=1 */
   router.get('/stats/cost-savings', async (req: Request, res: Response) => {
     try {
-      const period = (req.query.period as string) || '7d';
-      const days = period === '30d' ? 30 : period === '90d' ? 90 : 7;
+      const { since, until } = resolveWindow(req);
       const cid = (req as any).companyId;
       const pid = req.query.projectId ? parseInt(req.query.projectId as string, 10) : null;
       const pool = getPool();
-      const since = new Date(Date.now() - days * 86400000);
       const pidClause = pid ? `AND project_id = ${pid}` : '';
 
       const { rows } = await pool.query(
         `SELECT ai_tokens_used FROM healing_actions
-         WHERE created_at >= $1 AND ($2::int IS NULL OR company_id = $2) ${pidClause}`,
-        [since, cid],
+         WHERE created_at >= $1 AND created_at < $3 AND ($2::int IS NULL OR company_id = $2) ${pidClause}`,
+        [since, cid, until],
       );
 
       const totalActions = rows.length;
