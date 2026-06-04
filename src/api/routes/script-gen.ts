@@ -46,6 +46,7 @@ import * as fs from 'fs';
 import { CrawlOrchestrator } from '../../intelligence/crawl-orchestrator';
 import { PatternMatcher } from '../../intelligence/pattern-matcher';
 import { IntelligenceFusionService } from '../../services/intelligence-fusion-service';
+import { getContextFromRequest } from '../middleware/context';
 
 export function createScriptGenRouter(): Router {
   const router = Router();
@@ -163,6 +164,10 @@ export function createScriptGenRouter(): Router {
 
       // ── Application Intelligence: check cache before crawling ──
       const projectId = (req as any).projectId as number | undefined;
+      // Write-path attribution — environment / sprint selected in the dashboard
+      // (forwarded as x-environment-id / x-sprint-id headers, resolved by
+      // contextMiddleware). Undefined values let the DB triggers stamp defaults.
+      const { environmentId, sprintId } = getContextFromRequest(req);
       const crawlDecision = await crawlOrchestrator.decideCrawlStrategy(url, companyId, {
         forceFreshCrawl: forceFreshCrawl ?? false,
         authConfig: sanitizedAuthConfig,
@@ -284,6 +289,8 @@ export function createScriptGenRouter(): Router {
         files_generated: result.generatedFiles.map((f: GeneratedFile) => ({ path: f.path, size: f.content.length, type: f.type })),
         negative_tests_included: config.includeNegativeTests,
         intelligence_metadata: intelligenceMetadata,
+        environment_id: environmentId ?? null,
+        sprint_id: sprintId ?? null,
       }, companyId, projectId);
 
       console.log(`[ScriptGen] ✅ Generation complete — ID ${scriptId}, ${result.generatedFiles.length} files, ${generationTimeMs}ms, project=${projectId || 'none'}`);

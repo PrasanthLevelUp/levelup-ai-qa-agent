@@ -12,6 +12,7 @@
 
 import { Router, type Request, type Response } from 'express';
 import { logger } from '../../utils/logger';
+import { getContextFromRequest } from '../middleware/context';
 import {
   createRequirement,
   getRequirements,
@@ -48,6 +49,9 @@ export function createRequirementsRouter(): Router {
       const companyId = (req as any).companyId;
       const projectId = (req as any).projectId ?? null;
       const userId = (req as any).userId ?? null;
+      // Write-path attribution — environment / sprint selected in the dashboard.
+      // Undefined values let the DB triggers stamp the project defaults.
+      const { environmentId, sprintId } = getContextFromRequest(req);
       const {
         title,
         description,
@@ -85,6 +89,8 @@ export function createRequirementsRouter(): Router {
         tags: tags ?? null,
         createdBy: userId,
         metadata: metadata ?? null,
+        environmentId: environmentId ?? null,
+        sprintId: sprintId ?? null,
       });
 
       logger.info(MOD, 'Requirement created', {
