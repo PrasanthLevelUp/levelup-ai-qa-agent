@@ -54,7 +54,8 @@ function sanitizeConfig(toolType: string, config: Record<string, any>): Record<s
 router.get('/config', async (req: Request, res: Response) => {
   try {
     const cid = (req as any).companyId;
-    const configs = await getNotificationConfigs(cid);
+    const uid = (req as any).userId;
+    const configs = await getNotificationConfigs(cid, uid);
     const sanitized = configs.map((c) => ({
       ...c,
       config: sanitizeConfig(c.tool_type, c.config),
@@ -81,6 +82,7 @@ router.get('/config', async (req: Request, res: Response) => {
 router.post('/config', async (req: Request, res: Response) => {
   try {
     const cid = (req as any).companyId;
+    const uid = (req as any).userId;
     const { toolType, displayName, config } = req.body;
     if (!toolType || !displayName) {
       res.status(400).json({ success: false, error: 'toolType and displayName are required' });
@@ -91,7 +93,7 @@ router.post('/config', async (req: Request, res: Response) => {
       tool_type: toolType,
       display_name: displayName,
       config: config || {},
-    }, cid);
+    }, cid, uid);
 
     res.json({
       success: true,
@@ -124,7 +126,8 @@ router.delete('/config/:id', async (req: Request, res: Response) => {
     }
 
     const cid = (req as any).companyId as number | undefined;
-    const deleted = await deleteNotificationConfig(id, cid);
+    const uid = (req as any).userId as number | undefined;
+    const deleted = await deleteNotificationConfig(id, cid, uid);
     if (!deleted) {
       res.status(404).json({ success: false, error: 'Not found' });
       return;
@@ -273,8 +276,9 @@ router.post('/test', async (req: Request, res: Response) => {
 router.get('/logs', async (req: Request, res: Response) => {
   try {
     const cid = (req as any).companyId;
+    const uid = (req as any).userId;
     const limit = parseInt(String(req.query.limit || "50")) || 50;
-    const logs = await getNotificationLogs(limit, cid);
+    const logs = await getNotificationLogs(limit, cid, uid);
     res.json({ success: true, data: logs });
   } catch (error) {
     logger.error(MOD, 'GET /logs error', { error: (error as Error).message });
