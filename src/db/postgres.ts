@@ -6,6 +6,11 @@
 import { Pool, type PoolClient } from 'pg';
 import { logger } from '../utils/logger';
 import { RTM_STATEMENTS, RTM_TABLES, applyRtmSchema } from './rtm-schema';
+import {
+  ENV_SPRINT_STATEMENTS,
+  ENV_SPRINT_TABLES,
+  applyEnvSprintSchema,
+} from './environment-sprint-schema';
 
 const MOD = 'postgres';
 
@@ -114,6 +119,8 @@ const REQUIRED_TABLES = [
   'webhook_configs', 'webhook_events', 'release_windows',
   // RTM (Requirements Traceability Matrix)
   ...RTM_TABLES,
+  // Environment & Sprint management (Phase 1 Foundation)
+  ...ENV_SPRINT_TABLES,
 ];
 
 export async function initDb(): Promise<void> {
@@ -1207,6 +1214,16 @@ async function initSchema(client: PoolClient): Promise<void> {
   // failure degrades gracefully instead of aborting startup.
   console.log('🔧 [DB] Phase RTM: Requirements Traceability Matrix...');
   for (const stmt of RTM_STATEMENTS) {
+    await run(stmt.label, stmt.sql);
+  }
+
+  // ─── Phase ENV/SPRINT: Environment & Sprint management ──────────
+  // Applied after RTM so the requirements table and every project_id column
+  // (added during migrateDefaultCompany) already exist before we add the
+  // environment_id / sprint_id link columns and the triggers that reference
+  // them. Idempotent + routed through the same safeExec runner.
+  console.log('🔧 [DB] Phase ENV/SPRINT: Environment & Sprint management...');
+  for (const stmt of ENV_SPRINT_STATEMENTS) {
     await run(stmt.label, stmt.sql);
   }
 
@@ -5354,6 +5371,9 @@ export async function updateProject(id: number, companyId: number, data: {
   release_day_of_week?: number | null;
   release_timezone?: string;
   overview_default_range?: string;
+  sprint_duration_weeks?: number;
+  auto_create_sprints?: boolean;
+  sprint_naming_pattern?: string;
 }): Promise<any | null> {
   const pool = getPool();
   const sets: string[] = [];
@@ -5366,6 +5386,9 @@ export async function updateProject(id: number, companyId: number, data: {
   if (data.release_day_of_week !== undefined) { sets.push(`release_day_of_week = $${idx++}`); vals.push(data.release_day_of_week); }
   if (data.release_timezone !== undefined) { sets.push(`release_timezone = $${idx++}`); vals.push(data.release_timezone); }
   if (data.overview_default_range !== undefined) { sets.push(`overview_default_range = $${idx++}`); vals.push(data.overview_default_range); }
+  if (data.sprint_duration_weeks !== undefined) { sets.push(`sprint_duration_weeks = $${idx++}`); vals.push(data.sprint_duration_weeks); }
+  if (data.auto_create_sprints !== undefined) { sets.push(`auto_create_sprints = $${idx++}`); vals.push(data.auto_create_sprints); }
+  if (data.sprint_naming_pattern !== undefined) { sets.push(`sprint_naming_pattern = $${idx++}`); vals.push(data.sprint_naming_pattern); }
   if (sets.length === 0) return getProject(id, companyId);
   sets.push(`updated_at = NOW()`);
   vals.push(id, companyId);
@@ -7126,6 +7149,522 @@ export async function runRTMMigration(): Promise<{ ok: number; fail: number }> {
   });
   logger.info(MOD, `RTM migration complete (${result.ok} ok, ${result.fail} errors)`);
   return result;
+}
+
+/**
+ * Run the Environment & Sprint schema programmatically on demand (mirrors
+ * runRTMMigration). Idempotent — safe to call repeatedly.
+ */
+export async function runEnvSprintMigration(): Promise<{ ok: number; fail: number }> {
+  const result = await applyEnvSprintSchema(getPool(), (label, err) => {
+    logger.error(MOD, `Env/Sprint migration statement failed: ${label}`, { error: err.message });
+  });
+  logger.info(MOD, `Env/Sprint migration complete (${result.ok} ok, ${result.fail} errors)`);
+  return result;
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+ * Environment & Sprint Management — DB helpers (Phase 1 Foundation)
+ * ════════════════════════════════════════════════════════════════════════ */
+
+export interface ProjectEnvironment {
+  id: number;
+  company_id: number | null;
+  project_id: number;
+  name: string;
+  base_url: string | null;
+  description: string | null;
+  environment_type: string;
+  is_default: boolean;
+  is_active: boolean;
+  health_status: string | null;
+  last_health_check_at: string | null;
+  created_by: number | null;
+  created_at: string;
+  updated_at: string;
+  metadata: any;
+}
+
+export interface ProjectSprint {
+  id: number;
+  company_id: number | null;
+  project_id: number;
+  name: string;
+  sprint_type: string;
+  start_date: string | null;
+  end_date: string | null;
+  status: string;
+  is_current: boolean;
+  goals: string | null;
+  created_by: number | null;
+  created_at: string;
+  updated_at: string;
+  completed_at: string | null;
+  metadata: any;
+}
+
+/* ─── Environments ──────────────────────────────────────────────────── */
+
+export async function listEnvironments(
+  projectId: number,
+  opts: { includeInactive?: boolean } = {},
+): Promise<ProjectEnvironment[]> {
+  const pool = getPool();
+  const where = opts.includeInactive ? '' : 'AND is_active = true';
+  const { rows } = await pool.query(
+    `SELECT * FROM project_environments
+      WHERE project_id = $1 ${where}
+      ORDER BY is_default DESC, lower(name) ASC`,
+    [projectId],
+  );
+  return rows;
+}
+
+export async function getEnvironment(id: number, projectId: number): Promise<ProjectEnvironment | null> {
+  const pool = getPool();
+  const { rows } = await pool.query(
+    `SELECT * FROM project_environments WHERE id = $1 AND project_id = $2`,
+    [id, projectId],
+  );
+  return rows[0] || null;
+}
+
+export async function getDefaultEnvironment(projectId: number): Promise<ProjectEnvironment | null> {
+  const pool = getPool();
+  const { rows } = await pool.query(
+    `SELECT * FROM project_environments
+      WHERE project_id = $1 AND is_default = true AND is_active = true
+      LIMIT 1`,
+    [projectId],
+  );
+  return rows[0] || null;
+}
+
+export async function getEnvironmentByName(projectId: number, name: string): Promise<ProjectEnvironment | null> {
+  const pool = getPool();
+  const { rows } = await pool.query(
+    `SELECT * FROM project_environments
+      WHERE project_id = $1 AND lower(name) = lower($2) AND is_active = true
+      LIMIT 1`,
+    [projectId, name],
+  );
+  return rows[0] || null;
+}
+
+export async function createEnvironment(data: {
+  company_id?: number | null;
+  project_id: number;
+  name: string;
+  base_url?: string | null;
+  description?: string | null;
+  environment_type?: string | null;
+  is_default?: boolean;
+  created_by?: number | null;
+}): Promise<ProjectEnvironment> {
+  const pool = getPool();
+  // First environment for a project becomes the default automatically.
+  let isDefault = data.is_default === true;
+  if (!isDefault) {
+    const { rows: cnt } = await pool.query(
+      `SELECT COUNT(*)::int AS c FROM project_environments WHERE project_id = $1 AND is_active = true`,
+      [data.project_id],
+    );
+    if ((cnt[0]?.c || 0) === 0) isDefault = true;
+  }
+  const { rows } = await pool.query(
+    `INSERT INTO project_environments
+       (company_id, project_id, name, base_url, description, environment_type, is_default, created_by)
+     VALUES ($1, $2, $3, $4, $5, COALESCE($6, 'custom'), $7, $8)
+     RETURNING *`,
+    [
+      data.company_id ?? null,
+      data.project_id,
+      data.name,
+      data.base_url ?? null,
+      data.description ?? null,
+      data.environment_type ?? null,
+      isDefault,
+      data.created_by ?? null,
+    ],
+  );
+  return rows[0];
+}
+
+export async function updateEnvironment(
+  id: number,
+  projectId: number,
+  data: {
+    name?: string;
+    base_url?: string | null;
+    description?: string | null;
+    environment_type?: string;
+    is_default?: boolean;
+    is_active?: boolean;
+  },
+): Promise<ProjectEnvironment | null> {
+  const pool = getPool();
+  const sets: string[] = [];
+  const vals: any[] = [];
+  let i = 1;
+  for (const [k, v] of Object.entries(data)) {
+    if (v === undefined) continue;
+    sets.push(`${k} = $${i++}`);
+    vals.push(v);
+  }
+  if (sets.length === 0) return getEnvironment(id, projectId);
+  vals.push(id, projectId);
+  const { rows } = await pool.query(
+    `UPDATE project_environments SET ${sets.join(', ')}
+      WHERE id = $${i++} AND project_id = $${i}
+      RETURNING *`,
+    vals,
+  );
+  return rows[0] || null;
+}
+
+export async function setDefaultEnvironment(id: number, projectId: number): Promise<ProjectEnvironment | null> {
+  const pool = getPool();
+  // The enforce_single_default_environment trigger demotes the previous default.
+  const { rows } = await pool.query(
+    `UPDATE project_environments SET is_default = true
+      WHERE id = $1 AND project_id = $2 AND is_active = true
+      RETURNING *`,
+    [id, projectId],
+  );
+  return rows[0] || null;
+}
+
+export async function deleteEnvironment(id: number, projectId: number): Promise<boolean> {
+  const pool = getPool();
+  // Soft delete; if it was the default, promote the next active environment.
+  const { rows } = await pool.query(
+    `UPDATE project_environments SET is_active = false, is_default = false
+      WHERE id = $1 AND project_id = $2 AND is_active = true
+      RETURNING is_default`,
+    [id, projectId],
+  );
+  if (rows.length === 0) return false;
+  const promote = await pool.query(
+    `SELECT id FROM project_environments
+      WHERE project_id = $1 AND is_active = true
+      ORDER BY created_at ASC LIMIT 1`,
+    [projectId],
+  );
+  if (promote.rows.length > 0) {
+    const hasDefault = await pool.query(
+      `SELECT 1 FROM project_environments WHERE project_id = $1 AND is_default = true AND is_active = true LIMIT 1`,
+      [projectId],
+    );
+    if (hasDefault.rows.length === 0) {
+      await pool.query(`UPDATE project_environments SET is_default = true WHERE id = $1`, [promote.rows[0].id]);
+    }
+  }
+  return true;
+}
+
+export async function getEnvironmentUsageStats(id: number, projectId: number): Promise<{
+  testExecutions: number;
+  generatedScripts: number;
+  healingActions: number;
+  rcaAnalyses: number;
+}> {
+  const pool = getPool();
+  const safeCount = async (sql: string): Promise<number> => {
+    try {
+      const { rows } = await pool.query(sql, [id]);
+      return rows[0]?.c || 0;
+    } catch {
+      return 0;
+    }
+  };
+  // Guard against the case where the environment doesn't belong to the project.
+  const env = await getEnvironment(id, projectId);
+  if (!env) return { testExecutions: 0, generatedScripts: 0, healingActions: 0, rcaAnalyses: 0 };
+  const [testExecutions, generatedScripts, healingActions, rcaAnalyses] = await Promise.all([
+    safeCount(`SELECT COUNT(*)::int AS c FROM test_executions WHERE environment_id = $1`),
+    safeCount(`SELECT COUNT(*)::int AS c FROM generated_scripts WHERE environment_id = $1`),
+    safeCount(`SELECT COUNT(*)::int AS c FROM healing_actions WHERE environment_id = $1`),
+    safeCount(`SELECT COUNT(*)::int AS c FROM rca_analyses WHERE environment_id = $1`),
+  ]);
+  return { testExecutions, generatedScripts, healingActions, rcaAnalyses };
+}
+
+export async function recordEnvironmentHealth(
+  id: number,
+  projectId: number,
+  status: string,
+): Promise<void> {
+  const pool = getPool();
+  await pool.query(
+    `UPDATE project_environments
+        SET health_status = $3, last_health_check_at = NOW()
+      WHERE id = $1 AND project_id = $2`,
+    [id, projectId, status],
+  );
+}
+
+/* ─── Sprints ───────────────────────────────────────────────────────── */
+
+export async function listSprints(
+  projectId: number,
+  opts: { status?: string; limit?: number } = {},
+): Promise<ProjectSprint[]> {
+  const pool = getPool();
+  const params: any[] = [projectId];
+  let where = 'project_id = $1';
+  if (opts.status) {
+    params.push(opts.status);
+    where += ` AND status = $${params.length}`;
+  }
+  let limit = '';
+  if (opts.limit) {
+    params.push(opts.limit);
+    limit = ` LIMIT $${params.length}`;
+  }
+  const { rows } = await pool.query(
+    `SELECT * FROM project_sprints WHERE ${where}
+      ORDER BY COALESCE(start_date, created_at::date) DESC, id DESC${limit}`,
+    params,
+  );
+  return rows;
+}
+
+export async function getSprint(id: number, projectId: number): Promise<ProjectSprint | null> {
+  const pool = getPool();
+  const { rows } = await pool.query(
+    `SELECT * FROM project_sprints WHERE id = $1 AND project_id = $2`,
+    [id, projectId],
+  );
+  return rows[0] || null;
+}
+
+export async function getCurrentSprint(projectId: number): Promise<ProjectSprint | null> {
+  const pool = getPool();
+  // Prefer an explicitly flagged current sprint; fall back to the one whose
+  // date range contains today; finally the most recent active sprint.
+  const { rows } = await pool.query(
+    `SELECT * FROM project_sprints
+      WHERE project_id = $1
+      ORDER BY
+        (is_current = true) DESC,
+        (CURRENT_DATE BETWEEN COALESCE(start_date, CURRENT_DATE) AND COALESCE(end_date, CURRENT_DATE)) DESC,
+        (status = 'active') DESC,
+        COALESCE(start_date, created_at::date) DESC
+      LIMIT 1`,
+    [projectId],
+  );
+  return rows[0] || null;
+}
+
+export async function createSprint(data: {
+  company_id?: number | null;
+  project_id: number;
+  name: string;
+  sprint_type?: string | null;
+  start_date?: string | null;
+  end_date?: string | null;
+  status?: string | null;
+  is_current?: boolean;
+  goals?: string | null;
+  created_by?: number | null;
+}): Promise<ProjectSprint> {
+  const pool = getPool();
+  const { rows } = await pool.query(
+    `INSERT INTO project_sprints
+       (company_id, project_id, name, sprint_type, start_date, end_date, status, is_current, goals, created_by)
+     VALUES ($1, $2, $3, COALESCE($4, 'standard'), $5, $6, COALESCE($7, 'planned'), $8, $9, $10)
+     RETURNING *`,
+    [
+      data.company_id ?? null,
+      data.project_id,
+      data.name,
+      data.sprint_type ?? null,
+      data.start_date ?? null,
+      data.end_date ?? null,
+      data.status ?? null,
+      data.is_current === true,
+      data.goals ?? null,
+      data.created_by ?? null,
+    ],
+  );
+  return rows[0];
+}
+
+export async function updateSprint(
+  id: number,
+  projectId: number,
+  data: {
+    name?: string;
+    sprint_type?: string;
+    start_date?: string | null;
+    end_date?: string | null;
+    status?: string;
+    is_current?: boolean;
+    goals?: string | null;
+  },
+): Promise<ProjectSprint | null> {
+  const pool = getPool();
+  const sets: string[] = [];
+  const vals: any[] = [];
+  let i = 1;
+  for (const [k, v] of Object.entries(data)) {
+    if (v === undefined) continue;
+    sets.push(`${k} = $${i++}`);
+    vals.push(v);
+  }
+  if (sets.length === 0) return getSprint(id, projectId);
+  vals.push(id, projectId);
+  const { rows } = await pool.query(
+    `UPDATE project_sprints SET ${sets.join(', ')}
+      WHERE id = $${i++} AND project_id = $${i}
+      RETURNING *`,
+    vals,
+  );
+  return rows[0] || null;
+}
+
+export async function activateSprint(id: number, projectId: number): Promise<ProjectSprint | null> {
+  const pool = getPool();
+  // The enforce_single_current_sprint trigger demotes any previous current sprint.
+  const { rows } = await pool.query(
+    `UPDATE project_sprints
+        SET is_current = true,
+            status = CASE WHEN status IN ('planned', 'completed', 'cancelled') THEN 'active' ELSE status END
+      WHERE id = $1 AND project_id = $2
+      RETURNING *`,
+    [id, projectId],
+  );
+  return rows[0] || null;
+}
+
+export async function completeSprint(id: number, projectId: number): Promise<ProjectSprint | null> {
+  const pool = getPool();
+  const { rows } = await pool.query(
+    `UPDATE project_sprints
+        SET status = 'completed', is_current = false, completed_at = NOW()
+      WHERE id = $1 AND project_id = $2
+      RETURNING *`,
+    [id, projectId],
+  );
+  return rows[0] || null;
+}
+
+export async function deleteSprint(id: number, projectId: number): Promise<boolean> {
+  const pool = getPool();
+  const { rowCount } = await pool.query(
+    `DELETE FROM project_sprints WHERE id = $1 AND project_id = $2`,
+    [id, projectId],
+  );
+  return (rowCount ?? 0) > 0;
+}
+
+/**
+ * Aggregate QA metrics for a sprint (counts + healing success rate). Each
+ * sub-query is individually guarded so a missing column/table degrades to 0
+ * instead of throwing.
+ */
+export async function getSprintMetrics(id: number, projectId: number): Promise<{
+  testExecutions: number;
+  passed: number;
+  failed: number;
+  generatedScripts: number;
+  healingActions: number;
+  healingSucceeded: number;
+  healingSuccessRate: number;
+  rcaAnalyses: number;
+}> {
+  const pool = getPool();
+  const sprint = await getSprint(id, projectId);
+  const zero = {
+    testExecutions: 0, passed: 0, failed: 0, generatedScripts: 0,
+    healingActions: 0, healingSucceeded: 0, healingSuccessRate: 0, rcaAnalyses: 0,
+  };
+  if (!sprint) return zero;
+  const one = async (sql: string): Promise<any> => {
+    try {
+      const { rows } = await pool.query(sql, [id]);
+      return rows[0] || {};
+    } catch {
+      return {};
+    }
+  };
+  const te = await one(
+    `SELECT COUNT(*)::int AS total,
+            COUNT(*) FILTER (WHERE lower(status) IN ('passed','pass','success'))::int AS passed,
+            COUNT(*) FILTER (WHERE lower(status) IN ('failed','fail','error'))::int AS failed
+       FROM test_executions WHERE sprint_id = $1`,
+  );
+  const gs = await one(`SELECT COUNT(*)::int AS c FROM generated_scripts WHERE sprint_id = $1`);
+  const ha = await one(
+    `SELECT COUNT(*)::int AS total,
+            COUNT(*) FILTER (WHERE success = true)::int AS succeeded
+       FROM healing_actions WHERE sprint_id = $1`,
+  );
+  const rca = await one(`SELECT COUNT(*)::int AS c FROM rca_analyses WHERE sprint_id = $1`);
+  const healingActions = ha.total || 0;
+  const healingSucceeded = ha.succeeded || 0;
+  return {
+    testExecutions: te.total || 0,
+    passed: te.passed || 0,
+    failed: te.failed || 0,
+    generatedScripts: gs.c || 0,
+    healingActions,
+    healingSucceeded,
+    healingSuccessRate: healingActions > 0 ? Math.round((healingSucceeded / healingActions) * 1000) / 10 : 0,
+    rcaAnalyses: rca.c || 0,
+  };
+}
+
+/* ─── User project context ──────────────────────────────────────────── */
+
+export async function getUserProjectContext(userId: number, projectId: number): Promise<any | null> {
+  const pool = getPool();
+  const { rows } = await pool.query(
+    `SELECT * FROM user_project_context WHERE user_id = $1 AND project_id = $2`,
+    [userId, projectId],
+  );
+  return rows[0] || null;
+}
+
+export async function upsertUserProjectContext(data: {
+  company_id?: number | null;
+  user_id: number;
+  project_id: number;
+  environment_id?: number | null;
+  sprint_id?: number | null;
+  time_range?: string | null;
+  time_range_start?: string | null;
+  time_range_end?: string | null;
+  preferences?: any;
+}): Promise<any> {
+  const pool = getPool();
+  const { rows } = await pool.query(
+    `INSERT INTO user_project_context
+       (company_id, user_id, project_id, environment_id, sprint_id, time_range, time_range_start, time_range_end, preferences)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, COALESCE($9, '{}'::jsonb))
+     ON CONFLICT (user_id, project_id) DO UPDATE SET
+       company_id = COALESCE(EXCLUDED.company_id, user_project_context.company_id),
+       environment_id = EXCLUDED.environment_id,
+       sprint_id = EXCLUDED.sprint_id,
+       time_range = EXCLUDED.time_range,
+       time_range_start = EXCLUDED.time_range_start,
+       time_range_end = EXCLUDED.time_range_end,
+       preferences = COALESCE(EXCLUDED.preferences, user_project_context.preferences),
+       updated_at = NOW()
+     RETURNING *`,
+    [
+      data.company_id ?? null,
+      data.user_id,
+      data.project_id,
+      data.environment_id ?? null,
+      data.sprint_id ?? null,
+      data.time_range ?? null,
+      data.time_range_start ?? null,
+      data.time_range_end ?? null,
+      data.preferences ?? null,
+    ],
+  );
+  return rows[0];
 }
 
 
