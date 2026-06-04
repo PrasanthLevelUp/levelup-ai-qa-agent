@@ -132,9 +132,9 @@ export class GitHubService {
    * Retrieve the stored GitHub PAT for a company.
    * Returns null if not configured.
    */
-  async getToken(companyId?: number): Promise<string | null> {
+  async getToken(companyId?: number, userId?: number): Promise<string | null> {
     try {
-      const config = await getNotificationConfigByType('github', companyId);
+      const config = await getNotificationConfigByType('github', companyId, userId);
       if (!config || !config.config?.token) return null;
       return config.config.token as string;
     } catch (err) {
@@ -148,8 +148,8 @@ export class GitHubService {
   /**
    * Check if GitHub is connected and the token is valid.
    */
-  async getConnectionStatus(companyId?: number): Promise<GitHubConnectionStatus> {
-    const token = await this.getToken(companyId);
+  async getConnectionStatus(companyId?: number, userId?: number): Promise<GitHubConnectionStatus> {
+    const token = await this.getToken(companyId, userId);
     if (!token) {
       return { connected: false, error: 'GitHub not configured. Connect via Tools page.' };
     }
@@ -194,8 +194,9 @@ export class GitHubService {
   async listRepos(
     companyId?: number,
     options?: { page?: number; perPage?: number; sort?: string },
+    userId?: number,
   ): Promise<{ repos: GitHubRepo[]; hasMore: boolean; error?: string }> {
-    const token = await this.getToken(companyId);
+    const token = await this.getToken(companyId, userId);
     if (!token) return { repos: [], hasMore: false, error: 'GitHub not connected' };
 
     const page = options?.page ?? 1;
@@ -239,8 +240,9 @@ export class GitHubService {
     repoOwner: string,
     repoName: string,
     companyId?: number,
+    userId?: number,
   ): Promise<{ branches: GitHubBranch[]; error?: string }> {
-    const token = await this.getToken(companyId);
+    const token = await this.getToken(companyId, userId);
     if (!token) return { branches: [], error: 'GitHub not connected' };
 
     try {
@@ -276,8 +278,9 @@ export class GitHubService {
   async createPullRequest(
     request: PRCreationRequest,
     companyId?: number,
+    userId?: number,
   ): Promise<PRCreationResult> {
-    const token = await this.getToken(companyId);
+    const token = await this.getToken(companyId, userId);
     if (!token) {
       return { success: false, error: 'GitHub not connected. Connect via Tools page.' };
     }

@@ -29,7 +29,8 @@ export function createGitHubRouter(): Router {
   router.get('/status', async (req: Request, res: Response) => {
     try {
       const companyId = (req as any).companyId as number | undefined;
-      const status = await github.getConnectionStatus(companyId);
+      const userId = (req as any).userId as number | undefined;
+      const status = await github.getConnectionStatus(companyId, userId);
       res.json({ success: true, data: status });
     } catch (err: any) {
       logger.error(MOD, 'GET /status error', { error: err.message });
@@ -41,11 +42,12 @@ export function createGitHubRouter(): Router {
   router.get('/repos', async (req: Request, res: Response) => {
     try {
       const companyId = (req as any).companyId as number | undefined;
+      const userId = (req as any).userId as number | undefined;
       const page = parseInt(req.query.page as string) || 1;
       const perPage = parseInt(req.query.per_page as string) || 30;
       const sort = String(req.query.sort || 'pushed');
 
-      const result = await github.listRepos(companyId, { page, perPage, sort });
+      const result = await github.listRepos(companyId, { page, perPage, sort }, userId);
 
       if (result.error) {
         res.status(400).json({ success: false, error: result.error });
@@ -67,6 +69,7 @@ export function createGitHubRouter(): Router {
   router.get('/repos/:owner/:repo/branches', async (req: Request, res: Response) => {
     try {
       const companyId = (req as any).companyId as number | undefined;
+      const userId = (req as any).userId as number | undefined;
       const owner = String(req.params.owner);
       const repo = String(req.params.repo);
 
@@ -75,7 +78,7 @@ export function createGitHubRouter(): Router {
         return;
       }
 
-      const result = await github.listBranches(owner, repo, companyId);
+      const result = await github.listBranches(owner, repo, companyId, userId);
 
       if (result.error) {
         res.status(400).json({ success: false, error: result.error });
@@ -93,6 +96,7 @@ export function createGitHubRouter(): Router {
   router.post('/create-pr', async (req: Request, res: Response) => {
     try {
       const companyId = (req as any).companyId as number | undefined;
+      const userId = (req as any).userId as number | undefined;
       const {
         repoOwner,
         repoName,
@@ -156,7 +160,7 @@ export function createGitHubRouter(): Router {
         fileCount: resolvedFiles.length,
       });
 
-      const result = await github.createPullRequest(prRequest, companyId);
+      const result = await github.createPullRequest(prRequest, companyId, userId);
 
       if (!result.success) {
         res.status(400).json({ success: false, error: result.error });

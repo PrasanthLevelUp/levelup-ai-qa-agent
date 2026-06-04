@@ -474,13 +474,14 @@ async function initSchema(client: PoolClient): Promise<void> {
 
   await run('notification_configs', `CREATE TABLE IF NOT EXISTS notification_configs (
     id SERIAL PRIMARY KEY,
-    tool_type TEXT NOT NULL UNIQUE,
+    tool_type TEXT NOT NULL,
     display_name TEXT NOT NULL,
     status TEXT DEFAULT 'connected',
     config JSONB DEFAULT '{}',
     connected_at TIMESTAMPTZ,
     last_tested_at TIMESTAMPTZ,
     last_test_result TEXT,
+    user_id INTEGER,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW()
   )`);
@@ -494,6 +495,7 @@ async function initSchema(client: PoolClient): Promise<void> {
     status TEXT DEFAULT 'sent',
     error TEXT,
     metadata JSONB DEFAULT '{}',
+    user_id INTEGER,
     created_at TIMESTAMPTZ DEFAULT NOW()
   )`);
 
@@ -542,6 +544,13 @@ async function initSchema(client: PoolClient): Promise<void> {
     END IF;
     IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='company_id') THEN
       ALTER TABLE users ADD COLUMN company_id INTEGER REFERENCES companies(id);
+    END IF;
+    -- User-scoping for tool/integration connections (security: per-user, not per-tenant)
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='notification_configs' AND column_name='user_id') THEN
+      ALTER TABLE notification_configs ADD COLUMN user_id INTEGER REFERENCES users(id);
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='notification_logs' AND column_name='user_id') THEN
+      ALTER TABLE notification_logs ADD COLUMN user_id INTEGER REFERENCES users(id);
     END IF;
   END $$`);
 
@@ -593,7 +602,9 @@ async function initSchema(client: PoolClient): Promise<void> {
     `CREATE INDEX IF NOT EXISTS idx_rca_company ON rca_analyses(company_id)`,
     `CREATE INDEX IF NOT EXISTS idx_pr_company ON pr_automations(company_id)`,
     `CREATE INDEX IF NOT EXISTS idx_notif_config_company ON notification_configs(company_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_notif_config_user ON notification_configs(user_id)`,
     `CREATE INDEX IF NOT EXISTS idx_notif_log_company ON notification_logs(company_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_notif_log_user ON notification_logs(user_id)`,
     `CREATE INDEX IF NOT EXISTS idx_users_company ON users(company_id)`,
   ];
   for (const idx of indexes) {
@@ -1227,18 +1238,29 @@ async function migrateDefaultCompany(client: PoolClient): Promise<void> {
       `UPDATE ${t} SET company_id = ${defaultId} WHERE company_id IS NULL`);
   }
 
-  // Migrate notification_configs unique constraint
+  // Migrate notification_configs unique constraint.
+  // Tools/integrations are USER-scoped (security fix): uniqueness is keyed by
+  // (tool_type, company, user) so each user owns their own connection and can
+  // never see or use another user's stored credentials.
   await safeExec(client, 'notif_constraint_migration', `
     DO $$ BEGIN
+      -- Drop the original global UNIQUE(tool_type) constraint if it still exists
       IF EXISTS (
         SELECT 1 FROM pg_constraint
         WHERE conname = 'notification_configs_tool_type_key'
           AND conrelid = 'notification_configs'::regclass
       ) THEN
         ALTER TABLE notification_configs DROP CONSTRAINT notification_configs_tool_type_key;
-        CREATE UNIQUE INDEX IF NOT EXISTS uq_notif_tool_company
-          ON notification_configs (tool_type, COALESCE(company_id, 0));
       END IF;
+      -- Drop the previous company-only unique index (superseded by per-user index)
+      IF EXISTS (
+        SELECT 1 FROM pg_class WHERE relname = 'uq_notif_tool_company'
+      ) THEN
+        DROP INDEX IF EXISTS uq_notif_tool_company;
+      END IF;
+      -- Per-(tool, company, user) uniqueness
+      CREATE UNIQUE INDEX IF NOT EXISTS uq_notif_tool_company_user
+        ON notification_configs (tool_type, COALESCE(company_id, 0), COALESCE(user_id, 0));
     END $$`);
 
   // ── Add project_id to existing tables ──
@@ -3198,23 +3220,47 @@ export interface NotificationConfig {
   connected_at: string | null;
   last_tested_at: string | null;
   last_test_result: string | null;
+  user_id: number | null;
   created_at: string;
   updated_at: string;
 }
 
-export async function getNotificationConfigs(companyId?: number): Promise<NotificationConfig[]> {
-  const cf = companyId ? `WHERE company_id = ${companyId}` : '';
+/**
+ * List tool/integration connections.
+ *
+ * SECURITY: Tools are USER-scoped. When a userId is supplied (i.e. the request
+ * carries a valid session) only that user's connections are returned — a user
+ * can never see another team member's stored credentials. The companyId filter
+ * is kept as a defense-in-depth tenant boundary.
+ *
+ * When userId is omitted (e.g. internal/system calls without a session), we
+ * fall back to company-only scoping for backwards compatibility.
+ */
+export async function getNotificationConfigs(companyId?: number, userId?: number): Promise<NotificationConfig[]> {
+  const where: string[] = [];
+  const params: any[] = [];
+  if (companyId != null) { params.push(companyId); where.push(`company_id = $${params.length}`); }
+  if (userId != null) { params.push(userId); where.push(`user_id = $${params.length}`); }
+  const clause = where.length ? `WHERE ${where.join(' AND ')}` : '';
   const result = await getPool().query(
-    `SELECT * FROM notification_configs ${cf} ORDER BY created_at ASC`,
+    `SELECT * FROM notification_configs ${clause} ORDER BY created_at ASC`,
+    params,
   );
   return result.rows;
 }
 
-export async function getNotificationConfigByType(toolType: string, companyId?: number): Promise<NotificationConfig | null> {
-  const cfAnd = companyId ? `AND company_id = ${companyId}` : '';
+export async function getNotificationConfigByType(
+  toolType: string,
+  companyId?: number,
+  userId?: number,
+): Promise<NotificationConfig | null> {
+  const params: any[] = [toolType];
+  const where: string[] = [`tool_type = $1`];
+  if (companyId != null) { params.push(companyId); where.push(`company_id = $${params.length}`); }
+  if (userId != null) { params.push(userId); where.push(`user_id = $${params.length}`); }
   const result = await getPool().query(
-    `SELECT * FROM notification_configs WHERE tool_type = $1 ${cfAnd}`,
-    [toolType],
+    `SELECT * FROM notification_configs WHERE ${where.join(' AND ')} ORDER BY updated_at DESC LIMIT 1`,
+    params,
   );
   return result.rows[0] || null;
 }
@@ -3223,12 +3269,13 @@ export async function upsertNotificationConfig(data: {
   tool_type: string;
   display_name: string;
   config: Record<string, any>;
-}, companyId?: number): Promise<NotificationConfig> {
+}, companyId?: number, userId?: number): Promise<NotificationConfig> {
   const cid = companyId ?? null;
+  const uid = userId ?? null;
   const result = await getPool().query(
-    `INSERT INTO notification_configs (tool_type, display_name, status, config, connected_at, updated_at, company_id)
-     VALUES ($1, $2, 'connected', $3, NOW(), NOW(), $4)
-     ON CONFLICT (tool_type, COALESCE(company_id, 0))
+    `INSERT INTO notification_configs (tool_type, display_name, status, config, connected_at, updated_at, company_id, user_id)
+     VALUES ($1, $2, 'connected', $3, NOW(), NOW(), $4, $5)
+     ON CONFLICT (tool_type, COALESCE(company_id, 0), COALESCE(user_id, 0))
      DO UPDATE SET
        display_name = EXCLUDED.display_name,
        config = EXCLUDED.config,
@@ -3237,17 +3284,18 @@ export async function upsertNotificationConfig(data: {
        updated_at = NOW(),
        last_test_result = NULL
      RETURNING *`,
-    [data.tool_type, data.display_name, JSON.stringify(data.config), cid],
+    [data.tool_type, data.display_name, JSON.stringify(data.config), cid, uid],
   );
   return result.rows[0];
 }
 
-export async function deleteNotificationConfig(id: number, companyId?: number): Promise<boolean> {
-  const cfAnd = companyId ? `AND company_id = $2` : '';
+export async function deleteNotificationConfig(id: number, companyId?: number, userId?: number): Promise<boolean> {
   const params: any[] = [id];
-  if (companyId) params.push(companyId);
+  const where: string[] = [`id = $1`];
+  if (companyId != null) { params.push(companyId); where.push(`company_id = $${params.length}`); }
+  if (userId != null) { params.push(userId); where.push(`user_id = $${params.length}`); }
   const result = await getPool().query(
-    `DELETE FROM notification_configs WHERE id = $1 ${cfAnd}`,
+    `DELETE FROM notification_configs WHERE ${where.join(' AND ')}`,
     params,
   );
   return (result.rowCount ?? 0) > 0;
@@ -3280,10 +3328,10 @@ export async function insertNotificationLog(data: {
   status: string;
   error?: string;
   metadata?: Record<string, any>;
-}, companyId?: number): Promise<number> {
+}, companyId?: number, userId?: number): Promise<number> {
   const result = await getPool().query(
-    `INSERT INTO notification_logs (tool_type, event_type, channel, message_preview, status, error, metadata, company_id)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+    `INSERT INTO notification_logs (tool_type, event_type, channel, message_preview, status, error, metadata, company_id, user_id)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
      RETURNING id`,
     [
       data.tool_type,
@@ -3294,16 +3342,37 @@ export async function insertNotificationLog(data: {
       data.error ?? null,
       JSON.stringify(data.metadata ?? {}),
       companyId ?? null,
+      userId ?? null,
     ],
   );
   return result.rows[0].id;
 }
 
-export async function getNotificationLogs(limit = 50, companyId?: number): Promise<any[]> {
-  const cf = companyId ? `WHERE company_id = ${companyId}` : '';
+export async function getNotificationLogs(
+  limit = 50,
+  companyId?: number,
+  userId?: number,
+): Promise<any[]> {
+  const conditions: string[] = [];
+  const params: any[] = [];
+  let idx = 1;
+
+  // User-scoped: only return this user's logs when a userId is provided.
+  if (userId !== undefined && userId !== null) {
+    conditions.push(`user_id = $${idx++}`);
+    params.push(userId);
+  }
+  // Defense-in-depth company scoping.
+  if (companyId !== undefined && companyId !== null) {
+    conditions.push(`company_id = $${idx++}`);
+    params.push(companyId);
+  }
+
+  const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+  params.push(limit);
   const result = await getPool().query(
-    `SELECT * FROM notification_logs ${cf} ORDER BY created_at DESC LIMIT $1`,
-    [limit],
+    `SELECT * FROM notification_logs ${where} ORDER BY created_at DESC LIMIT $${idx}`,
+    params,
   );
   return result.rows;
 }
