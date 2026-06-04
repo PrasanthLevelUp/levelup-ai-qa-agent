@@ -5371,6 +5371,9 @@ export async function updateProject(id: number, companyId: number, data: {
   release_day_of_week?: number | null;
   release_timezone?: string;
   overview_default_range?: string;
+  sprint_duration_weeks?: number;
+  auto_create_sprints?: boolean;
+  sprint_naming_pattern?: string;
 }): Promise<any | null> {
   const pool = getPool();
   const sets: string[] = [];
@@ -5383,6 +5386,9 @@ export async function updateProject(id: number, companyId: number, data: {
   if (data.release_day_of_week !== undefined) { sets.push(`release_day_of_week = $${idx++}`); vals.push(data.release_day_of_week); }
   if (data.release_timezone !== undefined) { sets.push(`release_timezone = $${idx++}`); vals.push(data.release_timezone); }
   if (data.overview_default_range !== undefined) { sets.push(`overview_default_range = $${idx++}`); vals.push(data.overview_default_range); }
+  if (data.sprint_duration_weeks !== undefined) { sets.push(`sprint_duration_weeks = $${idx++}`); vals.push(data.sprint_duration_weeks); }
+  if (data.auto_create_sprints !== undefined) { sets.push(`auto_create_sprints = $${idx++}`); vals.push(data.auto_create_sprints); }
+  if (data.sprint_naming_pattern !== undefined) { sets.push(`sprint_naming_pattern = $${idx++}`); vals.push(data.sprint_naming_pattern); }
   if (sets.length === 0) return getProject(id, companyId);
   sets.push(`updated_at = NOW()`);
   vals.push(id, companyId);
