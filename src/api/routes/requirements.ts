@@ -21,6 +21,8 @@ import {
   deleteRequirement,
   getRequirementCoverage,
   getCoverageSummary,
+  getTestCasesForRequirement,
+  getRequirementAutomationCoverage,
 } from '../../db/postgres';
 
 const MOD = 'requirements-routes';
@@ -161,6 +163,35 @@ export function createRequirementsRouter(): Router {
     } catch (error: any) {
       logger.error(MOD, 'Failed to get requirement coverage', { error: error?.message });
       res.status(500).json({ success: false, error: 'Failed to get requirement coverage' });
+    }
+  });
+
+  /* ─── Test cases for a requirement (Sprint 4B) ───────────────────────
+   * Lists the test cases linked to a requirement (RTM UUID FK) along with
+   * their automation status — powers the requirement → test-case selector and
+   * the automation badges. `?include_automation_status=true` is accepted for
+   * forward-compat; automation fields are always returned regardless. */
+  router.get('/:id/test-cases', async (req: Request, res: Response) => {
+    try {
+      const companyId = (req as any).companyId;
+      const testCases = await getTestCasesForRequirement(String(req.params.id), companyId);
+      res.json({ success: true, data: testCases, count: testCases.length });
+    } catch (error: any) {
+      logger.error(MOD, 'Failed to list requirement test cases', { error: error?.message });
+      res.status(500).json({ success: false, error: 'Failed to list requirement test cases' });
+    }
+  });
+
+  /* ─── Automation coverage for a requirement (Sprint 4B) ──────────────
+   * Returns { totalTestCases, automatedCount, automationPercentage }. */
+  router.get('/:id/automation-coverage', async (req: Request, res: Response) => {
+    try {
+      const companyId = (req as any).companyId;
+      const coverage = await getRequirementAutomationCoverage(String(req.params.id), companyId);
+      res.json({ success: true, data: coverage });
+    } catch (error: any) {
+      logger.error(MOD, 'Failed to get requirement automation coverage', { error: error?.message });
+      res.status(500).json({ success: false, error: 'Failed to get requirement automation coverage' });
     }
   });
 

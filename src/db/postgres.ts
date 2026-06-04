@@ -4509,14 +4509,143 @@ export async function getTestCaseById(
 
 export async function getTestCasesByRequirement(requirementId: number): Promise<any[]> {
   const pool = getPool();
+  // Sprint 4 — also surface automation state so the Test Case Lab can render an
+  // "🤖 Automated (N scripts)" badge per case:
+  //   • script_count       — number of (non-deleted) generated scripts linked
+  //   • automation_status   — derived string: automated | automation_in_progress | not_automated
   const r = await pool.query(
-    `SELECT tc.*, ts.scenario, ts.coverage_type
+    `SELECT tc.*, ts.scenario, ts.coverage_type,
+            COALESCE(sc.script_count, 0)::int AS script_count,
+            CASE
+              WHEN COALESCE(sc.script_count, 0) > 0 OR tc.is_automated = true THEN 'automated'
+              ELSE 'not_automated'
+            END AS automation_status
      FROM generated_test_cases tc
      JOIN generated_test_scenarios ts ON tc.scenario_id = ts.id
+     LEFT JOIN (
+       SELECT test_case_id, COUNT(*)::int AS script_count
+       FROM generated_scripts
+       WHERE deleted_at IS NULL
+       GROUP BY test_case_id
+     ) sc ON sc.test_case_id = tc.id
      WHERE ts.requirement_id = $1
      ORDER BY tc.priority, tc.id`, [requirementId]
   );
   return r.rows;
+}
+
+/**
+ * Sprint 4B — Mark a test case as automated.
+ *
+ * Called after a script is successfully generated for a test case. Sets the
+ * boolean flag, records the script that automated it, and stamps the time.
+ * Tolerates legacy rows with a NULL company_id so older test cases can still be
+ * flipped, but never crosses into a different company.
+ *
+ * @returns true if a row was updated, false otherwise (e.g. wrong company).
+ */
+export async function markTestCaseAutomated(
+  testCaseId: number,
+  scriptId: number | null,
+  companyId?: number | null,
+): Promise<boolean> {
+  const pool = getPool();
+  const vals: any[] = [scriptId, testCaseId];
+  let companyClause = '';
+  if (companyId !== undefined && companyId !== null) {
+    vals.push(companyId);
+    companyClause = ` AND (company_id = $${vals.length} OR company_id IS NULL)`;
+  }
+  const r = await pool.query(
+    `UPDATE generated_test_cases
+     SET is_automated = true,
+         last_automated_script_id = $1,
+         last_automated_at = NOW()
+     WHERE id = $2${companyClause}`,
+    vals,
+  );
+  return (r.rowCount ?? 0) > 0;
+}
+
+/**
+ * Sprint 4B — List test cases for an RTM requirement (UUID FK) with their
+ * automation status. Powers `GET /api/requirements/:id/test-cases`.
+ *
+ * `generated_test_cases.requirement_id` is a UUID column (added by the RTM
+ * schema), so this is the RTM path — distinct from getTestCasesByRequirement,
+ * which resolves via the scenario's numeric requirement_id.
+ */
+export async function getTestCasesForRequirement(
+  requirementId: string,
+  companyId?: number | null,
+): Promise<any[]> {
+  const pool = getPool();
+  const conds = ['tc.requirement_id = $1'];
+  const vals: any[] = [requirementId];
+  if (companyId !== undefined && companyId !== null) {
+    conds.push(`(tc.company_id = $${vals.length + 1} OR tc.company_id IS NULL)`);
+    vals.push(companyId);
+  }
+  const r = await pool.query(
+    `SELECT
+        tc.id,
+        tc.title,
+        tc.priority,
+        tc.severity,
+        tc.steps,
+        tc.expected_result,
+        tc.preconditions,
+        tc.test_data,
+        tc.tags,
+        tc.automation_ready,
+        COALESCE(tc.is_automated, false) AS is_automated,
+        tc.last_automated_script_id,
+        tc.last_automated_at,
+        tc.requirement_id,
+        tc.created_at
+     FROM generated_test_cases tc
+     WHERE ${conds.join(' AND ')}
+     ORDER BY tc.priority, tc.id`,
+    vals,
+  );
+  return r.rows;
+}
+
+/**
+ * Sprint 4B — Automation-coverage stats for a single RTM requirement.
+ * Powers `GET /api/requirements/:id/automation-coverage`.
+ *
+ * Returns total test cases, how many are automated, and the rounded percentage
+ * (0 when the requirement has no test cases — never divides by zero).
+ */
+export async function getRequirementAutomationCoverage(
+  requirementId: string,
+  companyId?: number | null,
+): Promise<{ totalTestCases: number; automatedCount: number; automationPercentage: number }> {
+  const pool = getPool();
+  const conds = ['requirement_id = $1'];
+  const vals: any[] = [requirementId];
+  if (companyId !== undefined && companyId !== null) {
+    conds.push(`(company_id = $${vals.length + 1} OR company_id IS NULL)`);
+    vals.push(companyId);
+  }
+  const r = await pool.query(
+    `SELECT
+        COUNT(*)::int AS total_test_cases,
+        COUNT(*) FILTER (WHERE is_automated = true)::int AS automated_count,
+        ROUND(
+          100.0 * COUNT(*) FILTER (WHERE is_automated = true) / GREATEST(COUNT(*), 1)
+        )::int AS automation_percentage
+     FROM generated_test_cases
+     WHERE ${conds.join(' AND ')}`,
+    vals,
+  );
+  const row = r.rows[0] ?? {};
+  return {
+    totalTestCases: row.total_test_cases ?? 0,
+    automatedCount: row.automated_count ?? 0,
+    automationPercentage: row.automation_percentage ?? 0,
+  };
 }
 
 // ---- Application Knowledge ----
@@ -7123,6 +7252,7 @@ export async function getRequirements(params: {
     `SELECT
         r.*,
         COUNT(DISTINCT tc.id)::int AS test_case_count,
+        COUNT(DISTINCT tc.id) FILTER (WHERE tc.is_automated = true)::int AS automated_count,
         COUNT(DISTINCT gs.id)::int AS script_count,
         COUNT(DISTINCT te.id)::int AS execution_count
      FROM requirements r
@@ -7849,6 +7979,43 @@ export async function getSprintMetrics(id: number, projectId: number): Promise<{
 }
 
 /* ─── User project context ──────────────────────────────────────────── */
+
+/**
+ * Sprint 4B — Fetch the base/app URL stored on a project's context, used as the
+ * fallback when no environment base_url is available (see services/url-resolver).
+ * Prefers a project-scoped active context; tolerates legacy rows with a NULL
+ * company_id. Returns the trimmed app_url or null.
+ */
+export async function getProjectContextAppUrl(
+  projectId?: number | null,
+  companyId?: number | null,
+): Promise<string | null> {
+  const pool = getPool();
+  const conds: string[] = ['pc.is_active = true', "COALESCE(pc.app_url, '') <> ''"];
+  const vals: any[] = [];
+  if (projectId !== undefined && projectId !== null) {
+    conds.push(`pc.project_id = $${vals.length + 1}`);
+    vals.push(projectId);
+  }
+  if (companyId !== undefined && companyId !== null) {
+    conds.push(`(pc.company_id = $${vals.length + 1} OR pc.company_id IS NULL)`);
+    vals.push(companyId);
+  }
+  try {
+    const { rows } = await pool.query(
+      `SELECT pc.app_url
+         FROM project_contexts pc
+        WHERE ${conds.join(' AND ')}
+        ORDER BY pc.updated_at DESC NULLS LAST, pc.created_at DESC
+        LIMIT 1`,
+      vals,
+    );
+    const url = rows[0]?.app_url;
+    return typeof url === 'string' && url.trim() ? url.trim() : null;
+  } catch {
+    return null;
+  }
+}
 
 export async function getUserProjectContext(userId: number, projectId: number): Promise<any | null> {
   const pool = getPool();

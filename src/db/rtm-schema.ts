@@ -206,6 +206,75 @@ export const RTM_STATEMENTS: RtmStatement[] = [
     label: 'idx_gtc_requirement',
     sql: `CREATE INDEX IF NOT EXISTS idx_gtc_requirement ON generated_test_cases(requirement_id)`,
   },
+
+  /* ─── Sprint 4B: Automation tracking on generated_test_cases ──────────
+   * Boolean-flag model (is_automated) plus a pointer to the script that
+   * automated the case and a timestamp. Additive + backward compatible:
+   * legacy rows default to is_automated=false. A backfill statement below
+   * flips existing test cases that already have a generated script. */
+  {
+    label: 'gtc_is_automated',
+    sql: `DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'generated_test_cases' AND column_name = 'is_automated'
+      ) THEN
+        ALTER TABLE generated_test_cases ADD COLUMN is_automated BOOLEAN DEFAULT false;
+      END IF;
+    END $$`,
+  },
+  {
+    label: 'gtc_last_automated_script_id',
+    sql: `DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'generated_test_cases' AND column_name = 'last_automated_script_id'
+      ) THEN
+        ALTER TABLE generated_test_cases ADD COLUMN last_automated_script_id INTEGER;
+      END IF;
+    END $$`,
+  },
+  {
+    label: 'gtc_last_automated_at',
+    sql: `DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'generated_test_cases' AND column_name = 'last_automated_at'
+      ) THEN
+        ALTER TABLE generated_test_cases ADD COLUMN last_automated_at TIMESTAMPTZ;
+      END IF;
+    END $$`,
+  },
+  {
+    label: 'idx_gtc_is_automated',
+    sql: `CREATE INDEX IF NOT EXISTS idx_gtc_is_automated
+      ON generated_test_cases(is_automated) WHERE is_automated = true`,
+  },
+  {
+    // Backfill: any test case that already has a (non-deleted) generated script
+    // is, by definition, automated. Pick the most recent script per test case
+    // (DISTINCT ON) so last_automated_script_id / _at are unambiguous. Only
+    // touches rows still marked not-automated, so it is safe to re-run.
+    label: 'backfill_gtc_automation',
+    sql: `UPDATE generated_test_cases tc
+      SET is_automated = true,
+          last_automated_script_id = sub.script_id,
+          last_automated_at = sub.created_at
+      FROM (
+        SELECT DISTINCT ON (gs.test_case_id)
+               gs.test_case_id,
+               gs.id          AS script_id,
+               gs.created_at  AS created_at
+        FROM generated_scripts gs
+        WHERE gs.test_case_id IS NOT NULL AND gs.deleted_at IS NULL
+        ORDER BY gs.test_case_id, gs.created_at DESC, gs.id DESC
+      ) sub
+      WHERE tc.id = sub.test_case_id
+        AND COALESCE(tc.is_automated, false) = false`,
+  },
   {
     label: 'gs_test_case_id',
     sql: `DO $$
