@@ -26,12 +26,13 @@ export function createReleaseSignoffRouter(): Router {
   router.get('/generate', async (req: Request, res: Response) => {
     try {
       const cid = (req as any).companyId;
+      const pid = (req as any).projectId;
       const days = parseInt(req.query.days as string, 10) || 30;
 
       // Gather all data sources in parallel
       const [riskData, flakyTests, learningStats] = await Promise.all([
-        getReleaseRiskData(days, cid),
-        getFlakyTests(cid),
+        getReleaseRiskData(days, cid, pid),
+        getFlakyTests(cid, pid),
         getLearningStats(cid),
       ]);
 
@@ -64,11 +65,12 @@ export function createReleaseSignoffRouter(): Router {
   router.get('/decision', async (req: Request, res: Response) => {
     try {
       const cid = (req as any).companyId;
+      const pid = (req as any).projectId;
       const days = parseInt(req.query.days as string, 10) || 30;
 
       const [riskData, flakyTests, learningStats] = await Promise.all([
-        getReleaseRiskData(days, cid),
-        getFlakyTests(cid),
+        getReleaseRiskData(days, cid, pid),
+        getFlakyTests(cid, pid),
         getLearningStats(cid),
       ]);
 

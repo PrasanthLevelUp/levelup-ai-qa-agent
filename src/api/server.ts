@@ -179,8 +179,8 @@ export function createServer(): express.Application {
   app.use('/api/learning', authMiddleware, companyMiddleware, sessionMiddleware, createLearningRouter());
   app.use('/api/companies', authMiddleware, sessionMiddleware, createCompaniesRouter());
   app.use('/api/similarity', authMiddleware, companyMiddleware, sessionMiddleware, createSimilarityRouter());
-  app.use('/api/release-risk', authMiddleware, companyMiddleware, sessionMiddleware, createReleaseRiskRouter());
-  app.use('/api/release-signoff', authMiddleware, companyMiddleware, sessionMiddleware, createReleaseSignoffRouter());
+  app.use('/api/release-risk', authMiddleware, companyMiddleware, sessionMiddleware, projectContextMiddleware, createReleaseRiskRouter());
+  app.use('/api/release-signoff', authMiddleware, companyMiddleware, sessionMiddleware, projectContextMiddleware, createReleaseSignoffRouter());
   app.use('/api/rca-intelligence', authMiddleware, companyMiddleware, sessionMiddleware, createRCAIntelligenceRouter());
   app.use('/api/roi', authMiddleware, companyMiddleware, sessionMiddleware, createROIRouter());
   app.use('/api/test-coverage', authMiddleware, companyMiddleware, sessionMiddleware, projectContextMiddleware, createTestCoverageRouter());

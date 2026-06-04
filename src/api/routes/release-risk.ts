@@ -24,8 +24,9 @@ export function createReleaseRiskRouter(): Router {
   router.get('/assess', async (req: Request, res: Response) => {
     try {
       const cid = (req as any).companyId;
+      const pid = (req as any).projectId;
       const days = parseInt(req.query.days as string, 10) || 30;
-      const data = await getReleaseRiskData(days, cid);
+      const data = await getReleaseRiskData(days, cid, pid);
       const result = computeReleaseRisk(data);
       res.json(result);
     } catch (err) {
@@ -41,8 +42,9 @@ export function createReleaseRiskRouter(): Router {
   router.get('/trend', async (req: Request, res: Response) => {
     try {
       const cid = (req as any).companyId;
+      const pid = (req as any).projectId;
       const days = parseInt(req.query.days as string, 10) || 30;
-      const trend = await getRiskTrend(days, cid);
+      const trend = await getRiskTrend(days, cid, pid);
       res.json(trend);
     } catch (err) {
       logger.error(MOD, 'Failed to get risk trend', { error: err });
@@ -57,8 +59,9 @@ export function createReleaseRiskRouter(): Router {
   router.get('/signals', async (req: Request, res: Response) => {
     try {
       const cid = (req as any).companyId;
+      const pid = (req as any).projectId;
       const days = parseInt(req.query.days as string, 10) || 30;
-      const data = await getReleaseRiskData(days, cid);
+      const data = await getReleaseRiskData(days, cid, pid);
       const result = computeReleaseRisk(data);
       res.json(result.signals);
     } catch (err) {
@@ -74,8 +77,9 @@ export function createReleaseRiskRouter(): Router {
   router.get('/modules', async (req: Request, res: Response) => {
     try {
       const cid = (req as any).companyId;
+      const pid = (req as any).projectId;
       const days = parseInt(req.query.days as string, 10) || 30;
-      const data = await getReleaseRiskData(days, cid);
+      const data = await getReleaseRiskData(days, cid, pid);
       const result = computeReleaseRisk(data);
       res.json(result.riskAreas);
     } catch (err) {
