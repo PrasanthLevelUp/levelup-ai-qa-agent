@@ -2890,6 +2890,27 @@ export interface GeneratedScriptRecord {
   url: string;
   /** RTM link — the generated_test_cases.id this script implements (optional). */
   test_case_id?: number | null;
+  /**
+   * Sprint 4 — RTM link to the originating business requirement (UUID FK to
+   * requirements.id). Optional; populated when the generation request supplies
+   * a requirementId or when traceability auto-linking resolves one. NULL for
+   * legacy/url-based generations.
+   */
+  requirement_id?: string | null;
+  /**
+   * Sprint 4 — how this script was produced. One of:
+   *   'url_based'        — classic crawl-from-URL flow (default / backward compat)
+   *   'test_case_based'  — generated from a structured test case + steps
+   *   'requirement_based'— generated directly from a requirement
+   *   'hybrid'           — combination of the above
+   */
+  generation_source?: string;
+  /**
+   * Sprint 4 — structured locator-resolution report produced by the
+   * LocatorResolver (per-element strategy, confidence, source, validation
+   * status, and any low-confidence TODO annotations). Stored as JSONB.
+   */
+  locator_report?: any;
   page_type?: string;
   workflow_graph?: any;
   instructions?: string;
@@ -2927,6 +2948,28 @@ export interface GeneratedScriptRecord {
     profileCacheUsed?: boolean;
     crawlDecisionReason?: string;
     profileId?: string;
+    /* ---- Sprint 4: Enterprise Script Generation Enhancement ---- */
+    /** Which intelligence sources contributed (and at what weight) during fusion. */
+    intelligenceSources?: Array<{ source: string; weight: number; contributed: boolean }>;
+    /** Whether structured test-case data was fused into generation. */
+    testCaseDataUsed?: boolean;
+    testCaseId?: number;
+    /** Aggregate locator-resolution confidence (0..1) across resolved elements. */
+    locatorConfidence?: number;
+    /** Count of locators flagged low-confidence (annotated with // TODO). */
+    locatorTodoCount?: number;
+    /** Folder/placement decisions taken by the FolderStructureAnalyzer. */
+    folderDecision?: {
+      testRoot?: string;
+      targetDirectory?: string;
+      fileName?: string;
+      namingConvention?: string;
+      reason?: string;
+    };
+    /** Locator + folder strategies requested for this generation. */
+    locatorStrategy?: string;
+    folderStrategy?: string;
+    generationSource?: string;
   };
 }
 
@@ -2936,8 +2979,9 @@ export async function logGeneratedScript(data: GeneratedScriptRecord, companyId?
       (url, test_case_id, page_type, workflow_graph, instructions, script_content, test_plan,
        validation_status, reliability_score, review_score, review_issues,
        tokens_used, model, generation_time_ms, files_generated, negative_tests_included,
-       company_id, project_id, intelligence_metadata, environment_id, sprint_id)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
+       company_id, project_id, intelligence_metadata, environment_id, sprint_id,
+       requirement_id, generation_source, locator_report)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)
     RETURNING id`,
     [
       data.url,
@@ -2961,6 +3005,10 @@ export async function logGeneratedScript(data: GeneratedScriptRecord, companyId?
       data.intelligence_metadata ? JSON.stringify(data.intelligence_metadata) : null,
       data.environment_id ?? null,
       data.sprint_id ?? null,
+      // Sprint 4 — RTM requirement link, provenance, and locator report.
+      data.requirement_id ?? null,
+      data.generation_source ?? 'url_based',
+      data.locator_report ? JSON.stringify(data.locator_report) : '{}',
     ],
   );
   return result.rows[0].id;
@@ -4376,6 +4424,87 @@ export async function getTestCases(scenarioId: number): Promise<any[]> {
     [scenarioId]
   );
   return r.rows;
+}
+
+/**
+ * Fetch a single generated test case by its primary key, scoped to the
+ * company (cross-company access returns null — security: don't reveal
+ * existence). Enriches the row with:
+ *   • scenario   — the owning generated_test_scenarios row (title, coverage)
+ *   • requirement — the linked RTM requirement (if generated_test_cases has a
+ *                   requirement_id), so the Script Gen page can show the full
+ *                   Requirement → Test Case context banner in one round-trip.
+ *
+ * Used by GET /api/test-cases/:id (Sprint 4 — Enterprise Script Gen).
+ */
+export async function getTestCaseById(
+  id: number,
+  companyId?: number,
+): Promise<any | null> {
+  const pool = getPool();
+  const conds = ['tc.id = $1'];
+  const vals: any[] = [id];
+  // company_id may be NULL on legacy rows — match either the company or NULL so
+  // older test cases remain visible, but never leak across distinct companies.
+  if (companyId !== undefined && companyId !== null) {
+    conds.push(`(tc.company_id = $${vals.length + 1} OR tc.company_id IS NULL)`);
+    vals.push(companyId);
+  }
+
+  const r = await pool.query(
+    `SELECT tc.*,
+            ts.id            AS scenario_pk,
+            ts.scenario      AS scenario_title,
+            ts.coverage_type AS scenario_coverage_type,
+            ts.requirement_id AS scenario_requirement_id
+     FROM generated_test_cases tc
+     LEFT JOIN generated_test_scenarios ts ON tc.scenario_id = ts.id
+     WHERE ${conds.join(' AND ')}
+     LIMIT 1`,
+    vals,
+  );
+  const row = r.rows[0];
+  if (!row) return null;
+
+  // Attach a compact scenario object then drop the flattened helper columns.
+  row.scenario = row.scenario_pk
+    ? {
+        id: row.scenario_pk,
+        title: row.scenario_title,
+        coverage_type: row.scenario_coverage_type,
+        requirement_id: row.scenario_requirement_id,
+      }
+    : null;
+  delete row.scenario_pk;
+  delete row.scenario_title;
+  delete row.scenario_coverage_type;
+  delete row.scenario_requirement_id;
+
+  // Enrich with the linked RTM requirement (generated_test_cases.requirement_id
+  // is a UUID FK added by the RTM schema). Best-effort — never throws.
+  if (row.requirement_id && companyId !== undefined && companyId !== null) {
+    try {
+      const req = await getRequirement(String(row.requirement_id), companyId);
+      row.requirement = req
+        ? {
+            id: req.id,
+            requirement_id: req.requirement_id,
+            title: req.title,
+            priority: req.priority,
+            category: req.category,
+            acceptance_criteria: req.acceptance_criteria ?? null,
+            status: req.status,
+            coverage_percentage: req.coverage_percentage,
+          }
+        : null;
+    } catch {
+      row.requirement = null;
+    }
+  } else {
+    row.requirement = null;
+  }
+
+  return row;
 }
 
 export async function getTestCasesByRequirement(requirementId: number): Promise<any[]> {
@@ -7997,9 +8126,18 @@ export async function unlinkTestCaseFromRequirement(
  * Given a script that targets a test case, this:
  *   - ensures generated_scripts.test_case_id is set (fires the script coverage trigger)
  *   - records a testcase_to_script link
- *   - resolves the requirement via the test case and records a requirement_to_script link
+ *   - resolves the requirement via the test case (or an explicitly supplied
+ *     requirementId) and, if a requirement is known but the test case isn't yet
+ *     linked to it, sets generated_test_cases.requirement_id + creates a
+ *     requirement_to_testcase link
+ *   - stamps generated_scripts.requirement_id (Sprint 4 RTM column)
+ *   - records a requirement_to_script link
+ *
  * Best-effort and defensive: never throws (so it can't break script generation).
- * Returns the resolved requirementId (or null).
+ *
+ * Sprint 4 — returns the resolved requirementId AND a `linksCreated` array
+ * describing which traceability link types were established/ensured during this
+ * call (so the API can surface an `rtmUpdate` summary to the caller).
  */
 export async function autoLinkScriptTraceability(params: {
   scriptId: number;
@@ -8007,8 +8145,16 @@ export async function autoLinkScriptTraceability(params: {
   companyId: number;
   projectId?: number | null;
   userId?: number | null;
-}): Promise<{ requirementId: string | null }> {
+  /**
+   * Sprint 4 — optional explicit requirement to link. When provided and the
+   * test case is not yet linked to a requirement, the test case is linked to
+   * this requirement (FK + requirement_to_testcase link) before scripts are
+   * wired up. When omitted, the requirement is resolved from the test case.
+   */
+  requirementId?: string | null;
+}): Promise<{ requirementId: string | null; linksCreated: string[] }> {
   const pool = getPool();
+  const linksCreated: string[] = [];
   try {
     // Make sure the script points at the test case (idempotent).
     await pool.query(
@@ -8024,14 +8170,49 @@ export async function autoLinkScriptTraceability(params: {
       linkType: 'testcase_to_script',
       createdBy: params.userId ?? null,
     });
+    linksCreated.push('testcase_to_script');
 
+    // Resolve the requirement: prefer the test case's existing FK, else fall
+    // back to an explicitly supplied requirementId.
     const reqRow = await pool.query(
       `SELECT requirement_id FROM generated_test_cases WHERE id = $1 AND company_id = $2`,
       [params.testCaseId, params.companyId],
     );
-    const requirementId: string | null = reqRow.rows[0]?.requirement_id ?? null;
+    let requirementId: string | null = reqRow.rows[0]?.requirement_id ?? null;
+
+    // If the test case has no requirement yet but the caller supplied one,
+    // link the requirement → test case (sets the FK the coverage trigger reads).
+    if (!requirementId && params.requirementId) {
+      const reqCheck = await pool.query(
+        `SELECT id FROM requirements WHERE id = $1 AND company_id = $2 AND deleted_at IS NULL`,
+        [params.requirementId, params.companyId],
+      );
+      if (reqCheck.rows.length > 0) {
+        await pool.query(
+          `UPDATE generated_test_cases SET requirement_id = $1 WHERE id = $2 AND company_id = $3`,
+          [params.requirementId, params.testCaseId, params.companyId],
+        );
+        await createTraceabilityLink({
+          companyId: params.companyId,
+          projectId: params.projectId ?? null,
+          requirementId: params.requirementId,
+          testCaseId: params.testCaseId,
+          linkType: 'requirement_to_testcase',
+          createdBy: params.userId ?? null,
+        });
+        linksCreated.push('requirement_to_testcase');
+        requirementId = params.requirementId;
+      }
+    }
 
     if (requirementId) {
+      // Sprint 4 — stamp the requirement FK directly on the script row so the
+      // script is queryable by requirement without traversing the test case.
+      await pool.query(
+        `UPDATE generated_scripts SET requirement_id = $1 WHERE id = $2 AND company_id = $3`,
+        [requirementId, params.scriptId, params.companyId],
+      );
+
       await createTraceabilityLink({
         companyId: params.companyId,
         projectId: params.projectId ?? null,
@@ -8040,15 +8221,16 @@ export async function autoLinkScriptTraceability(params: {
         linkType: 'requirement_to_script',
         createdBy: params.userId ?? null,
       });
+      linksCreated.push('requirement_to_script');
     }
-    return { requirementId };
+    return { requirementId, linksCreated };
   } catch (err: any) {
     logger.warn(MOD, 'autoLinkScriptTraceability failed (non-fatal)', {
       scriptId: params.scriptId,
       testCaseId: params.testCaseId,
       error: err?.message,
     });
-    return { requirementId: null };
+    return { requirementId: null, linksCreated };
   }
 }
 

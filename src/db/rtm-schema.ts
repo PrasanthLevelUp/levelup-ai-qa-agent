@@ -380,6 +380,61 @@ export const RTM_STATEMENTS: RtmStatement[] = [
       WHEN (NEW.test_case_id IS NOT NULL)
       EXECUTE FUNCTION update_rtm_coverage_from_script()`,
   },
+
+  /* ─── 9. Sprint 4 — Enterprise Script Generation Enhancement ───────────
+   * Adds three convenience/quality columns to generated_scripts:
+   *   • requirement_id    — direct requirement reference (faster lookups; the
+   *                         linkage is still resolvable via the test case, but a
+   *                         direct FK avoids a JOIN on the hot RTM path).
+   *   • generation_source — distinguishes how a script was created
+   *                         ('url_based' | 'test_case_linked' | 'api_direct').
+   *   • locator_report     — JSONB summary of locator quality / sourcing so the
+   *                         dashboard can show "9/12 locators verified against
+   *                         the real DOM" without re-parsing the script body.
+   * All guarded / idempotent so re-running startup never errors. */
+  {
+    label: 'gs_requirement_id_s4',
+    sql: `DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'generated_scripts' AND column_name = 'requirement_id'
+      ) THEN
+        ALTER TABLE generated_scripts
+          ADD COLUMN requirement_id UUID REFERENCES requirements(id) ON DELETE SET NULL;
+      END IF;
+    END $$`,
+  },
+  {
+    label: 'idx_gs_requirement_s4',
+    sql: `CREATE INDEX IF NOT EXISTS idx_gs_requirement ON generated_scripts(requirement_id)`,
+  },
+  {
+    label: 'gs_generation_source_s4',
+    sql: `DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'generated_scripts' AND column_name = 'generation_source'
+      ) THEN
+        ALTER TABLE generated_scripts
+          ADD COLUMN generation_source VARCHAR(50) DEFAULT 'url_based';
+      END IF;
+    END $$`,
+  },
+  {
+    label: 'gs_locator_report_s4',
+    sql: `DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'generated_scripts' AND column_name = 'locator_report'
+      ) THEN
+        ALTER TABLE generated_scripts
+          ADD COLUMN locator_report JSONB DEFAULT '{}'::jsonb;
+      END IF;
+    END $$`,
+  },
 ];
 
 /** Table names RTM adds — surfaced to verifySchema / health checks. */

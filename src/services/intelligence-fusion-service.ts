@@ -47,6 +47,21 @@ const MOD = 'intelligence-fusion';
 
 export interface FusedIntelligence {
   repository?: any;
+  /**
+   * Sprint 4 — structured test-case data fused as a first-class intelligence
+   * source (steps, expected results, preconditions). Drives both the prompt's
+   * "TEST CASE" section and locator resolution.
+   */
+  testCaseData?: {
+    id?: number;
+    title?: string;
+    stepCount: number;
+    steps: Array<{ action?: string; expected?: string; raw?: any }>;
+    preconditions?: string | null;
+    expectedResult?: string | null;
+    priority?: string | null;
+    tags?: string[];
+  } | null;
   appKnowledge?: { itemsCount: number; categoriesCount: number } | null;
   applicationProfile?: any;
   flakyTests?: any[];
@@ -59,6 +74,11 @@ export interface FusedIntelligence {
     sourcesUsed: string[];
     missingCritical: string[];
     warnings: string[];
+    /**
+     * Sprint 4 — per-source contribution breakdown (source name, weight, and
+     * whether it actually contributed) for metadata tracking + UI display.
+     */
+    sourceBreakdown?: Array<{ source: string; weight: number; contributed: boolean }>;
   };
 }
 
@@ -77,18 +97,41 @@ export interface FuseParams {
    */
   preloadedRepoProfile?: any;
   knowledgeItemsCount?: number;
+  /**
+   * Sprint 4 — structured test case (from getTestCaseById). When supplied, the
+   * test-case data is fused as a first-class source and steered into the prompt
+   * and locator resolution. Loose shape to avoid a hard dependency on the DB row type.
+   */
+  testCase?: {
+    id?: number;
+    title?: string;
+    steps?: any;
+    preconditions?: string | null;
+    expected_result?: string | null;
+    priority?: string | null;
+    tags?: any;
+  } | null;
 }
 
-/** Per-source confidence weighting (sums to 100). */
+/**
+ * Per-source confidence weighting (sums to 100).
+ *
+ * Sprint 4 rebalance — introduces `testCaseData` (15) as a first-class source
+ * and reduces repository (30→25) and appKnowledge (20→15) so the totals still
+ * sum to 100 while structured test-case data gets meaningful weight:
+ *   repository 25 + testCaseData 15 + appKnowledge 15 + applicationProfile 15
+ *   + flakyTests 8 + domMemory 8 + learningPatterns 5 + similarTests 5 + rcaInsights 4 = 100
+ */
 const WEIGHTS = {
-  repository: 30,
-  appKnowledge: 20,
+  repository: 25,
+  testCaseData: 15,
+  appKnowledge: 15,
   applicationProfile: 15,
-  flakyTests: 10,
-  domMemory: 10,
+  flakyTests: 8,
+  domMemory: 8,
   learningPatterns: 5,
   similarTests: 5,
-  rcaInsights: 5,
+  rcaInsights: 4,
 } as const;
 
 /* ──────────────────────────────────────────────────────────────────────────
@@ -113,7 +156,7 @@ export class IntelligenceFusionService {
 
     const intelligence: FusedIntelligence = {
       confidenceScore: 0,
-      fusionMetadata: { sourcesUsed: [], missingCritical: [], warnings: [] },
+      fusionMetadata: { sourcesUsed: [], missingCritical: [], warnings: [], sourceBreakdown: [] },
     };
 
     /* 1. Repository Intelligence (CRITICAL) */
@@ -136,6 +179,21 @@ export class IntelligenceFusionService {
       }
     } catch (error) {
       logger.warn(MOD, 'Repository Intelligence error', { error: (error as Error).message });
+    }
+
+    /* 1b. Test Case Data (Sprint 4 — first-class source) */
+    try {
+      if (params.testCase) {
+        intelligence.testCaseData = this.summarizeTestCase(params.testCase);
+        if (intelligence.testCaseData && intelligence.testCaseData.stepCount > 0) {
+          intelligence.confidenceScore += WEIGHTS.testCaseData;
+          intelligence.fusionMetadata.sourcesUsed.push(
+            `Test Case Data (${intelligence.testCaseData.stepCount} steps)`
+          );
+        }
+      }
+    } catch (error) {
+      logger.warn(MOD, 'Test Case Data error', { error: (error as Error).message });
     }
 
     /* 2. App Knowledge (HIGH) */
@@ -237,6 +295,19 @@ export class IntelligenceFusionService {
 
     intelligence.confidenceScore = Math.min(100, Math.max(0, Math.round(intelligence.confidenceScore)));
 
+    /* Sprint 4 — record the per-source contribution breakdown for metadata tracking. */
+    intelligence.fusionMetadata.sourceBreakdown = [
+      { source: 'repository', weight: WEIGHTS.repository, contributed: !!intelligence.repository },
+      { source: 'testCaseData', weight: WEIGHTS.testCaseData, contributed: !!(intelligence.testCaseData && intelligence.testCaseData.stepCount > 0) },
+      { source: 'appKnowledge', weight: WEIGHTS.appKnowledge, contributed: !!(intelligence.appKnowledge && intelligence.appKnowledge.itemsCount > 0) },
+      { source: 'applicationProfile', weight: WEIGHTS.applicationProfile, contributed: !!intelligence.applicationProfile },
+      { source: 'flakyTests', weight: WEIGHTS.flakyTests, contributed: !!(intelligence.flakyTests && intelligence.flakyTests.length > 0) },
+      { source: 'domMemory', weight: WEIGHTS.domMemory, contributed: !!(intelligence.domMemory && intelligence.domMemory.length > 0) },
+      { source: 'learningPatterns', weight: WEIGHTS.learningPatterns, contributed: !!(intelligence.learningPatterns && intelligence.learningPatterns.length > 0) },
+      { source: 'similarTests', weight: WEIGHTS.similarTests, contributed: !!(intelligence.similarTests && intelligence.similarTests.length > 0) },
+      { source: 'rcaInsights', weight: WEIGHTS.rcaInsights, contributed: !!(intelligence.rcaInsights && intelligence.rcaInsights.length > 0) },
+    ];
+
     logger.info(MOD, '=== Intelligence Fusion Complete ===', {
       confidenceScore: intelligence.confidenceScore,
       sourcesUsed: intelligence.fusionMetadata.sourcesUsed,
@@ -244,6 +315,48 @@ export class IntelligenceFusionService {
     });
 
     return intelligence;
+  }
+
+  /**
+   * Sprint 4 — normalise a raw test-case row (from getTestCaseById) into the
+   * compact `testCaseData` summary. Tolerates `steps` being a JSON array of
+   * strings, an array of objects ({ action/step/expected }), or a JSON string.
+   */
+  private summarizeTestCase(tc: FuseParams['testCase']): NonNullable<FusedIntelligence['testCaseData']> {
+    let rawSteps: any = tc?.steps ?? [];
+    if (typeof rawSteps === 'string') {
+      try { rawSteps = JSON.parse(rawSteps); } catch { rawSteps = []; }
+    }
+    if (!Array.isArray(rawSteps)) rawSteps = [];
+
+    const steps = rawSteps.map((s: any) => {
+      if (s && typeof s === 'object') {
+        return {
+          action: s.action ?? s.step ?? s.description ?? s.text ?? undefined,
+          expected: s.expected ?? s.expectedResult ?? s.expected_result ?? undefined,
+          raw: s,
+        };
+      }
+      return { action: String(s), raw: s };
+    });
+
+    let tags: string[] = [];
+    const rawTags = tc?.tags;
+    if (Array.isArray(rawTags)) tags = rawTags.map((t) => String(t));
+    else if (typeof rawTags === 'string') {
+      try { const p = JSON.parse(rawTags); if (Array.isArray(p)) tags = p.map((t) => String(t)); } catch { /* ignore */ }
+    }
+
+    return {
+      id: tc?.id,
+      title: tc?.title,
+      stepCount: steps.length,
+      steps,
+      preconditions: tc?.preconditions ?? null,
+      expectedResult: tc?.expected_result ?? null,
+      priority: tc?.priority ?? null,
+      tags,
+    };
   }
 
   /* ────────────────────────── source loaders ────────────────────────── */
@@ -468,6 +581,30 @@ export class IntelligenceFusionService {
       parts.push(
         '⚠️ INTELLIGENCE WARNINGS:\n' +
           fused.fusionMetadata.warnings.map((w) => `- ${w}`).join('\n')
+      );
+    }
+
+    /* Sprint 4 — structured test case steps drive the generated scenario. */
+    if (fused.testCaseData && fused.testCaseData.stepCount > 0) {
+      const tc = fused.testCaseData;
+      const stepLines = tc.steps
+        .map((s, i) => {
+          const action = s.action ? String(s.action).trim() : `Step ${i + 1}`;
+          const expected = s.expected ? ` → expected: ${String(s.expected).trim()}` : '';
+          return `  ${i + 1}. ${action}${expected}`;
+        })
+        .join('\n');
+      const meta: string[] = [];
+      if (tc.title) meta.push(`Title: ${tc.title}`);
+      if (tc.priority) meta.push(`Priority: ${tc.priority}`);
+      if (tc.preconditions) meta.push(`Preconditions: ${tc.preconditions}`);
+      if (tc.expectedResult) meta.push(`Overall expected result: ${tc.expectedResult}`);
+      parts.push(
+        `📋 TEST CASE (implement these steps faithfully):\n` +
+          (meta.length ? meta.map((m) => `- ${m}`).join('\n') + '\n' : '') +
+          `Steps:\n${stepLines}\n` +
+          'Generate a script that performs EXACTLY these steps in order and asserts the expected results. ' +
+          'Do not invent extra steps; do not skip steps.'
       );
     }
 

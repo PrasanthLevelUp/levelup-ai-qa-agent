@@ -26,7 +26,12 @@ import {
   logProjectExport,
   getKnowledgeItem,
   autoLinkScriptTraceability,
+  getTestCaseById,
+  getRequirement,
+  getProfileByUrl,
 } from '../../db/postgres';
+import { LocatorResolver, type CrawlDataLike, type LocatorReport } from '../../services/locator-resolver';
+import { FolderStructureAnalyzer } from '../../services/folder-analyzer';
 import { ScriptGenEngine, type GenerationConfig, type GenerationResult, type GeneratedFile } from '../../script-gen/script-gen-engine';
 import { getRepositoryContext } from '../../db/postgres';
 import { KnowledgeOptimizer, type KnowledgeItem } from '../../ai/knowledge-optimizer';
@@ -47,6 +52,79 @@ import { CrawlOrchestrator } from '../../intelligence/crawl-orchestrator';
 import { PatternMatcher } from '../../intelligence/pattern-matcher';
 import { IntelligenceFusionService } from '../../services/intelligence-fusion-service';
 import { getContextFromRequest } from '../middleware/context';
+
+/**
+ * Sprint 4 — Extract human-readable element descriptions for locator resolution.
+ *
+ * The Locator Resolution Service needs a flat list of UI element descriptions
+ * (e.g. "Login button", "email input", "Submit") so it can walk the priority
+ * cascade and produce a locator + confidence for each. Those descriptions are
+ * derived from, in order of preference:
+ *   1. The structured test-case steps (when generating from a test case).
+ *   2. The free-text generation instructions (the url-based / legacy flow).
+ *
+ * Step shapes vary across the platform (plain strings, objects with
+ * `action`/`step`/`description`/`text`/`element`, or JSON-encoded strings), so
+ * this helper normalises all of them defensively. It always returns a
+ * de-duplicated array of trimmed, non-empty strings, and never throws — locator
+ * resolution is strictly best-effort and must never break generation.
+ */
+function extractElementDescriptions(
+  testCase: any | null | undefined,
+  instructions: string | null | undefined,
+): string[] {
+  const out: string[] = [];
+
+  const pushText = (val: unknown): void => {
+    if (val == null) return;
+    if (typeof val === 'string') {
+      const trimmed = val.trim();
+      if (trimmed) out.push(trimmed);
+    } else if (typeof val === 'object') {
+      const obj = val as Record<string, unknown>;
+      const candidate =
+        obj.action ?? obj.step ?? obj.description ?? obj.text ?? obj.element ?? obj.name ?? obj.title;
+      if (typeof candidate === 'string') pushText(candidate);
+    }
+  };
+
+  // 1. Prefer structured test-case steps when available.
+  try {
+    let steps: unknown = testCase?.steps;
+    if (typeof steps === 'string') {
+      // Steps may arrive as a JSON-encoded string.
+      try { steps = JSON.parse(steps); } catch { /* leave as raw string */ }
+    }
+    if (Array.isArray(steps)) {
+      for (const s of steps) pushText(s);
+    } else if (typeof steps === 'string' && steps.trim()) {
+      // Newline / numbered-list separated free text.
+      for (const line of steps.split(/\r?\n/)) pushText(line);
+    }
+  } catch { /* non-fatal */ }
+
+  // 2. Fall back to (or augment with) the free-text instructions.
+  if (typeof instructions === 'string' && instructions.trim()) {
+    for (const line of instructions.split(/\r?\n|(?<=[.;])\s+/)) {
+      const trimmed = line.trim();
+      // Skip very short fragments that won't resolve to a meaningful element.
+      if (trimmed.length >= 3) out.push(trimmed);
+    }
+  }
+
+  // De-duplicate (case-insensitive) while preserving order.
+  const seen = new Set<string>();
+  const deduped: string[] = [];
+  for (const item of out) {
+    const key = item.toLowerCase();
+    if (!seen.has(key)) {
+      seen.add(key);
+      deduped.push(item);
+    }
+  }
+  // Cap to a sane number to bound locator-resolution work.
+  return deduped.slice(0, 50);
+}
 
 export function createScriptGenRouter(): Router {
   const router = Router();
@@ -72,6 +150,11 @@ export function createScriptGenRouter(): Router {
         additionalUrls,
         forceFreshCrawl,
         testCaseId,
+        // ── Sprint 4: Enterprise Script Generation Enhancement ──
+        requirementId,
+        generationSource: rawGenerationSource,
+        locatorStrategy,
+        folderStrategy,
       } = req.body;
 
       if (!url || typeof url !== 'string') {
@@ -101,6 +184,30 @@ export function createScriptGenRouter(): Router {
         console.log(`[ScriptGen] Authentication enabled — loginUrl: ${sanitizedAuthConfig.loginUrl ?? '(auto-detect)'}`);
       }
       const companyId = (req as any).companyId as number | undefined;
+
+      // ── Sprint 4: Load the structured test case (steps + requirement) ──
+      // When a testCaseId is supplied, fetch the full test case so its steps
+      // can drive the prompt + locator resolution. Best-effort: a missing test
+      // case never blocks generation (preserves the url-based flow).
+      let testCase: any = null;
+      if (testCaseId != null && companyId != null) {
+        try {
+          testCase = await getTestCaseById(Number(testCaseId), companyId);
+          if (testCase) {
+            console.log(`[ScriptGen] 📋 Test case loaded — id=${testCase.id}, steps=${Array.isArray(testCase.steps) ? testCase.steps.length : 'n/a'}, requirement=${testCase.requirement_id ?? testCase.requirement?.id ?? 'none'}`);
+          } else {
+            console.log(`[ScriptGen] ⚠️ Test case ${testCaseId} not found for company ${companyId} (continuing url-based)`);
+          }
+        } catch (tcErr: any) {
+          console.warn(`[ScriptGen] Could not load test case (non-blocking): ${tcErr?.message}`);
+        }
+      }
+
+      // Resolve the generation provenance. Explicit value wins; otherwise infer
+      // from what the caller supplied (test case / requirement / url).
+      const generationSource: string =
+        (typeof rawGenerationSource === 'string' && rawGenerationSource) ||
+        (testCase ? 'test_case_based' : requirementId ? 'requirement_based' : 'url_based');
 
       // Auto-load repository intelligence if repoId provided
       let repoIntelligence: string | undefined;
@@ -188,6 +295,8 @@ export function createScriptGenRouter(): Router {
             testScenario: instructions || undefined,
             preloadedRepoProfile: repoProfile,
             knowledgeItemsCount: knowledgeItemsUsed.length,
+            // Sprint 4 — fuse structured test-case data as a first-class source.
+            ...(testCase ? { testCase } : {}),
           });
           fusionContext = fusionService.buildFusionContext(fusion) || undefined;
           console.log(`[ScriptGen] 🔮 Fusion confidence=${fusion.confidenceScore}/100, sources=[${fusion.fusionMetadata.sourcesUsed.join(', ')}]`);
@@ -244,6 +353,76 @@ export function createScriptGenRouter(): Router {
       // Determine validation status
       const validationStatus = validationReport.overallScore >= 80 ? 'passed' : 'needs_review';
 
+      // ── Sprint 4: Locator Resolution Report ──
+      // Resolve a locator for each interactive element implied by the test case
+      // steps, walking the priority cascade (App Profile DOM → Knowledge → Repo
+      // patterns → smart fallbacks) and validating against the cached DOM. The
+      // resulting report is persisted for locator-quality tracking. Best-effort.
+      let locatorReport: LocatorReport | null = null;
+      try {
+        const crawlData: CrawlDataLike | null =
+          (crawlDecision.usedCache && crawlDecision.crawlData)
+            ? (crawlDecision.crawlData as CrawlDataLike)
+            : (result.rawCrawlData as CrawlDataLike) ?? null;
+
+        // Element descriptions come from the test case steps (preferred) or the
+        // free-text instructions. Only run when we have something to resolve.
+        const elementDescriptions = extractElementDescriptions(testCase, instructions);
+        if (elementDescriptions.length > 0) {
+          const minConfidence =
+            locatorStrategy && typeof locatorStrategy.minConfidence === 'number'
+              ? locatorStrategy.minConfidence
+              : 50;
+          const resolver = new LocatorResolver({
+            crawlData,
+            knowledgeItems: knowledgeItemsUsed as any[],
+            repoProfile: repoProfile ?? null,
+            minConfidence,
+          });
+          const { report } = resolver.resolveAll(elementDescriptions);
+          locatorReport = report;
+          console.log(`[ScriptGen] 🎯 Locator report — ${report.totalLocators} locators, validated=${report.validatedCount}, avgConfidence=${report.avgConfidence}, todo=${report.todoCount}`);
+        }
+      } catch (locErr: any) {
+        console.warn(`[ScriptGen] Locator resolution non-blocking error: ${locErr?.message}`);
+      }
+
+      // ── Sprint 4: Folder Placement Decision ──
+      // Decide where the primary generated test file should live, honouring the
+      // repo's existing conventions and never overwriting existing files.
+      let folderDecision: { testRoot?: string; targetDirectory?: string; fileName?: string; namingConvention?: string; reason?: string } | undefined;
+      try {
+        if (repoProfile) {
+          const analyzer = new FolderStructureAnalyzer(repoProfile);
+          const featureName = testCase?.title || instructions || 'generated test';
+          const existingFiles = (repoProfile as any)?.testSuites?.map((s: any) => s.filePath).filter(Boolean) ?? [];
+          const placement = analyzer.decidePlacement('test', String(featureName), existingFiles);
+          folderDecision = {
+            testRoot: analyzer.analyze().testRoot,
+            targetDirectory: placement.directory,
+            fileName: placement.fileName,
+            namingConvention: placement.namingConvention,
+            reason: placement.reason,
+          };
+          console.log(`[ScriptGen] 📁 Folder decision — ${placement.targetPath} (${placement.reason})`);
+        }
+      } catch (folderErr: any) {
+        console.warn(`[ScriptGen] Folder analysis non-blocking error: ${folderErr?.message}`);
+      }
+
+      // ── Sprint 4: capture RTM coverage BEFORE linking (for the rtmUpdate delta) ──
+      const coverageRequirementId: string | null =
+        (testCase?.requirement_id as string) ||
+        (testCase?.requirement?.id as string) ||
+        (typeof requirementId === 'string' ? requirementId : null);
+      let coverageBefore: { coverage_percentage?: number; status?: string } | null = null;
+      if (coverageRequirementId && companyId != null) {
+        try {
+          const reqRow = await getRequirement(coverageRequirementId, companyId);
+          if (reqRow) coverageBefore = { coverage_percentage: reqRow.coverage_percentage, status: reqRow.status };
+        } catch { /* non-fatal */ }
+      }
+
       // Build intelligence metadata — tracks every intelligence source used
       const intelligenceMetadata = {
         repoIntelligenceUsed: !!repoIntelligence,
@@ -264,6 +443,15 @@ export function createScriptGenRouter(): Router {
         fusionSourcesUsed: fusion?.fusionMetadata.sourcesUsed ?? [],
         fusionMissingCritical: fusion?.fusionMetadata.missingCritical ?? [],
         fusionWarnings: fusion?.fusionMetadata.warnings ?? [],
+        // ── Sprint 4: Enterprise Script Generation Enhancement ──
+        intelligenceSources: fusion?.fusionMetadata.sourceBreakdown ?? [],
+        testCaseDataUsed: !!(fusion?.testCaseData && fusion.testCaseData.stepCount > 0),
+        testCaseId: testCaseId != null ? Number(testCaseId) : undefined,
+        generationSource,
+        locatorStrategy: typeof locatorStrategy === 'object' ? JSON.stringify(locatorStrategy) : (locatorStrategy ?? undefined),
+        folderStrategy: typeof folderStrategy === 'object' ? JSON.stringify(folderStrategy) : (folderStrategy ?? undefined),
+        ...(locatorReport ? { locatorConfidence: locatorReport.avgConfidence, locatorTodoCount: locatorReport.todoCount } : {}),
+        ...(folderDecision ? { folderDecision } : {}),
       };
 
       console.log(`[ScriptGen] 📊 Intelligence summary: repoIntel=${intelligenceMetadata.repoIntelligenceUsed} (${intelligenceMetadata.repoFramework ?? 'n/a'}), knowledge=${intelligenceMetadata.knowledgeItemsUsed} items, cache=${intelligenceMetadata.profileCacheUsed}, adaptive=${intelligenceMetadata.adaptiveCodegenUsed} (${intelligenceMetadata.adaptiveMode ?? 'n/a'})`);
@@ -291,21 +479,57 @@ export function createScriptGenRouter(): Router {
         intelligence_metadata: intelligenceMetadata,
         environment_id: environmentId ?? null,
         sprint_id: sprintId ?? null,
+        // ── Sprint 4: RTM requirement link, provenance, locator report ──
+        requirement_id: coverageRequirementId ?? null,
+        generation_source: generationSource,
+        locator_report: locatorReport ?? {},
       }, companyId, projectId);
 
       console.log(`[ScriptGen] ✅ Generation complete — ID ${scriptId}, ${result.generatedFiles.length} files, ${generationTimeMs}ms, project=${projectId || 'none'}`);
 
       // RTM: auto-link the script to its test case (and the resolved requirement).
       // Best-effort — never let traceability failures break script generation.
+      // Sprint 4 — capture the links created + the coverage delta for `rtmUpdate`.
+      let rtmUpdate: {
+        requirementId: string | null;
+        linksCreated: string[];
+        coverageBefore: number | null;
+        coverageAfter: number | null;
+        statusBefore: string | null;
+        statusAfter: string | null;
+      } | undefined;
       if (testCaseId != null && companyId != null) {
         try {
-          await autoLinkScriptTraceability({
+          const linkResult = await autoLinkScriptTraceability({
             scriptId,
             testCaseId: Number(testCaseId),
             companyId,
             projectId: projectId ?? null,
             userId: (req as any).userId ?? null,
+            // Sprint 4 — pass an explicit requirement so the link is established
+            // even if the test case wasn't previously linked to one.
+            requirementId: coverageRequirementId ?? null,
           });
+
+          // Re-read coverage AFTER the DB triggers fired to surface the delta.
+          const resolvedReqId = linkResult.requirementId ?? coverageRequirementId;
+          let coverageAfter: { coverage_percentage?: number; status?: string } | null = null;
+          if (resolvedReqId) {
+            try {
+              const reqRow = await getRequirement(resolvedReqId, companyId);
+              if (reqRow) coverageAfter = { coverage_percentage: reqRow.coverage_percentage, status: reqRow.status };
+            } catch { /* non-fatal */ }
+          }
+
+          rtmUpdate = {
+            requirementId: resolvedReqId ?? null,
+            linksCreated: linkResult.linksCreated,
+            coverageBefore: coverageBefore?.coverage_percentage ?? null,
+            coverageAfter: coverageAfter?.coverage_percentage ?? coverageBefore?.coverage_percentage ?? null,
+            statusBefore: coverageBefore?.status ?? null,
+            statusAfter: coverageAfter?.status ?? coverageBefore?.status ?? null,
+          };
+          console.log(`[ScriptGen] 🔗 RTM update — requirement=${rtmUpdate.requirementId ?? 'none'}, links=[${rtmUpdate.linksCreated.join(', ')}], coverage ${rtmUpdate.coverageBefore ?? '-'}%→${rtmUpdate.coverageAfter ?? '-'}%`);
         } catch (linkErr: any) {
           console.warn(`[ScriptGen] ⚠️ Traceability auto-link failed (non-fatal): ${linkErr?.message}`);
         }
@@ -360,7 +584,16 @@ export function createScriptGenRouter(): Router {
             missingCritical: fusion?.fusionMetadata.missingCritical ?? [],
             warnings: fusion?.fusionMetadata.warnings ?? [],
             recommendation: fusion ? IntelligenceFusionService.recommendationFor(fusion.confidenceScore) : null,
+            // Sprint 4: test-case-driven generation source + folder decision
+            generationSource,
+            testCaseId: testCase?.id ?? null,
+            testCaseDataUsed: !!testCase,
+            ...(folderDecision ? { folderDecision } : {}),
           },
+          // Sprint 4: locator resolution report (element → locator + confidence)
+          ...(locatorReport ? { locatorReport } : {}),
+          // Sprint 4: RTM auto-update result (requirement link + coverage delta)
+          ...(rtmUpdate ? { rtmUpdate } : {}),
         },
       });
     } catch (err: any) {
@@ -779,6 +1012,62 @@ export function createScriptGenRouter(): Router {
       }
     } catch (err: any) {
       console.error('[ScriptGen] push error:', err);
+      res.status(500).json({ success: false, error: err.message });
+    }
+  });
+
+  /* ── Sprint 4: Validate Locators ─────────────────────────────
+   * POST /api/scripts/validate-locators
+   *
+   * Validate a set of candidate locators against the cached DOM of the
+   * Application Profile for a given URL. Used by the dashboard to surface
+   * locator quality (DOM match / pattern / syntax-only) and warnings before
+   * a script is committed. Backward compatible — purely additive.
+   *
+   * Body: { url: string, locators: string[] }
+   * Resp: { success, data: { results: LocatorValidation[], summary } }
+   */
+  router.post('/validate-locators', async (req: Request, res: Response) => {
+    try {
+      const companyId = (req as any).companyId as number | undefined;
+      const projectId = (req as any).projectId as number | undefined;
+      const { url, locators } = req.body ?? {};
+
+      if (!url || typeof url !== 'string') {
+        return res.status(400).json({ success: false, error: 'A "url" string is required.' });
+      }
+      if (!Array.isArray(locators) || locators.length === 0) {
+        return res.status(400).json({ success: false, error: 'A non-empty "locators" array is required.' });
+      }
+
+      // Load the cached DOM for this URL (best source for DOM-match validation).
+      let crawlData: CrawlDataLike | null = null;
+      try {
+        const profile = await getProfileByUrl(url, companyId, projectId);
+        crawlData = (profile?.crawl_data as CrawlDataLike) ?? null;
+      } catch (profErr: any) {
+        console.warn(`[ScriptGen] validate-locators: profile lookup failed (continuing syntax-only): ${profErr?.message}`);
+      }
+
+      const resolver = new LocatorResolver({ crawlData });
+      const results = locators
+        .filter((l: unknown) => typeof l === 'string' && l.trim().length > 0)
+        .map((l: string) => resolver.validateLocator(l, crawlData));
+
+      const validCount = results.filter((r) => r.isValid).length;
+      const domMatched = results.filter((r) => r.validationMethod === 'dom_match').length;
+      const summary = {
+        total: results.length,
+        valid: validCount,
+        invalid: results.length - validCount,
+        domMatched,
+        domAvailable: !!crawlData,
+      };
+
+      console.log(`[ScriptGen] 🔎 validate-locators — ${summary.valid}/${summary.total} valid, ${domMatched} DOM-matched (domAvailable=${summary.domAvailable})`);
+      res.json({ success: true, data: { results, summary } });
+    } catch (err: any) {
+      console.error('[ScriptGen] validate-locators error:', err);
       res.status(500).json({ success: false, error: err.message });
     }
   });
