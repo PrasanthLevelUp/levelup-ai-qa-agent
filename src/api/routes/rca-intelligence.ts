@@ -20,6 +20,21 @@ import { logger } from '../../utils/logger';
 
 const MOD = 'rca-intelligence-routes';
 
+/**
+ * Read an optional sprint date window (WHEN) from the query string.
+ * Returns {} when not both present / invalid so callers fall back to the
+ * trailing `days` window (backward-compatible).
+ */
+function readWindow(req: Request): { startDate?: string; endDate?: string } {
+  const startDate = req.query.startDate as string | undefined;
+  const endDate = req.query.endDate as string | undefined;
+  if (!startDate || !endDate) return {};
+  const s = new Date(startDate);
+  const e = new Date(endDate);
+  if (isNaN(s.getTime()) || isNaN(e.getTime()) || e.getTime() <= s.getTime()) return {};
+  return { startDate, endDate };
+}
+
 export function createRCAIntelligenceRouter(): Router {
   const router = Router();
 
@@ -31,12 +46,13 @@ export function createRCAIntelligenceRouter(): Router {
     try {
       const cid = (req as any).companyId;
       const days = parseInt(req.query.days as string, 10) || 30;
+      const { startDate, endDate } = readWindow(req);
 
       const [classificationStats, componentStats, classificationTrend, domainTrend] = await Promise.all([
-        getClassificationStats(days, cid),
-        getComponentClassificationStats(days, cid),
-        getClassificationTrend(days, cid),
-        getDomainTrendComparison(days, cid),
+        getClassificationStats(days, cid, startDate, endDate),
+        getComponentClassificationStats(days, cid, startDate, endDate),
+        getClassificationTrend(days, cid, startDate, endDate),
+        getDomainTrendComparison(days, cid, startDate, endDate),
       ]);
 
       const totalAnalyses = classificationStats.reduce((s, c) => s + c.count, 0);
@@ -65,7 +81,8 @@ export function createRCAIntelligenceRouter(): Router {
     try {
       const cid = (req as any).companyId;
       const days = parseInt(req.query.days as string, 10) || 30;
-      const trend = await getClassificationTrend(days, cid);
+      const { startDate, endDate } = readWindow(req);
+      const trend = await getClassificationTrend(days, cid, startDate, endDate);
       res.json({ success: true, data: trend });
     } catch (err) {
       logger.error(MOD, 'Failed to get classification trend', { error: err });
@@ -81,7 +98,8 @@ export function createRCAIntelligenceRouter(): Router {
     try {
       const cid = (req as any).companyId;
       const days = parseInt(req.query.days as string, 10) || 30;
-      const data = await getComponentClassificationStats(days, cid);
+      const { startDate, endDate } = readWindow(req);
+      const data = await getComponentClassificationStats(days, cid, startDate, endDate);
       res.json({ success: true, data });
     } catch (err) {
       logger.error(MOD, 'Failed to get component heatmap', { error: err });
