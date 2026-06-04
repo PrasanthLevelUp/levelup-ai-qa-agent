@@ -29,7 +29,11 @@ import {
   getTestCaseById,
   getRequirement,
   getProfileByUrl,
+  markTestCaseAutomated,
+  getRequirementAutomationCoverage,
 } from '../../db/postgres';
+import { resolveBaseUrl } from '../../services/url-resolver';
+import { parseScriptContent } from '../../services/script-file-parser';
 import { LocatorResolver, type CrawlDataLike, type LocatorReport } from '../../services/locator-resolver';
 import { FolderStructureAnalyzer } from '../../services/folder-analyzer';
 import { ScriptGenEngine, type GenerationConfig, type GenerationResult, type GeneratedFile } from '../../script-gen/script-gen-engine';
@@ -137,7 +141,7 @@ export function createScriptGenRouter(): Router {
     const startTime = Date.now();
     try {
       const {
-        url,
+        url: bodyUrl,
         instructions,
         testTypes,
         credentials,
@@ -156,6 +160,29 @@ export function createScriptGenRouter(): Router {
         locatorStrategy,
         folderStrategy,
       } = req.body;
+
+      // ── Sprint 4B: auto-populate the target URL from the environment ──────
+      // An explicit, caller-supplied URL always wins. Only when it is blank
+      // (e.g. requirement / test-case driven generation) do we resolve it from
+      // the active environment → default environment → project context app_url.
+      // Best-effort and non-blocking — never throws.
+      let url: string = typeof bodyUrl === 'string' ? bodyUrl.trim() : '';
+      if (!url) {
+        try {
+          const { environmentId: envIdForUrl } = getContextFromRequest(req);
+          const resolved = await resolveBaseUrl({
+            projectId: (req as any).projectId ?? null,
+            environmentId: envIdForUrl ?? null,
+            companyId: (req as any).companyId ?? null,
+          });
+          if (resolved.url) {
+            url = resolved.url;
+            console.log(`[ScriptGen] Auto-populated url from ${resolved.source}${resolved.label ? ` ("${resolved.label}")` : ''}: ${url}`);
+          }
+        } catch (urlErr: any) {
+          console.warn(`[ScriptGen] Could not auto-populate url (non-blocking): ${urlErr?.message}`);
+        }
+      }
 
       if (!url || typeof url !== 'string') {
         return res.status(400).json({ success: false, error: 'url is required' });
@@ -416,10 +443,17 @@ export function createScriptGenRouter(): Router {
         (testCase?.requirement?.id as string) ||
         (typeof requirementId === 'string' ? requirementId : null);
       let coverageBefore: { coverage_percentage?: number; status?: string } | null = null;
+      // Sprint 4B — also snapshot the requirement's automation coverage BEFORE,
+      // so the response can surface the automation delta once this test case is
+      // marked automated.
+      let automationCoverageBefore: { totalTestCases: number; automatedCount: number; automationPercentage: number } | null = null;
       if (coverageRequirementId && companyId != null) {
         try {
           const reqRow = await getRequirement(coverageRequirementId, companyId);
           if (reqRow) coverageBefore = { coverage_percentage: reqRow.coverage_percentage, status: reqRow.status };
+        } catch { /* non-fatal */ }
+        try {
+          automationCoverageBefore = await getRequirementAutomationCoverage(coverageRequirementId, companyId);
         } catch { /* non-fatal */ }
       }
 
@@ -498,6 +532,14 @@ export function createScriptGenRouter(): Router {
         statusBefore: string | null;
         statusAfter: string | null;
       } | undefined;
+      // Sprint 4B — automation marking + the requirement's automation-coverage delta.
+      let automationUpdate: {
+        testCaseId: number;
+        isAutomated: boolean;
+        scriptId: number;
+        coverageBefore: { totalTestCases: number; automatedCount: number; automationPercentage: number } | null;
+        coverageAfter: { totalTestCases: number; automatedCount: number; automationPercentage: number } | null;
+      } | undefined;
       if (testCaseId != null && companyId != null) {
         try {
           const linkResult = await autoLinkScriptTraceability({
@@ -530,8 +572,51 @@ export function createScriptGenRouter(): Router {
             statusAfter: coverageAfter?.status ?? coverageBefore?.status ?? null,
           };
           console.log(`[ScriptGen] 🔗 RTM update — requirement=${rtmUpdate.requirementId ?? 'none'}, links=[${rtmUpdate.linksCreated.join(', ')}], coverage ${rtmUpdate.coverageBefore ?? '-'}%→${rtmUpdate.coverageAfter ?? '-'}%`);
+
+          // Sprint 4B — mark the test case as automated now that a script exists.
+          // Flips is_automated=true and records last_automated_script_id/_at.
+          // Best-effort: never let automation tracking break script generation.
+          let isAutomated = false;
+          try {
+            isAutomated = await markTestCaseAutomated(Number(testCaseId), scriptId, companyId);
+            console.log(`[ScriptGen] ✅ Marked test case #${testCaseId} as automated (script #${scriptId})`);
+          } catch (markErr: any) {
+            console.warn(`[ScriptGen] ⚠️ Could not mark test case automated (non-fatal): ${markErr?.message}`);
+          }
+
+          // Re-read the requirement's automation coverage AFTER marking.
+          let automationCoverageAfter: { totalTestCases: number; automatedCount: number; automationPercentage: number } | null = null;
+          if (resolvedReqId) {
+            try {
+              automationCoverageAfter = await getRequirementAutomationCoverage(resolvedReqId, companyId);
+            } catch { /* non-fatal */ }
+          }
+
+          automationUpdate = {
+            testCaseId: Number(testCaseId),
+            isAutomated,
+            scriptId,
+            coverageBefore: automationCoverageBefore,
+            coverageAfter: automationCoverageAfter ?? automationCoverageBefore,
+          };
+          console.log(`[ScriptGen] 📈 Automation coverage ${automationUpdate.coverageBefore?.automationPercentage ?? '-'}%→${automationUpdate.coverageAfter?.automationPercentage ?? '-'}%`);
         } catch (linkErr: any) {
           console.warn(`[ScriptGen] ⚠️ Traceability auto-link failed (non-fatal): ${linkErr?.message}`);
+
+          // Even if RTM linking failed, still try to mark the test case automated.
+          try {
+            const isAutomated = await markTestCaseAutomated(Number(testCaseId), scriptId, companyId);
+            automationUpdate = {
+              testCaseId: Number(testCaseId),
+              isAutomated,
+              scriptId,
+              coverageBefore: automationCoverageBefore,
+              coverageAfter: automationCoverageBefore,
+            };
+            console.log(`[ScriptGen] ✅ Marked test case #${testCaseId} as automated (script #${scriptId}) [post-link-failure]`);
+          } catch (markErr: any) {
+            console.warn(`[ScriptGen] ⚠️ Could not mark test case automated (non-fatal): ${markErr?.message}`);
+          }
         }
       }
 
@@ -594,6 +679,8 @@ export function createScriptGenRouter(): Router {
           ...(locatorReport ? { locatorReport } : {}),
           // Sprint 4: RTM auto-update result (requirement link + coverage delta)
           ...(rtmUpdate ? { rtmUpdate } : {}),
+          // Sprint 4B: automation marking + automation-coverage delta (before/after)
+          ...(automationUpdate ? { automationUpdate } : {}),
         },
       });
     } catch (err: any) {
@@ -614,9 +701,18 @@ export function createScriptGenRouter(): Router {
 
       const { records, total } = await getScriptHistory(companyId, { projectId, limit, offset, sortBy, sortOrder });
 
+      // Sprint 4B — enrich each record with a structured per-file breakdown
+      // parsed from the stored `script_content` blob. `script_content` is kept
+      // for backward compatibility; the new `files` array powers the redesigned
+      // file-wise history view (filename, content, language, framework, …).
+      const data = records.map((rec: any) => ({
+        ...rec,
+        files: parseScriptContent(rec.script_content, rec.files_generated),
+      }));
+
       res.json({
         success: true,
-        data: records,
+        data,
         pagination: { total, limit, offset, hasMore: offset + limit < total },
       });
     } catch (err: any) {
