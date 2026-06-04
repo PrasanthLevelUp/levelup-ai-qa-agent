@@ -291,7 +291,14 @@ export function createProjectsRouter(): Router {
         res.status(400).json({ error: 'Invalid project ID' });
         return;
       }
-      const { release_cycle_type, release_cycle_days, release_day_of_week, release_timezone, overview_default_range } = req.body;
+      // Accept both snake_case and camelCase keys so the config is never
+      // silently dropped due to a key-casing mismatch between client/server.
+      const body = req.body ?? {};
+      const release_cycle_type = body.release_cycle_type ?? body.releaseCycleType;
+      const release_cycle_days = body.release_cycle_days ?? body.releaseCycleDays;
+      const release_day_of_week = body.release_day_of_week ?? body.releaseDayOfWeek;
+      const release_timezone = body.release_timezone ?? body.releaseTimezone;
+      const overview_default_range = body.overview_default_range ?? body.overviewDefaultRange;
       const validTypes = ['continuous', 'sprint', 'monthly', 'quarterly', 'custom'];
       if (release_cycle_type && !validTypes.includes(release_cycle_type)) {
         res.status(400).json({ error: `Invalid release_cycle_type. Must be one of: ${validTypes.join(', ')}` });
