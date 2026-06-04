@@ -14,6 +14,24 @@ import { logger } from '../../utils/logger';
 
 const MOD = 'release-risk-routes';
 
+/**
+ * Read an optional sprint window (Phase 2) from the request query.
+ * Returns `{ startDate, endDate }` only when both are present & valid ISO dates;
+ * otherwise `undefined` values so the data layer falls back to the rolling `days` window.
+ */
+function readWindow(req: Request): { startDate?: string; endDate?: string } {
+  const startDate = (req.query.startDate as string) || undefined;
+  const endDate = (req.query.endDate as string) || undefined;
+  if (startDate && endDate) {
+    const s = new Date(startDate);
+    const e = new Date(endDate);
+    if (!isNaN(s.getTime()) && !isNaN(e.getTime()) && e.getTime() > s.getTime()) {
+      return { startDate, endDate };
+    }
+  }
+  return {};
+}
+
 export function createReleaseRiskRouter(): Router {
   const router = Router();
 
@@ -26,7 +44,8 @@ export function createReleaseRiskRouter(): Router {
       const cid = (req as any).companyId;
       const pid = (req as any).projectId;
       const days = parseInt(req.query.days as string, 10) || 30;
-      const data = await getReleaseRiskData(days, cid, pid);
+      const { startDate, endDate } = readWindow(req);
+      const data = await getReleaseRiskData(days, cid, pid, startDate, endDate);
       const result = computeReleaseRisk(data);
       res.json(result);
     } catch (err) {
@@ -44,7 +63,8 @@ export function createReleaseRiskRouter(): Router {
       const cid = (req as any).companyId;
       const pid = (req as any).projectId;
       const days = parseInt(req.query.days as string, 10) || 30;
-      const trend = await getRiskTrend(days, cid, pid);
+      const { startDate, endDate } = readWindow(req);
+      const trend = await getRiskTrend(days, cid, pid, startDate, endDate);
       res.json(trend);
     } catch (err) {
       logger.error(MOD, 'Failed to get risk trend', { error: err });
@@ -61,7 +81,8 @@ export function createReleaseRiskRouter(): Router {
       const cid = (req as any).companyId;
       const pid = (req as any).projectId;
       const days = parseInt(req.query.days as string, 10) || 30;
-      const data = await getReleaseRiskData(days, cid, pid);
+      const { startDate, endDate } = readWindow(req);
+      const data = await getReleaseRiskData(days, cid, pid, startDate, endDate);
       const result = computeReleaseRisk(data);
       res.json(result.signals);
     } catch (err) {
@@ -79,7 +100,8 @@ export function createReleaseRiskRouter(): Router {
       const cid = (req as any).companyId;
       const pid = (req as any).projectId;
       const days = parseInt(req.query.days as string, 10) || 30;
-      const data = await getReleaseRiskData(days, cid, pid);
+      const { startDate, endDate } = readWindow(req);
+      const data = await getReleaseRiskData(days, cid, pid, startDate, endDate);
       const result = computeReleaseRisk(data);
       res.json(result.riskAreas);
     } catch (err) {

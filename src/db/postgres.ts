@@ -3664,6 +3664,29 @@ export async function getSemanticGroupStats(companyId?: number): Promise<Array<{
 /*  Release Risk Data Gathering                                               */
 /* -------------------------------------------------------------------------- */
 
+/**
+ * Build a SQL time-window predicate factory (Phase 2: context-aware analytics).
+ *
+ * Returns a function `win(col)` that produces a WHERE-clause fragment for the
+ * given timestamp column:
+ *   • With a valid sprint window (startDate < endDate) → bounded range
+ *       `col >= '<isoStart>' AND col < '<isoEnd>'`
+ *   • Otherwise → trailing rolling window `col >= NOW() - INTERVAL 'N days'`
+ *
+ * Injection-safe: bounds are normalised through `Date.toISOString()`, which only
+ * ever yields a fixed `YYYY-MM-DDTHH:MM:SS.sssZ` format (no quotes/specials).
+ */
+function sqlTimeWindow(days: number, startDate?: string, endDate?: string): (col: string) => string {
+  const s = startDate ? new Date(startDate) : null;
+  const e = endDate ? new Date(endDate) : null;
+  if (s && e && !isNaN(s.getTime()) && !isNaN(e.getTime()) && e.getTime() > s.getTime()) {
+    const iso = (d: Date) => d.toISOString();
+    return (col: string) => `${col} >= '${iso(s)}' AND ${col} < '${iso(e)}'`;
+  }
+  const n = Number.isFinite(days) && days > 0 ? Math.floor(days) : 30;
+  return (col: string) => `${col} >= NOW() - INTERVAL '${n} days'`;
+}
+
 export interface ReleaseRiskInputData {
   totalHealings: number;
   failedHealings: number;
@@ -3688,7 +3711,7 @@ export interface ReleaseRiskInputData {
   }>;
 }
 
-export async function getReleaseRiskData(days: number = 30, companyId?: number, projectId?: number): Promise<ReleaseRiskInputData> {
+export async function getReleaseRiskData(days: number = 30, companyId?: number, projectId?: number, startDate?: string, endDate?: string): Promise<ReleaseRiskInputData> {
   const p = getPool();
   const cfAnd = companyId ? `AND company_id = ${companyId}` : '';
   // Project scoping: include rows for this project OR rows with no project assigned (backward compat).
@@ -3696,30 +3719,34 @@ export async function getReleaseRiskData(days: number = 30, companyId?: number, 
   const pid = projectId && Number.isInteger(projectId) ? projectId : 0;
   const pfAnd = pid ? `AND (project_id = ${pid} OR project_id IS NULL)` : '';
 
-  const interval = `${days} days`;
+  // Phase 2: when a sprint window (startDate/endDate) is supplied, scope to that
+  // exact bounded range; otherwise use the trailing N-day rolling window.
+  // `win(col)` returns a SQL predicate for the given timestamp column. ISO strings
+  // from toISOString() are a fixed safe format, so interpolation is injection-safe.
+  const win = sqlTimeWindow(days, startDate, endDate);
 
   // Healing metrics (within time window)
   const [healTotal, healFailed, healLowConf, healAvgConf] = await Promise.all([
-    p.query(`SELECT COUNT(*) AS c FROM healing_actions WHERE created_at >= NOW() - INTERVAL '${interval}' ${cfAnd} ${pfAnd}`),
-    p.query(`SELECT COUNT(*) AS c FROM healing_actions WHERE success = false AND created_at >= NOW() - INTERVAL '${interval}' ${cfAnd} ${pfAnd}`),
-    p.query(`SELECT COUNT(*) AS c FROM healing_actions WHERE confidence < 0.5 AND confidence > 0 AND created_at >= NOW() - INTERVAL '${interval}' ${cfAnd} ${pfAnd}`),
-    p.query(`SELECT COALESCE(AVG(confidence), 0) AS avg FROM healing_actions WHERE created_at >= NOW() - INTERVAL '${interval}' ${cfAnd} ${pfAnd}`),
+    p.query(`SELECT COUNT(*) AS c FROM healing_actions WHERE ${win('created_at')} ${cfAnd} ${pfAnd}`),
+    p.query(`SELECT COUNT(*) AS c FROM healing_actions WHERE success = false AND ${win('created_at')} ${cfAnd} ${pfAnd}`),
+    p.query(`SELECT COUNT(*) AS c FROM healing_actions WHERE confidence < 0.5 AND confidence > 0 AND ${win('created_at')} ${cfAnd} ${pfAnd}`),
+    p.query(`SELECT COALESCE(AVG(confidence), 0) AS avg FROM healing_actions WHERE ${win('created_at')} ${cfAnd} ${pfAnd}`),
   ]);
 
   // Execution metrics
   const [execTotal, execFailed, execUnhealed] = await Promise.all([
-    p.query(`SELECT COUNT(*) AS c FROM test_executions WHERE created_at >= NOW() - INTERVAL '${interval}' ${cfAnd} ${pfAnd}`),
-    p.query(`SELECT COUNT(*) AS c FROM test_executions WHERE status IN ('failed', 'timedOut') AND created_at >= NOW() - INTERVAL '${interval}' ${cfAnd} ${pfAnd}`),
-    p.query(`SELECT COUNT(*) AS c FROM test_executions WHERE healing_attempted = true AND healing_succeeded = false AND created_at >= NOW() - INTERVAL '${interval}' ${cfAnd} ${pfAnd}`),
+    p.query(`SELECT COUNT(*) AS c FROM test_executions WHERE ${win('created_at')} ${cfAnd} ${pfAnd}`),
+    p.query(`SELECT COUNT(*) AS c FROM test_executions WHERE status IN ('failed', 'timedOut') AND ${win('created_at')} ${cfAnd} ${pfAnd}`),
+    p.query(`SELECT COUNT(*) AS c FROM test_executions WHERE healing_attempted = true AND healing_succeeded = false AND ${win('created_at')} ${cfAnd} ${pfAnd}`),
   ]);
 
   // RCA severity distribution
   const [rcaTotal, rcaFlaky, rcaCritical, rcaHigh, rcaMedium] = await Promise.all([
-    p.query(`SELECT COUNT(*) AS c FROM rca_analyses WHERE created_at >= NOW() - INTERVAL '${interval}' ${cfAnd} ${pfAnd}`),
-    p.query(`SELECT COUNT(*) AS c FROM rca_analyses WHERE is_flaky = true AND created_at >= NOW() - INTERVAL '${interval}' ${cfAnd} ${pfAnd}`),
-    p.query(`SELECT COUNT(*) AS c FROM rca_analyses WHERE severity = 'critical' AND created_at >= NOW() - INTERVAL '${interval}' ${cfAnd} ${pfAnd}`),
-    p.query(`SELECT COUNT(*) AS c FROM rca_analyses WHERE severity = 'high' AND created_at >= NOW() - INTERVAL '${interval}' ${cfAnd} ${pfAnd}`),
-    p.query(`SELECT COUNT(*) AS c FROM rca_analyses WHERE severity = 'medium' AND created_at >= NOW() - INTERVAL '${interval}' ${cfAnd} ${pfAnd}`),
+    p.query(`SELECT COUNT(*) AS c FROM rca_analyses WHERE ${win('created_at')} ${cfAnd} ${pfAnd}`),
+    p.query(`SELECT COUNT(*) AS c FROM rca_analyses WHERE is_flaky = true AND ${win('created_at')} ${cfAnd} ${pfAnd}`),
+    p.query(`SELECT COUNT(*) AS c FROM rca_analyses WHERE severity = 'critical' AND ${win('created_at')} ${cfAnd} ${pfAnd}`),
+    p.query(`SELECT COUNT(*) AS c FROM rca_analyses WHERE severity = 'high' AND ${win('created_at')} ${cfAnd} ${pfAnd}`),
+    p.query(`SELECT COUNT(*) AS c FROM rca_analyses WHERE severity = 'medium' AND ${win('created_at')} ${cfAnd} ${pfAnd}`),
   ]);
 
   // Trend: recent 7 days vs previous 7 days
@@ -3745,7 +3772,7 @@ export async function getReleaseRiskData(days: number = 30, companyId?: number, 
       COUNT(CASE WHEN r.severity = 'critical' THEN 1 END) AS critical_rcas
     FROM rca_analyses r
     LEFT JOIN test_executions te ON r.test_execution_id = te.id
-    WHERE r.created_at >= NOW() - INTERVAL '${interval}' ${cfAnd.replace('company_id', 'r.company_id')} ${pfAnd.replace(/project_id/g, 'r.project_id')}
+    WHERE ${win('r.created_at')} ${cfAnd.replace('company_id', 'r.company_id')} ${pfAnd.replace(/project_id/g, 'r.project_id')}
     GROUP BY r.affected_component
     ORDER BY failures DESC
     LIMIT 20
@@ -3776,7 +3803,7 @@ export async function getReleaseRiskData(days: number = 30, companyId?: number, 
   };
 }
 
-export async function getRiskTrend(days: number = 30, companyId?: number, projectId?: number): Promise<Array<{
+export async function getRiskTrend(days: number = 30, companyId?: number, projectId?: number, startDate?: string, endDate?: string): Promise<Array<{
   date: string;
   riskScore: number;
   failureRate: number;
@@ -3788,6 +3815,9 @@ export async function getRiskTrend(days: number = 30, companyId?: number, projec
   const pid = projectId && Number.isInteger(projectId) ? projectId : 0;
   const pfAnd = pid ? `AND (project_id = ${pid} OR project_id IS NULL)` : '';
 
+  // Phase 2: sprint window (startDate/endDate) scopes to a bounded range; else trailing N days.
+  const win = sqlTimeWindow(days, startDate, endDate);
+
   const result = await p.query(`
     SELECT
       DATE(te.created_at) AS date,
@@ -3795,7 +3825,7 @@ export async function getRiskTrend(days: number = 30, companyId?: number, projec
       COUNT(CASE WHEN te.status IN ('failed', 'timedOut') THEN 1 END) AS failures,
       COUNT(CASE WHEN te.healing_attempted = true AND te.healing_succeeded = false THEN 1 END) AS unhealed
     FROM test_executions te
-    WHERE te.created_at >= NOW() - INTERVAL '${days} days' ${cfAnd.replace('company_id', 'te.company_id')} ${pfAnd.replace(/project_id/g, 'te.project_id')}
+    WHERE ${win('te.created_at')} ${cfAnd.replace('company_id', 'te.company_id')} ${pfAnd.replace(/project_id/g, 'te.project_id')}
     GROUP BY DATE(te.created_at)
     ORDER BY date ASC
   `);
@@ -3804,7 +3834,7 @@ export async function getRiskTrend(days: number = 30, companyId?: number, projec
   const flakyRes = await p.query(`
     SELECT DATE(created_at) AS date, COUNT(*) AS flaky
     FROM rca_analyses
-    WHERE is_flaky = true AND created_at >= NOW() - INTERVAL '${days} days' ${cfAnd} ${pfAnd}
+    WHERE is_flaky = true AND ${win('created_at')} ${cfAnd} ${pfAnd}
     GROUP BY DATE(created_at)
   `);
   const flakyMap = new Map<string, number>();
@@ -3850,9 +3880,9 @@ const SEVERITY_MAP: Record<string, number> = { critical: 4, high: 3, medium: 2, 
 /**
  * Classification stats with healing rates and severity for the env intelligence engine.
  */
-export async function getClassificationStats(days: number, companyId?: number) {
+export async function getClassificationStats(days: number, companyId?: number, startDate?: string, endDate?: string) {
   const p = getPool();
-  const interval = `${days} days`;
+  const win = sqlTimeWindow(days, startDate, endDate);
   const cf = companyId ? `AND company_id = ${companyId}` : '';
 
   const res = await p.query(`
@@ -3872,7 +3902,7 @@ export async function getClassificationStats(days: number, companyId?: number) {
         END
       ), 2) AS avg_severity
     FROM rca_analyses
-    WHERE created_at >= NOW() - INTERVAL '${interval}' ${cf}
+    WHERE ${win('created_at')} ${cf}
     GROUP BY classification
     ORDER BY count DESC
   `);
@@ -3890,9 +3920,9 @@ export async function getClassificationStats(days: number, companyId?: number) {
 /**
  * Component × classification cross-tab for heatmap.
  */
-export async function getComponentClassificationStats(days: number, companyId?: number) {
+export async function getComponentClassificationStats(days: number, companyId?: number, startDate?: string, endDate?: string) {
   const p = getPool();
-  const interval = `${days} days`;
+  const win = sqlTimeWindow(days, startDate, endDate);
   const cf = companyId ? `AND company_id = ${companyId}` : '';
 
   const res = await p.query(`
@@ -3910,7 +3940,7 @@ export async function getComponentClassificationStats(days: number, companyId?: 
         END
       ), 2) AS avg_severity
     FROM rca_analyses
-    WHERE created_at >= NOW() - INTERVAL '${interval}' ${cf}
+    WHERE ${win('created_at')} ${cf}
     GROUP BY component, classification
     ORDER BY count DESC
   `);
@@ -3926,9 +3956,9 @@ export async function getComponentClassificationStats(days: number, companyId?: 
 /**
  * Classification trend — daily counts by classification type.
  */
-export async function getClassificationTrend(days: number, companyId?: number) {
+export async function getClassificationTrend(days: number, companyId?: number, startDate?: string, endDate?: string) {
   const p = getPool();
-  const interval = `${days} days`;
+  const win = sqlTimeWindow(days, startDate, endDate);
   const cf = companyId ? `AND company_id = ${companyId}` : '';
 
   const res = await p.query(`
@@ -3942,7 +3972,7 @@ export async function getClassificationTrend(days: number, companyId?: number) {
       COUNT(*) FILTER (WHERE classification = 'selector_drift') AS selector_drift,
       COUNT(*) FILTER (WHERE classification = 'unknown') AS unknown
     FROM rca_analyses
-    WHERE created_at >= NOW() - INTERVAL '${interval}' ${cf}
+    WHERE ${win('created_at')} ${cf}
     GROUP BY DATE(created_at)
     ORDER BY date ASC
   `);
@@ -3962,12 +3992,32 @@ export async function getClassificationTrend(days: number, companyId?: number) {
 /**
  * Domain trend comparison — recent half vs older half of the window.
  */
-export async function getDomainTrendComparison(days: number, companyId?: number) {
+export async function getDomainTrendComparison(days: number, companyId?: number, startDate?: string, endDate?: string) {
   const p = getPool();
-  const halfDays = Math.floor(days / 2);
-  const interval = `${days} days`;
-  const halfInterval = `${halfDays} days`;
   const cf = companyId ? `AND company_id = ${companyId}` : '';
+
+  // Determine whether a bounded (sprint) window was supplied.
+  const start = startDate ? new Date(startDate) : null;
+  const end = endDate ? new Date(endDate) : null;
+  const bounded =
+    !!start && !!end && !isNaN(start.getTime()) && !isNaN(end.getTime()) && end.getTime() > start.getTime();
+
+  const win = sqlTimeWindow(days, startDate, endDate);
+
+  // "recent" = second half of the window, "older" = first half.
+  // For a bounded sprint window we split at its midpoint; otherwise we
+  // split the trailing N-day window relative to NOW (legacy behaviour).
+  let recentExpr: string;
+  let olderExpr: string;
+  if (bounded) {
+    const mid = new Date((start!.getTime() + end!.getTime()) / 2).toISOString();
+    recentExpr = `created_at >= '${mid}'`;
+    olderExpr = `created_at < '${mid}'`;
+  } else {
+    const halfInterval = `${Math.floor(days / 2)} days`;
+    recentExpr = `created_at >= NOW() - INTERVAL '${halfInterval}'`;
+    olderExpr = `created_at < NOW() - INTERVAL '${halfInterval}'`;
+  }
 
   // Map classification → domain in SQL
   const domainCase = `
@@ -3982,14 +4032,14 @@ export async function getDomainTrendComparison(days: number, companyId?: number)
   const res = await p.query(`
     SELECT
       domain,
-      SUM(CASE WHEN created_at >= NOW() - INTERVAL '${halfInterval}' THEN 1 ELSE 0 END) AS recent_count,
-      SUM(CASE WHEN created_at < NOW() - INTERVAL '${halfInterval}' AND created_at >= NOW() - INTERVAL '${interval}' THEN 1 ELSE 0 END) AS older_count,
+      SUM(CASE WHEN ${recentExpr} THEN 1 ELSE 0 END) AS recent_count,
+      SUM(CASE WHEN ${olderExpr} THEN 1 ELSE 0 END) AS older_count,
       COALESCE(AVG(confidence), 0) AS avg_confidence,
       MODE() WITHIN GROUP (ORDER BY COALESCE(NULLIF(affected_component, ''), 'Unknown')) AS top_component
     FROM (
       SELECT *, ${domainCase} AS domain
       FROM rca_analyses
-      WHERE created_at >= NOW() - INTERVAL '${interval}' ${cf}
+      WHERE ${win('created_at')} ${cf}
     ) sub
     GROUP BY domain
     ORDER BY recent_count DESC
