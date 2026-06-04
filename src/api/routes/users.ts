@@ -23,6 +23,7 @@ import {
   getPool,
   logAudit,
 } from '../../db/postgres';
+import { contextService } from '../../services/context-service';
 
 const MOD = 'user-routes';
 const SALT_ROUNDS = 12;
@@ -32,6 +33,56 @@ const VALID_ROLES = ['admin', 'qa_manager', 'qa_engineer', 'viewer', 'client'] a
 
 export function createUsersRouter(): Router {
   const router = Router();
+
+  /* ── User project context (Phase 1 Foundation) ───────────────────
+   * GET/PUT /api/users/me/context/:projectId — persist the signed-in user's
+   * per-project working context (selected environment / sprint / time range).
+   * Registered before `/:id` so the literal "me" segment can't be swallowed. */
+  router.get('/me/context/:projectId', async (req: Request, res: Response) => {
+    try {
+      const userId = (req as any).userId as number | undefined;
+      const companyId = (req as any).companyId as number | undefined;
+      if (!userId) return res.status(401).json({ success: false, error: 'Not authenticated' });
+      const projectId = parseInt(String(req.params['projectId']), 10);
+      if (isNaN(projectId) || projectId <= 0) {
+        return res.status(400).json({ success: false, error: 'Invalid project ID' });
+      }
+      const saved = await contextService.getContext(userId, projectId);
+      const resolved = await contextService.resolveContext(userId, projectId);
+      return res.json({ success: true, data: { context: saved, resolved } });
+    } catch (err: any) {
+      logger.error(MOD, 'Get user context failed', { error: err.message });
+      return res.status(500).json({ success: false, error: 'Failed to get context' });
+    }
+  });
+
+  router.put('/me/context/:projectId', async (req: Request, res: Response) => {
+    try {
+      const userId = (req as any).userId as number | undefined;
+      const companyId = (req as any).companyId as number | undefined;
+      if (!userId) return res.status(401).json({ success: false, error: 'Not authenticated' });
+      const projectId = parseInt(String(req.params['projectId']), 10);
+      if (isNaN(projectId) || projectId <= 0) {
+        return res.status(400).json({ success: false, error: 'Invalid project ID' });
+      }
+      const { environment_id, sprint_id, time_range, time_range_start, time_range_end, preferences } = req.body || {};
+      const context = await contextService.saveContext({
+        companyId: companyId ?? null,
+        userId,
+        projectId,
+        environmentId: environment_id ?? null,
+        sprintId: sprint_id ?? null,
+        timeRange: time_range ?? null,
+        timeRangeStart: time_range_start ?? null,
+        timeRangeEnd: time_range_end ?? null,
+        preferences: preferences ?? null,
+      });
+      return res.json({ success: true, data: { context } });
+    } catch (err: any) {
+      logger.error(MOD, 'Save user context failed', { error: err.message });
+      return res.status(500).json({ success: false, error: 'Failed to save context' });
+    }
+  });
 
   /* ── List Users ──────────────────────────────────────────────── */
   router.get('/', async (req: Request, res: Response) => {
