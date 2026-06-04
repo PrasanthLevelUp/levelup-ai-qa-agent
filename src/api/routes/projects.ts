@@ -280,9 +280,19 @@ export function createProjectsRouter(): Router {
     }
   });
 
-  // ─── Release Cycle Configuration ───────────────────────────────
+  // ─── Release Cycle Configuration (LEGACY) ──────────────────────
+  //
+  // NOTE (Phase 1 simplification): time-based tracking is now owned entirely by
+  // the Sprint system (project_sprints + the per-project sprint_* settings).
+  // These release_cycle_* columns previously duplicated sprint cadence/timing
+  // and caused confusion, so the "Release Config" UI was removed from the
+  // dashboard. This endpoint is kept only for backward compatibility and is no
+  // longer surfaced in the product. Do NOT add new UI on top of it — model any
+  // new "WHEN" concept as a Sprint instead. (Deployment/version tracking, if
+  // ever needed, belongs in a dedicated, clearly-named "releases" concept, not
+  // here.)
 
-  // PUT /api/projects/:id/release-config — Update release cycle settings
+  // PUT /api/projects/:id/release-config — Update release cycle settings (legacy)
   router.put('/:id/release-config', async (req: Request, res: Response) => {
     try {
       const companyId = (req as any).companyId;
