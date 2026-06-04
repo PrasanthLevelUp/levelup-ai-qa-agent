@@ -171,6 +171,10 @@ export function createTestCoverageRouter(): Router {
         useRepoIntelligence: !!repoContextUsed,
         repoId: repoContextUsed ? repoId : undefined,
         includeCoverageGaps: includeCoverageGaps !== false, // default true
+        // Persist the coverage gaps inside the analysis JSONB so they survive to
+        // the History detail view (gaps are not stored in a separate table).
+        coverageGaps: result.coverageGaps || [],
+        gapsFound: result.stats?.gapsFound ?? (result.coverageGaps?.length || 0),
       };
 
       let reqId: number;
