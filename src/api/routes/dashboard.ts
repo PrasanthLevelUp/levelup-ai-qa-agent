@@ -26,13 +26,15 @@ export function createDashboardRouter(): Router {
     try {
       const limit = Math.min(parseInt(req.query.limit as string) || 20, 50);
       const cid = (req as any).companyId;
+      const pid = req.query.projectId ? parseInt(req.query.projectId as string, 10) : null;
+      const pidClause = pid ? `AND ha.project_id = ${pid}` : '';
       const pool = getPool();
 
       const { rows } = await pool.query(
         `SELECT ha.*, te.test_name AS exec_test_name
          FROM healing_actions ha
          LEFT JOIN test_executions te ON ha.test_execution_id = te.id
-         WHERE ($1::int IS NULL OR ha.company_id = $1)
+         WHERE ($1::int IS NULL OR ha.company_id = $1) ${pidClause}
          ORDER BY ha.created_at DESC
          LIMIT $2`,
         [cid, limit],
