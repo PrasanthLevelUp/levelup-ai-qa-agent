@@ -4602,8 +4602,19 @@ export async function getTestCasesForRequirement(
         tc.last_automated_script_id,
         tc.last_automated_at,
         tc.requirement_id,
-        tc.created_at
+        tc.created_at,
+        COALESCE(sc.script_count, 0)::int AS script_count,
+        CASE
+          WHEN COALESCE(sc.script_count, 0) > 0 OR tc.is_automated = true THEN 'automated'
+          ELSE 'not_automated'
+        END AS automation_status
      FROM generated_test_cases tc
+     LEFT JOIN (
+       SELECT test_case_id, COUNT(*)::int AS script_count
+       FROM generated_scripts
+       WHERE deleted_at IS NULL
+       GROUP BY test_case_id
+     ) sc ON sc.test_case_id = tc.id
      WHERE ${conds.join(' AND ')}
      ORDER BY tc.priority, tc.id`,
     vals,
