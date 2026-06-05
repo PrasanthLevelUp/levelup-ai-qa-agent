@@ -16,8 +16,23 @@ import {
   type PRCreationRequest,
 } from '../../integrations/github-service';
 import { getGeneratedScript } from '../../db/postgres';
-import type { GeneratedFile } from '../../script-gen/script-gen-engine';
+import { parseScriptContent } from '../../services/script-file-parser';
 import { logger } from '../../utils/logger';
+
+/**
+ * Validate a repo-relative file path before sending it to the GitHub service.
+ * Mirrors the GitHubService sanitization rules (no traversal, no absolute
+ * paths) and additionally rejects any residual delimiter artifacts (e.g. a
+ * leading `//` or trailing ` ===`) that would otherwise be silently pushed.
+ */
+function isValidRepoPath(p: string): boolean {
+  if (!p || !p.trim()) return false;
+  const path = p.trim();
+  if (path.includes('..') || path.startsWith('/')) return false;
+  // Reject leftover comment/delimiter artifacts from malformed parsing.
+  if (path.startsWith('//') || path.includes('===')) return false;
+  return true;
+}
 
 const MOD = 'github-routes';
 
@@ -123,15 +138,16 @@ export function createGitHubRouter(): Router {
           return;
         }
 
-        // Reconstruct files from stored content
-        const filesInfo = script.files_generated as Array<{ path: string; size: number; type: string }>;
-        const chunks = (script.script_content as string).split('\n// === ').filter(Boolean);
-        resolvedFiles = chunks.map((chunk: string, i: number) => {
-          const firstNewline = chunk.indexOf('\n');
-          const filePath = chunk.substring(0, firstNewline).replace(' ===', '').trim();
-          const content = chunk.substring(firstNewline + 1);
-          return { path: filePath, content };
-        });
+        // Reconstruct files from stored content using the shared parser. This
+        // correctly strips `// === <path> ===` delimiters (including the first
+        // header which has no leading newline) instead of the previous manual
+        // string splitting that left a `// ` prefix and trailing ` ===` in the
+        // path (root cause of the "Invalid file path" error).
+        const parsed = parseScriptContent(
+          script.script_content as string,
+          script.files_generated,
+        );
+        resolvedFiles = parsed.map((f) => ({ path: f.path, content: f.content }));
       }
 
       if (!resolvedFiles.length) {
@@ -141,6 +157,17 @@ export function createGitHubRouter(): Router {
 
       if (!repoOwner || !repoName) {
         res.status(400).json({ success: false, error: 'repoOwner and repoName are required' });
+        return;
+      }
+
+      // Final guard: reject any malformed path (covers both the scriptId and the
+      // directly-provided `files` paths) before reaching the GitHub service.
+      const invalidPaths = resolvedFiles.filter((f) => !isValidRepoPath(f.path));
+      if (invalidPaths.length > 0) {
+        res.status(400).json({
+          success: false,
+          error: `Cannot create PR — invalid file path(s): ${invalidPaths.map((f) => f.path).join(', ')}`,
+        });
         return;
       }
 

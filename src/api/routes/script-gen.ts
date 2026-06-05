@@ -58,6 +58,32 @@ import { IntelligenceFusionService } from '../../services/intelligence-fusion-se
 import { getContextFromRequest } from '../middleware/context';
 
 /**
+ * Reconstruct `GeneratedFile[]` from a stored script blob.
+ *
+ * The blob is a single `script_content` column delimited by `// === <path> ===`
+ * headers. We delegate parsing to the shared `parseScriptContent` utility
+ * (src/services/script-file-parser.ts) which correctly strips the delimiters —
+ * including the very first header that has no leading newline — instead of the
+ * previous manual `split('\n// === ')` + `replace(' ===', '')` logic that left
+ * a `// ` prefix and a trailing ` ===` on the first file's path (the root cause
+ * of the "Invalid file path" error during PR creation).
+ *
+ * File `type` is sourced from `parseScriptContent` (which itself prefers the
+ * separately-stored `files_generated` metadata), keeping the AI-review, export
+ * and push flows consistent.
+ */
+function reconstructGeneratedFiles(
+  scriptContent: string | null | undefined,
+  filesGenerated?: unknown,
+): GeneratedFile[] {
+  return parseScriptContent(scriptContent, filesGenerated).map((f) => ({
+    path: f.path,
+    content: f.content,
+    type: f.type as GeneratedFile['type'],
+  }));
+}
+
+/**
  * Sprint 4 — Extract human-readable element descriptions for locator resolution.
  *
  * The Locator Resolution Service needs a flat list of UI element descriptions
@@ -823,16 +849,10 @@ export function createScriptGenRouter(): Router {
       console.log(`[ScriptGen] Running AI review on script #${id}`);
 
       // Reconstruct GeneratedFile[] from stored data
-      const filesInfo = script.files_generated as Array<{ path: string; size: number; type: string }>;
-      const scriptContent = script.script_content || '';
-      const chunks = scriptContent.split('\n// === ').filter(Boolean);
-      const generatedFiles: GeneratedFile[] = chunks.map((chunk: string, i: number) => {
-        const firstNewline = chunk.indexOf('\n');
-        const filePath = chunk.substring(0, firstNewline).replace(' ===', '').trim();
-        const content = chunk.substring(firstNewline + 1);
-        const fileType = (filesInfo[i]?.type || 'test') as GeneratedFile['type'];
-        return { path: filePath, content, type: fileType };
-      });
+      const generatedFiles: GeneratedFile[] = reconstructGeneratedFiles(
+        script.script_content,
+        script.files_generated,
+      );
 
       const reviewer = new AIReviewEngine();
       const reviewResult = await reviewer.review(generatedFiles, script.test_plan || undefined);
@@ -880,16 +900,10 @@ export function createScriptGenRouter(): Router {
       console.log(`[ScriptGen] Exporting project for script #${id}`);
 
       // Reconstruct GeneratedFile[] from stored content
-      const filesInfo = script.files_generated as Array<{ path: string; size: number; type: string }>;
-      const scriptContent = script.script_content || '';
-      const chunks = scriptContent.split('\n// === ').filter(Boolean);
-      const generatedFiles: GeneratedFile[] = chunks.map((chunk: string, i: number) => {
-        const firstNewline = chunk.indexOf('\n');
-        const filePath = chunk.substring(0, firstNewline).replace(' ===', '').trim();
-        const content = chunk.substring(firstNewline + 1);
-        const fileType = (filesInfo[i]?.type || 'test') as GeneratedFile['type'];
-        return { path: filePath, content, type: fileType };
-      });
+      const generatedFiles: GeneratedFile[] = reconstructGeneratedFiles(
+        script.script_content,
+        script.files_generated,
+      );
 
       const exporter = new ProjectExportEngine();
       const outputDir = path.join(os.tmpdir(), `levelup-export-${id}-${Date.now()}`);
@@ -967,16 +981,10 @@ export function createScriptGenRouter(): Router {
       console.log(`[ScriptGen] Pushing script #${id} to GitHub: ${repoUrl}`);
 
       // Reconstruct generated files from stored content
-      const filesInfo = script.files_generated as Array<{ path: string; size: number; type: string }>;
-      const scriptContent = script.script_content || '';
-      const chunks = scriptContent.split('\n// === ').filter(Boolean);
-      const generatedFiles: GeneratedFile[] = chunks.map((chunk: string, i: number) => {
-        const firstNewline = chunk.indexOf('\n');
-        const filePath = chunk.substring(0, firstNewline).replace(' ===', '').trim();
-        const content = chunk.substring(firstNewline + 1);
-        const fileType = (filesInfo[i]?.type || 'test') as GeneratedFile['type'];
-        return { path: filePath, content, type: fileType };
-      });
+      const generatedFiles: GeneratedFile[] = reconstructGeneratedFiles(
+        script.script_content,
+        script.files_generated,
+      );
 
       // Export to a temp directory first
       const exporter = new ProjectExportEngine();
