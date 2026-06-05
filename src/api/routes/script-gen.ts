@@ -185,6 +185,10 @@ export function createScriptGenRouter(): Router {
         generationSource: rawGenerationSource,
         locatorStrategy,
         folderStrategy,
+        // Opt-in to project scaffold files (playwright.config, README, .env.example,
+        // CI workflow, utils). Suppressed by default — only test artifacts are
+        // generated unless this is explicitly true.
+        includeScaffold,
       } = req.body;
 
       // ── Sprint 4B: auto-populate the target URL from the environment ──────
@@ -368,6 +372,7 @@ export function createScriptGenRouter(): Router {
         maxPages: maxPages ?? 3,
         repoIntelligence,
         knowledgeContext,
+        ...(typeof includeScaffold === 'boolean' ? { includeScaffold } : {}),
         ...(fusionContext ? { fusionContext } : {}),
         ...(repoProfile ? { repoProfile } : {}),
         ...(sanitizedAuthConfig ? { authConfig: sanitizedAuthConfig } : {}),
