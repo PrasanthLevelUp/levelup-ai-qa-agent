@@ -228,6 +228,110 @@ export class CrawlOrchestrator {
   }
 
   /**
+   * Save the result of a DEEP multi-page authenticated crawl.
+   *
+   * Aggregates every crawled page into a single profile: the crawl_data blob
+   * holds the sitemap + per-page selector intelligence, and one page snapshot
+   * row is written per discovered page.
+   */
+  async saveDeepCrawlResult(
+    baseUrl: string,
+    multi: {
+      pages: any[];
+      navigationGraph?: any[];
+      siteMap?: any[];
+      authenticated?: boolean;
+      authResult?: any;
+      totalCrawlTimeMs?: number;
+    },
+    companyId?: number,
+    config?: OrchestratorConfig,
+    projectId?: number,
+  ): Promise<ApplicationProfile | null> {
+    const pages = Array.isArray(multi?.pages) ? multi.pages : [];
+    const totalElements = pages.reduce((s, p) => s + (p?.elements?.length ?? 0), 0);
+    const totalForms = pages.reduce((s, p) => s + (p?.forms?.length ?? 0), 0);
+    const totalInteractive = pages.reduce((s, p) => s + (p?.interactiveElements ?? 0), 0);
+
+    // Compact crawl_data blob (omit heavy screenshot buffers / raw html).
+    const crawlData = {
+      multiPage: true,
+      entryUrl: baseUrl,
+      authenticated: !!multi?.authenticated,
+      pageCount: pages.length,
+      totalElements,
+      totalForms,
+      totalInteractive,
+      siteMap: multi?.siteMap ?? [],
+      navigationGraph: multi?.navigationGraph ?? [],
+      crawlTimeMs: multi?.totalCrawlTimeMs,
+      pages: pages.map((p) => ({
+        url: p?.url,
+        finalUrl: p?.finalUrl,
+        title: p?.title,
+        pageType: p?.pageType,
+        elements: p?.elements,           // includes multi-strategy selectors
+        forms: p?.forms,
+        buttons: p?.buttons,
+        inputs: p?.inputs,
+        navigationLinks: p?.navigationLinks,
+        headings: p?.headings,
+        interactiveElements: p?.interactiveElements,
+      })),
+    };
+
+    const input: SaveProfileInput = {
+      baseUrl,
+      crawlData,
+      authRequired: !!config?.authConfig,
+      authConfig: config?.authConfig,
+      totalElements,
+      totalForms,
+      totalInteractive,
+      ttlDays: config?.ttlDays ?? 30,
+      pages: pages.map((p) => ({
+        url: p?.finalUrl || p?.url || baseUrl,
+        title: p?.title,
+        pageType: p?.pageType,
+        domStructure: {
+          totalElements: p?.totalElements,
+          interactiveElements: p?.interactiveElements,
+          headings: p?.headings,
+        },
+        selectors: {
+          forms: p?.forms,
+          buttons: p?.buttons,
+          inputs: p?.inputs,
+          navigationLinks: p?.navigationLinks,
+          // Per-element multi-strategy locators (id/data-testid/css/xpath).
+          elements: p?.elements,
+        },
+        elementsCount: p?.elements?.length ?? 0,
+        formsCount: p?.forms?.length ?? 0,
+        interactiveCount: p?.interactiveElements ?? 0,
+      })),
+    };
+
+    try {
+      console.log(`[CrawlOrchestrator] 💾 Saving DEEP crawl for ${baseUrl} (pages=${pages.length}, elements=${totalElements}, forms=${totalForms}, authed=${!!multi?.authenticated})`);
+      const profile = await this.profileService.saveProfile(input, companyId, projectId);
+      console.log(`[CrawlOrchestrator] ✅ Deep profile saved: id=${profile.id}, status=${profile.status}, pages=${pages.length}`);
+      logger.info(MOD, 'Deep crawl result saved to profile', { profileId: profile.id, url: baseUrl, pages: pages.length, projectId });
+      return profile;
+    } catch (saveErr: any) {
+      console.error(
+        `[CrawlOrchestrator] ❌ Deep profile save failed for ${baseUrl}: ${saveErr.message}` +
+          (saveErr.code ? ` [code=${saveErr.code}]` : '') +
+          (saveErr.constraint ? ` [constraint=${saveErr.constraint}]` : ''),
+      );
+      logger.warn(MOD, 'Could not save deep crawl result (non-blocking)', {
+        url: baseUrl, companyId, projectId, error: saveErr.message, code: saveErr.code,
+      });
+      return null;
+    }
+  }
+
+  /**
    * Mark a profile as currently being crawled (for long-running crawls).
    */
   async markCrawling(profileId: string): Promise<void> {

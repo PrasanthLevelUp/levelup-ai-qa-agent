@@ -25,7 +25,8 @@ import { ProfileService } from '../../intelligence/profile-service';
 import { CrawlOrchestrator } from '../../intelligence/crawl-orchestrator';
 import { SelectorHealingEngine } from '../../intelligence/healing-engine';
 import { PatternMatcher } from '../../intelligence/pattern-matcher';
-import { findMatchingPatterns, migrateDataToDefaultProjects, getProjectStats, listProfiles, listRepositories, getKnowledgeStats, upsertProfile, getPool } from '../../db/postgres';
+import { findMatchingPatterns, migrateDataToDefaultProjects, getProjectStats, listProfiles, listRepositories, getKnowledgeStats, upsertProfile, getPool, getProfileById, updateProfileAuth, updateProfileStatus } from '../../db/postgres';
+import { PageCrawler } from '../../script-gen/page-crawler';
 import { IntelligenceHealthService } from '../../services/intelligence-health-service';
 
 /* ──────────────────────────────────────────────────────────────────────────
@@ -65,6 +66,29 @@ const screenshotUpload = multer({
   },
 });
 
+/**
+ * Strip credential values from a profile before returning it to the client.
+ * The presence of auth is exposed via `auth_required` and a boolean flag,
+ * but raw username/password are never echoed back.
+ */
+function sanitizeProfileAuth(profile: any): any {
+  if (!profile) return profile;
+  const ac = profile.auth_config
+    ? (typeof profile.auth_config === 'string' ? JSON.parse(profile.auth_config) : profile.auth_config)
+    : null;
+  return {
+    ...profile,
+    auth_config: ac
+      ? {
+          loginUrl: ac.loginUrl,
+          hasCredentials: !!(ac.credentials && (ac.credentials.username || ac.credentials.email)),
+          username: ac.credentials?.username || ac.credentials?.email || undefined, // username is not secret
+          customSelectors: ac.customSelectors,
+        }
+      : null,
+  };
+}
+
 export function createIntelligenceRouter(): Router {
   const router = Router();
   const profileService = new ProfileService();
@@ -86,7 +110,7 @@ export function createIntelligenceRouter(): Router {
       const offset = parseInt(String(req.query.offset || '0'), 10);
 
       const result = await profileService.listProfiles(companyId, { status, limit, offset, projectId });
-      res.json({ success: true, data: result.profiles, total: result.total });
+      res.json({ success: true, data: result.profiles.map(sanitizeProfileAuth), total: result.total });
     } catch (err) {
       res.status(500).json({ success: false, error: (err as Error).message });
     }
@@ -152,7 +176,7 @@ export function createIntelligenceRouter(): Router {
     try {
       const detail = await profileService.getProfileDetail(String(req.params.id));
       if (!detail) return res.status(404).json({ success: false, error: 'Profile not found' });
-      res.json({ success: true, data: detail });
+      res.json({ success: true, data: sanitizeProfileAuth(detail) });
     } catch (err) {
       res.status(500).json({ success: false, error: (err as Error).message });
     }
@@ -292,6 +316,126 @@ export function createIntelligenceRouter(): Router {
         ttlDays,
       });
       res.json({ success: true, data: decision });
+    } catch (err) {
+      res.status(500).json({ success: false, error: (err as Error).message });
+    }
+  });
+
+  /**
+   * Save authentication config for a profile (used by the "Configure Auth" UI).
+   *
+   * Body: { username, password, loginUrl?, usernameSelector?, passwordSelector?,
+   *         submitSelector?, authRequired? }
+   *
+   * SECURITY: credentials are stored in the auth_config JSONB column and are
+   * never echoed back in responses or logs.
+   */
+  router.post('/profiles/:id/auth', async (req: Request, res: Response) => {
+    try {
+      const companyId = (req as any).companyId;
+      const id = String(req.params.id);
+      const b = req.body || {};
+
+      const profile = await getProfileById(id);
+      if (!profile) return res.status(404).json({ success: false, error: 'Profile not found' });
+
+      const username = String(b.username || b.email || '').trim();
+      const password = String(b.password || '').trim();
+      const authRequired = b.authRequired !== undefined ? !!b.authRequired : true;
+
+      // Allow clearing auth entirely.
+      if (!authRequired) {
+        const cleared = await updateProfileAuth(id, false, null, companyId);
+        return res.json({ success: true, data: sanitizeProfileAuth(cleared) });
+      }
+
+      if (!username || !password) {
+        return res.status(400).json({ success: false, error: 'username and password are required when authRequired is true' });
+      }
+
+      const customSelectors: Record<string, string> = {};
+      if (b.usernameSelector) customSelectors.usernameField = String(b.usernameSelector);
+      if (b.passwordSelector) customSelectors.passwordField = String(b.passwordSelector);
+      if (b.submitSelector) customSelectors.submitButton = String(b.submitSelector);
+
+      const authConfig: any = {
+        loginUrl: b.loginUrl ? String(b.loginUrl).trim() : undefined,
+        credentials: { username, password },
+      };
+      if (Object.keys(customSelectors).length) authConfig.customSelectors = customSelectors;
+
+      const updated = await updateProfileAuth(id, true, authConfig, companyId);
+      if (!updated) return res.status(404).json({ success: false, error: 'Profile not found' });
+
+      // Never return credential values to the client.
+      res.json({ success: true, data: sanitizeProfileAuth(updated) });
+    } catch (err) {
+      res.status(500).json({ success: false, error: (err as Error).message });
+    }
+  });
+
+  /**
+   * Manually trigger a real DEEP crawl for a profile (the "Crawl Now" button).
+   *
+   * Runs asynchronously: the profile is immediately marked `crawling` and the
+   * crawl proceeds in the background (it can take 30s+). The UI polls
+   * GET /profiles/:id to observe status transition to `fresh` (or `error`).
+   *
+   * If the profile has auth_config saved, the crawl authenticates first, then
+   * autonomously discovers and visits internal pages in the same session.
+   */
+  router.post('/profiles/:id/crawl', async (req: Request, res: Response) => {
+    try {
+      const companyId = (req as any).companyId;
+      const projectId = (req as any).projectId as number | undefined;
+      const id = String(req.params.id);
+      const b = req.body || {};
+
+      const profile = await getProfileById(id);
+      if (!profile) return res.status(404).json({ success: false, error: 'Profile not found' });
+
+      const baseUrl = profile.base_url;
+      const maxPages = Math.min(parseInt(String(b.maxPages || 12), 10) || 12, 15);
+      const maxDepth = Math.min(parseInt(String(b.maxDepth || 2), 10) || 2, 3);
+      const authConfig = profile.auth_config
+        ? (typeof profile.auth_config === 'string' ? JSON.parse(profile.auth_config) : profile.auth_config)
+        : undefined;
+
+      // Mark crawling immediately so the UI reflects progress.
+      await updateProfileStatus(id, 'crawling');
+
+      // Fire-and-forget: run the deep crawl in the background.
+      (async () => {
+        const t0 = Date.now();
+        try {
+          console.log(`[intelligence] 🕷️  Manual deep crawl started for ${baseUrl} (profile=${id}, auth=${!!authConfig}, maxPages=${maxPages}, maxDepth=${maxDepth})`);
+          const crawler = new PageCrawler({
+            url: baseUrl,
+            authConfig,
+            maxPages,
+            maxDepth,
+            captureScreenshot: true,
+          });
+          const result = await crawler.crawlDeepAuthenticated();
+          await crawlOrchestrator.saveDeepCrawlResult(
+            baseUrl,
+            result,
+            companyId,
+            { authConfig },
+            projectId ?? profile.project_id ?? undefined,
+          );
+          console.log(`[intelligence] ✅ Manual deep crawl finished for ${baseUrl}: pages=${result.pages.length}, authed=${result.authenticated}, ${Date.now() - t0}ms`);
+        } catch (crawlErr: any) {
+          console.error(`[intelligence] ❌ Manual deep crawl failed for ${baseUrl}: ${crawlErr.message}`);
+          await updateProfileStatus(id, 'error', crawlErr.message).catch(() => {});
+        }
+      })();
+
+      res.status(202).json({
+        success: true,
+        message: 'Crawl started — poll GET /profiles/:id for status',
+        data: { id, status: 'crawling', baseUrl, authenticated: !!authConfig, maxPages, maxDepth },
+      });
     } catch (err) {
       res.status(500).json({ success: false, error: (err as Error).message });
     }

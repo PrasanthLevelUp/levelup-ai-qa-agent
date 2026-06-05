@@ -45,6 +45,32 @@ export interface CrawlConfig {
   additionalUrls?: string[];
 }
 
+/**
+ * Multiple selector strategies for a single element, ordered by robustness.
+ * Test scripts can pick the most stable available locator (id/testid first,
+ * falling back to CSS/XPath). `recommended` is the single best pick.
+ */
+export interface ElementSelectors {
+  /** `#id` selector when the element has a stable id. */
+  id?: string;
+  /** `[data-testid="..."]` selector — most stable for test automation. */
+  dataTestId?: string;
+  /** `[name="..."]` selector (form fields). */
+  name?: string;
+  /** ARIA-role + accessible-name based selector hint (Playwright getByRole). */
+  role?: string;
+  /** Visible-text based selector hint (Playwright getByText / :has-text). */
+  text?: string;
+  /** Unique CSS path computed from the DOM tree. */
+  css?: string;
+  /** Absolute/indexed XPath computed from the DOM tree. */
+  xpath?: string;
+  /** The single most robust selector to use first. */
+  recommended?: string;
+  /** Strategy name of the recommended selector (id|data-testid|name|role|text|css|xpath). */
+  recommendedStrategy?: string;
+}
+
 export interface PageElement {
   tag: string;
   type?: string;             // input type
@@ -68,6 +94,8 @@ export interface PageElement {
   nearbyLabel?: string;
   formIndex?: number;        // which form this belongs to (-1 if none)
   attributes: Record<string, string>;
+  /** Multiple selector strategies (id, data-testid, css, xpath, …) per element. */
+  selectors?: ElementSelectors;
 }
 
 export interface FormInfo {
@@ -117,9 +145,27 @@ export interface CrawlResult {
   authResult?: AuthResult;
 }
 
+/** A single node in the discovered application sitemap. */
+export interface SiteMapNode {
+  url: string;
+  title: string;
+  pageType: PageType;
+  depth: number;
+  /** URL this page was discovered from (null for the entry/landing page). */
+  discoveredFrom: string | null;
+  elementCount: number;
+  formCount: number;
+  interactiveCount: number;
+}
+
 export interface MultiPageCrawlResult {
   pages: CrawlResult[];
   navigationGraph: { from: string; to: string; linkText: string }[];
+  /** Structured map of the application discovered during the crawl. */
+  siteMap?: SiteMapNode[];
+  /** True when an authenticated session was established for the crawl. */
+  authenticated?: boolean;
+  authResult?: AuthResult;
   totalCrawlTimeMs: number;
 }
 
@@ -302,7 +348,88 @@ const EXTRACT_ELEMENTS_SCRIPT = `
   const results = [];
   const interactive = 'a,button,input,select,textarea,[role="button"],[role="link"],[role="tab"],[role="menuitem"],[onclick],[data-testid]';
   const elements = document.querySelectorAll(interactive);
-  
+
+  // ── Selector-strategy helpers (run in browser context) ──────────────
+  const cssEscape = (v) => {
+    if (window.CSS && CSS.escape) return CSS.escape(v);
+    return String(v).replace(/([^a-zA-Z0-9_-])/g, '\\\\$1');
+  };
+
+  // Build a unique-ish CSS path by walking up to <body>, using nth-of-type.
+  const cssPath = (el) => {
+    if (!(el instanceof Element)) return '';
+    const parts = [];
+    let node = el;
+    let depth = 0;
+    while (node && node.nodeType === 1 && node.tagName.toLowerCase() !== 'html' && depth < 6) {
+      let selector = node.tagName.toLowerCase();
+      if (node.id) {
+        // an id makes the path unique — prepend and stop.
+        parts.unshift('#' + cssEscape(node.id));
+        return parts.join(' > ');
+      }
+      const parent = node.parentElement;
+      if (parent) {
+        const sameTag = Array.from(parent.children).filter(c => c.tagName === node.tagName);
+        if (sameTag.length > 1) {
+          const index = sameTag.indexOf(node) + 1;
+          selector += ':nth-of-type(' + index + ')';
+        }
+      }
+      parts.unshift(selector);
+      node = parent;
+      depth++;
+    }
+    return parts.join(' > ');
+  };
+
+  // Build an indexed XPath up to a stable ancestor (id) or document root.
+  const xPath = (el) => {
+    if (!(el instanceof Element)) return '';
+    const segs = [];
+    let node = el;
+    while (node && node.nodeType === 1) {
+      if (node.id) {
+        segs.unshift('//*[@id="' + node.id + '"]');
+        return segs.join('/');
+      }
+      let ix = 1;
+      let sib = node.previousElementSibling;
+      while (sib) { if (sib.tagName === node.tagName) ix++; sib = sib.previousElementSibling; }
+      segs.unshift(node.tagName.toLowerCase() + '[' + ix + ']');
+      node = node.parentElement;
+    }
+    return '/' + segs.join('/');
+  };
+
+  // Pick the most robust selector & build the strategies object.
+  const buildSelectors = (el) => {
+    const sel = {};
+    const testId = el.getAttribute('data-testid') || el.getAttribute('data-test-id') || el.getAttribute('data-test');
+    const nameAttr = el.getAttribute('name');
+    const roleAttr = el.getAttribute('role');
+    const ariaLabel = el.getAttribute('aria-label');
+    const text = (el.textContent || '').trim().replace(/\\s+/g, ' ').substring(0, 60);
+
+    if (el.id) sel.id = '#' + cssEscape(el.id);
+    if (testId) sel.dataTestId = '[data-testid="' + testId + '"]';
+    if (nameAttr) sel.name = el.tagName.toLowerCase() + '[name="' + nameAttr + '"]';
+    if (roleAttr && (ariaLabel || text)) sel.role = 'role=' + roleAttr + '[name="' + (ariaLabel || text) + '"]';
+    if (text && ['BUTTON','A'].includes(el.tagName)) sel.text = 'text=' + text;
+    sel.css = cssPath(el);
+    sel.xpath = xPath(el);
+
+    // Recommendation order: data-testid > id > name > role > text > css > xpath
+    if (sel.dataTestId) { sel.recommended = sel.dataTestId; sel.recommendedStrategy = 'data-testid'; }
+    else if (sel.id) { sel.recommended = sel.id; sel.recommendedStrategy = 'id'; }
+    else if (sel.name) { sel.recommended = sel.name; sel.recommendedStrategy = 'name'; }
+    else if (sel.role) { sel.recommended = sel.role; sel.recommendedStrategy = 'role'; }
+    else if (sel.text) { sel.recommended = sel.text; sel.recommendedStrategy = 'text'; }
+    else if (sel.css) { sel.recommended = sel.css; sel.recommendedStrategy = 'css'; }
+    else { sel.recommended = sel.xpath; sel.recommendedStrategy = 'xpath'; }
+    return sel;
+  };
+
   elements.forEach((el, idx) => {
     if (idx > 500) return; // cap at 500 elements
     const rect = el.getBoundingClientRect();
@@ -357,6 +484,7 @@ const EXTRACT_ELEMENTS_SCRIPT = `
       nearbyLabel,
       formIndex,
       attributes: attrs,
+      selectors: buildSelectors(el),
     });
   });
   
@@ -434,12 +562,12 @@ export class PageCrawler {
   constructor(config: CrawlConfig) {
     this.config = {
       ...config,
-      maxDepth: config.maxDepth ?? 1,
+      maxDepth: Math.min(config.maxDepth ?? 1, 3), // cap depth at 3 to bound deep crawls
       timeout: Math.min(config.timeout ?? 15000, 30000), // cap at 30s
       waitAfterLoad: Math.min(config.waitAfterLoad ?? 2000, 5000),
       captureScreenshot: config.captureScreenshot ?? true,
       followLinks: config.followLinks ?? false,
-      maxPages: Math.min(config.maxPages ?? 5, 10), // cap at 10 pages
+      maxPages: Math.min(config.maxPages ?? 5, 15), // cap at 15 pages
       viewport: config.viewport ?? { width: 1280, height: 720 },
     };
   }
@@ -733,6 +861,160 @@ export class PageCrawler {
     } catch (error) {
       if (browser) try { await browser.close(); } catch { /* ignore */ }
       throw new Error(`Authenticated multi-page crawl failed: ${(error as Error).message}`);
+    }
+  }
+
+  /**
+   * Deep authenticated crawl with AUTONOMOUS link discovery.
+   *
+   * This is the method that powers "Crawl Now" from the Application Profiles UI.
+   * It needs no pre-written scripts or hand-supplied locators — Playwright drives
+   * a real browser and the crawler discovers the app structure itself:
+   *
+   *   1. Launch a headless browser + single shared context.
+   *   2. If authConfig is present, log in ONCE (session cookies persist for all
+   *      subsequent navigations in the same context).
+   *   3. Crawl the landing/target page, capturing interactive elements
+   *      (forms, inputs, buttons, selects) with multiple selector strategies.
+   *   4. BFS-discover internal navigation links from each crawled page and keep
+   *      visiting new same-origin routes — in the SAME authenticated session —
+   *      until maxPages or maxDepth is reached.
+   *   5. Build a sitemap describing the discovered application structure.
+   *
+   * The session is preserved across every page, so authenticated areas
+   * (dashboards, settings, inventory, etc.) are reachable — unlike
+   * `crawlMultiPage`, which spins up a fresh unauthenticated browser per URL.
+   */
+  async crawlDeepAuthenticated(): Promise<MultiPageCrawlResult> {
+    const validation = validateUrl(this.config.url);
+    if (!validation.valid) {
+      throw new Error(`URL validation failed: ${validation.reason}`);
+    }
+
+    const startTime = Date.now();
+    const pages: CrawlResult[] = [];
+    const navigationGraph: { from: string; to: string; linkText: string }[] = [];
+    const siteMap: SiteMapNode[] = [];
+    let browser: any = null;
+    let authResult: AuthResult | undefined;
+
+    const origin = (() => { try { return new URL(this.config.url).origin; } catch { return ''; } })();
+    const normalize = (u: string) => u.replace(/#.*$/, '').replace(/\/$/, '');
+
+    try {
+      const pw = await import('playwright');
+      browser = await pw.chromium.launch({
+        headless: true,
+        args: ['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
+      });
+      const context = await browser.newContext({
+        viewport: this.config.viewport,
+        userAgent: 'LevelUpAI-Crawler/1.0 (Test Automation)',
+        javaScriptEnabled: true,
+        ignoreHTTPSErrors: true,
+      });
+      context.setDefaultTimeout(this.config.timeout);
+      context.setDefaultNavigationTimeout(this.config.timeout);
+
+      const page = await context.newPage();
+      await page.route('**/*.{mp4,webm,ogg,mp3,wav,flac}', (route: any) => route.abort());
+      await page.route('**/*.{woff,woff2,ttf,eot}', (route: any) => route.abort());
+
+      // ── 1. Authenticate once (if configured) ─────────────────────────
+      if (this.config.authConfig) {
+        const authEngine = new AuthEngine();
+        authResult = await authEngine.authenticate(page, context, this.config.authConfig, this.config.url);
+        logger.info(MOD, 'Deep crawl auth attempt', {
+          success: authResult.success,
+          strategy: authResult.strategy,
+          durationMs: authResult.durationMs,
+        });
+        if (!authResult.success) {
+          logger.warn(MOD, 'Deep crawl auth failed — continuing best-effort (public pages only)', {
+            error: authResult.message,
+          });
+        }
+      }
+
+      // ── 2. BFS over discovered same-origin links in the SAME session ──
+      const visited = new Set<string>();
+      const queue: { url: string; depth: number; from: string | null; linkText: string }[] = [
+        { url: this.config.url, depth: 0, from: null, linkText: 'entry' },
+      ];
+      // Seed any caller-provided URLs too.
+      for (const extra of this.config.additionalUrls || []) {
+        queue.push({ url: extra, depth: 0, from: this.config.url, linkText: 'seed' });
+      }
+
+      while (queue.length > 0 && pages.length < this.config.maxPages) {
+        const item = queue.shift()!;
+        const key = normalize(item.url);
+        if (visited.has(key)) continue;
+        visited.add(key);
+
+        const urlVal = validateUrl(item.url);
+        if (!urlVal.valid) {
+          logger.warn(MOD, 'Skipping invalid/blocked URL during deep crawl', { url: item.url, reason: urlVal.reason });
+          continue;
+        }
+
+        try {
+          const result = await this.crawlPageInContext(page, item.url, pages.length === 0);
+          if (authResult) result.authResult = authResult;
+          pages.push(result);
+
+          if (item.from) {
+            navigationGraph.push({ from: item.from, to: item.url, linkText: item.linkText });
+          }
+          siteMap.push({
+            url: result.finalUrl || item.url,
+            title: result.title,
+            pageType: result.pageType,
+            depth: item.depth,
+            discoveredFrom: item.from,
+            elementCount: result.elements.length,
+            formCount: result.forms.length,
+            interactiveCount: result.interactiveElements,
+          });
+
+          // Discover next-level internal links (same-origin, not yet visited).
+          if (item.depth < this.config.maxDepth) {
+            for (const link of result.navigationLinks) {
+              const linkKey = normalize(link.href);
+              const sameOrigin = origin ? link.href.startsWith(origin) : link.isInternal;
+              if (sameOrigin && !visited.has(linkKey) && !queue.some(q => normalize(q.url) === linkKey)) {
+                queue.push({ url: link.href, depth: item.depth + 1, from: item.url, linkText: link.text });
+              }
+            }
+          }
+        } catch (e) {
+          logger.warn(MOD, 'Deep crawl page failed, skipping', { url: item.url, error: (e as Error).message });
+        }
+      }
+
+      await context.close();
+      await browser.close();
+      browser = null;
+
+      logger.info(MOD, 'Deep authenticated crawl complete', {
+        entry: this.config.url,
+        pagesCrawled: pages.length,
+        authenticated: !!authResult?.success,
+        totalElements: pages.reduce((s, p) => s + p.elements.length, 0),
+        totalForms: pages.reduce((s, p) => s + p.forms.length, 0),
+      });
+
+      return {
+        pages,
+        navigationGraph,
+        siteMap,
+        authenticated: !!authResult?.success,
+        authResult,
+        totalCrawlTimeMs: Date.now() - startTime,
+      };
+    } catch (error) {
+      if (browser) try { await browser.close(); } catch { /* ignore */ }
+      throw new Error(`Deep authenticated crawl failed for ${this.config.url}: ${(error as Error).message}`);
     }
   }
 
