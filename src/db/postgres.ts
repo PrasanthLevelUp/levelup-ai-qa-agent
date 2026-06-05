@@ -6471,6 +6471,28 @@ export async function updateProfileStatus(id: string, status: string, errorMessa
   );
 }
 
+/**
+ * Update only the authentication fields of a profile (used by the
+ * "Configure Auth" UI). Leaves crawl data and all other fields intact.
+ * Credentials are persisted in the auth_config JSONB column.
+ */
+export async function updateProfileAuth(
+  id: string,
+  authRequired: boolean,
+  authConfig: any | null,
+  companyId?: number,
+): Promise<ApplicationProfile | null> {
+  const pool = getPool();
+  const { rows } = await pool.query(
+    `UPDATE application_profiles
+       SET auth_required = $1, auth_config = $2, updated_at = NOW()
+     WHERE id = $3 AND COALESCE(company_id, 0) = COALESCE($4, 0)
+     RETURNING *`,
+    [authRequired, authConfig ? JSON.stringify(authConfig) : null, id, companyId ?? null],
+  );
+  return rows[0] || null;
+}
+
 export async function deleteProfile(id: string, companyId?: number): Promise<boolean> {
   const pool = getPool();
   const { rowCount } = await pool.query(
