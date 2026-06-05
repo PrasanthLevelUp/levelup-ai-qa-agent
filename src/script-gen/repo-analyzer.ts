@@ -49,6 +49,16 @@ export interface RepoStructureAnalysis {
   /** Test folder path (e.g. 'tests') */
   testDir: string;
 
+  /* ── Page-object layout (POM repos) ── */
+  /** Folder where page objects live (e.g. 'pages', 'page-objects'). */
+  pageObjectDir: string;
+  /**
+   * Naming convention for page-object files, derived from the repo's
+   * existing page objects (e.g. PascalCase `LoginPage.ts` rather than the
+   * framework-default kebab-case `login-page.page.ts`).
+   */
+  pageObjectNaming: NamingConvention;
+
   /* ── Existing assets — things we must NOT overwrite ── */
   hasPlaywrightConfig: boolean;
   hasCIWorkflow: boolean;
@@ -85,12 +95,16 @@ export function analyzeRepoStructure(profile: RepositoryProfile): RepoStructureA
   const existingTestFiles = extractTestFilePaths(profile);
   const naming = detectNaming(existingTestFiles, profile.codingStyle);
   const nextFileNumber = computeNextNumber(existingTestFiles, naming);
+  const pageObjectDir = detectPageObjectDir(profile.folderStructure);
+  const pageObjectNaming = detectPageObjectNaming(profile);
 
   return {
     mode,
     naming,
     nextFileNumber,
     testDir,
+    pageObjectDir,
+    pageObjectNaming,
 
     hasPlaywrightConfig: hasConfigFile(profile.folderStructure, 'playwright.config'),
     hasCIWorkflow: !!profile.ciIntegration || hasCIFiles(profile.folderStructure),
@@ -134,6 +148,141 @@ function detectTestDir(fs: FolderStructure): string {
     return fs.testFolder.replace(/^\.?\//, '');
   }
   return 'tests'; // Playwright default
+}
+
+function detectPageObjectDir(fs: FolderStructure): string {
+  if (fs.pageObjectFolder) {
+    return fs.pageObjectFolder.replace(/^\.?\//, '').replace(/\/$/, '');
+  }
+  return 'pages'; // POM default
+}
+
+/**
+ * Derive the naming convention used by the repo's existing page-object files.
+ *
+ * This is what lets us emit `LoginPage.ts` (PascalCase, plain `.ts`) for a repo
+ * that already follows that convention, instead of the framework-default
+ * kebab-case `login-page.page.ts`.
+ */
+function detectPageObjectNaming(profile: RepositoryProfile): NamingConvention {
+  const baseNames = (profile.pageObjects ?? [])
+    .map(po => (po.filePath || '').split('/').pop() || '')
+    .filter(Boolean);
+
+  // Fall back to the repo-wide naming convention when no page objects exist yet.
+  if (baseNames.length === 0) {
+    const casing = (profile.codingStyle?.namingConvention ?? 'PascalCase') as NamingConvention['casing'];
+    const separator = casing === 'snake_case' ? '_' : casing === 'kebab-case' ? '-' : '';
+    return {
+      pattern: `Name.page.ts`,
+      separator,
+      casing: casing === 'mixed' ? 'PascalCase' : casing,
+      extension: '.page.ts',
+      usesNumberPrefix: false,
+    };
+  }
+
+  // Detect extension (e.g. '.page.ts' vs '.ts').
+  const extMatch = baseNames[0].match(/(\.\w+\.\w+|\.\w+)$/);
+  const extension = extMatch ? extMatch[0] : '.ts';
+
+  // Strip the extension to inspect the descriptive part.
+  const descriptiveParts = baseNames
+    .map(n => n.replace(/(\.\w+\.\w+|\.\w+)$/, ''))
+    .filter(Boolean);
+
+  let casing: NamingConvention['casing'] = 'PascalCase';
+  let separator = '';
+
+  if (descriptiveParts.length > 0) {
+    const kebabCount = descriptiveParts.filter(d => d.includes('-')).length;
+    const snakeCount = descriptiveParts.filter(d => d.includes('_')).length;
+    const pascalCount = descriptiveParts.filter(d => /^[A-Z][a-zA-Z0-9]*$/.test(d) && /[a-z]/.test(d)).length;
+    const camelCount = descriptiveParts.filter(d => /^[a-z][a-zA-Z0-9]*$/.test(d) && /[A-Z]/.test(d)).length;
+
+    if (kebabCount > snakeCount && kebabCount >= pascalCount) {
+      casing = 'kebab-case';
+      separator = '-';
+    } else if (snakeCount > 0 && snakeCount >= pascalCount) {
+      casing = 'snake_case';
+      separator = '_';
+    } else if (pascalCount >= camelCount && pascalCount > 0) {
+      casing = 'PascalCase';
+      separator = '';
+    } else if (camelCount > 0) {
+      casing = 'camelCase';
+      separator = '';
+    } else {
+      // Single-word names with no separators → honour repo coding style.
+      casing = (profile.codingStyle?.namingConvention as NamingConvention['casing']) ?? 'PascalCase';
+      if (casing === 'mixed') casing = 'PascalCase';
+      separator = casing === 'snake_case' ? '_' : casing === 'kebab-case' ? '-' : '';
+    }
+  }
+
+  return {
+    pattern: `Name${extension}`,
+    separator,
+    casing,
+    extension,
+    usesNumberPrefix: false,
+  };
+}
+
+/* ------------------------------------------------------------------ */
+/*  Shared file-name builders (used by the default POM generator)       */
+/* ------------------------------------------------------------------ */
+
+/** Split a raw name (camelCase, "Login Page", "login_page", etc.) into lowercase words. */
+function splitWords(raw: string): string[] {
+  return raw
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2') // split camelCase / PascalCase
+    .replace(/[^a-zA-Z0-9]+/g, ' ')         // separators → space
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean)
+    .map(w => w.toLowerCase());
+}
+
+/** Apply a casing convention to a list of words. */
+export function applyCasing(words: string[], casing: NamingConvention['casing'], separator = '-'): string {
+  const cap = (w: string) => w.charAt(0).toUpperCase() + w.slice(1);
+  switch (casing) {
+    case 'snake_case':
+      return words.join('_');
+    case 'kebab-case':
+      return words.join('-');
+    case 'camelCase':
+      return words.map((w, i) => (i === 0 ? w : cap(w))).join('');
+    case 'PascalCase':
+      return words.map(cap).join('');
+    default:
+      return words.join(separator || '-');
+  }
+}
+
+/**
+ * Build a page-object file name from a raw page-object name using the
+ * repo's detected convention (e.g. "Login Page" → `LoginPage.ts`).
+ */
+export function buildPageObjectFileName(rawName: string, naming: NamingConvention): string {
+  const words = splitWords(rawName);
+  if (words.length === 0) return `Page${naming.extension}`;
+  return `${applyCasing(words, naming.casing, naming.separator)}${naming.extension}`;
+}
+
+/**
+ * Build a test spec file name from a flow name using the repo's detected
+ * convention, optionally prefixing a zero-padded number.
+ */
+export function buildSpecFileName(flowName: string, naming: NamingConvention, num = 1): string {
+  const words = splitWords(flowName);
+  const desc = words.length > 0 ? applyCasing(words, naming.casing, naming.separator) : 'test';
+  if (naming.usesNumberPrefix) {
+    const prefix = String(num).padStart(2, '0');
+    return `${prefix}${naming.separator || '-'}${desc}${naming.extension}`;
+  }
+  return `${desc}${naming.extension}`;
 }
 
 function extractTestFilePaths(profile: RepositoryProfile): string[] {
