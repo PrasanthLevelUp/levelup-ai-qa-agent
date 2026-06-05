@@ -26,7 +26,8 @@ import { SelectorQualityEngine, type ScoredSelector } from './selector-quality-e
 import { AssertionEngine, type GeneratedAssertion } from './assertion-engine';
 import { WaitStrategyEngine, type WaitStrategy } from './wait-strategy-engine';
 import { logger } from '../utils/logger';
-import type { RepositoryProfile } from '../context/types';
+import type { RepositoryProfile, ClassInfo } from '../context/types';
+import { extractSelectorInfo } from '../context/ast-analyzer';
 import { analyzeRepoStructure, buildPageObjectFileName, buildSpecFileName } from './repo-analyzer';
 import type { RepoStructureAnalysis } from './repo-analyzer';
 import { adaptiveGenerateFiles } from './adaptive-codegen';
@@ -864,14 +865,27 @@ Generate comprehensive test flows covering all detected functionality.`;
     const pageDir = analysis ? analysis.pageObjectDir : 'pages';
     const testDir = analysis ? analysis.testDir : 'tests';
 
-    // 1. Page Objects — core artifact. Always generated for new pages.
+    // 1. Page Objects — core artifact. Generated for new pages, but REUSED
+    //    (not duplicated) when the connected repo already defines them (Fix #2).
     for (const po of testPlan.pageObjects) {
+      const existing = this.findExistingPageObject(po, config);
+      // If the repo already has this page object AND it covers every locator we
+      // need, skip regeneration entirely to avoid duplicate definitions.
+      if (existing && this.existingCoversAllLocators(po, existing)) {
+        skipped.push(`page-object:${po.name} (already defined in ${existing.filePath} — reused as-is)`);
+        logger.info(MOD, '♻️  Skipping page object generation — fully covered by existing', {
+          pageObject: po.name,
+          existingFile: existing.filePath,
+        });
+        console.log(`[ScriptGenEngine] ♻️  Reusing existing ${existing.filePath} for ${po.name} (no duplicate generated)`);
+        continue;
+      }
       const fileName = analysis
         ? buildPageObjectFileName(po.name, analysis.pageObjectNaming)
         : po.fileName;
       files.push({
         path: `${pageDir}/${fileName}`,
-        content: this.generatePageObject(po),
+        content: this.maybeAddAuthImport(this.generatePageObject(po, config), config),
         type: 'page-object',
       });
     }
@@ -885,7 +899,7 @@ Generate comprehensive test flows covering all detected functionality.`;
       if (analysis?.naming.usesNumberPrefix) specNum++;
       files.push({
         path: `${testDir}/${fileName}`,
-        content: this.generateTestSpec(flow, testPlan, config),
+        content: this.maybeAddAuthImport(this.generateTestSpec(flow, testPlan, config), config),
         type: 'test',
       });
     }
@@ -897,7 +911,7 @@ Generate comprehensive test flows covering all detected functionality.`;
       if (!analysis?.hasFixtures) {
         files.push({
           path: 'fixtures/test-fixtures.ts',
-          content: this.generateFixtures(testPlan.fixtures, config),
+          content: this.maybeAddAuthImport(this.generateFixtures(testPlan.fixtures, config), config),
           type: 'fixture',
         });
         logger.debug(MOD, 'Scaffold decision: fixtures/test-fixtures.ts → GENERATE', {
@@ -905,6 +919,27 @@ Generate comprehensive test flows covering all detected functionality.`;
         });
       } else {
         skipped.push('fixtures/test-fixtures.ts (repo already has fixtures)');
+      }
+    }
+
+    // 3b. Auth fixture (Fix #3) — when the connected repo profile carries real
+    //     credentials and/or a base URL, emit `fixtures/auth.ts` so generated
+    //     specs can import concrete `testCredentials`/`baseUrl` instead of
+    //     relying on un-provisioned environment variables. Skipped silently for
+    //     greenfield runs where no credentials are available.
+    if (this.credsAvailable(config)) {
+      const alreadyEmitted = files.some(f => f.path === 'fixtures/auth.ts');
+      if (!alreadyEmitted) {
+        files.push({
+          path: 'fixtures/auth.ts',
+          content: this.generateAuthFixture(config),
+          type: 'fixture',
+        });
+        logger.info(MOD, '🔐 Emitting fixtures/auth.ts with injected credentials/baseUrl', {
+          hasUsername: !!config.credentials?.username,
+          hasBaseUrl: !!config.url,
+        });
+        console.log('[ScriptGenEngine] 🔐 Generated fixtures/auth.ts (credentials + baseUrl injected from repo profile)');
       }
     }
 
@@ -1039,14 +1074,54 @@ Generate comprehensive test flows covering all detected functionality.`;
 
   /* ──────── Page Object Generator ──────── */
 
-  private generatePageObject(po: PageObjectSpec): string {
-    const locatorDefs = po.locators.map(l =>
-      `  readonly ${l.name} = ${l.selector || `this.page.locator('/* ${escapeTodo(`TODO: No selector resolved for "${l.name}".`)} */')`};`
-    ).join('\n');
+  private generatePageObject(po: PageObjectSpec, config?: GenerationConfig): string {
+    // Fix #2: try to reuse selectors from an existing page object in the
+    // connected repo instead of recreating them from scratch.
+    const existing = config ? this.findExistingPageObject(po, config) : null;
+    const existingLocators = existing
+      ? existing.properties.filter(p => p.selector)
+      : [];
+
+    let reusedCount = 0;
+    let newCount = 0;
+
+    const locatorDefs = po.locators.map(l => {
+      const match = existing ? this.matchExistingLocator(l, existingLocators) : null;
+      if (match) {
+        reusedCount++;
+        const code = this.reconstructLocatorCode(match.selector!, match.locatorType || 'locator');
+        return `  // Reused from existing ${existing!.filePath} (matched by ${match.matchType}: ${match.name})\n  readonly ${l.name} = ${code};`;
+      }
+      newCount++;
+      // Fix #5 (PR-A): emit an annotated diagnostic TODO — not a silent one —
+      // when no concrete selector could be resolved for this element.
+      const sel = l.selector
+        || `this.page.locator('/* ${escapeTodo(`TODO: No selector resolved for "${l.name}".`)} */')`;
+      const tag = existing ? '  // New element — not found in existing page object\n' : '';
+      return `${tag}  readonly ${l.name} = ${sel};`;
+    }).join('\n');
+
+    if (existing) {
+      logger.info(MOD, '♻️  Page object reuse', {
+        pageObject: po.name,
+        existingFile: existing.filePath,
+        reusedSelectors: reusedCount,
+        newSelectors: newCount,
+        totalLocators: po.locators.length,
+      });
+      console.log(
+        `[ScriptGenEngine] ♻️  ${po.name}: reusing ${reusedCount}/${po.locators.length} selector(s) from existing ${existing.filePath}, ${newCount} new`,
+      );
+    } else {
+      logger.info(MOD, '🆕 Page object generated (no existing match)', {
+        pageObject: po.name,
+        newSelectors: po.locators.length,
+      });
+    }
 
     const actionMethods = po.actions.map(a => {
       const steps = (a.steps || []).map((s: TestPlanStep) => {
-        return `    ${this.stepToCode(s)}`;
+        return `    ${this.stepToCode(s, config)}`;
       }).join('\n');
       return `
   async ${a.name}() {
@@ -1054,13 +1129,17 @@ ${steps || '    // TODO: implement'}
   }`;
     }).join('\n');
 
+    const reuseNote = existing
+      ? `\n * Reuses selectors from existing page object: ${existing.filePath}\n * (${reusedCount} reused, ${newCount} new)`
+      : '';
+
     return `import { type Page, type Locator, expect } from '@playwright/test';
 
 /**
  * Page Object: ${po.name}
  * URL: ${po.url}
  * Page Type: ${po.pageType}
- * 
+ *${reuseNote}
  * Generated by LevelUp AI QA Engine
  */
 export class ${po.name} {
@@ -1081,11 +1160,201 @@ ${actionMethods}
 `;
   }
 
+  /* ──────── Page Object Reuse Helpers (Fix #2) ──────── */
+
+  /**
+   * Find an existing page object in the connected repo profile that
+   * corresponds to the page object we are about to generate. Matches by
+   * normalized class-name intent (e.g. "LoginPage" ≈ "Login"), so a generated
+   * `LoginPage` reuses the repo's existing `LoginPage`/`LoginPageObject`.
+   * Returns null when there is no connected repo or no confident match.
+   */
+  private findExistingPageObject(po: PageObjectSpec, config: GenerationConfig): ClassInfo | null {
+    const pageObjects = config.repoProfile?.pageObjects;
+    if (!Array.isArray(pageObjects) || pageObjects.length === 0) return null;
+
+    try {
+      const wanted = this.normalizePageObjectName(po.name);
+      // 1) Exact normalized name match.
+      let hit = pageObjects.find(c => this.normalizePageObjectName(c.name) === wanted);
+      // 2) Containment match (LoginPage vs Login / SignInPage).
+      if (!hit) {
+        hit = pageObjects.find(c => {
+          const n = this.normalizePageObjectName(c.name);
+          return n.length > 2 && wanted.length > 2 && (n.includes(wanted) || wanted.includes(n));
+        });
+      }
+      // Only reuse if the matched class actually exposes selectors we can use.
+      if (hit && hit.properties.some(p => p.selector)) return hit;
+      return null;
+    } catch (err: any) {
+      logger.warn(MOD, 'findExistingPageObject failed — generating fresh page object', { error: err?.message });
+      return null;
+    }
+  }
+
+  /** Normalize a page-object class name to a comparable intent token. */
+  private normalizePageObjectName(name: string): string {
+    return (name || '')
+      .toLowerCase()
+      .replace(/[^a-z0-9]/g, '')
+      .replace(/(pageobject|page|pom|screen|view|component|cmp)$/, '');
+  }
+
+  /**
+   * Strip a locator/element property name down to its semantic intent so
+   * `loginButton`, `loginBtn`, `login_button` all collapse to `login`.
+   */
+  private normalizeElementIntent(name: string): string {
+    return (name || '')
+      .toLowerCase()
+      .replace(/[^a-z0-9]/g, '')
+      .replace(/(input|field|button|btn|textbox|txt|text|box|link|dropdown|select|checkbox|element|locator|el)$/, '');
+  }
+
+  /**
+   * Reduce a selector string to a comparable core token so that
+   * `#user-name`, `[data-test="user-name"]`, `this.page.locator('#user-name')`
+   * are recognised as the same underlying element.
+   */
+  private selectorCore(raw: string): string {
+    if (!raw) return '';
+    // If it's Playwright code, pull the inner selector out first.
+    const parsed = extractSelectorInfo(raw);
+    const sel = parsed ? parsed.selector : raw;
+    return sel
+      .toLowerCase()
+      .replace(/^this\.page\./, '')
+      .replace(/['"`#.\[\]()]/g, '')
+      .replace(/data-?test(id)?=?/g, '')
+      .replace(/[^a-z0-9]/g, '');
+  }
+
+  /**
+   * Match a to-be-generated locator against the selectors found in an existing
+   * page object. Matching strategy (in priority order):
+   *   1. Exact property-name match.
+   *   2. Intent match (loginButton → loginBtn).
+   *   3. Selector-similarity match (#user-name → existing #user-name).
+   */
+  private matchExistingLocator(
+    loc: { name: string; selector?: string },
+    existingLocators: ClassInfo['properties'],
+  ): (ClassInfo['properties'][number] & { matchType: string }) | null {
+    if (!existingLocators.length) return null;
+
+    // 1) Exact name.
+    let hit = existingLocators.find(p => p.name.toLowerCase() === loc.name.toLowerCase());
+    if (hit) return { ...hit, matchType: 'name' };
+
+    // 2) Intent.
+    const intent = this.normalizeElementIntent(loc.name);
+    if (intent) {
+      hit = existingLocators.find(p => this.normalizeElementIntent(p.name) === intent);
+      if (hit) return { ...hit, matchType: 'intent' };
+    }
+
+    // 3) Selector similarity.
+    if (loc.selector) {
+      const newCore = this.selectorCore(loc.selector);
+      if (newCore.length > 2) {
+        hit = existingLocators.find(p => p.selector && this.selectorCore(p.selector) === newCore);
+        if (hit) return { ...hit, matchType: 'selector' };
+      }
+    }
+
+    return null;
+  }
+
+  /**
+   * True when an existing page object already defines a selector for EVERY
+   * locator the new page object needs — in which case we reuse it as-is and
+   * skip generating a duplicate file.
+   */
+  private existingCoversAllLocators(po: PageObjectSpec, existing: ClassInfo): boolean {
+    if (!po.locators.length) return false;
+    const existingLocators = existing.properties.filter(p => p.selector);
+    if (!existingLocators.length) return false;
+    return po.locators.every(l => this.matchExistingLocator(l, existingLocators) !== null);
+  }
+
+  /** Reconstruct Playwright locator code from an extracted selector + strategy. */
+  private reconstructLocatorCode(selector: string, locatorType: string): string {
+    const esc = (s: string) => s.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+    switch (locatorType) {
+      case 'getByTestId':    return `this.page.getByTestId('${esc(selector)}')`;
+      case 'getByText':      return `this.page.getByText('${esc(selector)}')`;
+      case 'getByLabel':     return `this.page.getByLabel('${esc(selector)}')`;
+      case 'getByPlaceholder': return `this.page.getByPlaceholder('${esc(selector)}')`;
+      case 'getByAltText':   return `this.page.getByAltText('${esc(selector)}')`;
+      case 'getByTitle':     return `this.page.getByTitle('${esc(selector)}')`;
+      case 'getByRole': {
+        const m = selector.match(/^(.*?)\[name=("[\s\S]*?")\]$/);
+        if (m) return `this.page.getByRole('${esc(m[1])}', { name: ${m[2]} })`;
+        return `this.page.getByRole('${esc(selector)}')`;
+      }
+      default:
+        return `this.page.locator('${esc(selector)}')`;
+    }
+  }
+
+  /* ──────── Credential Injection Helpers (Fix #3) ──────── */
+
+  /** True when the profile provided credentials we can inject programmatically. */
+  private credsAvailable(config?: GenerationConfig): boolean {
+    return !!(config?.credentials && (config.credentials.username || config.credentials.password));
+  }
+
+  /**
+   * Generate `fixtures/auth.ts` with the real credentials + base URL pulled
+   * from the application profile, so generated specs can import concrete
+   * values instead of relying on process.env placeholders.
+   */
+  private generateAuthFixture(config: GenerationConfig): string {
+    const esc = (s: string) => String(s ?? '').replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+    const username = esc(config.credentials?.username || '');
+    const password = esc(config.credentials?.password || '');
+    const baseUrl = esc(config.url || '');
+
+    return `// Auth fixtures — generated by LevelUp AI QA Engine
+// Credentials and base URL are injected from the application profile.
+// NOTE: avoid committing real secrets — override via env vars in CI if needed.
+
+export const testCredentials = {
+  username: process.env.USERNAME || '${username}',
+  password: process.env.PASSWORD || '${password}',
+};
+
+export const baseUrl = process.env.BASE_URL || '${baseUrl}';
+`;
+  }
+
+  /**
+   * Inject `import { testCredentials, baseUrl } from '../fixtures/auth';` into a
+   * generated file when (a) the profile supplied credentials and (b) the file
+   * actually references those symbols. Avoids unused imports.
+   */
+  private maybeAddAuthImport(content: string, config?: GenerationConfig): string {
+    if (!this.credsAvailable(config)) return content;
+    const needs = /\btestCredentials\b/.test(content) || /\bbaseUrl\b/.test(content);
+    if (!needs) return content;
+    if (/from '[^']*fixtures\/auth'/.test(content)) return content; // already imported
+
+    const importLine = `import { testCredentials, baseUrl } from '../fixtures/auth';`;
+    const lines = content.split('\n');
+    const idx = lines.findIndex(l => /^import\s/.test(l));
+    if (idx >= 0) {
+      lines.splice(idx + 1, 0, importLine);
+      return lines.join('\n');
+    }
+    return `${importLine}\n${content}`;
+  }
+
   /* ──────── Test Spec Generator ──────── */
 
   private generateTestSpec(flow: TestPlanFlow, plan: TestPlan, config: GenerationConfig): string {
     const steps = flow.steps.map((step, i) => {
-      const code = this.stepToCode(step);
+      const code = this.stepToCode(step, config);
       const wait = step.waitAfter ? `\n    ${step.waitAfter}` : '';
       const assertions = (step.assertions || []).map(a => `\n    ${a}`).join('');
       return `    // Step ${i + 1}: ${step.description}\n    ${code}${wait}${assertions}`;
@@ -1171,7 +1440,7 @@ ${this.generateNegativeTests(flow, config)}
 
   private generateFixtures(fixtures: TestPlanFixture[], config: GenerationConfig): string {
     const fixtureCode = fixtures.map(f => {
-      const steps = f.steps.map(s => `    ${this.stepToCode(s)}`).join('\n');
+      const steps = f.steps.map(s => `    ${this.stepToCode(s, config)}`).join('\n');
       return `
 /**
  * ${f.description}
@@ -1399,16 +1668,31 @@ jobs:
 
   /* ──────── Step to Code Converter ──────── */
 
-  private stepToCode(step: TestPlanStep): string {
+  private stepToCode(step: TestPlanStep, config?: GenerationConfig): string {
     const selector = step.selector || (step.target ? this.targetToPlaywright(step.target) : '');
+    const useFixtures = this.credsAvailable(config);
 
     switch (step.action) {
       case 'navigate':
+        // Fix #3: when a profile base URL/credentials are present, use the
+        // injected `baseUrl` fixture instead of a process.env lookup.
+        if (useFixtures) {
+          return `await page.goto(baseUrl);\n    await page.waitForLoadState('domcontentloaded');`;
+        }
         return `await page.goto(process.env.BASE_URL || '${step.target || ''}');\n    await page.waitForLoadState('domcontentloaded');`;
 
       case 'fill': {
         const val = step.value || '';
-        // Replace template vars with process.env
+
+        // Fix #3: inject real credentials from the profile via the auth fixture.
+        if (useFixtures && /\{\{\s*USERNAME\s*\}\}/i.test(val)) {
+          return `await ${selector}.fill(testCredentials.username);`;
+        }
+        if (useFixtures && /\{\{\s*PASSWORD\s*\}\}/i.test(val)) {
+          return `await ${selector}.fill(testCredentials.password);`;
+        }
+
+        // Replace template vars with process.env (fallback when no profile creds)
         const resolvedVal = val
           .replace('{{USERNAME}}', "' + (process.env.USERNAME || 'Admin') + '")
           .replace('{{PASSWORD}}', "' + (process.env.PASSWORD || 'admin123') + '")
