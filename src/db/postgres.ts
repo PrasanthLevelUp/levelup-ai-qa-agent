@@ -7290,7 +7290,7 @@ export async function getRequirements(params: {
         COUNT(DISTINCT te.id)::int AS execution_count
      FROM requirements r
      LEFT JOIN generated_test_cases tc ON tc.requirement_id = r.id
-     LEFT JOIN generated_scripts gs ON gs.test_case_id = tc.id AND gs.deleted_at IS NULL
+     LEFT JOIN generated_scripts gs ON (gs.test_case_id = tc.id OR gs.requirement_id = r.id) AND gs.deleted_at IS NULL
      LEFT JOIN rtm_test_executions te ON te.requirement_id = r.id
      WHERE ${whereSql}
      GROUP BY r.id
@@ -7316,7 +7316,7 @@ export async function getRequirement(
         COUNT(DISTINCT te.id)::int AS execution_count
      FROM requirements r
      LEFT JOIN generated_test_cases tc ON tc.requirement_id = r.id
-     LEFT JOIN generated_scripts gs ON gs.test_case_id = tc.id AND gs.deleted_at IS NULL
+     LEFT JOIN generated_scripts gs ON (gs.test_case_id = tc.id OR gs.requirement_id = r.id) AND gs.deleted_at IS NULL
      LEFT JOIN rtm_test_executions te ON te.requirement_id = r.id
      WHERE r.id = $1 AND r.company_id = $2 AND r.deleted_at IS NULL
      GROUP BY r.id`,
@@ -7525,7 +7525,7 @@ export async function recalculateRequirementCoverage(
          END AS stat
        FROM requirements req
        LEFT JOIN generated_test_cases tc ON tc.requirement_id = req.id
-       LEFT JOIN generated_scripts gs ON gs.test_case_id = tc.id AND gs.deleted_at IS NULL
+       LEFT JOIN generated_scripts gs ON (gs.test_case_id = tc.id OR gs.requirement_id = req.id) AND gs.deleted_at IS NULL
        LEFT JOIN rtm_test_executions te ON te.requirement_id = req.id
        WHERE req.id = $1
      ) sub
