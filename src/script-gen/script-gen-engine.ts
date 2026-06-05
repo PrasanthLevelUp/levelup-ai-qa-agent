@@ -523,6 +523,20 @@ Generate comprehensive test flows covering all detected functionality.`;
   /* ──────────────────────────────────────────────────────────────────────── */
 
   private resolveSelectors(testPlan: TestPlan, elements: PageElement[]): void {
+    const totalElements = elements.length;
+    let resolved = 0;
+    let todos = 0;
+
+    // Pre-compute a short catalog of available element identifiers for diagnostics.
+    const availableElements = elements.map(el => this.describeElement(el));
+
+    if (totalElements === 0) {
+      logger.warn(MOD, 'resolveSelectors: crawl data is EMPTY — every locator will be a TODO', {
+        flows: testPlan.flows.length,
+        pageObjects: testPlan.pageObjects.length,
+      });
+    }
+
     for (const flow of testPlan.flows) {
       for (const step of flow.steps) {
         if (step.target && !step.selector) {
@@ -534,17 +548,64 @@ Generate comprehensive test flows covering all detected functionality.`;
     // Resolve page object locators
     for (const po of testPlan.pageObjects) {
       for (const locator of po.locators) {
-        if (!locator.selector) {
-          const matchedEl = this.findElementByDescription(locator.name, elements);
-          if (matchedEl) {
-            const report = this.selectorEngine.rankSelectors(matchedEl);
-            locator.selector = report.bestSelector.playwrightCode;
-            locator.score = report.bestSelector.score;
-            locator.strategy = report.bestSelector.strategy;
-          }
+        if (locator.selector) continue;
+
+        const match = this.matchElement(locator.name, elements);
+        if (match) {
+          const report = this.selectorEngine.rankSelectors(match.element);
+          locator.selector = report.bestSelector.playwrightCode;
+          locator.score = report.bestSelector.score;
+          locator.strategy = report.bestSelector.strategy;
+          resolved++;
+          logger.debug(MOD, 'Locator resolved', {
+            pageObject: po.name,
+            intent: locator.name,
+            variantsTried: normalizeIntent(locator.name),
+            matchedVia: match.via,
+            score: match.score,
+            selector: locator.selector,
+          });
+        } else {
+          // Annotated diagnostic TODO so the reader sees exactly what's missing.
+          locator.selector = this.buildDiagnosticTodo(locator.name, availableElements, totalElements);
+          locator.score = 0;
+          locator.strategy = 'todo';
+          todos++;
+          logger.warn(MOD, 'Locator UNRESOLVED — emitting diagnostic TODO', {
+            pageObject: po.name,
+            intent: locator.name,
+            reason: totalElements === 0 ? 'no-crawl-data' : 'no-matching-element',
+            variantsTried: normalizeIntent(locator.name),
+            availableSample: availableElements.slice(0, 5),
+            totalElements,
+          });
         }
       }
     }
+
+    logger.info(MOD, 'Selector resolution complete', {
+      pageObjectLocators: resolved + todos,
+      resolved,
+      todos,
+      totalCrawledElements: totalElements,
+      todoRate: resolved + todos > 0 ? `${Math.round((todos / (resolved + todos)) * 100)}%` : 'n/a',
+    });
+  }
+
+  /**
+   * Build an annotated diagnostic TODO selector for an unresolved locator.
+   * Instead of a silent `/* TODO *\/`, this surfaces exactly what was searched,
+   * what elements were available, and how many elements the crawl captured —
+   * so the gap is obvious without re-running the crawl.
+   */
+  private buildDiagnosticTodo(intent: string, availableElements: string[], totalElements: number): string {
+    const sample = availableElements.slice(0, 3).join(', ') || '(none)';
+    const reason = totalElements === 0 ? 'no crawl data available' : 'no matching element';
+    const note =
+      `TODO: No match found for "${intent}" (${reason}). ` +
+      `Available elements: ${sample}. Crawled ${totalElements} elements.`;
+    // Keep it a valid Playwright expression so the file still compiles/typechecks.
+    return `this.page.locator('/* ${escapeTodo(note)} */')`;
   }
 
   private resolveSelector(target: string, action: string, elements: PageElement[]): string {
@@ -563,31 +624,102 @@ Generate comprehensive test flows covering all detected functionality.`;
     return this.targetToPlaywright(target);
   }
 
+  /**
+   * Resolve a human/camelCase intent (e.g. "usernameInput") to a crawled
+   * element. Strategy, in priority order:
+   *   1. Exact match of any normalized variant against a high-signal attribute
+   *      (data-testid > id > name > aria-label).
+   *   2. Exact match against placeholder / nearby-label / text.
+   *   3. Substring / token overlap.
+   *   4. Fuzzy (Levenshtein ≤ 2) close match.
+   * Returns the highest-scoring element, or undefined when nothing is close.
+   */
   private findElementByDescription(desc: string, elements: PageElement[]): PageElement | undefined {
-    const lower = desc.toLowerCase();
+    const match = this.matchElement(desc, elements);
+    return match?.element;
+  }
 
-    // Try exact matches first
-    return elements.find(el => {
-      if (el.dataTestId?.toLowerCase() === lower) return true;
-      if (el.name?.toLowerCase() === lower) return true;
-      if (el.id?.toLowerCase() === lower) return true;
-      if (el.placeholder?.toLowerCase().includes(lower)) return true;
-      if (el.nearbyLabel?.toLowerCase().includes(lower)) return true;
-      if (el.ariaLabel?.toLowerCase().includes(lower)) return true;
-      if (el.textContent?.toLowerCase().includes(lower)) return true;
+  /**
+   * Score every element against the intent and return the best candidate
+   * together with diagnostic info (the variant/attribute that matched and the
+   * score) — used both for resolution and for annotated TODO diagnostics.
+   */
+  private matchElement(
+    desc: string,
+    elements: PageElement[],
+  ): { element: PageElement; score: number; via: string } | undefined {
+    const variants = normalizeIntent(desc);
+    if (!variants.length || !elements.length) return undefined;
 
-      // Fuzzy: "username input" matches name="username"
-      const words = lower.split(/\s+/);
-      for (const word of words) {
-        if (word.length < 3) continue;
-        if (el.name?.toLowerCase().includes(word)) return true;
-        if (el.placeholder?.toLowerCase().includes(word)) return true;
-        if (el.nearbyLabel?.toLowerCase().includes(word)) return true;
-        if (el.textContent?.toLowerCase().includes(word)) return true;
+    let best: { element: PageElement; score: number; via: string } | undefined;
+
+    for (const el of elements) {
+      // Attributes ordered by selector quality / signal strength.
+      const attrs: { label: string; value: string | undefined; weight: number }[] = [
+        { label: 'data-testid', value: el.dataTestId, weight: 100 },
+        { label: 'id', value: el.id, weight: 95 },
+        { label: 'name', value: el.name, weight: 90 },
+        { label: 'aria-label', value: el.ariaLabel, weight: 85 },
+        { label: 'placeholder', value: el.placeholder, weight: 70 },
+        { label: 'label', value: el.nearbyLabel, weight: 65 },
+        { label: 'text', value: el.textContent, weight: 50 },
+      ];
+
+      for (const attr of attrs) {
+        if (!attr.value) continue;
+        const attrLower = attr.value.toLowerCase().trim();
+        const attrKebab = toKebab(attr.value);
+        if (!attrLower) continue;
+
+        for (const variant of variants) {
+          let score = 0;
+          let kind = '';
+
+          // 1. Exact (raw or kebab-normalized) → strongest.
+          if (attrLower === variant || attrKebab === variant) {
+            score = attr.weight + 50;
+            kind = 'exact';
+          }
+          // 2. Substring containment either direction.
+          else if (
+            attrLower.includes(variant) ||
+            variant.includes(attrLower) ||
+            attrKebab.includes(variant) ||
+            variant.includes(attrKebab)
+          ) {
+            // Longer variants are more specific → reward.
+            score = attr.weight + Math.min(20, variant.length);
+            kind = 'partial';
+          }
+          // 3. Fuzzy close match (typo / minor shape diff), threshold 2.
+          else if (variant.length >= 4) {
+            const dist = Math.min(levenshtein(variant, attrLower), levenshtein(variant, attrKebab));
+            if (dist <= 2) {
+              score = attr.weight - dist * 10;
+              kind = `fuzzy(d=${dist})`;
+            }
+          }
+
+          if (score > 0 && (!best || score > best.score)) {
+            best = { element: el, score, via: `${attr.label}="${attr.value}" ~ "${variant}" [${kind}]` };
+          }
+        }
       }
+    }
 
-      return false;
-    });
+    return best;
+  }
+
+  /** Short human-readable identifier for an element, for diagnostics/TODOs. */
+  private describeElement(el: PageElement): string {
+    const id = el.dataTestId ? `data-testid=${el.dataTestId}`
+      : el.id ? `#${el.id}`
+      : el.name ? `name=${el.name}`
+      : el.ariaLabel ? `aria=${el.ariaLabel}`
+      : el.placeholder ? `placeholder=${el.placeholder}`
+      : el.textContent ? `text="${el.textContent.slice(0, 24)}"`
+      : el.tag;
+    return `${el.tag}[${id}]`;
   }
 
   private targetToPlaywright(target: string): string {
@@ -909,7 +1041,7 @@ Generate comprehensive test flows covering all detected functionality.`;
 
   private generatePageObject(po: PageObjectSpec): string {
     const locatorDefs = po.locators.map(l =>
-      `  readonly ${l.name} = ${l.selector || `this.page.locator('/* TODO: ${l.name} */')`};`
+      `  readonly ${l.name} = ${l.selector || `this.page.locator('/* ${escapeTodo(`TODO: No selector resolved for "${l.name}".`)} */')`};`
     ).join('\n');
 
     const actionMethods = po.actions.map(a => {
@@ -1409,8 +1541,147 @@ function toKebab(s: string): string {
     .replace(/^-|-$/g, '');
 }
 
+/* ────────────────────────────────────────────────────────────────────────── */
+/*  Intent normalization & fuzzy matching                                      */
+/*                                                                              */
+/*  A test plan describes elements with human/camelCase intents like           */
+/*  "usernameInput" or "passwordField", but crawled elements expose attributes  */
+/*  in many shapes ("user-name", "user_name", "password", "login-button").      */
+/*  These helpers bridge that gap so generated locators actually resolve.       */
+/* ────────────────────────────────────────────────────────────────────────── */
+
+/** Common element-purpose suffixes that can be stripped to reach the core noun. */
+const INTENT_SUFFIXES = [
+  'input', 'field', 'button', 'btn', 'box', 'textbox', 'element',
+  'el', 'txt', 'text', 'link', 'icon', 'dropdown', 'select', 'checkbox',
+  'radio', 'toggle', 'label', 'menu', 'item', 'option',
+];
+
+/** Common compound words to decompose, e.g. "username" → "user name". */
+const COMPOUND_SPLITS: Record<string, string[]> = {
+  username: ['user', 'name'],
+  firstname: ['first', 'name'],
+  lastname: ['last', 'name'],
+  fullname: ['full', 'name'],
+  signin: ['sign', 'in'],
+  signup: ['sign', 'up'],
+  signout: ['sign', 'out'],
+  logout: ['log', 'out'],
+  login: ['log', 'in'],
+  checkout: ['check', 'out'],
+  dropdown: ['drop', 'down'],
+  textbox: ['text', 'box'],
+  searchbar: ['search', 'bar'],
+  emailaddress: ['email', 'address'],
+  phonenumber: ['phone', 'number'],
+  zipcode: ['zip', 'code'],
+  postalcode: ['postal', 'code'],
+};
+
+/** Split an arbitrary intent string into lowercase word tokens. */
+function tokenizeIntent(intent: string): string[] {
+  return intent
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')        // camelCase → camel Case
+    .replace(/([A-Z]+)([A-Z][a-z])/g, '$1 $2')      // ACRONYMWord → ACRONYM Word
+    .replace(/[_\-./]+/g, ' ')                       // snake/kebab/path → spaces
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase()
+    .split(' ')
+    .filter(Boolean);
+}
+
+/** Render a set of word tokens into kebab / snake / spaced / joined variants. */
+function wordsToVariants(words: string[]): string[] {
+  if (!words.length) return [];
+  return [
+    words.join('-'),
+    words.join('_'),
+    words.join(' '),
+    words.join(''),
+  ];
+}
+
+/**
+ * Normalize an intent (e.g. "usernameInput") into the many concrete attribute
+ * shapes it might match against in crawled element data.
+ *
+ * Example: "usernameInput" →
+ *   ["usernameinput", "username-input", "username_input", "username input",
+ *    "username", "user-name", "user_name", "user name", "username", ...]
+ *
+ * Exported for unit testing.
+ */
+export function normalizeIntent(intent: string): string[] {
+  const out = new Set<string>();
+  const raw = (intent || '').trim();
+  if (!raw) return [];
+
+  out.add(raw.toLowerCase());
+
+  const words = tokenizeIntent(raw);
+  if (!words.length) return Array.from(out);
+
+  // 1. Full intent in every shape.
+  wordsToVariants(words).forEach(v => out.add(v));
+
+  // 2. Core intent with trailing purpose-suffix removed ("usernameInput" → "username").
+  if (words.length > 1 && INTENT_SUFFIXES.includes(words[words.length - 1])) {
+    const core = words.slice(0, -1);
+    wordsToVariants(core).forEach(v => out.add(v));
+  }
+
+  // 3. Decompose compound words ("username" → "user name") for every word.
+  const decomposed: string[] = [];
+  for (const w of words) {
+    if (INTENT_SUFFIXES.includes(w)) continue; // drop purpose suffix from decomposition
+    if (COMPOUND_SPLITS[w]) {
+      decomposed.push(...COMPOUND_SPLITS[w]);
+    } else {
+      decomposed.push(w);
+    }
+  }
+  if (decomposed.length) {
+    wordsToVariants(decomposed).forEach(v => out.add(v));
+  }
+
+  return Array.from(out).filter(Boolean);
+}
+
+/** Classic iterative Levenshtein edit distance. */
+function levenshtein(a: string, b: string): number {
+  if (a === b) return 0;
+  if (!a.length) return b.length;
+  if (!b.length) return a.length;
+  const prev = new Array(b.length + 1);
+  for (let j = 0; j <= b.length; j++) prev[j] = j;
+  for (let i = 1; i <= a.length; i++) {
+    let prevDiag = prev[0];
+    prev[0] = i;
+    for (let j = 1; j <= b.length; j++) {
+      const tmp = prev[j];
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      prev[j] = Math.min(prev[j] + 1, prev[j - 1] + 1, prevDiag + cost);
+      prevDiag = tmp;
+    }
+  }
+  return prev[b.length];
+}
+
 function escapeStr(s: string): string {
   return s.replace(/'/g, "\\\'" ).replace(/\n/g, '\\n');
+}
+
+/**
+ * Sanitize a diagnostic note so it is safe inside a single-quoted JS string and
+ * inside a /* ... *\/ comment (no embedded quotes or comment terminators).
+ */
+function escapeTodo(s: string): string {
+  return s
+    .replace(/\*\//g, '* /')   // don't terminate the enclosing comment early
+    .replace(/'/g, '"')         // avoid breaking the single-quoted string literal
+    .replace(/\s+/g, ' ')
+    .trim();
 }
 
 function escapeRegex(s: string): string {
