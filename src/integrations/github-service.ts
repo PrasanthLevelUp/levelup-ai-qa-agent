@@ -111,6 +111,37 @@ async function ghFetch(
   return { ok: res.ok, status: res.status, data, headers: res.headers };
 }
 
+/**
+ * Produce an actionable error message for a failed GitHub write call.
+ *
+ * GitHub returns a terse "Resource not accessible by personal access token"
+ * (HTTP 403) when the configured PAT lacks the permission/scope required for
+ * the operation. We surface a clear, fix-oriented message so users know exactly
+ * what token permission to grant.
+ */
+function describeGitHubWriteError(
+  operation: string,
+  status: number,
+  apiMessage: string,
+): string {
+  const base = `Failed to ${operation}`;
+  const notAccessible =
+    status === 403 ||
+    /resource not accessible by (personal access token|integration)/i.test(apiMessage || '');
+
+  if (notAccessible) {
+    return (
+      `${base}: ${apiMessage || 'Resource not accessible by personal access token'}. ` +
+      `Your GitHub token is missing the required permissions. ` +
+      `Classic PAT: enable the "repo" scope (and "workflow" scope to push .github/workflows/*.yml files). ` +
+      `Fine-grained PAT: grant this repository "Contents: Read and write", "Pull requests: Read and write", ` +
+      `and "Workflows: Read and write", and make sure the token has access to this repository. ` +
+      `Update the token on the Tools → GitHub page, then retry.`
+    );
+  }
+  return `${base}: ${apiMessage || `GitHub API returned ${status}`}`;
+}
+
 function parseRateLimit(headers: Headers) {
   const remaining = parseInt(headers.get('x-ratelimit-remaining') || '', 10);
   const limit = parseInt(headers.get('x-ratelimit-limit') || '', 10);
@@ -355,7 +386,10 @@ export class GitHubService {
         }),
       });
       if (!blobRes.ok) {
-        return { success: false, error: `Failed to create blob for ${file.path}: ${blobRes.data.message || ''}` };
+        return {
+          success: false,
+          error: describeGitHubWriteError(`create blob for ${file.path}`, blobRes.status, blobRes.data.message),
+        };
       }
       tree.push({
         path: file.path,
@@ -374,7 +408,7 @@ export class GitHubService {
       }),
     });
     if (!treeRes.ok) {
-      return { success: false, error: `Failed to create git tree: ${treeRes.data.message || ''}` };
+      return { success: false, error: describeGitHubWriteError('create git tree', treeRes.status, treeRes.data.message) };
     }
 
     // Step 4: Create commit
@@ -387,7 +421,7 @@ export class GitHubService {
       }),
     });
     if (!commitRes.ok) {
-      return { success: false, error: `Failed to create commit: ${commitRes.data.message || ''}` };
+      return { success: false, error: describeGitHubWriteError('create commit', commitRes.status, commitRes.data.message) };
     }
 
     // Step 5: Create branch reference
@@ -409,7 +443,7 @@ export class GitHubService {
           return { success: false, error: `Branch '${branchName}' exists and could not be updated` };
         }
       } else {
-        return { success: false, error: `Failed to create branch: ${refCreateRes.data.message || ''}` };
+        return { success: false, error: describeGitHubWriteError('create branch', refCreateRes.status, refCreateRes.data.message) };
       }
     }
 
@@ -435,7 +469,10 @@ export class GitHubService {
           error: 'Files committed to branch, but a PR already exists for this branch.',
         };
       }
-      return { success: false, error: `Failed to create PR: ${prRes.data.message || prRes.data.errors?.[0]?.message || ''}` };
+      return {
+        success: false,
+        error: describeGitHubWriteError('create PR', prRes.status, prRes.data.message || prRes.data.errors?.[0]?.message),
+      };
     }
 
     logger.info(MOD, 'PR created successfully', {

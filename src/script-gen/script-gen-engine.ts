@@ -149,6 +149,18 @@ export interface GenerationConfig {
   additionalUrls?: string[];
   /** Pre-cached crawl data from Application Intelligence (skip crawl if provided) */
   cachedCrawlData?: any;
+  /**
+   * Explicitly request generation of project scaffold files (playwright.config,
+   * README, .env.example, CI workflow, utils helpers).
+   *
+   * Default behaviour (undefined / false) is to generate ONLY test artifacts
+   * (specs + page objects). Scaffold files are emitted only when (a) the target
+   * repo doesn't already provide them AND (b) the caller explicitly asks for
+   * them — either via this flag, or by mentioning them in `instructions`.
+   *
+   * Set to `true` to force the full scaffold (e.g. greenfield bootstrapping).
+   */
+  includeScaffold?: boolean;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -688,19 +700,23 @@ Generate comprehensive test flows covering all detected functionality.`;
       }
     }
     // ─── Default POM generation ───────────────────────────────────────
-    // Scaffold files (config, README, .env, CI) are gated behind repository
-    // intelligence: when the target repo already provides them we MUST NOT
-    // regenerate/overwrite them. Core artifacts (tests, page objects) are
-    // always emitted. When there's no repo profile (greenfield), everything
-    // is generated — preserving the original behaviour.
+    // Core artifacts (test specs + page objects) are ALWAYS emitted. Scaffold
+    // files (playwright.config, README, .env.example, CI workflow, utils) are
+    // SUPPRESSED BY DEFAULT and only emitted when the repo lacks them AND the
+    // caller explicitly opts in (see `generatePomFiles` / `resolveScaffoldIntent`).
     return this.generatePomFiles(testPlan, config, analysis);
   }
 
   /**
-   * Default POM file generation with intelligence-aware scaffolding.
+   * Default POM file generation.
    *
-   * @param analysis Repository structure analysis, or `null` for greenfield
-   *                 generation (no target repo → emit the full scaffold).
+   * Always emits test specs + page objects. Scaffold files are suppressed by
+   * default and only emitted when the repo lacks them AND the caller explicitly
+   * requests them (`config.includeScaffold` or a mention in `instructions`).
+   *
+   * @param analysis Repository structure analysis, or `null` when no target
+   *                 repo is connected (greenfield). With `null`, nothing is
+   *                 considered "present", so scaffold still needs explicit opt-in.
    */
   private generatePomFiles(
     testPlan: TestPlan,
@@ -742,7 +758,9 @@ Generate comprehensive test flows covering all detected functionality.`;
       });
     }
 
-    // 3. Fixtures — only if the test plan needs them AND the repo lacks them.
+    // 3. Fixtures — a functional artifact (test data the generated specs rely
+    //    on), NOT a scaffold file. Generated only if the plan needs them and the
+    //    repo lacks them. Always logged.
     if (testPlan.fixtures.length > 0) {
       if (!analysis?.hasFixtures) {
         files.push({
@@ -750,75 +768,141 @@ Generate comprehensive test flows covering all detected functionality.`;
           content: this.generateFixtures(testPlan.fixtures, config),
           type: 'fixture',
         });
+        logger.debug(MOD, 'Scaffold decision: fixtures/test-fixtures.ts → GENERATE', {
+          reason: 'test plan declares fixtures and repo has none',
+        });
       } else {
         skipped.push('fixtures/test-fixtures.ts (repo already has fixtures)');
       }
     }
 
-    // 4. Config — only when the repo doesn't already have a Playwright config.
-    if (!analysis?.hasPlaywrightConfig) {
-      files.push({
+    // ─── Scaffold files (playwright.config, utils, .env.example, README, CI) ───
+    // These are NOT test artifacts. They are project scaffolding. Per product
+    // requirement they must be COMPLETELY SUPPRESSED by default. A scaffold file
+    // is emitted only when BOTH conditions hold:
+    //   (a) the target repo does NOT already provide it, AND
+    //   (b) the caller explicitly asked for it (config.includeScaffold === true,
+    //       or the file type is mentioned in the user's instructions).
+    // When no repo is connected (greenfield, analysis === null) nothing is
+    // "present", so scaffold files still require an explicit opt-in.
+    const intent = this.resolveScaffoldIntent(config);
+    logger.info(MOD, 'Scaffold generation intent resolved', {
+      hasAnalysis: !!analysis,
+      includeScaffoldFlag: config.includeScaffold === true,
+      intent,
+    });
+
+    type ScaffoldSpec = {
+      key: keyof Omit<ReturnType<ScriptGenEngine['resolveScaffoldIntent']>, 'explicit'>;
+      path: string;
+      repoHas: boolean;
+      build: () => GeneratedFile;
+    };
+
+    const scaffoldSpecs: ScaffoldSpec[] = [
+      {
+        key: 'config',
         path: 'playwright.config.ts',
-        content: this.generatePlaywrightConfig(config),
-        type: 'config',
-      });
-    } else {
-      skipped.push('playwright.config.ts (repo already has Playwright config)');
-    }
-
-    // 5. Utils — only when the repo doesn't already have a utils/helpers folder.
-    if (!analysis?.hasUtils) {
-      files.push({
+        repoHas: !!analysis?.hasPlaywrightConfig,
+        build: () => ({ path: 'playwright.config.ts', content: this.generatePlaywrightConfig(config), type: 'config' }),
+      },
+      {
+        key: 'utils',
         path: 'utils/test-helpers.ts',
-        content: this.generateTestHelpers(),
-        type: 'util',
-      });
-    } else {
-      skipped.push('utils/test-helpers.ts (repo already has a utils/helpers folder)');
-    }
-
-    // 6. Env example — only when the repo doesn't already manage env config.
-    if (!analysis?.hasEnvExample) {
-      files.push({
+        repoHas: !!analysis?.hasUtils,
+        build: () => ({ path: 'utils/test-helpers.ts', content: this.generateTestHelpers(), type: 'util' }),
+      },
+      {
+        key: 'env',
         path: '.env.example',
-        content: this.generateEnvExample(config),
-        type: 'config',
-      });
-    } else {
-      skipped.push('.env.example (repo already manages environment config)');
-    }
-
-    // 7. README — only when the repo doesn't already ship one.
-    if (!analysis?.hasReadme) {
-      files.push({
+        repoHas: !!analysis?.hasEnvExample,
+        build: () => ({ path: '.env.example', content: this.generateEnvExample(config), type: 'config' }),
+      },
+      {
+        key: 'readme',
         path: 'README.md',
-        content: this.generateReadme(testPlan, config),
-        type: 'readme',
-      });
-    } else {
-      skipped.push('README.md (repo already has a README)');
-    }
-
-    // 8. CI/CD config — only when the repo doesn't already have a CI workflow.
-    if (!analysis?.hasCIWorkflow) {
-      files.push({
+        repoHas: !!analysis?.hasReadme,
+        build: () => ({ path: 'README.md', content: this.generateReadme(testPlan, config), type: 'readme' }),
+      },
+      {
+        key: 'ci',
         path: '.github/workflows/playwright.yml',
-        content: this.generateGithubActionsConfig(),
-        type: 'config',
+        repoHas: !!analysis?.hasCIWorkflow,
+        build: () => ({ path: '.github/workflows/playwright.yml', content: this.generateGithubActionsConfig(), type: 'config' }),
+      },
+    ];
+
+    for (const spec of scaffoldSpecs) {
+      const requested = intent[spec.key];
+      if (spec.repoHas) {
+        skipped.push(`${spec.path} (repo already provides it — never overwritten)`);
+        logger.info(MOD, `Scaffold decision: ${spec.path} → SKIP`, {
+          reason: 'repo already provides this file',
+          repoHas: true,
+          explicitlyRequested: requested,
+        });
+        continue;
+      }
+      if (!requested) {
+        skipped.push(`${spec.path} (suppressed by default — not in repo and not explicitly requested)`);
+        logger.info(MOD, `Scaffold decision: ${spec.path} → SKIP`, {
+          reason: 'scaffold suppressed by default; not present in repo and not explicitly requested',
+          repoHas: false,
+          explicitlyRequested: false,
+        });
+        continue;
+      }
+      files.push(spec.build());
+      logger.info(MOD, `Scaffold decision: ${spec.path} → GENERATE`, {
+        reason: 'explicitly requested and not present in repo',
+        repoHas: false,
+        explicitlyRequested: true,
       });
-    } else {
-      skipped.push('.github/workflows/playwright.yml (repo already has CI workflows)');
     }
 
-    if (skipped.length > 0) {
-      logger.info(MOD, 'Skipped scaffold files already present in target repository', {
-        skippedCount: skipped.length,
-        skipped,
-        generatedCount: files.length,
-      });
-    }
+    logger.info(MOD, 'POM generation complete', {
+      generatedCount: files.length,
+      generatedPaths: files.map(f => f.path),
+      skippedCount: skipped.length,
+      skipped,
+    });
 
     return files;
+  }
+
+  /**
+   * Resolve which scaffold files the caller actually wants.
+   *
+   * Default is to want NONE — scaffold generation is opt-in. A scaffold type is
+   * "wanted" if either:
+   *   • `config.includeScaffold === true` (force-all, e.g. greenfield bootstrap), or
+   *   • the user's free-text `instructions` mention that file type.
+   *
+   * Note: "wanted" is necessary but not sufficient — the caller in
+   * `generatePomFiles` still suppresses any file the repo already provides.
+   */
+  private resolveScaffoldIntent(config: GenerationConfig): {
+    config: boolean;
+    utils: boolean;
+    env: boolean;
+    readme: boolean;
+    ci: boolean;
+    explicit: boolean;
+  } {
+    const all = config.includeScaffold === true;
+    const text = (config.instructions ?? '').toLowerCase();
+
+    const mentions = (patterns: RegExp[]): boolean => patterns.some(re => re.test(text));
+
+    const intent = {
+      config: all || mentions([/playwright\.config/, /\bconfig file\b/, /playwright config/]),
+      utils: all || mentions([/\butils?\b/, /\bhelpers?\b/, /helper function/]),
+      env: all || mentions([/\.env/, /env\.example/, /environment variable/, /\benv file\b/]),
+      readme: all || mentions([/\breadme\b/, /documentation file/]),
+      ci: all || mentions([/\bci\b/, /ci\/cd/, /cicd/, /\bworkflow\b/, /\bpipeline\b/, /github action/, /gitlab/, /jenkins/, /circleci/]),
+      explicit: all,
+    };
+    return intent;
   }
 
   /* ──────── Page Object Generator ──────── */

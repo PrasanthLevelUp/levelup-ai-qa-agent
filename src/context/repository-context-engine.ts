@@ -187,6 +187,20 @@ function detectFolderStructure(repoRoot: string, analyses: FileAnalysis[]): Fold
     }
   }
 
+  // ── Scaffold-file detection (Issue: scaffold files were always regenerated) ──
+  // The AST analyzer only walks code files (.ts/.js), so README, .env*, and CI
+  // workflow files were NEVER recorded in the profile. As a result the script
+  // generator's `hasReadme`/`hasEnvExample`/`hasCIWorkflow` flags were always
+  // false and the scaffold files got regenerated even when the repo had them.
+  // We scan the filesystem directly so these files are captured in the profile.
+  for (const f of detectScaffoldFiles(repoRoot)) {
+    // README / .env style files live in configFiles so they're picked up by the
+    // analyzer's `allKnownFiles()` helper; CI workflow files do too.
+    if (!configFiles.includes(f) && !supportFiles.includes(f)) {
+      configFiles.push(f);
+    }
+  }
+
   return {
     testFolder: findFolder(testFolders),
     pageObjectFolder: findFolder(poFolders),
@@ -195,6 +209,60 @@ function detectFolderStructure(repoRoot: string, analyses: FileAnalysis[]): Fold
     configFiles,
     supportFiles,
   };
+}
+
+/**
+ * Scan the repo root for scaffold files (README, .env*, CI workflows) that the
+ * AST analyzer ignores. Returns repo-relative paths so the script generator can
+ * detect their presence and avoid regenerating/overwriting them.
+ */
+function detectScaffoldFiles(repoRoot: string): string[] {
+  const found: string[] = [];
+  if (!repoRoot) return found;
+
+  const safeExists = (p: string): boolean => {
+    try {
+      return fs.existsSync(path.join(repoRoot, p));
+    } catch {
+      return false;
+    }
+  };
+
+  // 1. README — any common variant at the repo root.
+  for (const readme of ['README.md', 'README.MD', 'readme.md', 'README', 'README.txt', 'README.rst']) {
+    if (safeExists(readme)) {
+      found.push(readme);
+      break;
+    }
+  }
+
+  // 2. Environment config — .env / .env.example / .env.sample etc.
+  for (const env of ['.env', '.env.example', '.env.sample', '.env.template', '.env.local']) {
+    if (safeExists(env)) found.push(env);
+  }
+
+  // 3. CI / pipeline definitions.
+  const ciCandidates = ['.gitlab-ci.yml', 'Jenkinsfile', 'azure-pipelines.yml', 'bitbucket-pipelines.yml'];
+  for (const ci of ciCandidates) {
+    if (safeExists(ci)) found.push(ci);
+  }
+  // GitHub Actions: enumerate workflow files under .github/workflows.
+  try {
+    const wfDir = path.join(repoRoot, '.github', 'workflows');
+    if (fs.existsSync(wfDir)) {
+      const entries = fs.readdirSync(wfDir).filter(f => /\.(ya?ml)$/i.test(f));
+      if (entries.length > 0) {
+        for (const e of entries) found.push(`.github/workflows/${e}`);
+      } else {
+        // Directory exists even if empty — still a signal CI is managed here.
+        found.push('.github/workflows');
+      }
+    }
+  } catch {
+    /* ignore */
+  }
+
+  return found;
 }
 
 /* ------------------------------------------------------------------ */
