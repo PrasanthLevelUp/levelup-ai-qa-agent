@@ -27,7 +27,8 @@ import { AssertionEngine, type GeneratedAssertion } from './assertion-engine';
 import { WaitStrategyEngine, type WaitStrategy } from './wait-strategy-engine';
 import { logger } from '../utils/logger';
 import type { RepositoryProfile } from '../context/types';
-import { analyzeRepoStructure, type RepoStructureAnalysis } from './repo-analyzer';
+import { analyzeRepoStructure, buildPageObjectFileName, buildSpecFileName } from './repo-analyzer';
+import type { RepoStructureAnalysis } from './repo-analyzer';
 import { adaptiveGenerateFiles } from './adaptive-codegen';
 
 const MOD = 'script-gen-engine';
@@ -662,6 +663,8 @@ Generate comprehensive test flows covering all detected functionality.`;
           mode: analysis.mode,
           nextNum: analysis.nextFileNumber,
           naming: analysis.naming.pattern,
+          pageObjectDir: analysis.pageObjectDir,
+          pageObjectNaming: analysis.pageObjectNaming.pattern,
           hasConfig: analysis.hasPlaywrightConfig,
           hasCI: analysis.hasCIWorkflow,
           hasReadme: analysis.hasReadme,
@@ -707,20 +710,33 @@ Generate comprehensive test flows covering all detected functionality.`;
     const files: GeneratedFile[] = [];
     const skipped: string[] = [];
 
+    // Honour the existing repo's folder structure and naming conventions
+    // (Issue #4) instead of hardcoding kebab-case `pages/login-page.page.ts`
+    // style paths. Falls back to sensible defaults for greenfield generation.
+    const pageDir = analysis ? analysis.pageObjectDir : 'pages';
+    const testDir = analysis ? analysis.testDir : 'tests';
+
     // 1. Page Objects — core artifact. Always generated for new pages.
     for (const po of testPlan.pageObjects) {
+      const fileName = analysis
+        ? buildPageObjectFileName(po.name, analysis.pageObjectNaming)
+        : po.fileName;
       files.push({
-        path: `pages/${po.fileName}`,
+        path: `${pageDir}/${fileName}`,
         content: this.generatePageObject(po),
         type: 'page-object',
       });
     }
 
     // 2. Test spec files (one per flow) — the core purpose. ALWAYS generated.
+    let specNum = analysis ? analysis.nextFileNumber : 1;
     for (const flow of testPlan.flows) {
-      const fileName = `${toKebab(flow.name)}.spec.ts`;
+      const fileName = analysis
+        ? buildSpecFileName(flow.name, analysis.naming, specNum)
+        : `${toKebab(flow.name)}.spec.ts`;
+      if (analysis?.naming.usesNumberPrefix) specNum++;
       files.push({
-        path: `tests/${fileName}`,
+        path: `${testDir}/${fileName}`,
         content: this.generateTestSpec(flow, testPlan, config),
         type: 'test',
       });
