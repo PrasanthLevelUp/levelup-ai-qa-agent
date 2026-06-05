@@ -409,7 +409,18 @@ export class ValidationEngine {
     try {
       // Dynamic import to avoid hard dependency on playwright at module load
       const pw = await import('playwright');
-      browser = await pw.chromium.launch({ headless: true });
+      browser = await pw.chromium.launch({
+        headless: true,
+        args: [
+          '--no-sandbox',
+          '--disable-dev-shm-usage',
+          '--disable-blink-features=AutomationControlled',
+          // Suppress password manager / save-password / leak-detection popups.
+          '--disable-features=PasswordManager,PasswordLeakDetection,AutofillServerCommunication,SavePasswordBubble',
+          '--disable-save-password-bubble',
+          '--password-store=basic',
+        ],
+      });
       const page = await browser.newPage();
 
       await page.goto(url, { timeout: 15000, waitUntil: 'domcontentloaded' });
