@@ -28,6 +28,7 @@ import { PatternMatcher } from '../../intelligence/pattern-matcher';
 import { findMatchingPatterns, migrateDataToDefaultProjects, getProjectStats, listProfiles, listRepositories, getKnowledgeStats, upsertProfile, getPool, getProfileById, updateProfileAuth, updateProfileStatus } from '../../db/postgres';
 import { PageCrawler } from '../../script-gen/page-crawler';
 import { IntelligenceHealthService } from '../../services/intelligence-health-service';
+import { startCrawlLog, appendCrawlLog, finishCrawlLog, getCrawlLog } from '../../intelligence/crawl-log-store';
 
 /* ──────────────────────────────────────────────────────────────────────────
  *  Screenshot upload configuration (multer → local disk)
@@ -403,6 +404,7 @@ export function createIntelligenceRouter(): Router {
 
       // Mark crawling immediately so the UI reflects progress.
       await updateProfileStatus(id, 'crawling');
+      startCrawlLog(id, baseUrl);
 
       // Fire-and-forget: run the deep crawl in the background.
       (async () => {
@@ -415,6 +417,8 @@ export function createIntelligenceRouter(): Router {
             maxPages,
             maxDepth,
             captureScreenshot: true,
+            // Stream progress lines into the crawl-log store for the diagnostics endpoint.
+            onLog: (msg: string) => appendCrawlLog(id, msg),
           });
           const result = await crawler.crawlDeepAuthenticated();
           await crawlOrchestrator.saveDeepCrawlResult(
@@ -424,9 +428,13 @@ export function createIntelligenceRouter(): Router {
             { authConfig },
             projectId ?? profile.project_id ?? undefined,
           );
-          console.log(`[intelligence] ✅ Manual deep crawl finished for ${baseUrl}: pages=${result.pages.length}, authed=${result.authenticated}, ${Date.now() - t0}ms`);
+          const totalElements = result.pages.reduce((s, p) => s + p.elements.length, 0);
+          appendCrawlLog(id, `Saved crawl: ${result.pages.length} page(s), ${totalElements} elements`);
+          finishCrawlLog(id, 'success');
+          console.log(`[intelligence] ✅ Manual deep crawl finished for ${baseUrl}: pages=${result.pages.length}, elements=${totalElements}, authed=${result.authenticated}, ${Date.now() - t0}ms`);
         } catch (crawlErr: any) {
           console.error(`[intelligence] ❌ Manual deep crawl failed for ${baseUrl}: ${crawlErr.message}`);
+          finishCrawlLog(id, 'error', crawlErr.message);
           await updateProfileStatus(id, 'error', crawlErr.message).catch(() => {});
         }
       })();
@@ -436,6 +444,28 @@ export function createIntelligenceRouter(): Router {
         message: 'Crawl started — poll GET /profiles/:id for status',
         data: { id, status: 'crawling', baseUrl, authenticated: !!authConfig, maxPages, maxDepth },
       });
+    } catch (err) {
+      res.status(500).json({ success: false, error: (err as Error).message });
+    }
+  });
+
+  /**
+   * Diagnostic endpoint: fetch the live/last crawl log for a profile.
+   * Useful for debugging why a crawl captured 0 elements/forms.
+   * Returns the structured log entry { profileId, url, status, startedAt,
+   * finishedAt, error, lines[] } captured during the most recent crawl.
+   */
+  router.get('/profiles/:id/crawl-logs', async (req: Request, res: Response) => {
+    try {
+      const id = String(req.params.id);
+      const entry = getCrawlLog(id);
+      if (!entry) {
+        return res.status(404).json({
+          success: false,
+          error: 'No crawl log found for this profile. Trigger a crawl first via POST /profiles/:id/crawl.',
+        });
+      }
+      return res.json({ success: true, data: entry });
     } catch (err) {
       res.status(500).json({ success: false, error: (err as Error).message });
     }

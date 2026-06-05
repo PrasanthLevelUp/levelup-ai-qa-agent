@@ -43,6 +43,14 @@ export interface CrawlConfig {
    * These are crawled in the SAME browser context (session preserved).
    */
   additionalUrls?: string[];
+
+  /**
+   * Optional progress callback invoked with human-readable status lines during
+   * the crawl (e.g. "Visiting page: …", "Extracted 23 elements from …").
+   * Used to surface live diagnostics via the crawl-logs endpoint. Errors thrown
+   * by the callback are swallowed so logging can never break a crawl.
+   */
+  onLog?: (message: string) => void;
 }
 
 /**
@@ -545,6 +553,55 @@ const EXTRACT_NAV_LINKS_SCRIPT = `
 `;
 
 /* -------------------------------------------------------------------------- */
+/*  In-page script runner                                                     */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Run one of the EXTRACT_* scripts inside the page and return its result.
+ *
+ * CRITICAL: Playwright's `page.evaluate(arg)` treats a STRING argument as a
+ * JavaScript *expression to evaluate*, NOT a function to invoke. Our EXTRACT_*
+ * constants are arrow-function *sources* (e.g. "() => { ... }"), so passing
+ * them directly causes Playwright to evaluate the expression to a function
+ * object — which is non-serializable and comes back as `undefined`. That made
+ * every page report 0 elements / 0 forms.
+ *
+ * Wrapping the source as an invoked IIFE — `(() => { ... })()` — turns it into
+ * an expression that actually *calls* the function and returns its
+ * (serializable) result, which is what we want.
+ */
+async function runPageScript<T = any>(page: any, scriptSource: string): Promise<T> {
+  return page.evaluate(`(${scriptSource})()`);
+}
+
+/* -------------------------------------------------------------------------- */
+/*  Browser launch hardening                                                  */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Chromium launch flags shared by every crawl path.
+ *
+ * Besides the usual sandbox/gpu flags, these disable Chrome's password
+ * manager, the "save password?" bubble, the password-leak ("found in a data
+ * breach") warning, and the AutomationControlled fingerprint — all of which
+ * can pop modal dialogs that steal focus and break automated login/crawl runs.
+ */
+const BROWSER_LAUNCH_ARGS = [
+  '--no-sandbox',
+  '--disable-dev-shm-usage',
+  '--disable-gpu',
+  // Don't advertise navigator.webdriver / automation infobar.
+  '--disable-blink-features=AutomationControlled',
+  // Kill password manager, save-password prompt, leak detection & autofill sync.
+  '--disable-features=PasswordManager,PasswordManagerOnboarding,PasswordLeakDetection,AutofillServerCommunication,SavePasswordBubble',
+  '--disable-password-manager-reauthentication',
+  '--disable-save-password-bubble',
+  '--no-first-run',
+  '--no-default-browser-check',
+  '--password-store=basic',
+];
+
+/* -------------------------------------------------------------------------- */
 /*  Crawler Class                                                             */
 /* -------------------------------------------------------------------------- */
 
@@ -572,6 +629,17 @@ export class PageCrawler {
     };
   }
 
+  /**
+   * Emit a progress/diagnostic line. Goes to the structured logger, to stdout
+   * (so it shows in server logs / `docker logs`), and to the optional onLog
+   * callback (so the crawl-logs endpoint can surface it). Never throws.
+   */
+  private progress(message: string, data?: Record<string, any>): void {
+    try { logger.info(MOD, message, data); } catch { /* ignore */ }
+    try { console.log(`🕷️  [crawl] ${message}${data ? ' ' + JSON.stringify(data) : ''}`); } catch { /* ignore */ }
+    try { this.config.onLog?.(message); } catch { /* ignore */ }
+  }
+
   async crawl(): Promise<CrawlResult> {
     // Validate URL
     const validation = validateUrl(this.config.url);
@@ -587,7 +655,7 @@ export class PageCrawler {
       const pw = await import('playwright');
       browser = await pw.chromium.launch({
         headless: true,
-        args: ['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
+        args: BROWSER_LAUNCH_ARGS,
       });
 
       const context = await browser.newContext({
@@ -671,7 +739,7 @@ export class PageCrawler {
       // Elements
       let elements: PageElement[] = [];
       try {
-        const rawElements = await page.evaluate(EXTRACT_ELEMENTS_SCRIPT);
+        const rawElements = await runPageScript(page, EXTRACT_ELEMENTS_SCRIPT);
         elements = Array.isArray(rawElements) ? rawElements : [];
       } catch (e) {
         errors.push(`Element extraction failed: ${(e as Error).message}`);
@@ -680,7 +748,7 @@ export class PageCrawler {
       // Forms
       let formInfos: Array<{ index: number; action?: string; method?: string; id?: string; name?: string }> = [];
       try {
-        const rawForms = await page.evaluate(EXTRACT_FORMS_SCRIPT);
+        const rawForms = await runPageScript(page, EXTRACT_FORMS_SCRIPT);
         formInfos = Array.isArray(rawForms) ? rawForms : [];
       } catch (e) {
         errors.push(`Form extraction failed: ${(e as Error).message}`);
@@ -700,14 +768,14 @@ export class PageCrawler {
       // Headings
       let headings: { level: number; text: string }[] = [];
       try {
-        const rawHeadings = await page.evaluate(EXTRACT_HEADINGS_SCRIPT);
+        const rawHeadings = await runPageScript(page, EXTRACT_HEADINGS_SCRIPT);
         headings = Array.isArray(rawHeadings) ? rawHeadings : [];
       } catch { /* ignore */ }
 
       // Navigation links
       let navigationLinks: NavigationLink[] = [];
       try {
-        const rawNavLinks = await page.evaluate(EXTRACT_NAV_LINKS_SCRIPT);
+        const rawNavLinks = await runPageScript(page, EXTRACT_NAV_LINKS_SCRIPT);
         navigationLinks = Array.isArray(rawNavLinks) ? rawNavLinks : [];
       } catch { /* ignore */ }
 
@@ -807,7 +875,7 @@ export class PageCrawler {
       const pw = await import('playwright');
       browser = await pw.chromium.launch({
         headless: true,
-        args: ['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
+        args: BROWSER_LAUNCH_ARGS,
       });
       const context = await browser.newContext({
         viewport: this.config.viewport,
@@ -901,11 +969,17 @@ export class PageCrawler {
     const origin = (() => { try { return new URL(this.config.url).origin; } catch { return ''; } })();
     const normalize = (u: string) => u.replace(/#.*$/, '').replace(/\/$/, '');
 
+    this.progress(`Starting authenticated crawl of ${this.config.url}`, {
+      maxPages: this.config.maxPages,
+      maxDepth: this.config.maxDepth,
+      hasAuth: !!this.config.authConfig,
+    });
+
     try {
       const pw = await import('playwright');
       browser = await pw.chromium.launch({
         headless: true,
-        args: ['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
+        args: BROWSER_LAUNCH_ARGS,
       });
       const context = await browser.newContext({
         viewport: this.config.viewport,
@@ -922,18 +996,19 @@ export class PageCrawler {
 
       // ── 1. Authenticate once (if configured) ─────────────────────────
       if (this.config.authConfig) {
+        this.progress('Authenticating before crawl…');
         const authEngine = new AuthEngine();
         authResult = await authEngine.authenticate(page, context, this.config.authConfig, this.config.url);
-        logger.info(MOD, 'Deep crawl auth attempt', {
-          success: authResult.success,
-          strategy: authResult.strategy,
-          durationMs: authResult.durationMs,
-        });
-        if (!authResult.success) {
+        if (authResult.success) {
+          this.progress(`Login successful (strategy=${authResult.strategy}, ${authResult.durationMs}ms)`);
+        } else {
+          this.progress(`Login FAILED — continuing best-effort with public pages only: ${authResult.message}`);
           logger.warn(MOD, 'Deep crawl auth failed — continuing best-effort (public pages only)', {
             error: authResult.message,
           });
         }
+      } else {
+        this.progress('No auth configured — crawling as anonymous visitor');
       }
 
       // ── 2. BFS over discovered same-origin links in the SAME session ──
@@ -941,6 +1016,20 @@ export class PageCrawler {
       const queue: { url: string; depth: number; from: string | null; linkText: string }[] = [
         { url: this.config.url, depth: 0, from: null, linkText: 'entry' },
       ];
+
+      // If login redirected us to a different landing page (e.g. /inventory.html
+      // on SauceDemo), seed that authenticated URL FIRST. Otherwise the crawl
+      // would only ever re-visit the public login page and miss everything
+      // behind the auth wall.
+      if (authResult?.success && authResult.finalUrl) {
+        const landingKey = normalize(authResult.finalUrl);
+        const entryKey = normalize(this.config.url);
+        if (landingKey !== entryKey && validateUrl(authResult.finalUrl).valid) {
+          queue.unshift({ url: authResult.finalUrl, depth: 0, from: this.config.url, linkText: 'post-login landing' });
+          this.progress(`Seeding authenticated landing page: ${authResult.finalUrl}`);
+        }
+      }
+
       // Seed any caller-provided URLs too.
       for (const extra of this.config.additionalUrls || []) {
         queue.push({ url: extra, depth: 0, from: this.config.url, linkText: 'seed' });
@@ -959,10 +1048,12 @@ export class PageCrawler {
         }
 
         try {
+          this.progress(`Visiting page (depth ${item.depth}): ${item.url}`);
           const result = await this.crawlPageInContext(page, item.url, pages.length === 0);
           if (authResult) result.authResult = authResult;
           pages.push(result);
 
+          const beforeQueue = queue.length;
           if (item.from) {
             navigationGraph.push({ from: item.from, to: item.url, linkText: item.linkText });
           }
@@ -987,7 +1078,14 @@ export class PageCrawler {
               }
             }
           }
+          const newlyQueued = queue.length - beforeQueue;
+          this.progress(
+            `Extracted ${result.elements.length} elements, ${result.forms.length} forms from ${result.finalUrl || item.url}` +
+            ` (title="${result.title}", type=${result.pageType}, +${newlyQueued} links queued)` +
+            (result.errors && result.errors.length ? ` ⚠️ ${result.errors.join('; ')}` : ''),
+          );
         } catch (e) {
+          this.progress(`Page FAILED, skipping ${item.url}: ${(e as Error).message}`);
           logger.warn(MOD, 'Deep crawl page failed, skipping', { url: item.url, error: (e as Error).message });
         }
       }
@@ -996,13 +1094,13 @@ export class PageCrawler {
       await browser.close();
       browser = null;
 
-      logger.info(MOD, 'Deep authenticated crawl complete', {
-        entry: this.config.url,
-        pagesCrawled: pages.length,
-        authenticated: !!authResult?.success,
-        totalElements: pages.reduce((s, p) => s + p.elements.length, 0),
-        totalForms: pages.reduce((s, p) => s + p.forms.length, 0),
-      });
+      const totalElements = pages.reduce((s, p) => s + p.elements.length, 0);
+      const totalForms = pages.reduce((s, p) => s + p.forms.length, 0);
+      this.progress(
+        `Crawl complete: ${pages.length} page(s), ${totalElements} elements, ${totalForms} forms, ` +
+        `authenticated=${!!authResult?.success}, ${Date.now() - startTime}ms`,
+        { pagesCrawled: pages.length, totalElements, totalForms },
+      );
 
       return {
         pages,
@@ -1034,10 +1132,10 @@ export class PageCrawler {
     try { metaDescription = await page.$eval('meta[name="description"]', (el: any) => el.getAttribute('content')).catch(() => undefined); } catch { /* */ }
 
     let elements: PageElement[] = [];
-    try { const raw = await page.evaluate(EXTRACT_ELEMENTS_SCRIPT); elements = Array.isArray(raw) ? raw : []; } catch (e) { errors.push(`Element extraction: ${(e as Error).message}`); }
+    try { const raw = await runPageScript(page, EXTRACT_ELEMENTS_SCRIPT); elements = Array.isArray(raw) ? raw : []; } catch (e) { errors.push(`Element extraction: ${(e as Error).message}`); }
 
     let formInfos: any[] = [];
-    try { const raw = await page.evaluate(EXTRACT_FORMS_SCRIPT); formInfos = Array.isArray(raw) ? raw : []; } catch (e) { errors.push(`Form extraction: ${(e as Error).message}`); }
+    try { const raw = await runPageScript(page, EXTRACT_FORMS_SCRIPT); formInfos = Array.isArray(raw) ? raw : []; } catch (e) { errors.push(`Form extraction: ${(e as Error).message}`); }
     const forms: FormInfo[] = formInfos.map(fi => {
       const fields = elements.filter(el => el.formIndex === fi.index);
       const submitButton = fields.find(el => el.tag === 'button' || (el.tag === 'input' && el.type === 'submit'));
@@ -1045,9 +1143,9 @@ export class PageCrawler {
     });
 
     let headings: { level: number; text: string }[] = [];
-    try { const raw = await page.evaluate(EXTRACT_HEADINGS_SCRIPT); headings = Array.isArray(raw) ? raw : []; } catch { /* */ }
+    try { const raw = await runPageScript(page, EXTRACT_HEADINGS_SCRIPT); headings = Array.isArray(raw) ? raw : []; } catch { /* */ }
     let navigationLinks: NavigationLink[] = [];
-    try { const raw = await page.evaluate(EXTRACT_NAV_LINKS_SCRIPT); navigationLinks = Array.isArray(raw) ? raw : []; } catch { /* */ }
+    try { const raw = await runPageScript(page, EXTRACT_NAV_LINKS_SCRIPT); navigationLinks = Array.isArray(raw) ? raw : []; } catch { /* */ }
 
     const buttons = elements.filter(el => el.tag === 'button' || el.role === 'button' || (el.tag === 'input' && el.type === 'submit'));
     const inputs = elements.filter(el => el.tag === 'input' || el.tag === 'textarea' || el.tag === 'select');
