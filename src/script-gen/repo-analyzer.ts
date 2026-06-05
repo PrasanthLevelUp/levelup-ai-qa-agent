@@ -55,6 +55,10 @@ export interface RepoStructureAnalysis {
   hasFixtures: boolean;
   hasUtils: boolean;
   hasPageObjects: boolean;
+  /** Whether the repo already ships a README — avoid clobbering it */
+  hasReadme: boolean;
+  /** Whether the repo already has an env example / dotenv setup */
+  hasEnvExample: boolean;
   existingTestFiles: string[];
 
   /* ── Style ── */
@@ -93,6 +97,8 @@ export function analyzeRepoStructure(profile: RepositoryProfile): RepoStructureA
     hasFixtures: profile.hasCustomFixtures || !!profile.folderStructure.fixtureFolder,
     hasUtils: !!profile.folderStructure.utilsFolder,
     hasPageObjects: !!profile.folderStructure.pageObjectFolder || profile.pageObjects.length > 0,
+    hasReadme: hasReadmeFile(profile.folderStructure),
+    hasEnvExample: hasEnvFile(profile.folderStructure, profile),
     existingTestFiles,
 
     tagPattern: profile.codingStyle.tagConvention || null,
@@ -226,6 +232,25 @@ function hasCIFiles(fs: FolderStructure): boolean {
     f.includes('.gitlab-ci') ||
     f.includes('azure-pipelines'),
   );
+}
+
+/** All file-path-ish entries we know about in the folder structure. */
+function allKnownFiles(fs: FolderStructure): string[] {
+  return [...(fs.configFiles ?? []), ...(fs.supportFiles ?? [])];
+}
+
+function hasReadmeFile(fs: FolderStructure): boolean {
+  return allKnownFiles(fs).some(f => /(^|\/)readme(\.\w+)?$/i.test(f));
+}
+
+function hasEnvFile(fs: FolderStructure, profile: RepositoryProfile): boolean {
+  // A committed .env / .env.example, or a dotenv dependency, both indicate the
+  // repo already manages its own environment configuration.
+  const hasEnvCommitted = allKnownFiles(fs).some(f =>
+    /(^|\/)\.env(\.\w+)?$/i.test(f) || f.toLowerCase().includes('.env.example'),
+  );
+  const hasDotenvDep = (profile.dependencies ?? []).some(d => d.name === 'dotenv');
+  return hasEnvCommitted || hasDotenvDep;
 }
 
 function detectCredentialStyle(profile: RepositoryProfile): RepoStructureAnalysis['credentialStyle'] {
