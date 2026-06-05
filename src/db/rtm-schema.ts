@@ -322,7 +322,7 @@ export const RTM_STATEMENTS: RtmStatement[] = [
             END
           FROM requirements req
           LEFT JOIN generated_test_cases tc ON tc.requirement_id = req.id
-          LEFT JOIN generated_scripts gs ON gs.test_case_id = tc.id AND gs.deleted_at IS NULL
+          LEFT JOIN generated_scripts gs ON (gs.test_case_id = tc.id OR gs.requirement_id = req.id) AND gs.deleted_at IS NULL
           LEFT JOIN rtm_test_executions te ON te.requirement_id = req.id
           WHERE req.id = v_req
         ),
@@ -336,7 +336,7 @@ export const RTM_STATEMENTS: RtmStatement[] = [
             END
           FROM requirements req
           LEFT JOIN generated_test_cases tc ON tc.requirement_id = req.id
-          LEFT JOIN generated_scripts gs ON gs.test_case_id = tc.id AND gs.deleted_at IS NULL
+          LEFT JOIN generated_scripts gs ON (gs.test_case_id = tc.id OR gs.requirement_id = req.id) AND gs.deleted_at IS NULL
           LEFT JOIN rtm_test_executions te ON te.requirement_id = req.id
           WHERE req.id = v_req
         ),
@@ -374,13 +374,36 @@ export const RTM_STATEMENTS: RtmStatement[] = [
       EXECUTE FUNCTION update_rtm_requirement_coverage()`,
   },
 
+  /* ─── 7b. Direct requirement link on scripts ──────────────────────────
+   * Must be added BEFORE the section-8 script coverage trigger, whose WHEN
+   * clause references NEW.requirement_id (validated at trigger-create time).
+   * Idempotent. */
+  {
+    label: 'gs_requirement_id_s4',
+    sql: `DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'generated_scripts' AND column_name = 'requirement_id'
+      ) THEN
+        ALTER TABLE generated_scripts
+          ADD COLUMN requirement_id UUID REFERENCES requirements(id) ON DELETE SET NULL;
+      END IF;
+    END $$`,
+  },
+  {
+    label: 'idx_gs_requirement_s4',
+    sql: `CREATE INDEX IF NOT EXISTS idx_gs_requirement ON generated_scripts(requirement_id)`,
+  },
+
   /* ─── 8. Script coverage trigger ──────────────────────────────────────
-   * generated_scripts has no requirement_id of its own — it links to a
-   * requirement indirectly through generated_test_cases.test_case_id. When a
-   * script is created/updated for a linked test case we must recompute the
-   * owning requirement's coverage (a script bumps coverage to 66% / status
-   * "In Progress"). This function resolves the requirement via the test case
-   * then reuses the exact same coverage maths as update_rtm_requirement_coverage. */
+   * A generated_script links to a requirement either directly (its own
+   * requirement_id column) or indirectly through generated_test_cases. When a
+   * script is created/updated we must recompute the owning requirement's
+   * coverage (a script bumps coverage to 66% / status "In Progress"). This
+   * function resolves the requirement from the direct link first, then falls
+   * back to the test case, and reuses the exact same coverage maths as
+   * update_rtm_requirement_coverage. */
   {
     label: 'fn_update_rtm_coverage_from_script',
     sql: `CREATE OR REPLACE FUNCTION update_rtm_coverage_from_script()
@@ -388,13 +411,17 @@ export const RTM_STATEMENTS: RtmStatement[] = [
     DECLARE
       v_req UUID;
     BEGIN
-      IF NEW.test_case_id IS NULL THEN
-        RETURN NEW;
-      END IF;
+      -- Resolve the owning requirement. A script may link to a requirement
+      -- directly (NEW.requirement_id) and/or indirectly through its test case
+      -- (generated_test_cases.requirement_id). Prefer the direct link, then
+      -- fall back to the test case. If neither resolves, nothing to do.
+      v_req := NEW.requirement_id;
 
-      SELECT requirement_id INTO v_req
-      FROM generated_test_cases
-      WHERE id = NEW.test_case_id;
+      IF v_req IS NULL AND NEW.test_case_id IS NOT NULL THEN
+        SELECT requirement_id INTO v_req
+        FROM generated_test_cases
+        WHERE id = NEW.test_case_id;
+      END IF;
 
       IF v_req IS NULL THEN
         RETURN NEW;
@@ -412,7 +439,7 @@ export const RTM_STATEMENTS: RtmStatement[] = [
             END
           FROM requirements req
           LEFT JOIN generated_test_cases tc ON tc.requirement_id = req.id
-          LEFT JOIN generated_scripts gs ON gs.test_case_id = tc.id AND gs.deleted_at IS NULL
+          LEFT JOIN generated_scripts gs ON (gs.test_case_id = tc.id OR gs.requirement_id = req.id) AND gs.deleted_at IS NULL
           LEFT JOIN rtm_test_executions te ON te.requirement_id = req.id
           WHERE req.id = v_req
         ),
@@ -426,7 +453,7 @@ export const RTM_STATEMENTS: RtmStatement[] = [
             END
           FROM requirements req
           LEFT JOIN generated_test_cases tc ON tc.requirement_id = req.id
-          LEFT JOIN generated_scripts gs ON gs.test_case_id = tc.id AND gs.deleted_at IS NULL
+          LEFT JOIN generated_scripts gs ON (gs.test_case_id = tc.id OR gs.requirement_id = req.id) AND gs.deleted_at IS NULL
           LEFT JOIN rtm_test_executions te ON te.requirement_id = req.id
           WHERE req.id = v_req
         ),
@@ -446,7 +473,7 @@ export const RTM_STATEMENTS: RtmStatement[] = [
     sql: `CREATE TRIGGER trigger_rtm_coverage_on_script
       AFTER INSERT OR UPDATE ON generated_scripts
       FOR EACH ROW
-      WHEN (NEW.test_case_id IS NOT NULL)
+      WHEN (NEW.test_case_id IS NOT NULL OR NEW.requirement_id IS NOT NULL)
       EXECUTE FUNCTION update_rtm_coverage_from_script()`,
   },
 
@@ -460,24 +487,10 @@ export const RTM_STATEMENTS: RtmStatement[] = [
    *   • locator_report     — JSONB summary of locator quality / sourcing so the
    *                         dashboard can show "9/12 locators verified against
    *                         the real DOM" without re-parsing the script body.
-   * All guarded / idempotent so re-running startup never errors. */
-  {
-    label: 'gs_requirement_id_s4',
-    sql: `DO $$
-    BEGIN
-      IF NOT EXISTS (
-        SELECT 1 FROM information_schema.columns
-        WHERE table_name = 'generated_scripts' AND column_name = 'requirement_id'
-      ) THEN
-        ALTER TABLE generated_scripts
-          ADD COLUMN requirement_id UUID REFERENCES requirements(id) ON DELETE SET NULL;
-      END IF;
-    END $$`,
-  },
-  {
-    label: 'idx_gs_requirement_s4',
-    sql: `CREATE INDEX IF NOT EXISTS idx_gs_requirement ON generated_scripts(requirement_id)`,
-  },
+   * All guarded / idempotent so re-running startup never errors.
+   * NOTE: the requirement_id column itself is created earlier (before the
+   * section-8 script coverage trigger) because that trigger's WHEN clause
+   * references NEW.requirement_id and would fail to create otherwise. */
   {
     label: 'gs_generation_source_s4',
     sql: `DO $$

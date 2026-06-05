@@ -52,6 +52,7 @@ import {
 import * as path from 'path';
 import * as os from 'os';
 import * as fs from 'fs';
+import JSZip from 'jszip';
 import { CrawlOrchestrator } from '../../intelligence/crawl-orchestrator';
 import { PatternMatcher } from '../../intelligence/pattern-matcher';
 import { IntelligenceFusionService } from '../../services/intelligence-fusion-service';
@@ -783,11 +784,48 @@ export function createScriptGenRouter(): Router {
       if (!code) {
         return res.status(404).json({ success: false, error: 'Script content not found' });
       }
+
       const safeName = (script.url || 'test').replace(/[^a-zA-Z0-9_-]/g, '_').substring(0, 50);
-      const filename = `${safeName}_${new Date().toISOString().split('T')[0]}.spec.ts`;
-      res.setHeader('Content-Type', 'text/plain');
-      res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
-      res.send(code);
+      const dateStr = new Date().toISOString().split('T')[0];
+
+      // Reconstruct the individual generated files (tests/, pages/, fixtures/, …)
+      // from the stored blob. A generation almost always produces MULTIPLE files,
+      // so the correct download artifact is a zip archive that preserves the repo
+      // folder structure — not a single concatenated `.spec.ts` (Bug #2).
+      const files = parseScriptContent(script.script_content, script.files_generated);
+
+      // Fallback: if for some reason the blob couldn't be split into discrete
+      // files, serve the raw content as a single .ts file (previous behaviour).
+      if (files.length <= 1) {
+        const single = files[0];
+        const body = single ? single.content : code;
+        const filename = single?.filename || `${safeName}_${dateStr}.spec.ts`;
+        res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+        res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+        return res.send(body);
+      }
+
+      // Build a zip archive preserving each file's repo-relative path so the user
+      // gets a ready-to-use folder tree (tests/…, pages/…, fixtures/…).
+      const zip = new JSZip();
+      for (const f of files) {
+        // Guard against absolute/escaping paths; keep them repo-relative.
+        const safePath = f.path.replace(/^[/\\]+/, '').replace(/\.\.[/\\]/g, '');
+        zip.file(safePath || f.filename, f.content);
+      }
+
+      const zipBuffer = await zip.generateAsync({
+        type: 'nodebuffer',
+        compression: 'DEFLATE',
+        compressionOptions: { level: 6 },
+      });
+
+      const zipName = `${safeName}_${dateStr}.zip`;
+      res.setHeader('Content-Type', 'application/zip');
+      res.setHeader('Content-Disposition', `attachment; filename="${zipName}"`);
+      res.setHeader('Content-Length', String(zipBuffer.length));
+      console.log(`[ScriptGen] 📦 Zipped ${files.length} file(s) for download → ${zipName}`);
+      return res.send(zipBuffer);
     } catch (err: any) {
       console.error('[ScriptGen] download error:', err);
       res.status(500).json({ success: false, error: 'Failed to download script', details: err.message });

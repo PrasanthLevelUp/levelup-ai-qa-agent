@@ -107,7 +107,8 @@ export class RTMService {
           '[]'
         ) AS test_cases,
 
-        -- Scripts array (generated_scripts linked via test_case_id)
+        -- Scripts array (generated_scripts linked via test_case_id OR directly
+        -- via the requirement_id FK — see the JOIN below).
         COALESCE(
           json_agg(
             DISTINCT jsonb_build_object(
@@ -146,7 +147,14 @@ export class RTMService {
 
       FROM requirements r
       LEFT JOIN generated_test_cases tc ON tc.requirement_id = r.id
-      LEFT JOIN generated_scripts gs ON gs.test_case_id = tc.id AND gs.deleted_at IS NULL
+      -- A script counts toward a requirement when it is linked EITHER through one
+      -- of the requirement's test cases (gs.test_case_id) OR directly via the
+      -- requirement FK stamped at generation time (gs.requirement_id). Counting
+      -- only the test-case path left requirement-scoped scripts showing as "0"
+      -- on the RTM dashboard even after a successful generation (Bug #3).
+      LEFT JOIN generated_scripts gs
+        ON (gs.test_case_id = tc.id OR gs.requirement_id = r.id)
+        AND gs.deleted_at IS NULL
       LEFT JOIN rtm_test_executions te ON te.requirement_id = r.id
       WHERE ${whereClause}
       GROUP BY r.id
@@ -183,7 +191,7 @@ export class RTMService {
         COUNT(DISTINCT gs.id)::int AS scripts_count
       FROM requirements r
       LEFT JOIN generated_test_cases tc ON tc.requirement_id = r.id
-      LEFT JOIN generated_scripts gs ON gs.test_case_id = tc.id AND gs.deleted_at IS NULL
+      LEFT JOIN generated_scripts gs ON (gs.test_case_id = tc.id OR gs.requirement_id = r.id) AND gs.deleted_at IS NULL
       WHERE r.company_id = $1
         AND ($2::int IS NULL OR r.project_id = $2)
         AND r.deleted_at IS NULL
