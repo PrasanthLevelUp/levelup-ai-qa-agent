@@ -27,7 +27,7 @@ import { AssertionEngine, type GeneratedAssertion } from './assertion-engine';
 import { WaitStrategyEngine, type WaitStrategy } from './wait-strategy-engine';
 import { logger } from '../utils/logger';
 import type { RepositoryProfile } from '../context/types';
-import { analyzeRepoStructure } from './repo-analyzer';
+import { analyzeRepoStructure, type RepoStructureAnalysis } from './repo-analyzer';
 import { adaptiveGenerateFiles } from './adaptive-codegen';
 
 const MOD = 'script-gen-engine';
@@ -654,15 +654,20 @@ Generate comprehensive test flows covering all detected functionality.`;
 
   private generatePlaywrightCode(testPlan: TestPlan, config: GenerationConfig): GeneratedFile[] {
     // ─── Adaptive generation: match existing repo structure ────────────
+    let analysis: RepoStructureAnalysis | null = null;
     if (config.repoProfile) {
       try {
-        const analysis = analyzeRepoStructure(config.repoProfile);
+        analysis = analyzeRepoStructure(config.repoProfile);
         logger.info(MOD, 'Repo structure analysis', {
           mode: analysis.mode,
           nextNum: analysis.nextFileNumber,
           naming: analysis.naming.pattern,
           hasConfig: analysis.hasPlaywrightConfig,
           hasCI: analysis.hasCIWorkflow,
+          hasReadme: analysis.hasReadme,
+          hasEnvExample: analysis.hasEnvExample,
+          hasUtils: analysis.hasUtils,
+          hasFixtures: analysis.hasFixtures,
         });
 
         const adaptiveFiles = adaptiveGenerateFiles(testPlan, config, analysis);
@@ -676,12 +681,33 @@ Generate comprehensive test flows covering all detected functionality.`;
         // adaptiveFiles === null → mode is POM, fall through to default
       } catch (err: any) {
         logger.warn(MOD, 'Adaptive codegen failed, falling back to default', { error: err.message });
+        analysis = null;
       }
     }
-    // ─── Default POM generation (original behaviour) ──────────────────
-    const files: GeneratedFile[] = [];
+    // ─── Default POM generation ───────────────────────────────────────
+    // Scaffold files (config, README, .env, CI) are gated behind repository
+    // intelligence: when the target repo already provides them we MUST NOT
+    // regenerate/overwrite them. Core artifacts (tests, page objects) are
+    // always emitted. When there's no repo profile (greenfield), everything
+    // is generated — preserving the original behaviour.
+    return this.generatePomFiles(testPlan, config, analysis);
+  }
 
-    // 1. Page Objects
+  /**
+   * Default POM file generation with intelligence-aware scaffolding.
+   *
+   * @param analysis Repository structure analysis, or `null` for greenfield
+   *                 generation (no target repo → emit the full scaffold).
+   */
+  private generatePomFiles(
+    testPlan: TestPlan,
+    config: GenerationConfig,
+    analysis: RepoStructureAnalysis | null,
+  ): GeneratedFile[] {
+    const files: GeneratedFile[] = [];
+    const skipped: string[] = [];
+
+    // 1. Page Objects — core artifact. Always generated for new pages.
     for (const po of testPlan.pageObjects) {
       files.push({
         path: `pages/${po.fileName}`,
@@ -690,7 +716,7 @@ Generate comprehensive test flows covering all detected functionality.`;
       });
     }
 
-    // 2. Test spec files (one per flow)
+    // 2. Test spec files (one per flow) — the core purpose. ALWAYS generated.
     for (const flow of testPlan.flows) {
       const fileName = `${toKebab(flow.name)}.spec.ts`;
       files.push({
@@ -700,49 +726,81 @@ Generate comprehensive test flows covering all detected functionality.`;
       });
     }
 
-    // 3. Fixtures
+    // 3. Fixtures — only if the test plan needs them AND the repo lacks them.
     if (testPlan.fixtures.length > 0) {
-      files.push({
-        path: 'fixtures/test-fixtures.ts',
-        content: this.generateFixtures(testPlan.fixtures, config),
-        type: 'fixture',
-      });
+      if (!analysis?.hasFixtures) {
+        files.push({
+          path: 'fixtures/test-fixtures.ts',
+          content: this.generateFixtures(testPlan.fixtures, config),
+          type: 'fixture',
+        });
+      } else {
+        skipped.push('fixtures/test-fixtures.ts (repo already has fixtures)');
+      }
     }
 
-    // 4. Config
-    files.push({
-      path: 'playwright.config.ts',
-      content: this.generatePlaywrightConfig(config),
-      type: 'config',
-    });
+    // 4. Config — only when the repo doesn't already have a Playwright config.
+    if (!analysis?.hasPlaywrightConfig) {
+      files.push({
+        path: 'playwright.config.ts',
+        content: this.generatePlaywrightConfig(config),
+        type: 'config',
+      });
+    } else {
+      skipped.push('playwright.config.ts (repo already has Playwright config)');
+    }
 
-    // 5. Utils
-    files.push({
-      path: 'utils/test-helpers.ts',
-      content: this.generateTestHelpers(),
-      type: 'util',
-    });
+    // 5. Utils — only when the repo doesn't already have a utils/helpers folder.
+    if (!analysis?.hasUtils) {
+      files.push({
+        path: 'utils/test-helpers.ts',
+        content: this.generateTestHelpers(),
+        type: 'util',
+      });
+    } else {
+      skipped.push('utils/test-helpers.ts (repo already has a utils/helpers folder)');
+    }
 
-    // 6. Env example
-    files.push({
-      path: '.env.example',
-      content: this.generateEnvExample(config),
-      type: 'config',
-    });
+    // 6. Env example — only when the repo doesn't already manage env config.
+    if (!analysis?.hasEnvExample) {
+      files.push({
+        path: '.env.example',
+        content: this.generateEnvExample(config),
+        type: 'config',
+      });
+    } else {
+      skipped.push('.env.example (repo already manages environment config)');
+    }
 
-    // 7. README
-    files.push({
-      path: 'README.md',
-      content: this.generateReadme(testPlan, config),
-      type: 'readme',
-    });
+    // 7. README — only when the repo doesn't already ship one.
+    if (!analysis?.hasReadme) {
+      files.push({
+        path: 'README.md',
+        content: this.generateReadme(testPlan, config),
+        type: 'readme',
+      });
+    } else {
+      skipped.push('README.md (repo already has a README)');
+    }
 
-    // 8. CI/CD config
-    files.push({
-      path: '.github/workflows/playwright.yml',
-      content: this.generateGithubActionsConfig(),
-      type: 'config',
-    });
+    // 8. CI/CD config — only when the repo doesn't already have a CI workflow.
+    if (!analysis?.hasCIWorkflow) {
+      files.push({
+        path: '.github/workflows/playwright.yml',
+        content: this.generateGithubActionsConfig(),
+        type: 'config',
+      });
+    } else {
+      skipped.push('.github/workflows/playwright.yml (repo already has CI workflows)');
+    }
+
+    if (skipped.length > 0) {
+      logger.info(MOD, 'Skipped scaffold files already present in target repository', {
+        skippedCount: skipped.length,
+        skipped,
+        generatedCount: files.length,
+      });
+    }
 
     return files;
   }
