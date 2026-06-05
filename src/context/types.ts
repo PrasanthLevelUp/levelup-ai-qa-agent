@@ -62,7 +62,23 @@ export interface ClassInfo {
   isExported: boolean;
   baseClass: string | null;
   methods: FunctionSignature[];
-  properties: Array<{ name: string; type: string; isReadonly: boolean }>;
+  properties: Array<{
+    name: string;
+    type: string;
+    isReadonly: boolean;
+    /**
+     * The actual selector value extracted from the property initializer,
+     * constructor assignment, or getter return — e.g. "#user-name" or
+     * "button[name='login']". Undefined when the property is not a locator
+     * or the selector could not be statically resolved.
+     */
+    selector?: string;
+    /**
+     * How the selector is expressed: 'locator' (page.locator), 'getByRole',
+     * 'getByTestId', 'getByText', 'getByLabel', 'getByPlaceholder', 'css', etc.
+     */
+    locatorType?: string;
+  }>;
   category: 'page-object' | 'fixture' | 'base-class' | 'utility' | 'unknown';
   lineNumber: number;
 }

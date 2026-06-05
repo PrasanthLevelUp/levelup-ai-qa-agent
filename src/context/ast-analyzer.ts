@@ -141,6 +141,71 @@ function extractPatterns(content: string, patterns: Array<{ regex: RegExp; label
 }
 
 /* ------------------------------------------------------------------ */
+/*  Selector value extraction (for Page Object reuse)                  */
+/* ------------------------------------------------------------------ */
+
+export interface ExtractedSelector {
+  selector: string;     // e.g. "#user-name" or "button[name=\"Login\"]"
+  locatorType: string;  // 'locator' | 'getByRole' | 'getByTestId' | ...
+}
+
+/**
+ * Statically extract the selector value + locator strategy from a property
+ * initializer / constructor assignment / getter body expression.
+ *
+ * Handles the common Playwright, WebdriverIO, Cypress and Selenium locator
+ * forms used inside page objects:
+ *   - this.page.locator('#user-name')        → { '#user-name', 'locator' }
+ *   - page.getByTestId('username')           → { 'username', 'getByTestId' }
+ *   - page.getByRole('button', { name: 'X' })→ { 'button[name="X"]', 'getByRole' }
+ *   - $('#user-name') / $$('.row')           → { '#user-name', 'css' }
+ *   - cy.get('[data-cy=login]')              → { '[data-cy=login]', 'cy.get' }
+ *   - By.id('user-name')                     → { 'user-name', 'By.id' }
+ *   - '#user-name' (plain string property)   → { '#user-name', 'css' }
+ *
+ * Returns null when no selector can be resolved (e.g. dynamic/computed).
+ */
+export function extractSelectorInfo(expr: string | undefined | null): ExtractedSelector | null {
+  if (!expr) return null;
+  const text = expr.trim();
+
+  // Playwright semantic locators: getByRole / getByTestId / getByText / ...
+  const semantic = text.match(
+    /\.(getByRole|getByTestId|getByText|getByLabel|getByPlaceholder|getByAltText|getByTitle)\s*\(\s*(['"`])([\s\S]*?)\2\s*(?:,\s*\{([^}]*)\})?/,
+  );
+  if (semantic) {
+    const method = semantic[1];
+    const arg = semantic[3];
+    const opts = semantic[4] || '';
+    const nameMatch = opts.match(/name\s*:\s*(['"`])([\s\S]*?)\1/);
+    const selector = nameMatch ? `${arg}[name=${JSON.stringify(nameMatch[2])}]` : arg;
+    return { selector, locatorType: method };
+  }
+
+  // page.locator('css') / this.page.locator('css')
+  const cssLoc = text.match(/\.locator\s*\(\s*(['"`])([\s\S]*?)\1/);
+  if (cssLoc) return { selector: cssLoc[2], locatorType: 'locator' };
+
+  // WebdriverIO-style $('sel') / $$('sel')
+  const dollar = text.match(/\$\$?\s*\(\s*(['"`])([\s\S]*?)\1/);
+  if (dollar) return { selector: dollar[2], locatorType: 'css' };
+
+  // Cypress cy.get('sel')
+  const cyGet = text.match(/cy\.get\s*\(\s*(['"`])([\s\S]*?)\1/);
+  if (cyGet) return { selector: cyGet[2], locatorType: 'cy.get' };
+
+  // Selenium By.id('x') / By.css('x') / By.xpath('x') / By.name / By.className
+  const by = text.match(/By\.(id|css|xpath|name|className)\s*\(\s*(['"`])([\s\S]*?)\2/);
+  if (by) return { selector: by[3], locatorType: `By.${by[1]}` };
+
+  // Plain string property that looks like a selector: '#x' / '.x' / '[x]' / '//x'
+  const plain = text.match(/^(['"`])([#.\[/][\s\S]*?)\1$/);
+  if (plain) return { selector: plain[2], locatorType: 'css' };
+
+  return null;
+}
+
+/* ------------------------------------------------------------------ */
 /*  Main AST Analyzer                                                  */
 /* ------------------------------------------------------------------ */
 
@@ -326,11 +391,39 @@ export class ASTAnalyzer {
 
       const methods = cls.getMethods().map(m => this.methodToSignature(m, relPath));
 
-      const properties = cls.getProperties().map(p => ({
-        name: p.getName(),
-        type: p.getType()?.getText(p) || 'any',
-        isReadonly: p.isReadonly(),
-      }));
+      // Selectors assigned inside the constructor: `this.usernameInput = page.locator('#user-name')`
+      const ctorSelectors = this.extractCtorSelectors(cls);
+
+      const properties = cls.getProperties().map(p => {
+        const propName = p.getName();
+        // 1) Direct initializer: `readonly usernameInput = this.page.locator('#user-name')`
+        let sel = extractSelectorInfo(p.getInitializer()?.getText());
+        // 2) Fallback to a matching constructor assignment.
+        if (!sel && ctorSelectors.has(propName)) sel = ctorSelectors.get(propName)!;
+
+        return {
+          name: propName,
+          type: p.getType()?.getText(p) || 'any',
+          isReadonly: p.isReadonly(),
+          ...(sel ? { selector: sel.selector, locatorType: sel.locatorType } : {}),
+        };
+      });
+
+      // 3) Getter accessors that return a locator: `get loginButton() { return this.page.getByRole(...) }`
+      for (const getter of cls.getGetAccessors()) {
+        const getterName = getter.getName();
+        if (properties.some(pr => pr.name === getterName)) continue;
+        const sel = extractSelectorInfo(getter.getBodyText() || getter.getText());
+        if (sel) {
+          properties.push({
+            name: getterName,
+            type: 'Locator',
+            isReadonly: true,
+            selector: sel.selector,
+            locatorType: sel.locatorType,
+          });
+        }
+      }
 
       return {
         name,
@@ -365,6 +458,35 @@ export class ASTAnalyzer {
       category: categorizeFn(name, relPath, true),
       complexity: countComplexity(m),
     };
+  }
+
+  /**
+   * Extract `this.<prop> = <locator expression>` assignments from a class
+   * constructor, mapping each property name to its resolved selector. This
+   * supports the common POM style where locators are wired up in the ctor:
+   *
+   *   constructor(page: Page) {
+   *     this.usernameInput = page.locator('#user-name');
+   *     this.loginButton   = page.getByRole('button', { name: 'Login' });
+   *   }
+   */
+  private extractCtorSelectors(cls: ClassDeclaration): Map<string, ExtractedSelector> {
+    const map = new Map<string, ExtractedSelector>();
+    try {
+      for (const ctor of cls.getConstructors()) {
+        const body = ctor.getBodyText() || '';
+        const re = /this\.(\w+)\s*=\s*([^;]+);/g;
+        let m: RegExpExecArray | null;
+        while ((m = re.exec(body)) !== null) {
+          if (map.has(m[1])) continue;
+          const sel = extractSelectorInfo(m[2]);
+          if (sel) map.set(m[1], sel);
+        }
+      }
+    } catch {
+      /* best-effort — malformed ctor shouldn't break analysis */
+    }
+    return map;
   }
 
   /* ---------------------------------------------------------------- */
