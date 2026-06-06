@@ -2243,12 +2243,13 @@ export async function persistJob(job: {
   result?: any;
   error?: string;
   companyId?: number;
+  projectId?: number;
 }): Promise<void> {
   await getPool().query(
     `INSERT INTO healing_jobs
       (id, repository_id, repository_url, branch, commit_sha, status, progress,
-       created_at, started_at, completed_at, result, error, company_id)
-    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+       created_at, started_at, completed_at, result, error, company_id, project_id)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
     ON CONFLICT(id) DO UPDATE SET
       status = EXCLUDED.status,
       progress = EXCLUDED.progress,
@@ -2270,8 +2271,35 @@ export async function persistJob(job: {
       job.result ? JSON.stringify(job.result) : null,
       job.error ?? null,
       job.companyId ?? null,
+      job.projectId ?? null,
     ],
   );
+}
+
+/**
+ * Resolve the owning project id for a healing job from the `repositories` table.
+ * Matches by repo URL first, then by name/id — best effort, returns null when
+ * no repository row maps to a project. Used to backfill project_id on healings
+ * that were triggered via paths (CI webhook, ingest) where the project wasn't
+ * explicitly supplied.
+ */
+export async function getProjectIdForRepo(
+  repoUrlOrName?: string,
+  companyId?: number,
+): Promise<number | null> {
+  if (!repoUrlOrName) return null;
+  try {
+    const { rows } = await getPool().query(
+      `SELECT project_id FROM repositories
+       WHERE ($2::int IS NULL OR company_id = $2)
+         AND (url = $1 OR name = $1)
+       ORDER BY updated_at DESC LIMIT 1`,
+      [repoUrlOrName, companyId ?? null],
+    );
+    return rows[0]?.project_id ?? null;
+  } catch {
+    return null;
+  }
 }
 
 export async function loadJobFromDb(jobId: string): Promise<any | null> {
