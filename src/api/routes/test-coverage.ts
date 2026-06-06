@@ -33,7 +33,12 @@ import {
   getExportHistory,
   updateCoverageGapPreference,
   linkTestCasesToRequirement,
+  findExistingRequirementBySignature,
+  deleteRequirementTestCases,
+  setRequirementGenerationState,
+  getApplicationProfileForGeneration,
 } from '../../db/postgres';
+import { buildApplicationProfileContext } from '../../utils/application-profile-context';
 import { ExportService } from '../../services/export-service';
 import { TemplateService } from '../../services/template-service';
 
@@ -59,6 +64,7 @@ export function createTestCoverageRouter(): Router {
         useRepoIntelligence, repoId,
         includeCoverageGaps,
         requirementId,
+        force,
       } = req.body;
 
       if (!title || !description) {
@@ -71,7 +77,31 @@ export function createTestCoverageRouter(): Router {
 
       const companyId = (req as any).companyId;
       const projectId = (req as any).projectId;
-      logger.info(MOD, 'Generate request', { title, companyId, projectId, coverageTypes: selectedTypes, knowledgeItemIds });
+      logger.info(MOD, 'Generate request', { title, companyId, projectId, coverageTypes: selectedTypes, knowledgeItemIds, force: !!force });
+
+      // ── Issue #1: Duplicate prevention ──
+      // Block regenerating for a requirement that is still 'generated' and already
+      // has test cases, unless the caller explicitly passes force=true (which the
+      // UI sends only after the user deletes the prior cases / confirms regenerate).
+      if (!force) {
+        try {
+          const existing = await findExistingRequirementBySignature({
+            title, module: mod, companyId, projectId,
+          });
+          if (existing) {
+            logger.info(MOD, '♻️ Duplicate generation blocked', { existingRequirementId: existing.id, testCaseCount: existing.test_case_count });
+            return res.status(409).json({
+              error: `Test cases already exist for "${existing.title}" (${existing.test_case_count} cases). Delete them first to regenerate.`,
+              code: 'DUPLICATE',
+              existingRequirementId: existing.id,
+              testCaseCount: existing.test_case_count,
+            });
+          }
+        } catch (dupErr: any) {
+          // Never let the dedupe guard break generation — fail open.
+          logger.warn(MOD, 'Duplicate check failed (continuing)', { error: dupErr.message });
+        }
+      }
 
       // Fetch app knowledge for context (legacy application_knowledge table)
       let knowledge: KnowledgeContext = { modules: [], historicalBugs: [] };
@@ -145,6 +175,34 @@ export function createTestCoverageRouter(): Router {
         }
       }
 
+      // ── Issue #2: Ground generation in the REAL crawled application ──
+      // Load the freshest application profile for this project and project its
+      // crawl_data (pages, forms, real selectors, login flow) into the knowledge
+      // context. When no profile exists this is a no-op and generation falls back
+      // to the previous generic behaviour.
+      let appProfileUsed: { id: string; name?: string | null; pageCount?: number; totalElements?: number; totalForms?: number } | null = null;
+      try {
+        const profile = await getApplicationProfileForGeneration(companyId, projectId);
+        const profileCtx = buildApplicationProfileContext(profile);
+        if (profile && profileCtx) {
+          knowledge.applicationProfile = profileCtx;
+          appProfileUsed = {
+            id: profile.id,
+            name: profile.name,
+            pageCount: profile.page_count,
+            totalElements: profile.total_elements,
+            totalForms: profile.total_forms,
+          };
+          logger.info(MOD, '🧠 Application profile loaded for generation', {
+            profileId: profile.id, pages: profile.page_count, elements: profile.total_elements, forms: profile.total_forms,
+          });
+        } else {
+          logger.info(MOD, 'No application profile available — generic generation', { companyId, projectId });
+        }
+      } catch (profErr: any) {
+        logger.warn(MOD, 'Could not load application profile (continuing)', { error: profErr.message });
+      }
+
       const input: RequirementInput = {
         title, description, jiraId, businessFlow,
         acceptanceCriteria, apiDocs, releaseNotes, module: mod,
@@ -154,6 +212,7 @@ export function createTestCoverageRouter(): Router {
         knowledgeModules: knowledge.modules?.length || 0,
         enterpriseKnowledge: knowledge.enterpriseKnowledge?.length || 0,
         repositoryContext: repoContextUsed ? true : false,
+        applicationProfile: appProfileUsed ? true : false,
       });
       const result = await getEngine().generateFullCoverage(input, selectedTypes, knowledge);
       logger.info(MOD, 'AI engine returned', {
@@ -175,6 +234,8 @@ export function createTestCoverageRouter(): Router {
         // the History detail view (gaps are not stored in a separate table).
         coverageGaps: result.coverageGaps || [],
         gapsFound: result.stats?.gapsFound ?? (result.coverageGaps?.length || 0),
+        // Issue #2: record whether real app knowledge was used for this generation
+        appProfileUsed: appProfileUsed || undefined,
       };
 
       let reqId: number;
@@ -261,6 +322,13 @@ export function createTestCoverageRouter(): Router {
         }
         logger.info(MOD, 'Test cases persisted', { inserted: insertedCases, total: result.testCases.length });
 
+        // ── Issue #1: record generation lifecycle state for duplicate prevention ──
+        try {
+          await setRequirementGenerationState(reqId, 'generated', insertedCases);
+        } catch (stateErr: any) {
+          logger.warn(MOD, 'Could not set generation state', { reqId, error: stateErr.message });
+        }
+
         // RTM: if an existing requirement was supplied, link the freshly
         // generated test cases to it so coverage updates automatically.
         // Best-effort — never let traceability failures break generation.
@@ -288,6 +356,8 @@ export function createTestCoverageRouter(): Router {
           title: ki.title,
           category: ki.category,
         })) : undefined,
+        // Issue #2: surface whether the real application profile grounded this run
+        appProfileUsed: appProfileUsed || undefined,
       });
     } catch (err: any) {
       logger.error(MOD, 'Generation failed', { error: err.message, stack: err.stack });
@@ -335,6 +405,23 @@ export function createTestCoverageRouter(): Router {
       return res.json({ deleted });
     } catch (err: any) {
       return res.status(500).json({ error: 'Failed to delete', details: err.message });
+    }
+  });
+
+  /* ---- DELETE /requirements/:id/test-cases — clear generated artifacts so the
+         requirement can be regenerated (Issue #1). Keeps the requirement row but
+         removes its scenarios/cases and marks generation_state='deleted'. ---- */
+  router.delete('/requirements/:id/test-cases', async (req: Request, res: Response) => {
+    try {
+      const id = parseInt(String(req.params.id), 10);
+      if (Number.isNaN(id)) return res.status(400).json({ error: 'Invalid requirement id' });
+      const companyId = (req as any).companyId;
+      const { deletedScenarios } = await deleteRequirementTestCases(id, companyId);
+      logger.info(MOD, '🗑️ Cleared generated test cases for regeneration', { requirementId: id, deletedScenarios });
+      return res.json({ cleared: true, requirementId: id, deletedScenarios, generationState: 'deleted' });
+    } catch (err: any) {
+      logger.error(MOD, 'Failed to clear test cases', { error: err.message });
+      return res.status(500).json({ error: 'Failed to clear test cases', details: err.message });
     }
   });
 

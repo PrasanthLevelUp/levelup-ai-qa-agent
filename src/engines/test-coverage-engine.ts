@@ -117,6 +117,32 @@ export interface KnowledgeContext {
   automationCoverage?: string[];
   enterpriseKnowledge?: EnterpriseKnowledgeItem[];
   repositoryContext?: RepositoryIntelligence;
+  /**
+   * Real application structure captured by the crawler (application_profiles.crawl_data).
+   * When present, generation is grounded in REAL selectors, forms, flows and
+   * credentials instead of generic guesses. Issue #2 fix.
+   */
+  applicationProfile?: ApplicationProfileContext;
+}
+
+/** Compact, token-budgeted projection of an application profile for prompts. */
+export interface ApplicationProfileContext {
+  baseUrl?: string;
+  name?: string;
+  pageCount?: number;
+  totalElements?: number;
+  totalForms?: number;
+  loginUrl?: string;
+  username?: string;          // real username; password is NEVER included
+  pages?: Array<{ url?: string; title?: string; pageType?: string; elementCount?: number; formCount?: number }>;
+  forms?: Array<{
+    page?: string;
+    action?: string;
+    method?: string;
+    fields?: Array<{ name?: string; type?: string; required?: boolean; selector?: string; label?: string }>;
+    submitSelector?: string;
+  }>;
+  keyElements?: Array<{ label?: string; tag?: string; selector?: string; role?: string }>;
 }
 
 /* ------------------------------------------------------------------ */
@@ -208,6 +234,61 @@ Use this repository context to:
 3. Consider architectural boundaries and service interactions`;
   }
 
+  /* ---- Build Application Profile Block (REAL crawled app structure — Issue #2) ---- */
+  private buildApplicationProfileBlock(knowledge?: KnowledgeContext): string {
+    const ap = knowledge?.applicationProfile;
+    if (!ap) return '';
+    const parts: string[] = [];
+
+    const summary: string[] = [];
+    if (ap.name) summary.push(`App: ${ap.name}`);
+    if (ap.baseUrl) summary.push(`Base URL: ${ap.baseUrl}`);
+    if (ap.pageCount != null) summary.push(`Pages crawled: ${ap.pageCount}`);
+    if (ap.totalElements != null) summary.push(`Elements: ${ap.totalElements}`);
+    if (ap.totalForms != null) summary.push(`Forms: ${ap.totalForms}`);
+    if (summary.length) parts.push(summary.join(' | '));
+
+    if (ap.loginUrl || ap.username) {
+      parts.push(`\nAUTHENTICATION:\n  Login URL: ${ap.loginUrl || 'N/A'}\n  Username: ${ap.username || 'N/A'}\n  Password: use the placeholder <password> (never a real secret)`);
+    }
+
+    if (ap.pages?.length) {
+      const pageLines = ap.pages.slice(0, 12).map(p =>
+        `  - ${p.title || p.url || 'page'} [${p.pageType || 'unknown'}] (${p.elementCount ?? 0} elements, ${p.formCount ?? 0} forms)`
+      );
+      parts.push(`\nSITE MAP (real pages — reference these in navigation steps):\n${pageLines.join('\n')}`);
+    }
+
+    if (ap.forms?.length) {
+      const formLines = ap.forms.slice(0, 8).map((f, i) => {
+        const fields = (f.fields || []).slice(0, 10).map(fd =>
+          `      • ${fd.label || fd.name || 'field'} (type=${fd.type || 'text'}${fd.required ? ', REQUIRED' : ''}) selector=${fd.selector || 'n/a'}`
+        ).join('\n');
+        return `  Form ${i + 1}${f.page ? ` on ${f.page}` : ''} [${f.method || 'GET'} ${f.action || ''}]:\n${fields}${f.submitSelector ? `\n      • submit selector=${f.submitSelector}` : ''}`;
+      });
+      parts.push(`\nFORMS (real fields + recommended selectors — use these EXACT selectors):\n${formLines.join('\n')}`);
+    }
+
+    if (ap.keyElements?.length) {
+      const elLines = ap.keyElements.slice(0, 20).map(e =>
+        `  - ${e.label || e.tag || 'element'}${e.role ? ` (role=${e.role})` : ''} selector=${e.selector || 'n/a'}`
+      );
+      parts.push(`\nKEY INTERACTIVE ELEMENTS (real selectors):\n${elLines.join('\n')}`);
+    }
+
+    if (parts.length === 0) return '';
+
+    return `\n\nAPPLICATION PROFILE (REAL crawled application structure):\n${parts.join('\n')}
+
+CRITICAL — Because this application has been crawled, you MUST:
+1. Use the REAL selectors and field names above instead of generic placeholders.
+2. Ground every navigation step in the real pages listed in the site map.
+3. Write validation/negative tests against the actual REQUIRED form fields.
+4. Set "selectorAvailability" to "high" for cases that use a real selector above.
+5. Use the real login URL + username (with <password> placeholder) for auth steps.
+Do NOT invent selectors or pages that are not present above.`;
+  }
+
   /* ---- Phase 2: Requirement Understanding ---- */
   async analyzeRequirement(
     input: RequirementInput,
@@ -220,6 +301,7 @@ Use this repository context to:
       : '';
     const enterpriseBlock = this.buildEnterpriseKnowledgeBlock(knowledge, input);
     const repoBlock = this.buildRepoIntelligenceBlock(knowledge);
+    const appProfileBlock = this.buildApplicationProfileBlock(knowledge);
 
     const prompt = `You are a senior QA architect analyzing a software requirement.
 
@@ -230,7 +312,7 @@ ${input.acceptanceCriteria ? `Acceptance Criteria: ${input.acceptanceCriteria}` 
 ${input.businessFlow ? `Business Flow: ${input.businessFlow}` : ''}
 ${input.module ? `Module: ${input.module}` : ''}
 ${input.apiDocs ? `API Documentation: ${input.apiDocs}` : ''}
-${input.releaseNotes ? `Release Notes: ${input.releaseNotes}` : ''}${knowledgeBlock}${enterpriseBlock}${repoBlock}
+${input.releaseNotes ? `Release Notes: ${input.releaseNotes}` : ''}${knowledgeBlock}${enterpriseBlock}${repoBlock}${appProfileBlock}
 
 Analyze this requirement and return a JSON object with:
 - featureType: string (e.g. "authentication", "payment", "search", "data_entry", "reporting")
@@ -287,6 +369,7 @@ Return ONLY valid JSON, no markdown fences.`;
       : '';
     const enterpriseBlock = this.buildEnterpriseKnowledgeBlock(knowledge, input);
     const repoBlock = this.buildRepoIntelligenceBlock(knowledge);
+    const appProfileBlock = this.buildApplicationProfileBlock(knowledge);
 
     // Build per-type coverage expectations
     const coverageExpectations = coverageTypes.map(ct => {
@@ -328,7 +411,7 @@ Feature Type: ${analysis.featureType}
 Risk Level: ${analysis.riskLevel}
 Impacted Modules: ${analysis.impactedModules.join(', ')}
 Workflow: ${analysis.workflowSteps.join(' → ')}
-User Roles: ${analysis.userRolesAffected.join(', ')}${knowledgeBugs}${knowledgeTests}${enterpriseBlock}${repoBlock}
+User Roles: ${analysis.userRolesAffected.join(', ')}${knowledgeBugs}${knowledgeTests}${enterpriseBlock}${repoBlock}${appProfileBlock}
 
 COVERAGE TYPES REQUESTED (${numTypes} types): ${coverageTypes.join(', ')}
 
