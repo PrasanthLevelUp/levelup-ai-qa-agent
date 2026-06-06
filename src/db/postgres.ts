@@ -131,6 +131,8 @@ const REQUIRED_TABLES = [
   'application_knowledge', 'knowledge_items', 'knowledge_relationships',
   // Healing settings (admin-tunable confidence thresholds + cost caps)
   'healing_settings',
+  // Proactive script maintenance (change detection)
+  'crawl_snapshots',
   // Projects
   'projects', 'repositories',
   // Webhooks
@@ -1354,6 +1356,31 @@ async function migrateDefaultCompany(client: PoolClient): Promise<void> {
   await safeExec(client, 'idx_healing_settings_scope',
     `CREATE UNIQUE INDEX IF NOT EXISTS idx_healing_settings_scope
        ON healing_settings(COALESCE(company_id, 0), COALESCE(project_id, 0))`);
+
+  // ── Crawl snapshots (proactive script maintenance: change detection) ──
+  // Stores a lightweight, versioned "signature" of each crawl so we can diff
+  // successive crawls of the same app and detect UI/locator changes that may
+  // break existing generated scripts. Fully additive — absence of snapshots
+  // simply means no change-detection data is available yet.
+  console.log('🔧 [DB] Migration: crawl_snapshots table...');
+  await safeExec(client, 'crawl_snapshots', `CREATE TABLE IF NOT EXISTS crawl_snapshots (
+    id SERIAL PRIMARY KEY,
+    profile_id UUID,
+    base_url TEXT NOT NULL,
+    company_id INTEGER,
+    project_id INTEGER,
+    version INTEGER NOT NULL DEFAULT 1,
+    signature JSONB NOT NULL DEFAULT '{}'::jsonb,
+    element_count INTEGER DEFAULT 0,
+    form_count INTEGER DEFAULT 0,
+    selector_count INTEGER DEFAULT 0,
+    page_count INTEGER DEFAULT 0,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+  )`);
+  await safeExec(client, 'idx_crawl_snapshots_scope',
+    `CREATE INDEX IF NOT EXISTS idx_crawl_snapshots_scope
+       ON crawl_snapshots(base_url, COALESCE(company_id, 0), COALESCE(project_id, 0), version DESC)`);
+
   const projectIdIndexes = [
     `CREATE INDEX IF NOT EXISTS idx_pc_project ON project_contexts(project_id)`,
     `CREATE INDEX IF NOT EXISTS idx_gs_project ON generated_scripts(project_id)`,
@@ -3126,6 +3153,132 @@ export async function getScriptHistory(
   );
 
   return { records: dataR.rows, total };
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Proactive script maintenance: crawl snapshots + script-health queries
+// ───────────────────────────────────────────────────────────────────────────
+
+export interface CrawlSnapshotRecord {
+  id: number;
+  profile_id: string | null;
+  base_url: string;
+  company_id: number | null;
+  project_id: number | null;
+  version: number;
+  signature: any;
+  element_count: number;
+  form_count: number;
+  selector_count: number;
+  page_count: number;
+  created_at: string;
+}
+
+/**
+ * Persist a new versioned crawl signature for an app. Version auto-increments
+ * per (base_url, company, project) scope. Fully best-effort — callers should
+ * wrap in try/catch so a snapshot failure never blocks a crawl save.
+ */
+export async function insertCrawlSnapshot(data: {
+  profileId?: string | null;
+  baseUrl: string;
+  companyId?: number | null;
+  projectId?: number | null;
+  signature: any;
+  elementCount?: number;
+  formCount?: number;
+  selectorCount?: number;
+  pageCount?: number;
+}): Promise<CrawlSnapshotRecord | null> {
+  const pool = getPool();
+  const verR = await pool.query(
+    `SELECT COALESCE(MAX(version), 0) + 1 AS next
+       FROM crawl_snapshots
+      WHERE base_url = $1
+        AND COALESCE(company_id, 0) = COALESCE($2, 0)
+        AND COALESCE(project_id, 0) = COALESCE($3, 0)`,
+    [data.baseUrl, data.companyId ?? null, data.projectId ?? null],
+  );
+  const nextVersion = verR.rows[0]?.next || 1;
+  const result = await pool.query(
+    `INSERT INTO crawl_snapshots
+       (profile_id, base_url, company_id, project_id, version, signature,
+        element_count, form_count, selector_count, page_count)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+     RETURNING *`,
+    [
+      data.profileId ?? null,
+      data.baseUrl,
+      data.companyId ?? null,
+      data.projectId ?? null,
+      nextVersion,
+      JSON.stringify(data.signature ?? {}),
+      data.elementCount ?? 0,
+      data.formCount ?? 0,
+      data.selectorCount ?? 0,
+      data.pageCount ?? 0,
+    ],
+  );
+  return result.rows[0] || null;
+}
+
+/** Fetch the most recent crawl snapshots for a scope (newest first). */
+export async function getLatestSnapshots(
+  baseUrl: string,
+  companyId?: number,
+  projectId?: number,
+  limit = 2,
+): Promise<CrawlSnapshotRecord[]> {
+  const result = await getPool().query(
+    `SELECT * FROM crawl_snapshots
+      WHERE base_url = $1
+        AND COALESCE(company_id, 0) = COALESCE($2, 0)
+        AND COALESCE(project_id, 0) = COALESCE($3, 0)
+      ORDER BY version DESC
+      LIMIT $4`,
+    [baseUrl, companyId ?? null, projectId ?? null, limit],
+  );
+  return result.rows;
+}
+
+/** Distinct crawled base URLs that have at least one snapshot (per scope). */
+export async function getSnapshotBaseUrls(companyId?: number, projectId?: number): Promise<string[]> {
+  const result = await getPool().query(
+    `SELECT DISTINCT base_url FROM crawl_snapshots
+      WHERE COALESCE(company_id, 0) = COALESCE($1, 0)
+        AND COALESCE(project_id, 0) = COALESCE($2, 0)
+      ORDER BY base_url`,
+    [companyId ?? null, projectId ?? null],
+  );
+  return result.rows.map((r: any) => r.base_url);
+}
+
+/**
+ * Fetch generated scripts (active only) with the fields needed to compute
+ * script-health scores: locator report, reliability, url, page type, age.
+ */
+export async function getScriptsForHealth(
+  companyId: number,
+  projectId?: number,
+): Promise<Array<{
+  id: number;
+  url: string;
+  page_type: string | null;
+  reliability_score: number | null;
+  locator_report: any;
+  created_at: string;
+}>> {
+  const conditions = ['company_id = $1', 'deleted_at IS NULL'];
+  const params: any[] = [companyId];
+  if (projectId) { conditions.push(`(project_id = $${params.length + 1} OR project_id IS NULL)`); params.push(projectId); }
+  const result = await getPool().query(
+    `SELECT id, url, page_type, reliability_score, locator_report, created_at
+       FROM generated_scripts
+      WHERE ${conditions.join(' AND ')}
+      ORDER BY created_at DESC`,
+    params,
+  );
+  return result.rows;
 }
 
 /** Soft-delete a generated script */

@@ -10,8 +10,9 @@
 
 import { logger } from '../utils/logger';
 import { ProfileService, type SaveProfileInput } from './profile-service';
-import { updateProfileStatus } from '../db/postgres';
+import { updateProfileStatus, insertCrawlSnapshot } from '../db/postgres';
 import type { ApplicationProfile } from '../db/postgres';
+import { computeCrawlSignature, signatureToSnapshotFields } from '../services/script-maintenance';
 
 const MOD = 'CrawlOrchestrator';
 
@@ -204,6 +205,7 @@ export class CrawlOrchestrator {
         url: baseUrl,
         projectId,
       });
+      await this.captureSnapshot(profile, baseUrl, crawlResult, companyId, projectId);
       return profile;
     } catch (saveErr: any) {
       // Non-blocking: if application_profiles table doesn't exist, log and continue.
@@ -317,6 +319,7 @@ export class CrawlOrchestrator {
       const profile = await this.profileService.saveProfile(input, companyId, projectId);
       console.log(`[CrawlOrchestrator] ✅ Deep profile saved: id=${profile.id}, status=${profile.status}, pages=${pages.length}`);
       logger.info(MOD, 'Deep crawl result saved to profile', { profileId: profile.id, url: baseUrl, pages: pages.length, projectId });
+      await this.captureSnapshot(profile, baseUrl, crawlData, companyId, projectId);
       return profile;
     } catch (saveErr: any) {
       console.error(
@@ -334,6 +337,41 @@ export class CrawlOrchestrator {
   /**
    * Mark a profile as currently being crawled (for long-running crawls).
    */
+  /**
+   * Capture a lightweight, versioned signature of a crawl for change detection.
+   * Fully best-effort — never throws, never blocks the crawl-save path. If the
+   * crawl_snapshots table is missing (migration pending) it just logs and moves on.
+   */
+  private async captureSnapshot(
+    profile: ApplicationProfile | null,
+    baseUrl: string,
+    crawlData: any,
+    companyId?: number,
+    projectId?: number,
+  ): Promise<void> {
+    try {
+      const signature = computeCrawlSignature(crawlData);
+      const fields = signatureToSnapshotFields(signature);
+      const snap = await insertCrawlSnapshot({
+        profileId: profile?.id ?? null,
+        baseUrl,
+        companyId: companyId ?? null,
+        projectId: projectId ?? null,
+        signature,
+        ...fields,
+      });
+      if (snap) {
+        logger.info(MOD, '📸 Crawl snapshot captured for change detection', {
+          baseUrl, version: snap.version, selectors: fields.selectorCount, pages: fields.pageCount,
+        });
+      }
+    } catch (err: any) {
+      logger.warn(MOD, 'Could not capture crawl snapshot (non-blocking)', {
+        baseUrl, error: err?.message, code: err?.code,
+      });
+    }
+  }
+
   async markCrawling(profileId: string): Promise<void> {
     try {
       await updateProfileStatus(profileId, 'crawling');
