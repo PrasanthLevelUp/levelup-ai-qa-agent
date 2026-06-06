@@ -25,6 +25,8 @@ export interface HealingJob {
   companyId?: number;
   /** Project this healing job belongs to — used to scope DOM Memory and persist project_id on healings. */
   projectId?: number;
+  /** Optional spec file to scope the run to a single test file (relative path). Empty ⇒ run whole suite. */
+  testFile?: string;
   status: JobStatus;
   progress: string;
   createdAt: string;
@@ -60,7 +62,7 @@ export class JobQueue {
   /**
    * Create a new healing job and add to queue.
    */
-  createJob(repositoryId: string, branch = 'main', commit?: string, repositoryUrl?: string, companyId?: number, projectId?: number): HealingJob {
+  createJob(repositoryId: string, branch = 'main', commit?: string, repositoryUrl?: string, companyId?: number, projectId?: number, testFile?: string): HealingJob {
     const job: HealingJob = {
       id: `job_${uuidv4().slice(0, 12)}`,
       repositoryId,
@@ -68,6 +70,7 @@ export class JobQueue {
       branch,
       companyId,
       projectId,
+      testFile: testFile || undefined,
       commit,
       status: JobStatus.PENDING,
       progress: 'Queued for processing',

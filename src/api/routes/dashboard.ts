@@ -423,21 +423,30 @@ export function createDashboardRouter(): Router {
 
   // ─── Jobs ───────────────────────────────────────────────────
 
-  /** GET /api/dashboard/jobs?limit=50&status= */
+  /** GET /api/dashboard/jobs?limit=50&status=&projectId= */
   router.get('/jobs', async (req: Request, res: Response) => {
     try {
       const limit = parseInt(req.query.limit as string) || 50;
       const status = req.query.status as string;
+      const pid = req.query.projectId ? parseInt(req.query.projectId as string, 10) : null;
       const pool = getPool();
 
-      let query = `SELECT * FROM healing_jobs`;
+      // Build WHERE clause dynamically so project + status filters compose cleanly.
+      const conditions: string[] = [];
       const params: any[] = [];
       if (status) {
-        query += ` WHERE status = $1`;
         params.push(status);
+        conditions.push(`status = $${params.length}`);
       }
-      query += ` ORDER BY created_at DESC LIMIT $${params.length + 1}`;
+      if (pid && !Number.isNaN(pid)) {
+        params.push(pid);
+        conditions.push(`project_id = $${params.length}`);
+      }
+
+      let query = `SELECT * FROM healing_jobs`;
+      if (conditions.length > 0) query += ` WHERE ${conditions.join(' AND ')}`;
       params.push(limit);
+      query += ` ORDER BY created_at DESC LIMIT $${params.length}`;
 
       const { rows } = await pool.query(query, params);
 
@@ -450,6 +459,7 @@ export function createDashboardRouter(): Router {
           id: j.id,
           repositoryId: j.repository_id,
           repositoryUrl: j.repository_url,
+          projectId: j.project_id ?? null,
           branch: j.branch,
           commitSha: j.commit_sha,
           status: j.status,

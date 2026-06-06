@@ -18,9 +18,24 @@ export interface AIEngineResult {
 }
 
 export class AIEngine {
-  constructor(private readonly openaiClient: OpenAIClient) {}
+  // Client is optional: when OPENAI_API_KEY is absent the worker constructs the
+  // engine without a client so rule/pattern healing still works (AI simply no-ops)
+  // instead of throwing and crashing the entire healing job.
+  constructor(private readonly openaiClient?: OpenAIClient) {}
+
+  /** Whether the AI engine has a usable backing client. */
+  get isEnabled(): boolean {
+    return !!this.openaiClient;
+  }
 
   async suggest(failure: FailureDetails): Promise<AIEngineResult | null> {
+    if (!this.openaiClient) {
+      logger.warn(MOD, 'AI engine disabled (no OpenAI client configured) — skipping AI suggestion', {
+        testName: failure.testName,
+      });
+      return null;
+    }
+
     const response = await this.openaiClient.suggestSemanticLocator({
       errorMessage: failure.errorMessage,
       failedLine: failure.failedLineCode,
