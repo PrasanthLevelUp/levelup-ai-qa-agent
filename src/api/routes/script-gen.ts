@@ -31,7 +31,15 @@ import {
   getProfileByUrl,
   markTestCaseAutomated,
   getRequirementAutomationCoverage,
+  updateScriptContent,
+  saveScriptVersion,
 } from '../../db/postgres';
+import { syncScript } from '../../services/script-sync';
+import {
+  extractPreservedContent,
+  mergeRegenerated,
+  type MergeOptions,
+} from '../../services/smart-regeneration';
 import { resolveBaseUrl } from '../../services/url-resolver';
 import { parseScriptContent } from '../../services/script-file-parser';
 import { LocatorResolver, type CrawlDataLike, type LocatorReport } from '../../services/locator-resolver';
@@ -1159,6 +1167,209 @@ export function createScriptGenRouter(): Router {
       }
     } catch (err: any) {
       console.error('[ScriptGen] push error:', err);
+      res.status(500).json({ success: false, error: err.message });
+    }
+  });
+
+  /* ── Maintenance Suite: Script Sync ──────────────────────────
+   * POST /api/scripts/:id/sync
+   *
+   * Re-validate a script's locators against the *latest* crawl of its target
+   * app and auto-repair selectors that no longer resolve. Returns the list of
+   * proposed/applied changes. `apply` (default true) persists the rewritten
+   * script (after taking a versioned backup); `dryRun: true` previews only.
+   *
+   * Body: { dryRun?: boolean }
+   * Resp: { success, data: { changes, outdatedCount, replacedCount, unresolved, summary, applied, backupVersion } }
+   */
+  router.post('/:id/sync', async (req: Request, res: Response) => {
+    try {
+      const companyId = (req as any).companyId as number | undefined;
+      const projectId = (req as any).projectId as number | undefined;
+      const id = parseInt(req.params.id as string);
+      if (isNaN(id)) {
+        return res.status(400).json({ success: false, error: 'Invalid script ID' });
+      }
+      const dryRun = req.body?.dryRun === true;
+
+      const script = await getGeneratedScript(id, companyId, projectId);
+      if (!script) {
+        return res.status(404).json({ success: false, error: 'Script not found' });
+      }
+
+      // Load the latest crawl for the script's target app.
+      let crawlData: CrawlDataLike | null = null;
+      try {
+        const origin = (() => { try { return new URL(script.url).origin; } catch { return script.url; } })();
+        const profile =
+          (await getProfileByUrl(script.url, companyId, projectId)) ||
+          (await getProfileByUrl(origin, companyId, projectId));
+        crawlData = (profile?.crawl_data as CrawlDataLike) ?? null;
+      } catch (profErr: any) {
+        console.warn(`[ScriptGen] sync: profile lookup failed: ${profErr?.message}`);
+      }
+      if (!crawlData) {
+        return res.status(400).json({
+          success: false,
+          error: 'No crawl data available for this app. Re-crawl the application before syncing.',
+        });
+      }
+
+      const result = syncScript({
+        scriptContent: script.script_content,
+        filesGenerated: script.files_generated,
+        locatorReport: (script.locator_report as any) ?? null,
+        newCrawlData: crawlData,
+        apply: !dryRun,
+      });
+
+      let applied = false;
+      let backupVersion: number | null = null;
+      if (!dryRun && result.newScriptContent && result.changes.length) {
+        try {
+          const backup = await saveScriptVersion({
+            scriptId: id, companyId, projectId, reason: 'pre-sync',
+            scriptContent: script.script_content, filesGenerated: script.files_generated,
+          });
+          backupVersion = backup?.version ?? null;
+        } catch (bErr: any) {
+          console.warn(`[ScriptGen] sync: backup failed (continuing): ${bErr?.message}`);
+        }
+        applied = await updateScriptContent(id, result.newScriptContent, script.files_generated, companyId, projectId);
+      }
+
+      console.log(`[ScriptGen] 🔧 sync #${id} — ${result.outdatedCount} outdated, ${result.changes.length} repaired, applied=${applied}`);
+      res.json({
+        success: true,
+        data: {
+          changes: result.changes,
+          outdatedCount: result.outdatedCount,
+          replacedCount: result.replacedCount,
+          unresolved: result.unresolved,
+          summary: result.summary,
+          applied,
+          dryRun,
+          backupVersion,
+        },
+      });
+    } catch (err: any) {
+      console.error('[ScriptGen] sync error:', err);
+      res.status(500).json({ success: false, error: err.message });
+    }
+  });
+
+  /* ── Maintenance Suite: Smart Regeneration ───────────────────
+   * POST /api/scripts/:id/regenerate
+   *
+   * Refresh a script's page-objects/locators against the latest crawl while
+   * preserving hand-written test logic. The existing script is parsed with the
+   * TypeScript compiler API to extract test data, assertions and custom regions
+   * (`@preserve-start/-end`), which are merged back over the regenerated
+   * implementation. A versioned backup is always taken first.
+   *
+   * Body: { dryRun?: boolean, preserveTestData?, preserveAssertions?, preserveCustomRegions? }
+   * Resp: { success, data: { files, mergeReport, syncSummary, applied, backupVersion } }
+   */
+  router.post('/:id/regenerate', async (req: Request, res: Response) => {
+    try {
+      const companyId = (req as any).companyId as number | undefined;
+      const projectId = (req as any).projectId as number | undefined;
+      const id = parseInt(req.params.id as string);
+      if (isNaN(id)) {
+        return res.status(400).json({ success: false, error: 'Invalid script ID' });
+      }
+      const dryRun = req.body?.dryRun === true;
+      const mergeOptions: MergeOptions = {
+        preserveTestData: req.body?.preserveTestData !== false,
+        preserveAssertions: req.body?.preserveAssertions !== false,
+        preserveCustomRegions: req.body?.preserveCustomRegions !== false,
+      };
+
+      const script = await getGeneratedScript(id, companyId, projectId);
+      if (!script) {
+        return res.status(404).json({ success: false, error: 'Script not found' });
+      }
+
+      // Latest crawl → refresh locators (page-object regeneration core).
+      let crawlData: CrawlDataLike | null = null;
+      try {
+        const origin = (() => { try { return new URL(script.url).origin; } catch { return script.url; } })();
+        const profile =
+          (await getProfileByUrl(script.url, companyId, projectId)) ||
+          (await getProfileByUrl(origin, companyId, projectId));
+        crawlData = (profile?.crawl_data as CrawlDataLike) ?? null;
+      } catch (profErr: any) {
+        console.warn(`[ScriptGen] regenerate: profile lookup failed: ${profErr?.message}`);
+      }
+      if (!crawlData) {
+        return res.status(400).json({
+          success: false,
+          error: 'No crawl data available for this app. Re-crawl the application before regenerating.',
+        });
+      }
+
+      // 1. Regenerate locators/page-objects against the new crawl.
+      const sync = syncScript({
+        scriptContent: script.script_content,
+        filesGenerated: script.files_generated,
+        locatorReport: (script.locator_report as any) ?? null,
+        newCrawlData: crawlData,
+        apply: true,
+      });
+      const regenerated = sync.newScriptContent || script.script_content || '';
+
+      // 2. Parse old + new files; merge preserved logic per file.
+      const oldFiles = parseScriptContent(script.script_content, script.files_generated);
+      const newFiles = parseScriptContent(regenerated, script.files_generated);
+      const oldByPath = new Map(oldFiles.map((f) => [f.path, f]));
+
+      const mergedFiles: Array<{ path: string; content: string; report: any }> = [];
+      for (const nf of newFiles) {
+        const of = oldByPath.get(nf.path);
+        if (of && /\.(spec|test)\./.test(nf.path)) {
+          const preserved = extractPreservedContent(of.content);
+          const merged = mergeRegenerated(preserved, nf.content, mergeOptions);
+          mergedFiles.push({ path: nf.path, content: merged.content, report: merged.report });
+        } else {
+          mergedFiles.push({ path: nf.path, content: nf.content, report: null });
+        }
+      }
+
+      const newScriptContent = mergedFiles.map((f) => `// === ${f.path} ===\n${f.content}`).join('\n\n');
+      const mergeReport = mergedFiles
+        .filter((f) => f.report && (f.report.testDataInjected || f.report.assertionsInjected || f.report.customRegionsInjected))
+        .map((f) => ({ file: f.path, ...f.report }));
+
+      let applied = false;
+      let backupVersion: number | null = null;
+      if (!dryRun) {
+        try {
+          const backup = await saveScriptVersion({
+            scriptId: id, companyId, projectId, reason: 'pre-regenerate',
+            scriptContent: script.script_content, filesGenerated: script.files_generated,
+          });
+          backupVersion = backup?.version ?? null;
+        } catch (bErr: any) {
+          console.warn(`[ScriptGen] regenerate: backup failed (continuing): ${bErr?.message}`);
+        }
+        applied = await updateScriptContent(id, newScriptContent, script.files_generated, companyId, projectId);
+      }
+
+      console.log(`[ScriptGen] ♻️ regenerate #${id} — locator changes=${sync.changes.length}, merged files=${mergeReport.length}, applied=${applied}`);
+      res.json({
+        success: true,
+        data: {
+          files: mergedFiles.map((f) => ({ path: f.path, content: f.content })),
+          mergeReport,
+          syncSummary: sync.summary,
+          locatorChanges: sync.changes,
+          applied,
+          dryRun,
+          backupVersion,
+        },
+      });
+    } catch (err: any) {
+      console.error('[ScriptGen] regenerate error:', err);
       res.status(500).json({ success: false, error: err.message });
     }
   });
