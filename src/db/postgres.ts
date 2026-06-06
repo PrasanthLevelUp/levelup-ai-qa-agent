@@ -129,6 +129,8 @@ const REQUIRED_TABLES = [
   'test_requirements', 'generated_test_scenarios', 'generated_test_cases',
   // Knowledge
   'application_knowledge', 'knowledge_items', 'knowledge_relationships',
+  // Healing settings (admin-tunable confidence thresholds + cost caps)
+  'healing_settings',
   // Projects
   'projects', 'repositories',
   // Webhooks
@@ -1324,6 +1326,34 @@ async function migrateDefaultCompany(client: PoolClient): Promise<void> {
       ALTER TABLE repository_contexts ADD COLUMN project_id INTEGER REFERENCES projects(id) ON DELETE SET NULL;
     END IF;
   END $$`);
+
+  // ── Test Case Lab: generation state tracking (duplicate prevention) ──
+  console.log('🔧 [DB] Migration: test_requirements generation state...');
+  await safeExec(client, 'test_req_generation_state', `DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='test_requirements' AND column_name='generation_state') THEN
+      ALTER TABLE test_requirements ADD COLUMN generation_state VARCHAR(20) DEFAULT 'generated';
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='test_requirements' AND column_name='generated_at') THEN
+      ALTER TABLE test_requirements ADD COLUMN generated_at TIMESTAMPTZ;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='test_requirements' AND column_name='last_generated_count') THEN
+      ALTER TABLE test_requirements ADD COLUMN last_generated_count INTEGER DEFAULT 0;
+    END IF;
+  END $$`);
+
+  // ── Healing settings (admin-tunable confidence thresholds + cost caps) ──
+  console.log('🔧 [DB] Migration: healing_settings table...');
+  await safeExec(client, 'healing_settings', `CREATE TABLE IF NOT EXISTS healing_settings (
+    id SERIAL PRIMARY KEY,
+    company_id INTEGER REFERENCES companies(id),
+    project_id INTEGER REFERENCES projects(id) ON DELETE CASCADE,
+    settings JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+  )`);
+  await safeExec(client, 'idx_healing_settings_scope',
+    `CREATE UNIQUE INDEX IF NOT EXISTS idx_healing_settings_scope
+       ON healing_settings(COALESCE(company_id, 0), COALESCE(project_id, 0))`);
   const projectIdIndexes = [
     `CREATE INDEX IF NOT EXISTS idx_pc_project ON project_contexts(project_id)`,
     `CREATE INDEX IF NOT EXISTS idx_gs_project ON generated_scripts(project_id)`,
@@ -4390,6 +4420,158 @@ export async function deleteTestRequirement(id: number): Promise<boolean> {
   const pool = getPool();
   const r = await pool.query('DELETE FROM test_requirements WHERE id = $1', [id]);
   return (r.rowCount ?? 0) > 0;
+}
+
+// ---- Test Case Lab: duplicate prevention + generation state ----
+
+/**
+ * Detect an existing, still-active requirement that matches the incoming one by
+ * signature (case-insensitive title + module within the same company/project)
+ * and that already has generated test cases. Used to block duplicate generation.
+ */
+export async function findExistingRequirementBySignature(args: {
+  title: string; module?: string | null; companyId?: number; projectId?: number;
+}): Promise<{ id: number; title: string; test_case_count: number; generation_state: string } | null> {
+  const pool = getPool();
+  const conditions: string[] = [`LOWER(tr.title) = LOWER($1)`];
+  const params: any[] = [args.title.trim()];
+  if (args.module) { params.push(args.module); conditions.push(`COALESCE(tr.module,'') = $${params.length}`); }
+  if (args.companyId) { params.push(args.companyId); conditions.push(`tr.company_id = $${params.length}`); }
+  if (args.projectId) { params.push(args.projectId); conditions.push(`tr.project_id = $${params.length}`); }
+  const where = conditions.join(' AND ');
+  const r = await pool.query(
+    `SELECT tr.id, tr.title, COALESCE(tr.generation_state, 'generated') AS generation_state,
+       (SELECT COUNT(*) FROM generated_test_cases tc
+          JOIN generated_test_scenarios ts ON tc.scenario_id = ts.id
+          WHERE ts.requirement_id = tr.id) AS test_case_count
+     FROM test_requirements tr
+     WHERE ${where}
+     ORDER BY tr.created_at DESC LIMIT 1`, params
+  );
+  const row = r.rows[0];
+  if (!row) return null;
+  const count = parseInt(row.test_case_count, 10) || 0;
+  // Only an active ('generated') requirement WITH cases is considered a duplicate.
+  if (count > 0 && (row.generation_state === 'generated')) {
+    return { id: row.id, title: row.title, test_case_count: count, generation_state: row.generation_state };
+  }
+  return null;
+}
+
+/**
+ * Delete all generated scenarios + cases for a requirement and mark it 'deleted'
+ * so it can be regenerated. Scenarios cascade-delete their cases.
+ */
+export async function deleteRequirementTestCases(id: number, companyId?: number): Promise<{ deletedScenarios: number }> {
+  const pool = getPool();
+  // Verify ownership when companyId is provided
+  if (companyId) {
+    const own = await pool.query('SELECT 1 FROM test_requirements WHERE id = $1 AND company_id = $2', [id, companyId]);
+    if (own.rowCount === 0) return { deletedScenarios: 0 };
+  }
+  const del = await pool.query('DELETE FROM generated_test_scenarios WHERE requirement_id = $1', [id]);
+  await pool.query(
+    `UPDATE test_requirements SET generation_state = 'deleted', last_generated_count = 0, updated_at = NOW() WHERE id = $1`,
+    [id]
+  );
+  return { deletedScenarios: del.rowCount ?? 0 };
+}
+
+/** Update lifecycle state/count after a (re)generation or deletion. */
+export async function setRequirementGenerationState(
+  id: number, state: 'generated' | 'deleted', count?: number
+): Promise<void> {
+  const pool = getPool();
+  if (state === 'generated') {
+    await pool.query(
+      `UPDATE test_requirements
+         SET generation_state = 'generated', generated_at = NOW(),
+             last_generated_count = $2, updated_at = NOW()
+       WHERE id = $1`,
+      [id, count ?? 0]
+    );
+  } else {
+    await pool.query(
+      `UPDATE test_requirements SET generation_state = $2, updated_at = NOW() WHERE id = $1`,
+      [id, state]
+    );
+  }
+}
+
+// ---- Healing settings (admin-tunable confidence thresholds + cost caps) ----
+
+export interface HealingSettings {
+  ruleThreshold: number;
+  patternThreshold: number;
+  aiThreshold: number;
+  aiFallbackEnabled: boolean;
+  maxCostPerHealing: number;
+  maxDailyTokenBudget: number;
+}
+
+export const DEFAULT_HEALING_SETTINGS: HealingSettings = {
+  ruleThreshold: 0.70,
+  patternThreshold: 0.60,
+  aiThreshold: 0.50,
+  aiFallbackEnabled: true,
+  maxCostPerHealing: parseFloat(process.env.MAX_COST_PER_HEALING || '0.10'),
+  maxDailyTokenBudget: parseInt(process.env.MAX_DAILY_TOKEN_BUDGET || '100000', 10),
+};
+
+/** Read healing settings for a scope, merged over defaults (never throws on missing table). */
+export async function getHealingSettings(companyId?: number, projectId?: number): Promise<HealingSettings> {
+  const pool = getPool();
+  try {
+    const r = await pool.query(
+      `SELECT settings FROM healing_settings
+       WHERE COALESCE(company_id, 0) = COALESCE($1, 0)
+         AND COALESCE(project_id, 0) = COALESCE($2, 0)
+       LIMIT 1`,
+      [companyId ?? null, projectId ?? null]
+    );
+    const stored = r.rows[0]?.settings || {};
+    return { ...DEFAULT_HEALING_SETTINGS, ...stored };
+  } catch (err: any) {
+    if (err?.code === '42P01' || err?.message?.includes('does not exist')) {
+      return { ...DEFAULT_HEALING_SETTINGS };
+    }
+    throw err;
+  }
+}
+
+/** Upsert healing settings for a scope. Returns the merged effective settings. */
+export async function upsertHealingSettings(
+  settings: Partial<HealingSettings>, companyId?: number, projectId?: number
+): Promise<HealingSettings> {
+  const pool = getPool();
+  const current = await getHealingSettings(companyId, projectId);
+  const merged: HealingSettings = { ...current, ...settings };
+  await pool.query(
+    `INSERT INTO healing_settings (company_id, project_id, settings, created_at, updated_at)
+     VALUES ($1, $2, $3::jsonb, NOW(), NOW())
+     ON CONFLICT (COALESCE(company_id, 0), COALESCE(project_id, 0))
+     DO UPDATE SET settings = $3::jsonb, updated_at = NOW()`,
+    [companyId ?? null, projectId ?? null, JSON.stringify(merged)]
+  );
+  return merged;
+}
+
+/**
+ * Pick the freshest application profile for a project (or company) to ground
+ * test generation in the real app. Prefers 'fresh' status, falls back to most
+ * recently crawled. Returns null when no profile exists (graceful fallback).
+ */
+export async function getApplicationProfileForGeneration(
+  companyId?: number, projectId?: number
+): Promise<ApplicationProfile | null> {
+  try {
+    const fresh = await listProfiles(companyId, { projectId, status: 'fresh', limit: 1 });
+    if (fresh.profiles[0]) return fresh.profiles[0];
+    const any = await listProfiles(companyId, { projectId, limit: 1 });
+    return any.profiles[0] || null;
+  } catch {
+    return null;
+  }
 }
 
 // ---- Generated Test Scenarios ----

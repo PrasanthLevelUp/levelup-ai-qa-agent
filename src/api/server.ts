@@ -28,6 +28,7 @@ import { ExecutionEngine } from '../core/execution-engine';
 import { ArtifactCollector } from '../core/artifact-collector';
 import { FailureAnalyzer } from '../core/failure-analyzer';
 import { HealingOrchestrator } from '../core/healing-orchestrator';
+import { HealingStrategySelector, type StrategyConfig } from '../core/healing-strategy-selector';
 import { RuleEngine } from '../engines/rule-engine';
 import { PatternEngine } from '../engines/pattern-engine';
 import { AIEngine } from '../engines/ai-engine';
@@ -49,6 +50,7 @@ import { createReleaseRiskRouter } from './routes/release-risk';
 import { createReleaseSignoffRouter } from './routes/release-signoff';
 import { createRCAIntelligenceRouter } from './routes/rca-intelligence';
 import { createTestCoverageRouter } from './routes/test-coverage';
+import { createHealingSettingsRouter } from './routes/healing-settings';
 import { createRequirementsRouter } from './routes/requirements';
 import { createTestCasesRouter } from './routes/test-cases';
 import { createRtmRouter } from './routes/rtm';
@@ -85,6 +87,8 @@ import {
   logRCA,
   logPR,
   getProjectIdForRepo,
+  getHealingSettings,
+  type HealingSettings,
 } from '../db/postgres';
 import type { HealingJob } from './queue/job-queue';
 
@@ -189,6 +193,7 @@ export function createServer(): express.Application {
   app.use('/api/rca-intelligence', authMiddleware, companyMiddleware, sessionMiddleware, createRCAIntelligenceRouter());
   app.use('/api/roi', authMiddleware, companyMiddleware, sessionMiddleware, createROIRouter());
   app.use('/api/test-coverage', authMiddleware, companyMiddleware, sessionMiddleware, projectContextMiddleware, contextMiddleware, createTestCoverageRouter());
+  app.use('/api/healing-settings', authMiddleware, companyMiddleware, sessionMiddleware, projectContextMiddleware, contextMiddleware, createHealingSettingsRouter());
   app.use('/api/requirements', authMiddleware, companyMiddleware, sessionMiddleware, projectContextMiddleware, contextMiddleware, createRequirementsRouter());
   app.use('/api/test-cases', authMiddleware, companyMiddleware, sessionMiddleware, projectContextMiddleware, contextMiddleware, createTestCasesRouter());
   app.use('/api/rtm', authMiddleware, companyMiddleware, sessionMiddleware, projectContextMiddleware, contextMiddleware, createRtmRouter());
@@ -423,10 +428,46 @@ function createHealingWorker(
     if (!aiEngine.isEnabled) {
       logger.warn(MOD, '⚠️ OPENAI_API_KEY not set — AI healing strategy disabled (rule + pattern still active)');
     }
+
+    // ── Issue #3: apply admin-configured healing strategy settings ──
+    // Load per-company/project thresholds + cost caps and build a configured
+    // strategy selector. When no settings are stored, getHealingSettings returns
+    // the engine defaults, preserving prior behaviour. AI fallback off is modelled
+    // by setting the daily token budget to 0 so the AI budget check always fails.
+    let strategySelector: HealingStrategySelector | undefined;
+    try {
+      const hs: HealingSettings = await getHealingSettings(job.companyId, resolvedProjectId);
+      const strategyConfig: StrategyConfig = {
+        confidenceThresholds: {
+          rule: hs.ruleThreshold,
+          pattern: hs.patternThreshold,
+          ai: hs.aiThreshold,
+        },
+        costLimits: {
+          perHealing: hs.maxCostPerHealing,
+          perDay: hs.aiFallbackEnabled ? hs.maxDailyTokenBudget : 0,
+        },
+      };
+      strategySelector = new HealingStrategySelector(strategyConfig);
+      logger.info(MOD, '⚙️ Healing strategy settings applied', {
+        companyId: job.companyId ?? null,
+        projectId: resolvedProjectId ?? null,
+        thresholds: strategyConfig.confidenceThresholds,
+        aiFallbackEnabled: hs.aiFallbackEnabled,
+        maxCostPerHealing: hs.maxCostPerHealing,
+      });
+    } catch (settingsErr: any) {
+      logger.warn(MOD, 'Could not load healing settings — using engine defaults', { error: settingsErr.message });
+    }
+
     const orchestrator = new HealingOrchestrator(
       new RuleEngine(),
       new PatternEngine(),
       aiEngine,
+      undefined,
+      undefined,
+      undefined,
+      strategySelector,
     );
     const validationLayer = new ValidationLayer(path.join(reportDir, 'patches'));
 
