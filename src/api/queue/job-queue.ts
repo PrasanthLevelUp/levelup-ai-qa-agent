@@ -23,6 +23,8 @@ export interface HealingJob {
   branch: string;
   commit?: string;
   companyId?: number;
+  /** Project this healing job belongs to — used to scope DOM Memory and persist project_id on healings. */
+  projectId?: number;
   status: JobStatus;
   progress: string;
   createdAt: string;
@@ -58,13 +60,14 @@ export class JobQueue {
   /**
    * Create a new healing job and add to queue.
    */
-  createJob(repositoryId: string, branch = 'main', commit?: string, repositoryUrl?: string, companyId?: number): HealingJob {
+  createJob(repositoryId: string, branch = 'main', commit?: string, repositoryUrl?: string, companyId?: number, projectId?: number): HealingJob {
     const job: HealingJob = {
       id: `job_${uuidv4().slice(0, 12)}`,
       repositoryId,
       repositoryUrl,
       branch,
       companyId,
+      projectId,
       commit,
       status: JobStatus.PENDING,
       progress: 'Queued for processing',
@@ -213,6 +216,8 @@ export class JobQueue {
         completedAt: row.completed_at,
         result: row.result ? JSON.parse(row.result) : undefined,
         error: row.error,
+        companyId: row.company_id ?? undefined,
+        projectId: row.project_id ?? undefined,
       };
       jobs.set(job.id, job);
     }).catch(() => {});
@@ -235,6 +240,8 @@ export class JobQueue {
           completedAt: row.completed_at,
           result: row.result ? JSON.parse(row.result) : undefined,
           error: row.error,
+          companyId: row.company_id ?? undefined,
+          projectId: row.project_id ?? undefined,
         };
         jobs.set(job.id, job);
       }

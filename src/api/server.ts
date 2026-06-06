@@ -84,6 +84,7 @@ import {
   getHistoricalStats,
   logRCA,
   logPR,
+  getProjectIdForRepo,
 } from '../db/postgres';
 import type { HealingJob } from './queue/job-queue';
 
@@ -394,6 +395,21 @@ function createHealingWorker(
     // Step 5: Analyze and heal
     jobQueue.updateJob(job.id, { progress: `Analyzing ${artifacts.length} failure(s)...` });
 
+    // Resolve the owning project so every healing record is project-scoped (powers
+    // the project filter on the Healings screen) and DOM Memory is queried/learned
+    // per-project. Prefer the explicit projectId on the job; otherwise backfill
+    // from the repositories table by URL/name.
+    let resolvedProjectId: number | undefined = job.projectId;
+    if (!resolvedProjectId) {
+      const pid = await getProjectIdForRepo(repoUrl || repo?.url || job.repositoryId, job.companyId);
+      resolvedProjectId = pid ?? undefined;
+    }
+    logger.info(MOD, 'Healing project scope resolved', {
+      jobId: job.id,
+      projectId: resolvedProjectId ?? null,
+      companyId: job.companyId ?? null,
+    });
+
     const analyzer = new FailureAnalyzer();
     const orchestrator = new HealingOrchestrator(
       new RuleEngine(),
@@ -593,7 +609,7 @@ function createHealingWorker(
 
           // Try multiple suggestions for the SAME broken locator
           for (let retry = 0; retry < RETRIES_PER_LOCATOR; retry++) {
-            const outcome = await orchestrator.heal(failure, undefined, triedLocators);
+            const outcome = await orchestrator.heal(failure, undefined, triedLocators, resolvedProjectId, job.companyId);
             if (outcome.suggestion) {
               triedLocators.add(outcome.suggestion.newLocator);
             }
@@ -672,7 +688,19 @@ function createHealingWorker(
                 validation_status: 'approved',
                 validation_reason: `[Iter ${iteration + 1} R${retry + 1}] ${outcome.suggestion.reasoning}`,
                 patch_path: validation.patchPath,
+                project_id: resolvedProjectId ?? null,
               }, job.companyId);
+
+              // Feed the confirmed heal back into DOM Memory so future heals get
+              // smarter (and cheaper). Scoped to project + company.
+              await orchestrator.recordHealObservation({
+                failedSelector: failure.failedLocator,
+                healedSelector: outcome.suggestion.newLocator,
+                strategy: outcome.suggestion.strategy,
+                projectId: resolvedProjectId,
+                companyId: job.companyId,
+                pageUrl: failure.url || undefined,
+              });
 
               healings.push({
                 testName: failure.testName,
@@ -743,7 +771,17 @@ function createHealingWorker(
                   validation_status: 'approved',
                   validation_reason: `[Iter ${iteration + 1} R${retry + 1}] Confirmed healed via confirmation rerun.`,
                   patch_path: validation.patchPath,
+                  project_id: resolvedProjectId ?? null,
                 }, job.companyId);
+
+                await orchestrator.recordHealObservation({
+                  failedSelector: failure.failedLocator,
+                  healedSelector: outcome.suggestion.newLocator,
+                  strategy: outcome.suggestion.strategy,
+                  projectId: resolvedProjectId,
+                  companyId: job.companyId,
+                  pageUrl: failure.url || undefined,
+                });
 
                 healings.push({
                   testName: failure.testName,
@@ -824,6 +862,7 @@ function createHealingWorker(
                 validation_status: 'approved',
                 validation_reason: `[Iter ${iteration + 1} R${retry + 1}] ${outcome.suggestion.reasoning}`,
                 patch_path: validation.patchPath,
+                project_id: resolvedProjectId ?? null,
               }, job.companyId);
 
               healings.push({
@@ -848,6 +887,17 @@ function createHealingWorker(
                 confidence: outcome.suggestion.confidence,
                 avg_tokens_saved: outcome.suggestion.tokensUsed,
               }, job.companyId);
+
+              // The fix for THIS locator was correct (a different locator now
+              // fails), so record it into DOM Memory to strengthen the moat.
+              await orchestrator.recordHealObservation({
+                failedSelector: failure.failedLocator,
+                healedSelector: outcome.suggestion.newLocator,
+                strategy: outcome.suggestion.strategy,
+                projectId: resolvedProjectId,
+                companyId: job.companyId,
+                pageUrl: failure.url || undefined,
+              });
 
               // Advance to next locator
               healedLocators.add(failure.failedLocator); // Mark current locator as done
@@ -874,6 +924,7 @@ function createHealingWorker(
               validation_status: 'reverted',
               validation_reason: `[Iter ${iteration + 1} R${retry + 1}] Reverted — same locator still failing.`,
               patch_path: validation.patchPath,
+              project_id: resolvedProjectId ?? null,
             }, job.companyId);
           } // end retry loop
 

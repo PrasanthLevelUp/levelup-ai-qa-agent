@@ -75,20 +75,29 @@ export function createDashboardRouter(): Router {
 
   // ─── Healings ───────────────────────────────────────────────
 
-  /** GET /api/dashboard/healings/recent?limit=20 */
+  /** GET /api/dashboard/healings/recent?limit=20&projectId=&status=healed|failed */
   router.get('/healings/recent', async (req: Request, res: Response) => {
     try {
-      const limit = Math.min(parseInt(req.query.limit as string) || 20, 50);
+      // Allow a larger page size for the dedicated Healings screen while keeping
+      // the dashboard widget's default small.
+      const limit = Math.min(parseInt(req.query.limit as string) || 20, 200);
       const cid = (req as any).companyId;
       const pid = req.query.projectId ? parseInt(req.query.projectId as string, 10) : null;
-      const pidClause = pid ? `AND ha.project_id = ${pid}` : '';
+      const pidClause = pid && !Number.isNaN(pid) ? `AND ha.project_id = ${pid}` : '';
+
+      // Optional status filter: 'healed' → success=true, 'failed' → success=false.
+      const status = (req.query.status as string) || '';
+      const statusClause =
+        status === 'healed' ? 'AND ha.success = true'
+        : status === 'failed' ? 'AND ha.success = false'
+        : '';
       const pool = getPool();
 
       const { rows } = await pool.query(
         `SELECT ha.*, te.test_name AS exec_test_name
          FROM healing_actions ha
          LEFT JOIN test_executions te ON ha.test_execution_id = te.id
-         WHERE ($1::int IS NULL OR ha.company_id = $1) ${pidClause}
+         WHERE ($1::int IS NULL OR ha.company_id = $1) ${pidClause} ${statusClause}
          ORDER BY ha.created_at DESC
          LIMIT $2`,
         [cid, limit],
@@ -97,6 +106,7 @@ export function createDashboardRouter(): Router {
       const result = rows.map((a: any) => ({
         id: a.id,
         executionId: a.test_execution_id,
+        projectId: a.project_id ?? null,
         timestamp: a.created_at ? new Date(a.created_at).toISOString() : '',
         testName: a.test_name || '',
         repository: a.exec_test_name || 'unknown',
@@ -106,6 +116,8 @@ export function createDashboardRouter(): Router {
         strategy: a.healing_strategy || 'unknown',
         confidence: a.confidence || 0,
         tokensUsed: a.ai_tokens_used || 0,
+        cost: Math.round((a.ai_tokens_used || 0) * 0.000003 * 10000) / 10000,
+        validationStatus: a.validation_status || 'unknown',
       }));
 
       res.json(result);

@@ -219,6 +219,7 @@ async function handleWorkflowRun(
     parsed.commitSha,
     parsed.repoUrl,
     companyId,
+    webhookConfig?.project_id ?? undefined,
   );
 
   await updateWebhookEventStatus(eventId, 'healing_triggered', job.id);
@@ -292,6 +293,7 @@ async function handleCheckSuite(
     commitSha,
     repoUrl,
     companyId,
+    webhookConfig?.project_id ?? undefined,
   );
 
   await updateWebhookEventStatus(eventId, 'healing_triggered', job.id);

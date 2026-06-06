@@ -535,6 +535,39 @@ export class HealingOrchestrator {
   }
 
   /**
+   * Record a successful heal into DOM Memory so future heals get smarter.
+   *
+   * The iterative worker in `api/server.ts` performs its own apply/validate/
+   * rollback loop and logs healings directly (it does not call `finalize()`),
+   * which previously meant production heals never fed back into DOM Memory — the
+   * "moat" stayed cold. Call this after a confirmed successful heal to close the
+   * learning loop. Project/company scoping keeps observations isolated per tenant.
+   */
+  async recordHealObservation(data: {
+    failedSelector: string;
+    healedSelector: string;
+    strategy: string;
+    projectId?: number;
+    companyId?: number;
+    pageUrl?: string;
+    elementType?: string;
+  }): Promise<void> {
+    try {
+      await this.domMemory.recordHealingObservation({
+        failedSelector: data.failedSelector,
+        healedSelector: data.healedSelector,
+        projectId: data.projectId,
+        companyId: data.companyId,
+        pageUrl: data.pageUrl,
+        elementType: data.elementType,
+        source: `healing:${data.strategy}`,
+      });
+    } catch {
+      // Non-critical — never break the healing flow on a learning write.
+    }
+  }
+
+  /**
    * Finalize a successful healing — generate patch, store to DB, record to DOM Memory.
    */
   async finalize(

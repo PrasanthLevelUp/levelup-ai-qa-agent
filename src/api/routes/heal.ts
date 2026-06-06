@@ -10,10 +10,11 @@ const router = Router();
 
 export function createHealRouter(jobQueue: JobQueue, repoManager: RepoManager): Router {
   router.post('/', (req: Request, res: Response) => {
-    const { repository, branch, commit } = req.body as {
+    const { repository, branch, commit, projectId } = req.body as {
       repository?: string;
       branch?: string;
       commit?: string;
+      projectId?: number;
     };
 
     if (!repository) {
@@ -51,7 +52,8 @@ export function createHealRouter(jobQueue: JobQueue, repoManager: RepoManager): 
     }
 
     const cid = (req as any).companyId;
-    const job = jobQueue.createJob(repoId, branch ?? 'main', commit, repoUrl, cid);
+    const pid = typeof projectId === 'number' ? projectId : (req as any).projectId;
+    const job = jobQueue.createJob(repoId, branch ?? 'main', commit, repoUrl, cid, pid);
 
     res.status(202).json({
       jobId: job.id,
