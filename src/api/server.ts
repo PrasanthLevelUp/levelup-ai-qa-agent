@@ -355,8 +355,11 @@ function createHealingWorker(
     }
 
     // Step 3: Run tests
-    jobQueue.updateJob(job.id, { progress: 'Running tests...' });
-    const run = ExecutionEngine.run(testRepoPath);
+    // When the job specifies a single test file, scope the run to it; otherwise run the whole suite.
+    jobQueue.updateJob(job.id, {
+      progress: job.testFile ? `Running tests (${job.testFile})...` : 'Running tests...',
+    });
+    const run = ExecutionEngine.run(testRepoPath, job.testFile);
 
     // Step 4: Collect artifacts
     jobQueue.updateJob(job.id, { progress: 'Collecting failure artifacts...' });
@@ -411,13 +414,19 @@ function createHealingWorker(
     });
 
     const analyzer = new FailureAnalyzer();
+    // Guard AI engine construction: OpenAIClient throws if OPENAI_API_KEY is missing.
+    // Without this guard a missing key would crash the entire healing job instead of
+    // gracefully disabling only the AI strategy (rule + pattern healing still work).
+    const aiEngine = process.env['OPENAI_API_KEY']
+      ? new AIEngine(new OpenAIClient({ model: 'gpt-4o-mini', apiKey: process.env['OPENAI_API_KEY'] }))
+      : new AIEngine(); // AI disabled — no-ops, leaving rule/pattern strategies intact
+    if (!aiEngine.isEnabled) {
+      logger.warn(MOD, '⚠️ OPENAI_API_KEY not set — AI healing strategy disabled (rule + pattern still active)');
+    }
     const orchestrator = new HealingOrchestrator(
       new RuleEngine(),
       new PatternEngine(),
-      new AIEngine(new OpenAIClient({
-        model: 'gpt-4o-mini',
-        apiKey: process.env['OPENAI_API_KEY'],
-      })),
+      aiEngine,
     );
     const validationLayer = new ValidationLayer(path.join(reportDir, 'patches'));
 
