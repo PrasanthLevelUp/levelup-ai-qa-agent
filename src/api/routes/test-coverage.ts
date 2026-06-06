@@ -534,6 +534,9 @@ export function createTestCoverageRouter(): Router {
       logger.info(MOD, 'Scripts generated', {
         files: scriptResult.files.length,
         totalTests: scriptResult.totalTests,
+        coverageComplete: scriptResult.coverage.complete,
+        covered: scriptResult.coverage.covered,
+        totalTestCases: scriptResult.coverage.totalTestCases,
       });
 
       // 3. Commit to GitHub and create PR
@@ -570,7 +573,7 @@ export function createTestCoverageRouter(): Router {
         ].join('\n'),
         pr: {
           title: `🧪 Test Scripts: ${scriptResult.requirementTitle}`,
-          body: buildTestScriptPRBody(scriptResult, requirementId),
+          body: buildTestScriptPRBody(scriptResult, requirementId, scriptResult.coverage),
           labels: ['levelup-ai', 'generated-tests', 'test-case-lab'],
         },
       });
@@ -592,6 +595,7 @@ export function createTestCoverageRouter(): Router {
           })),
           totalTests: scriptResult.totalTests,
           totalFiles: scriptResult.totalFiles,
+          coverage: scriptResult.coverage,
           github: {
             prUrl: prResult.prUrl,
             prNumber: prResult.prNumber,
@@ -818,10 +822,50 @@ export function createTestCoverageRouter(): Router {
 function buildTestScriptPRBody(
   result: { requirementTitle: string; files: Array<{ filePath: string; testCount: number }>; totalTests: number; totalFiles: number },
   requirementId: number,
+  coverage?: {
+    totalTestCases: number; totalTestsGenerated: number; covered: number;
+    missing: number[]; extra: number; complete: boolean;
+    perFile: Array<{ filePath: string; feature: string; testCases: number; tests: number; complete: boolean }>;
+  },
 ): string {
   const fileRows = result.files
     .map(f => `| \`${f.filePath}\` | ${f.testCount} |`)
     .join('\n');
+
+  // Build a coverage section that *proves* 1:1 mapping (test cases in = tests out).
+  let coverageSection = '';
+  if (coverage) {
+    const badge = coverage.complete
+      ? `✅ **All ${coverage.totalTestCases} test case(s) covered** in ${result.totalFiles - 1} feature file(s)`
+      : `⚠️ **Only ${coverage.covered}/${coverage.totalTestCases} test case(s) covered**`;
+    const perFileRows = coverage.perFile
+      .map(f => `| \`${f.filePath}\` | ${f.feature} | ${f.testCases} | ${f.tests} | ${f.complete ? '✅' : '⚠️'} |`)
+      .join('\n');
+    const missingNote = coverage.missing.length
+      ? `\n> ⚠️ Uncovered test case ids: ${coverage.missing.join(', ')} (template tests were added as placeholders).`
+      : '';
+    const extraNote = coverage.extra > 0
+      ? `\n> ℹ️ ${coverage.extra} extra test(s) emitted beyond the source cases — review for relevance.`
+      : '';
+
+    coverageSection = `
+
+### 🎯 Coverage Report
+
+${badge}
+
+| Metric | Value |
+|--------|-------|
+| **Test Cases (in)** | ${coverage.totalTestCases} |
+| **Tests Generated (out)** | ${coverage.totalTestsGenerated} |
+| **Covered** | ${coverage.covered}/${coverage.totalTestCases} |
+| **Extra (unmapped)** | ${coverage.extra} |
+| **1:1 Complete** | ${coverage.complete ? 'Yes ✅' : 'No ⚠️'} |
+
+| File | Feature | Cases | Tests | Status |
+|------|---------|-------|-------|--------|
+${perFileRows}${missingNote}${extraNote}`;
+  }
 
   return `## 🧪 AI-Generated Test Scripts
 
@@ -833,8 +877,9 @@ function buildTestScriptPRBody(
 |-------|-------|
 | **Requirement** | ${result.requirementTitle} |
 | **Requirement ID** | #${requirementId} |
-| **Total Test Cases** | ${result.totalTests} |
+| **Total Test Cases** | ${coverage ? coverage.totalTestCases : result.totalTests} |
 | **Files Generated** | ${result.totalFiles} |
+${coverageSection}
 
 ### 📁 Generated Files
 
