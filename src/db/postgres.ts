@@ -133,6 +133,8 @@ const REQUIRED_TABLES = [
   'healing_settings',
   // Proactive script maintenance (change detection)
   'crawl_snapshots',
+  // Maintenance suite: migration assistant + smart-regeneration backups
+  'migrations', 'script_versions',
   // Projects
   'projects', 'repositories',
   // Webhooks
@@ -1380,6 +1382,49 @@ async function migrateDefaultCompany(client: PoolClient): Promise<void> {
   await safeExec(client, 'idx_crawl_snapshots_scope',
     `CREATE INDEX IF NOT EXISTS idx_crawl_snapshots_scope
        ON crawl_snapshots(base_url, COALESCE(company_id, 0), COALESCE(project_id, 0), version DESC)`);
+
+  // ── Migrations (Migration Assistant: bulk re-point scripts between crawls) ──
+  // A migration captures an old → new crawl snapshot pair, the element mapping
+  // suggestions (with manual overrides), and an apply result. Fully additive.
+  console.log('🔧 [DB] Migration: migrations table...');
+  await safeExec(client, 'migrations', `CREATE TABLE IF NOT EXISTS migrations (
+    id SERIAL PRIMARY KEY,
+    company_id INTEGER,
+    project_id INTEGER,
+    base_url TEXT,
+    old_snapshot_id INTEGER,
+    new_snapshot_id INTEGER,
+    status TEXT NOT NULL DEFAULT 'draft',
+    mappings JSONB NOT NULL DEFAULT '[]'::jsonb,
+    overrides JSONB NOT NULL DEFAULT '{}'::jsonb,
+    affected_script_ids JSONB NOT NULL DEFAULT '[]'::jsonb,
+    apply_result JSONB,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+  )`);
+  await safeExec(client, 'idx_migrations_scope',
+    `CREATE INDEX IF NOT EXISTS idx_migrations_scope
+       ON migrations(COALESCE(company_id, 0), COALESCE(project_id, 0), created_at DESC)`);
+
+  // ── Script versions (Smart Regeneration: versioned backups) ──
+  // Snapshots a generated script's content before a sync/regenerate so the
+  // operation is reversible. One row per backup; version auto-increments per
+  // script. Additive — absence simply means no backups have been taken yet.
+  console.log('🔧 [DB] Migration: script_versions table...');
+  await safeExec(client, 'script_versions', `CREATE TABLE IF NOT EXISTS script_versions (
+    id SERIAL PRIMARY KEY,
+    script_id INTEGER NOT NULL,
+    company_id INTEGER,
+    project_id INTEGER,
+    version INTEGER NOT NULL DEFAULT 1,
+    reason TEXT,
+    script_content TEXT,
+    files_generated JSONB,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+  )`);
+  await safeExec(client, 'idx_script_versions_script',
+    `CREATE INDEX IF NOT EXISTS idx_script_versions_script
+       ON script_versions(script_id, version DESC)`);
 
   const projectIdIndexes = [
     `CREATE INDEX IF NOT EXISTS idx_pc_project ON project_contexts(project_id)`,
@@ -3241,6 +3286,23 @@ export async function getLatestSnapshots(
   return result.rows;
 }
 
+/** Fetch a single crawl snapshot by id (optionally scoped). */
+export async function getSnapshotById(
+  id: number,
+  companyId?: number,
+  projectId?: number,
+): Promise<CrawlSnapshotRecord | null> {
+  const conditions = ['id = $1'];
+  const params: any[] = [id];
+  if (companyId != null) { conditions.push(`COALESCE(company_id, 0) = COALESCE($${params.length + 1}, 0)`); params.push(companyId); }
+  if (projectId != null) { conditions.push(`(project_id = $${params.length + 1} OR project_id IS NULL)`); params.push(projectId); }
+  const result = await getPool().query(
+    `SELECT * FROM crawl_snapshots WHERE ${conditions.join(' AND ')} LIMIT 1`,
+    params,
+  );
+  return result.rows[0] || null;
+}
+
 /** Distinct crawled base URLs that have at least one snapshot (per scope). */
 export async function getSnapshotBaseUrls(companyId?: number, projectId?: number): Promise<string[]> {
   const result = await getPool().query(
@@ -3276,6 +3338,185 @@ export async function getScriptsForHealth(
        FROM generated_scripts
       WHERE ${conditions.join(' AND ')}
       ORDER BY created_at DESC`,
+    params,
+  );
+  return result.rows;
+}
+
+/**
+ * Update a generated script's content + files in place (used by Script Sync &
+ * Smart Regeneration). Scoped by company/project for safety. Returns true when
+ * a row was updated.
+ */
+export async function updateScriptContent(
+  id: number,
+  scriptContent: string,
+  filesGenerated: any | undefined,
+  companyId?: number,
+  projectId?: number,
+): Promise<boolean> {
+  const conditions = ['id = $1'];
+  const params: any[] = [id];
+  if (companyId != null) { conditions.push(`company_id = $${params.length + 1}`); params.push(companyId); }
+  if (projectId != null) { conditions.push(`(project_id = $${params.length + 1} OR project_id IS NULL)`); params.push(projectId); }
+  const setClauses = [`script_content = $${params.length + 1}`];
+  params.push(scriptContent);
+  if (filesGenerated !== undefined) {
+    setClauses.push(`files_generated = $${params.length + 1}`);
+    params.push(filesGenerated == null ? null : JSON.stringify(filesGenerated));
+  }
+  const result = await getPool().query(
+    `UPDATE generated_scripts SET ${setClauses.join(', ')} WHERE ${conditions.join(' AND ')} RETURNING id`,
+    params,
+  );
+  return (result.rowCount ?? 0) > 0;
+}
+
+export interface ScriptVersionRecord {
+  id: number;
+  script_id: number;
+  company_id: number | null;
+  project_id: number | null;
+  version: number;
+  reason: string | null;
+  script_content: string | null;
+  files_generated: any;
+  created_at: string;
+}
+
+/**
+ * Save a versioned backup of a script's current content before a destructive
+ * sync/regenerate. Version auto-increments per script. Best-effort: callers
+ * should wrap so a backup failure never blocks the primary operation.
+ */
+export async function saveScriptVersion(data: {
+  scriptId: number;
+  companyId?: number | null;
+  projectId?: number | null;
+  reason?: string;
+  scriptContent?: string | null;
+  filesGenerated?: any;
+}): Promise<ScriptVersionRecord | null> {
+  const pool = getPool();
+  const verR = await pool.query(
+    `SELECT COALESCE(MAX(version), 0) + 1 AS next FROM script_versions WHERE script_id = $1`,
+    [data.scriptId],
+  );
+  const nextVersion = verR.rows[0]?.next || 1;
+  const result = await pool.query(
+    `INSERT INTO script_versions
+       (script_id, company_id, project_id, version, reason, script_content, files_generated)
+     VALUES ($1,$2,$3,$4,$5,$6,$7)
+     RETURNING *`,
+    [
+      data.scriptId,
+      data.companyId ?? null,
+      data.projectId ?? null,
+      nextVersion,
+      data.reason ?? null,
+      data.scriptContent ?? null,
+      data.filesGenerated == null ? null : JSON.stringify(data.filesGenerated),
+    ],
+  );
+  return result.rows[0] || null;
+}
+
+/** List versioned backups for a script (newest first). */
+export async function listScriptVersions(scriptId: number): Promise<ScriptVersionRecord[]> {
+  const result = await getPool().query(
+    `SELECT * FROM script_versions WHERE script_id = $1 ORDER BY version DESC`,
+    [scriptId],
+  );
+  return result.rows;
+}
+
+/* -------------------------------------------------------------------------- */
+/*  Migration Assistant                                                       */
+/* -------------------------------------------------------------------------- */
+
+export interface MigrationRecord {
+  id: number;
+  company_id: number | null;
+  project_id: number | null;
+  base_url: string | null;
+  old_snapshot_id: number | null;
+  new_snapshot_id: number | null;
+  status: string;
+  mappings: any;
+  overrides: any;
+  affected_script_ids: any;
+  apply_result: any;
+  created_at: string;
+  updated_at: string;
+}
+
+export async function createMigration(data: {
+  companyId?: number | null;
+  projectId?: number | null;
+  baseUrl?: string | null;
+  oldSnapshotId?: number | null;
+  newSnapshotId?: number | null;
+  mappings?: any;
+  affectedScriptIds?: number[];
+}): Promise<MigrationRecord | null> {
+  const result = await getPool().query(
+    `INSERT INTO migrations
+       (company_id, project_id, base_url, old_snapshot_id, new_snapshot_id, status, mappings, affected_script_ids)
+     VALUES ($1,$2,$3,$4,$5,'draft',$6,$7)
+     RETURNING *`,
+    [
+      data.companyId ?? null,
+      data.projectId ?? null,
+      data.baseUrl ?? null,
+      data.oldSnapshotId ?? null,
+      data.newSnapshotId ?? null,
+      JSON.stringify(data.mappings ?? []),
+      JSON.stringify(data.affectedScriptIds ?? []),
+    ],
+  );
+  return result.rows[0] || null;
+}
+
+export async function getMigration(id: number, companyId?: number, projectId?: number): Promise<MigrationRecord | null> {
+  const conditions = ['id = $1'];
+  const params: any[] = [id];
+  if (companyId != null) { conditions.push(`COALESCE(company_id, 0) = COALESCE($${params.length + 1}, 0)`); params.push(companyId); }
+  if (projectId != null) { conditions.push(`(project_id = $${params.length + 1} OR project_id IS NULL)`); params.push(projectId); }
+  const result = await getPool().query(
+    `SELECT * FROM migrations WHERE ${conditions.join(' AND ')} LIMIT 1`,
+    params,
+  );
+  return result.rows[0] || null;
+}
+
+export async function updateMigration(
+  id: number,
+  patch: { status?: string; mappings?: any; overrides?: any; affectedScriptIds?: number[]; applyResult?: any },
+): Promise<MigrationRecord | null> {
+  const setClauses: string[] = ['updated_at = NOW()'];
+  const params: any[] = [];
+  if (patch.status !== undefined) { params.push(patch.status); setClauses.push(`status = $${params.length}`); }
+  if (patch.mappings !== undefined) { params.push(JSON.stringify(patch.mappings)); setClauses.push(`mappings = $${params.length}`); }
+  if (patch.overrides !== undefined) { params.push(JSON.stringify(patch.overrides)); setClauses.push(`overrides = $${params.length}`); }
+  if (patch.affectedScriptIds !== undefined) { params.push(JSON.stringify(patch.affectedScriptIds)); setClauses.push(`affected_script_ids = $${params.length}`); }
+  if (patch.applyResult !== undefined) { params.push(JSON.stringify(patch.applyResult)); setClauses.push(`apply_result = $${params.length}`); }
+  params.push(id);
+  const result = await getPool().query(
+    `UPDATE migrations SET ${setClauses.join(', ')} WHERE id = $${params.length} RETURNING *`,
+    params,
+  );
+  return result.rows[0] || null;
+}
+
+export async function listMigrations(companyId?: number, projectId?: number, limit = 50): Promise<MigrationRecord[]> {
+  const conditions: string[] = [];
+  const params: any[] = [];
+  if (companyId != null) { conditions.push(`COALESCE(company_id, 0) = COALESCE($${params.length + 1}, 0)`); params.push(companyId); }
+  if (projectId != null) { conditions.push(`(project_id = $${params.length + 1} OR project_id IS NULL)`); params.push(projectId); }
+  params.push(limit);
+  const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+  const result = await getPool().query(
+    `SELECT * FROM migrations ${where} ORDER BY created_at DESC LIMIT $${params.length}`,
     params,
   );
   return result.rows;

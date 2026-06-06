@@ -41,6 +41,7 @@ import { createRCARouter } from './routes/rca';
 import { createPRRouter } from './routes/pr';
 import { createScriptGenRouter } from './routes/script-gen';
 import { createScriptHealthRouter } from './routes/script-health';
+import { createMigrationsRouter } from './routes/migrations';
 import { createAuthRouter } from './routes/auth';
 import { createNotificationsRouter } from './routes/notifications';
 import { createDomMemoryRouter } from './routes/dom-memory';
@@ -185,6 +186,7 @@ export function createServer(): express.Application {
   app.use('/api/pr', authMiddleware, companyMiddleware, sessionMiddleware, createPRRouter());
   app.use('/api/scripts', authMiddleware, companyMiddleware, sessionMiddleware, projectContextMiddleware, contextMiddleware, createScriptGenRouter());
   app.use('/api/script-health', authMiddleware, companyMiddleware, sessionMiddleware, projectContextMiddleware, contextMiddleware, createScriptHealthRouter());
+  app.use('/api/migrations', authMiddleware, companyMiddleware, sessionMiddleware, projectContextMiddleware, contextMiddleware, createMigrationsRouter());
   app.use('/api/notifications', authMiddleware, companyMiddleware, sessionMiddleware, createNotificationsRouter());
   app.use('/api/dom', authMiddleware, companyMiddleware, sessionMiddleware, createDomMemoryRouter());
   app.use('/api/learning', authMiddleware, companyMiddleware, sessionMiddleware, createLearningRouter());
