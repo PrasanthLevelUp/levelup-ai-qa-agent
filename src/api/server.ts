@@ -73,6 +73,7 @@ import { createUsersRouter } from './routes/users';
 import { createHealingPRRouter } from './routes/healing-pr';
 import { createGitHubRouter } from './routes/github';
 import { createIntelligenceRouter } from './routes/intelligence';
+import { createIntelligenceLearningRouter } from './routes/intelligence-learning';
 import { createCredentialsRouter } from './routes/credentials';
 import { sessionMiddleware } from './middleware/session';
 import { notifyRca } from '../integrations/slack';
@@ -216,6 +217,7 @@ export function createServer(): express.Application {
   app.use('/api/users', authMiddleware, companyMiddleware, sessionMiddleware, createUsersRouter());
   app.use('/api/github', authMiddleware, companyMiddleware, sessionMiddleware, createGitHubRouter());
   app.use('/api/intelligence', authMiddleware, companyMiddleware, sessionMiddleware, projectContextMiddleware, contextMiddleware, createIntelligenceRouter());
+  app.use('/api/intelligence-learning', authMiddleware, companyMiddleware, sessionMiddleware, projectContextMiddleware, contextMiddleware, createIntelligenceLearningRouter());
   app.use('/api/credentials', authMiddleware, companyMiddleware, sessionMiddleware, createCredentialsRouter());
 
   // List all jobs

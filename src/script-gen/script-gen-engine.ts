@@ -23,6 +23,7 @@ import { PageCrawler, type CrawlResult, type CrawlConfig, type PageElement } fro
 import type { AuthConfig, AuthResult } from './auth-engine';
 import { WorkflowMapper, type WorkflowMap, type WorkflowFlow, type WorkflowStep, type WorkflowAction } from './workflow-mapper';
 import { SelectorQualityEngine, type ScoredSelector } from './selector-quality-engine';
+import { buildStabilityProvider, trackGeneratedSelector } from '../services/intelligence-learning-service';
 import { AssertionEngine, type GeneratedAssertion } from './assertion-engine';
 import { WaitStrategyEngine, type WaitStrategy } from './wait-strategy-engine';
 import { logger } from '../utils/logger';
@@ -162,6 +163,12 @@ export interface GenerationConfig {
    * Set to `true` to force the full scaffold (e.g. greenfield bootstrapping).
    */
   includeScaffold?: boolean;
+  /** Tenant scope — enables Intelligence Learning Loop L1 (learned selector
+   * stability) so generation avoids selectors that healed in the past. Optional
+   * and fully backward-compatible: when omitted, global stability (if any) is
+   * still applied, and when no stability data exists generation is unchanged. */
+  companyId?: number | null;
+  projectId?: number | null;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -302,7 +309,21 @@ export class ScriptGenEngine {
     tokensUsed = testPlan.metadata.tokensUsed;
 
     // ─── Step 5: Resolve selectors in test plan ───────────────────
-    this.resolveSelectors(testPlan, crawlResult.elements);
+    // Intelligence Learning Loop L1: load learned selector stability for this
+    // scope and inject it so the quality engine demotes selectors that healing
+    // has proven fragile. Fail-safe — on any error the provider is a no-op.
+    try {
+      const stabilityProvider = await buildStabilityProvider({
+        companyId: config.companyId ?? null,
+        projectId: config.projectId ?? null,
+      });
+      this.selectorEngine.setStabilityProvider(stabilityProvider);
+    } catch (err: any) {
+      logger.warn(MOD, 'Could not load selector stability — generating without L1 adjustment', { error: err?.message });
+      this.selectorEngine.setStabilityProvider(undefined);
+    }
+
+    this.resolveSelectors(testPlan, crawlResult.elements, config);
 
     // ─── Step 6: Inject assertions & waits ────────────────────────
     this.injectAssertionsAndWaits(testPlan, crawlResult);
@@ -523,7 +544,7 @@ Generate comprehensive test flows covering all detected functionality.`;
   /*  Step 5: Resolve Selectors                                              */
   /* ──────────────────────────────────────────────────────────────────────── */
 
-  private resolveSelectors(testPlan: TestPlan, elements: PageElement[]): void {
+  private resolveSelectors(testPlan: TestPlan, elements: PageElement[], config?: GenerationConfig): void {
     const totalElements = elements.length;
     let resolved = 0;
     let todos = 0;
@@ -558,6 +579,15 @@ Generate comprehensive test flows covering all detected functionality.`;
           locator.score = report.bestSelector.score;
           locator.strategy = report.bestSelector.strategy;
           resolved++;
+          // Loop L1 write path: remember we emitted this selector so future
+          // heals can be attributed and stability tracked. Fire-and-forget.
+          trackGeneratedSelector({
+            selector: report.bestSelector.playwrightCode,
+            strategy: report.bestSelector.strategy,
+            pageUrl: testPlan.baseUrl,
+            companyId: config?.companyId ?? null,
+            projectId: config?.projectId ?? null,
+          });
           logger.debug(MOD, 'Locator resolved', {
             pageObject: po.name,
             intent: locator.name,

@@ -43,11 +43,38 @@ export interface SelectorQualityReport {
   hasStableSelector: boolean;  // score >= 0.7
 }
 
+/**
+ * Optional learned-stability lookup (Intelligence Learning Loop L1). Given a
+ * selector string and its strategy, returns a stability score in (0,1] (1 =
+ * never broke in production) or `undefined` when nothing is known. When set on
+ * the engine, candidate scores are blended with stability BEFORE ranking, so
+ * selectors that healing has proven fragile are demoted at generation time.
+ *
+ * Implemented by `buildStabilityProvider()` in intelligence-learning-service.ts.
+ */
+export type StabilityLookup = (selector: string, strategy: SelectorStrategy) => number | undefined;
+
+/** Mirror of applyStability() in intelligence-learning-service (kept inline so
+ * this scoring module stays dependency-free). adjusted = base × (FLOOR + (1−FLOOR)×stability). */
+const STABILITY_FLOOR = 0.5;
+
 /* -------------------------------------------------------------------------- */
 /*  Engine                                                                    */
 /* -------------------------------------------------------------------------- */
 
 export class SelectorQualityEngine {
+  /**
+   * Optional learned-stability provider (Loop L1). Defaults to undefined → the
+   * engine behaves exactly as before (no stability adjustment). Inject via
+   * `setStabilityProvider()` to make generation learn from past heals.
+   */
+  private stabilityProvider?: StabilityLookup;
+
+  /** Inject (or clear) the learned-stability lookup. Backward-compatible. */
+  setStabilityProvider(provider?: StabilityLookup): void {
+    this.stabilityProvider = provider;
+  }
+
   /**
    * Generate and rank all possible selectors for an element.
    */
@@ -149,6 +176,24 @@ export class SelectorQualityEngine {
           reason: 'CSS class selectors are fragile and change with styling updates',
           isRecommended: false,
         });
+      }
+    }
+
+    // ── Loop L1: blend in learned stability BEFORE ranking ──
+    // Selectors healing has proven fragile are demoted; unknown ones are left
+    // untouched. This is what makes generation "born healed" over time.
+    if (this.stabilityProvider) {
+      for (const sel of selectors) {
+        const stability = this.stabilityProvider(sel.selector, sel.strategy);
+        if (stability === undefined || stability === null || Number.isNaN(stability)) continue;
+        const clamped = Math.max(0, Math.min(1, stability));
+        const multiplier = STABILITY_FLOOR + (1 - STABILITY_FLOOR) * clamped;
+        const adjusted = parseFloat((sel.score * multiplier).toFixed(4));
+        if (adjusted < sel.score) {
+          sel.reason += ` · demoted by learned stability ${clamped.toFixed(2)} (broke in past runs)`;
+          sel.isRecommended = false;
+        }
+        sel.score = adjusted;
       }
     }
 
