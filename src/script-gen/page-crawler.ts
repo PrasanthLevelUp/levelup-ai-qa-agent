@@ -51,6 +51,23 @@ export interface CrawlConfig {
    * by the callback are swallowed so logging can never break a crawl.
    */
   onLog?: (message: string) => void;
+
+  /**
+   * Loop 2 (Test Failures → Crawl Intelligence): when set, this crawl is using
+   * a LEARNED adaptation for a page that has proven flaky in production. It
+   * raises the depth cap from 3 → 5 so deep/dynamic flows get captured, and
+   * allows a longer post-load wait. Set automatically by the generation engine
+   * when CrawlAdaptationService recommends it; defaults off (behaviour unchanged).
+   */
+  adaptive?: boolean;
+  /**
+   * When `adaptive` is set, capture loading states (the crawler already waits
+   * for networkidle; this also applies the longer `waitAfterLoad`) so dynamic
+   * content has settled before extraction.
+   */
+  captureLoadingStates?: boolean;
+  /** When `adaptive` is set, give animations extra time to finish before extracting. */
+  waitForAnimations?: boolean;
 }
 
 /**
@@ -617,11 +634,16 @@ export class PageCrawler {
   };
 
   constructor(config: CrawlConfig) {
+    // Loop 2: flaky pages get an adaptive crawl — a deeper depth cap (5 instead
+    // of 3) and a longer post-load wait cap so dynamic content / animations have
+    // time to settle. Non-adaptive crawls keep the original, conservative caps.
+    const depthCap = config.adaptive ? 5 : 3;
+    const waitCap = config.adaptive ? 8000 : 5000;
     this.config = {
       ...config,
-      maxDepth: Math.min(config.maxDepth ?? 1, 3), // cap depth at 3 to bound deep crawls
+      maxDepth: Math.min(config.maxDepth ?? 1, depthCap),
       timeout: Math.min(config.timeout ?? 15000, 30000), // cap at 30s
-      waitAfterLoad: Math.min(config.waitAfterLoad ?? 2000, 5000),
+      waitAfterLoad: Math.min(config.waitAfterLoad ?? 2000, waitCap),
       captureScreenshot: config.captureScreenshot ?? true,
       followLinks: config.followLinks ?? false,
       maxPages: Math.min(config.maxPages ?? 5, 15), // cap at 15 pages

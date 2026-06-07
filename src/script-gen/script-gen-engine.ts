@@ -24,6 +24,7 @@ import type { AuthConfig, AuthResult } from './auth-engine';
 import { WorkflowMapper, type WorkflowMap, type WorkflowFlow, type WorkflowStep, type WorkflowAction } from './workflow-mapper';
 import { SelectorQualityEngine, type ScoredSelector } from './selector-quality-engine';
 import { buildStabilityProvider, trackGeneratedSelector } from '../services/intelligence-learning-service';
+import { getCrawlAdaptationForUrl } from '../services/crawl-adaptation-service';
 import { AssertionEngine, type GeneratedAssertion } from './assertion-engine';
 import { WaitStrategyEngine, type WaitStrategy } from './wait-strategy-engine';
 import { logger } from '../utils/logger';
@@ -235,6 +236,35 @@ export class ScriptGenEngine {
         authConfig: config.authConfig,
         additionalUrls: config.additionalUrls,
       };
+
+      // Loop 2 (Test Failures → Crawl Intelligence): consult the learned
+      // adaptation for this page. If it has proven flaky in production, raise the
+      // crawl depth (3 → up to 5), capture loading states and wait for animations
+      // so dynamic content settles. Fully scope-aware (honours learning_scope)
+      // and fail-safe — any error leaves the crawl behaving exactly as before.
+      try {
+        const adaptation = await getCrawlAdaptationForUrl(config.url, {
+          companyId: config.companyId ?? undefined,
+          projectId: config.projectId ?? undefined,
+        });
+        if (adaptation && adaptation.isFlaky) {
+          crawlConfig.adaptive = true;
+          crawlConfig.maxDepth = adaptation.recommendedDepth;
+          crawlConfig.maxPages = Math.max(crawlConfig.maxPages ?? 3, adaptation.recommendedDepth);
+          crawlConfig.waitAfterLoad = adaptation.recommendedWaitMs;
+          crawlConfig.captureLoadingStates = adaptation.captureLoadingStates;
+          crawlConfig.waitForAnimations = adaptation.waitForAnimations;
+          logger.info(MOD, '🧭 Applying learned crawl adaptation (flaky page)', {
+            url: config.url,
+            recommendedDepth: adaptation.recommendedDepth,
+            waitMs: adaptation.recommendedWaitMs,
+            volatileElements: adaptation.volatileElements?.length ?? 0,
+          });
+        }
+      } catch (adaptErr: any) {
+        logger.warn(MOD, `crawl adaptation lookup failed (non-fatal): ${adaptErr?.message || adaptErr}`);
+      }
+
       const crawler = new PageCrawler(crawlConfig);
       const useAuthMultiPage = !!(config.authConfig && config.additionalUrls?.length);
 
