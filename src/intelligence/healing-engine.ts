@@ -17,6 +17,7 @@
 import { logger } from '../utils/logger';
 import { ProfileService } from './profile-service';
 import { findMatchingPatterns, incrementPatternUsage } from '../db/postgres';
+import { findMaintenancePattern, PATTERN_APPLY_THRESHOLD } from '../services/maintenance-pattern-service';
 
 const MOD = 'HealingEngine';
 
@@ -40,6 +41,9 @@ export interface SelectorAlternative {
   reasoning: string;
   /** Pattern ID if matched from pattern database */
   patternId?: string;
+  /** Loop 3: id of the learned maintenance_patterns row this came from, so the
+   *  caller can report the heal outcome back into the feedback loop. */
+  maintenancePatternId?: number;
 }
 
 export type SelectorStrategy =
@@ -50,7 +54,9 @@ export type SelectorStrategy =
   | 'dom-position'
   | 'parent-child'
   | 'css-fallback'
-  | 'pattern-match';
+  | 'pattern-match'
+  // Loop 3: instant, zero-AI-cost fix from the learned maintenance pattern library.
+  | 'maintenance-pattern';
 
 export interface HealingAnalysis {
   originalSelector: string;
@@ -92,8 +98,27 @@ export class SelectorHealingEngine {
     selector: string,
     baseUrl: string,
     companyId?: number,
+    projectId?: number,
   ): Promise<HealingAnalysis> {
     const start = Date.now();
+
+    // ── Loop 3: consult the learned maintenance pattern library FIRST. ──
+    // If a previous Script Sync / Migration confidently rewrote this exact
+    // selector and we trust that pattern (> threshold), we can heal instantly
+    // with ZERO AI / DOM-search cost. This is the maintenance → healing loop.
+    const patternAlt = await this.tryMaintenancePattern(selector, companyId, projectId);
+    if (patternAlt) {
+      logger.info(MOD, 'Healed from learned maintenance pattern (no AI cost)', {
+        selector, replacement: patternAlt.selector, confidence: patternAlt.confidence,
+      });
+      return {
+        originalSelector: selector,
+        broken: true,
+        alternatives: [patternAlt],
+        bestAlternative: patternAlt,
+        analysisTimeMs: Date.now() - start,
+      };
+    }
 
     const status = await this.profileService.getProfileStatus(baseUrl, companyId);
     if (!status.profile || status.status === 'not_exists') {
@@ -148,12 +173,13 @@ export class SelectorHealingEngine {
     testContent: string,
     baseUrl: string,
     companyId?: number,
+    projectId?: number,
   ): Promise<HealingSuggestion[]> {
     const selectors = this.extractSelectors(testContent);
     const suggestions: HealingSuggestion[] = [];
 
     for (const { selector, lineNumber } of selectors) {
-      const analysis = await this.analyzeSelector(selector, baseUrl, companyId);
+      const analysis = await this.analyzeSelector(selector, baseUrl, companyId, projectId);
       if (analysis.broken && analysis.bestAlternative) {
         suggestions.push({
           testFile: '',
@@ -171,6 +197,37 @@ export class SelectorHealingEngine {
   }
 
   /* ── Private Helpers ──────────────────────────────────────────── */
+
+  /**
+   * Loop 3: look up a trusted learned replacement for a broken selector in the
+   * maintenance pattern library. Returns a ready-to-apply alternative ONLY when
+   * a pattern matches with confidence ≥ PATTERN_APPLY_THRESHOLD (> 80%), so we
+   * never blindly trust a weak/penalised pattern. Fail-safe: any error → null,
+   * and healing falls through to the normal DOM/AI strategies.
+   */
+  private async tryMaintenancePattern(
+    selector: string,
+    companyId?: number,
+    projectId?: number,
+  ): Promise<SelectorAlternative | null> {
+    try {
+      const pattern = await findMaintenancePattern(selector, { companyId, projectId });
+      if (!pattern || pattern.confidence_score < PATTERN_APPLY_THRESHOLD) return null;
+      if (!pattern.new_selector || pattern.new_selector === selector) return null;
+      return {
+        selector: pattern.new_selector,
+        strategy: 'maintenance-pattern',
+        confidence: Math.min(0.99, pattern.confidence_score),
+        reasoning:
+          `Learned maintenance pattern (${pattern.source}, seen ${pattern.frequency}×, ` +
+          `${pattern.success_count} prior successful heal(s)) — instant fix, no AI cost.`,
+        maintenancePatternId: pattern.id,
+      };
+    } catch (err: any) {
+      logger.warn(MOD, `maintenance pattern lookup failed: ${err?.message || err}`);
+      return null;
+    }
+  }
 
   private selectorExistsInCrawl(selector: string, crawlData: any): boolean {
     if (!crawlData?.elements) return false;

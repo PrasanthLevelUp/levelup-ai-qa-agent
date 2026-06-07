@@ -479,12 +479,13 @@ export function createIntelligenceRouter(): Router {
   router.post('/healing/analyze', async (req: Request, res: Response) => {
     try {
       const companyId = (req as any).companyId;
+      const projectId = (req as any).projectId as number | undefined;
       const { testContent, baseUrl } = req.body;
       if (!testContent || !baseUrl) {
         return res.status(400).json({ success: false, error: 'testContent and baseUrl are required' });
       }
 
-      const suggestions = await healingEngine.analyzeTestFile(testContent, baseUrl, companyId);
+      const suggestions = await healingEngine.analyzeTestFile(testContent, baseUrl, companyId, projectId);
       res.json({
         success: true,
         data: {
@@ -502,12 +503,13 @@ export function createIntelligenceRouter(): Router {
   router.post('/healing/fix', async (req: Request, res: Response) => {
     try {
       const companyId = (req as any).companyId;
+      const projectId = (req as any).projectId as number | undefined;
       const { selector, baseUrl } = req.body;
       if (!selector || !baseUrl) {
         return res.status(400).json({ success: false, error: 'selector and baseUrl are required' });
       }
 
-      const analysis = await healingEngine.analyzeSelector(selector, baseUrl, companyId);
+      const analysis = await healingEngine.analyzeSelector(selector, baseUrl, companyId, projectId);
       res.json({ success: true, data: analysis });
     } catch (err) {
       res.status(500).json({ success: false, error: (err as Error).message });

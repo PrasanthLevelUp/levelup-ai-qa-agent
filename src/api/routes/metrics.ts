@@ -12,6 +12,12 @@
  *   GET  /api/metrics/crawl/adaptations        — learned per-page crawl configs
  *   POST /api/metrics/crawl/analyze            — (re)analyze failures → adaptations
  *
+ * Loop 3 — Maintenance → Healing:
+ *   GET  /api/metrics/patterns/maintenance     — learned old→new selector library
+ *
+ * MTTR (Mean Time To Repair) flows through /current and /trends automatically
+ * (mttr_minutes, mttr_manual_minutes, mttr_improvement_factor).
+ *
  * Privacy Controls:
  *   GET  /api/metrics/learning-scope           — current scope (project|company|disabled)
  *   PUT  /api/metrics/learning-scope           — update scope (enterprise can disable)
@@ -32,6 +38,7 @@ import {
   getFailureReport,
   listCrawlAdaptations,
 } from '../../services/crawl-adaptation-service';
+import { listMaintenancePatterns } from '../../services/maintenance-pattern-service';
 import {
   getLearningSettings,
   upsertLearningSettings,
@@ -160,6 +167,19 @@ export function createMetricsRouter(): Router {
       res.json({ success: true, data: settings });
     } catch (err: any) {
       logger.error(MOD, `learning-scope put error: ${err?.message || err}`);
+      res.status(500).json({ success: false, error: err.message });
+    }
+  });
+
+  // ── Loop 3: learned maintenance pattern library (old→new selector mappings) ──
+  router.get('/patterns/maintenance', async (req: Request, res: Response) => {
+    try {
+      const scope = scopeOf(req);
+      const limit = parseInt(String(req.query.limit ?? '100'), 10);
+      const patterns = await listMaintenancePatterns(scope, Number.isFinite(limit) ? limit : 100);
+      res.json({ success: true, data: { patterns, total: patterns.length } });
+    } catch (err: any) {
+      logger.error(MOD, `patterns/maintenance error: ${err?.message || err}`);
       res.status(500).json({ success: false, error: err.message });
     }
   });
