@@ -133,6 +133,8 @@ const REQUIRED_TABLES = [
   'healing_settings',
   // Proactive script maintenance (change detection)
   'crawl_snapshots',
+  // Intelligence Learning System (cross-system learning flywheel)
+  'selector_stability', 'intelligence_insights',
   // Maintenance suite: migration assistant + smart-regeneration backups
   'migrations', 'script_versions',
   // Projects
@@ -1426,6 +1428,62 @@ async function migrateDefaultCompany(client: PoolClient): Promise<void> {
     `CREATE INDEX IF NOT EXISTS idx_script_versions_script
        ON script_versions(script_id, version DESC)`);
 
+  // ── Intelligence Learning System: selector_stability (Loop L1) ──
+  // One row per (scope, selector, strategy). Continuously updated: incremented
+  // on generation/use, penalized when a heal proves the selector broke. The
+  // stability_score (0..1, Laplace-smoothed) is consumed by SelectorQualityEngine
+  // at generation time so selectors that break in production get demoted. Fully
+  // additive — absence simply means every selector is treated as fully stable.
+  console.log('🔧 [DB] Migration: selector_stability table (Intelligence Learning L1)...');
+  await safeExec(client, 'selector_stability', `CREATE TABLE IF NOT EXISTS selector_stability (
+    id SERIAL PRIMARY KEY,
+    company_id INTEGER,
+    project_id INTEGER,
+    page_url TEXT,
+    selector TEXT NOT NULL,
+    strategy TEXT NOT NULL,
+    times_used INTEGER DEFAULT 0,
+    times_broken INTEGER DEFAULT 0,
+    stability_score REAL DEFAULT 1.0,
+    last_used_at TIMESTAMPTZ,
+    last_broken_at TIMESTAMPTZ,
+    first_seen_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+  )`);
+  await safeExec(client, 'uq_selector_stability',
+    `CREATE UNIQUE INDEX IF NOT EXISTS uq_selector_stability
+       ON selector_stability(COALESCE(company_id, 0), COALESCE(project_id, 0), selector, strategy)`);
+  await safeExec(client, 'idx_selector_stability_scope',
+    `CREATE INDEX IF NOT EXISTS idx_selector_stability_scope
+       ON selector_stability(COALESCE(company_id, 0), COALESCE(project_id, 0))`);
+  await safeExec(client, 'idx_selector_stability_strategy',
+    `CREATE INDEX IF NOT EXISTS idx_selector_stability_strategy ON selector_stability(strategy)`);
+
+  // ── Intelligence Learning System: intelligence_insights (Loops L2–L5) ──
+  // Polymorphic ledger of everything the flywheel has learned. insight_type
+  // selects the loop (healing_patterns | selector_stability | crawl_improvements
+  // | template_enhancements | cross_project_patterns); payload carries the
+  // loop-specific recommendation. Additive — readers tolerate an empty ledger.
+  console.log('🔧 [DB] Migration: intelligence_insights table (Intelligence Learning L2-L5)...');
+  await safeExec(client, 'intelligence_insights', `CREATE TABLE IF NOT EXISTS intelligence_insights (
+    id SERIAL PRIMARY KEY,
+    company_id INTEGER,
+    project_id INTEGER,
+    insight_type TEXT NOT NULL,
+    scope_key TEXT,
+    payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+    confidence REAL DEFAULT 0,
+    evidence_count INTEGER DEFAULT 1,
+    status TEXT DEFAULT 'active',
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+  )`);
+  await safeExec(client, 'uq_intelligence_insights',
+    `CREATE UNIQUE INDEX IF NOT EXISTS uq_intelligence_insights
+       ON intelligence_insights(COALESCE(company_id, 0), COALESCE(project_id, 0), insight_type, COALESCE(scope_key, ''))`);
+  await safeExec(client, 'idx_intelligence_insights_type',
+    `CREATE INDEX IF NOT EXISTS idx_intelligence_insights_type ON intelligence_insights(insight_type, status)`);
+
   const projectIdIndexes = [
     `CREATE INDEX IF NOT EXISTS idx_pc_project ON project_contexts(project_id)`,
     `CREATE INDEX IF NOT EXISTS idx_gs_project ON generated_scripts(project_id)`,
@@ -2160,7 +2218,40 @@ export async function logHealing(data: HealingAction, companyId?: number): Promi
       data.sprint_id ?? null,
     ],
   );
+
+  // Intelligence Learning Loop L1 (real-time write path): a heal means the
+  // failed_locator broke. Record a stability penalty so future generation
+  // demotes it. Fire-and-forget — never let learning break healing logging.
+  if (data.failed_locator) {
+    void recordSelectorBreak({
+      selector: data.failed_locator,
+      strategy: inferStrategyForStability(data.failed_locator),
+      companyId: companyId ?? null,
+      projectId: data.project_id ?? null,
+    }).catch(() => { /* non-fatal */ });
+  }
+
   return result.rows[0].id;
+}
+
+/**
+ * Lightweight strategy inference for stability tracking. Kept inline here (a
+ * trimmed mirror of inferStrategyFromSelector in intelligence-learning-service)
+ * so the DB layer never imports the service layer (avoids a circular import).
+ */
+function inferStrategyForStability(selector: string): string {
+  const s = (selector || '').trim();
+  if (!s) return 'unknown';
+  if (/getByTestId|data-testid|data-test=|data-cy/i.test(s)) return 'data-testid';
+  if (/getByRole|\brole=/i.test(s)) return 'role';
+  if (/getByLabel/i.test(s)) return 'label';
+  if (/getByPlaceholder|placeholder=/i.test(s)) return 'placeholder';
+  if (/getByText|\btext=/i.test(s)) return 'text';
+  if (/\[name=|getByName/i.test(s)) return 'name-attr';
+  if (/^\/\/|xpath=/i.test(s)) return 'xpath';
+  if (/^#|#[\w-]+/.test(s) || /\bid=/.test(s)) return 'id';
+  if (/\.[a-zA-Z][\w-]*/.test(s)) return 'css-class';
+  return 'css-combined';
 }
 
 /* -------------------------------------------------------------------------- */
@@ -2940,6 +3031,299 @@ export async function getTopPatterns(limit = 10, companyId?: number): Promise<an
     [limit],
   );
   return result.rows;
+}
+
+/* -------------------------------------------------------------------------- */
+/*  Intelligence Learning System (cross-system learning flywheel)             */
+/*                                                                            */
+/*  selector_stability  — Loop L1 backbone (heal ⇒ demote at generation)      */
+/*  intelligence_insights — Loops L2–L5 polymorphic insight ledger            */
+/* -------------------------------------------------------------------------- */
+
+export interface SelectorStabilityRow {
+  selector: string;
+  strategy: string;
+  times_used: number;
+  times_broken: number;
+  stability_score: number;
+  page_url?: string | null;
+}
+
+interface StabilityScope {
+  companyId?: number | null;
+  projectId?: number | null;
+}
+
+/** Laplace-smoothed stability: 1 − (broken + 1) / (used + 2). Range (0,1]. */
+function computeStability(used: number, broken: number): number {
+  const s = 1 - (broken + 1) / (used + 2);
+  // Clamp to [0.01, 1] so a row never fully zeroes a score (keeps math sane).
+  return Math.max(0.01, Math.min(1, parseFloat(s.toFixed(4))));
+}
+
+/**
+ * Record that a selector was USED during generation/execution. Upserts the row
+ * and bumps times_used. Safe to call frequently; never throws fatally.
+ */
+export async function recordSelectorUsage(input: {
+  selector: string;
+  strategy: string;
+  pageUrl?: string | null;
+  companyId?: number | null;
+  projectId?: number | null;
+}): Promise<void> {
+  try {
+    await getPool().query(
+      `INSERT INTO selector_stability
+         (company_id, project_id, page_url, selector, strategy, times_used, times_broken, stability_score, last_used_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, 1, 0, 1.0, NOW(), NOW())
+       ON CONFLICT (COALESCE(company_id, 0), COALESCE(project_id, 0), selector, strategy)
+       DO UPDATE SET
+         times_used = selector_stability.times_used + 1,
+         stability_score = 1 - ((selector_stability.times_broken + 1.0) / (selector_stability.times_used + 1 + 2.0)),
+         page_url = COALESCE(EXCLUDED.page_url, selector_stability.page_url),
+         last_used_at = NOW(),
+         updated_at = NOW()`,
+      [input.companyId ?? null, input.projectId ?? null, input.pageUrl ?? null, input.selector, input.strategy],
+    );
+  } catch (err: any) {
+    logger.warn(MOD, 'recordSelectorUsage failed (non-fatal)', { error: err.message });
+  }
+}
+
+/**
+ * Record that a selector BROKE (a heal proved it failed). Upserts the row and
+ * bumps times_broken, recomputing the smoothed stability_score.
+ */
+export async function recordSelectorBreak(input: {
+  selector: string;
+  strategy: string;
+  pageUrl?: string | null;
+  companyId?: number | null;
+  projectId?: number | null;
+}): Promise<void> {
+  try {
+    await getPool().query(
+      `INSERT INTO selector_stability
+         (company_id, project_id, page_url, selector, strategy, times_used, times_broken, stability_score, last_broken_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, 1, 1, $6, NOW(), NOW())
+       ON CONFLICT (COALESCE(company_id, 0), COALESCE(project_id, 0), selector, strategy)
+       DO UPDATE SET
+         times_broken = selector_stability.times_broken + 1,
+         stability_score = 1 - ((selector_stability.times_broken + 1 + 1.0) / (selector_stability.times_used + 2.0)),
+         page_url = COALESCE(EXCLUDED.page_url, selector_stability.page_url),
+         last_broken_at = NOW(),
+         updated_at = NOW()`,
+      [
+        input.companyId ?? null,
+        input.projectId ?? null,
+        input.pageUrl ?? null,
+        input.selector,
+        input.strategy,
+        computeStability(1, 1),
+      ],
+    );
+  } catch (err: any) {
+    logger.warn(MOD, 'recordSelectorBreak failed (non-fatal)', { error: err.message });
+  }
+}
+
+/**
+ * Load all stability rows for a scope (project rows + global fallback rows).
+ * Returns the most-specific row per (selector, strategy). Never throws — a
+ * missing table or empty result yields an empty array so generation is safe.
+ */
+export async function getSelectorStability(scope: StabilityScope = {}): Promise<SelectorStabilityRow[]> {
+  try {
+    const result = await getPool().query(
+      `SELECT selector, strategy, times_used, times_broken, stability_score, page_url,
+              (CASE WHEN project_id IS NOT DISTINCT FROM $2 THEN 2
+                    WHEN company_id IS NOT DISTINCT FROM $1 THEN 1
+                    ELSE 0 END) AS specificity
+       FROM selector_stability
+       WHERE (company_id IS NOT DISTINCT FROM $1 OR company_id IS NULL)
+         AND (project_id IS NOT DISTINCT FROM $2 OR project_id IS NULL)
+       ORDER BY specificity DESC, times_used DESC`,
+      [scope.companyId ?? null, scope.projectId ?? null],
+    );
+    const seen = new Set<string>();
+    const out: SelectorStabilityRow[] = [];
+    for (const r of result.rows) {
+      const key = `${r.selector}__${r.strategy}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push({
+        selector: r.selector,
+        strategy: r.strategy,
+        times_used: parseInt(r.times_used, 10),
+        times_broken: parseInt(r.times_broken, 10),
+        stability_score: parseFloat(r.stability_score),
+        page_url: r.page_url,
+      });
+    }
+    return out;
+  } catch (err: any) {
+    logger.warn(MOD, 'getSelectorStability failed (non-fatal) — treating all selectors as stable', { error: err.message });
+    return [];
+  }
+}
+
+/** Per-strategy stability rollup (used by metrics + cross-project priors). */
+export async function getStrategyStability(scope: StabilityScope = {}): Promise<Array<{
+  strategy: string;
+  samples: number;
+  total_used: number;
+  total_broken: number;
+  avg_stability: number;
+}>> {
+  try {
+    const result = await getPool().query(
+      `SELECT strategy,
+              COUNT(*) AS samples,
+              COALESCE(SUM(times_used), 0) AS total_used,
+              COALESCE(SUM(times_broken), 0) AS total_broken,
+              COALESCE(AVG(stability_score), 1.0) AS avg_stability
+       FROM selector_stability
+       WHERE (company_id IS NOT DISTINCT FROM $1 OR company_id IS NULL)
+         AND (project_id IS NOT DISTINCT FROM $2 OR project_id IS NULL)
+       GROUP BY strategy
+       ORDER BY avg_stability ASC`,
+      [scope.companyId ?? null, scope.projectId ?? null],
+    );
+    return result.rows.map(r => ({
+      strategy: r.strategy,
+      samples: parseInt(r.samples, 10),
+      total_used: parseInt(r.total_used, 10),
+      total_broken: parseInt(r.total_broken, 10),
+      avg_stability: parseFloat(parseFloat(r.avg_stability).toFixed(4)),
+    }));
+  } catch (err: any) {
+    logger.warn(MOD, 'getStrategyStability failed (non-fatal)', { error: err.message });
+    return [];
+  }
+}
+
+/** Aggregate stability KPI for the "getting smarter over time" dashboard. */
+export async function getStabilitySummary(scope: StabilityScope = {}): Promise<{
+  trackedSelectors: number;
+  avgStability: number;
+  stablePct: number;
+  flakySelectors: number;
+  totalBreaks: number;
+}> {
+  try {
+    const result = await getPool().query(
+      `SELECT COUNT(*) AS tracked,
+              COALESCE(AVG(stability_score), 1.0) AS avg_stability,
+              COALESCE(SUM(CASE WHEN stability_score >= 0.7 THEN 1 ELSE 0 END), 0) AS stable_count,
+              COALESCE(SUM(CASE WHEN stability_score < 0.5 THEN 1 ELSE 0 END), 0) AS flaky_count,
+              COALESCE(SUM(times_broken), 0) AS total_breaks
+       FROM selector_stability
+       WHERE (company_id IS NOT DISTINCT FROM $1 OR company_id IS NULL)
+         AND (project_id IS NOT DISTINCT FROM $2 OR project_id IS NULL)`,
+      [scope.companyId ?? null, scope.projectId ?? null],
+    );
+    const r = result.rows[0];
+    const tracked = parseInt(r.tracked, 10);
+    return {
+      trackedSelectors: tracked,
+      avgStability: parseFloat(parseFloat(r.avg_stability).toFixed(4)),
+      stablePct: tracked > 0 ? parseFloat(((parseInt(r.stable_count, 10) / tracked) * 100).toFixed(1)) : 100,
+      flakySelectors: parseInt(r.flaky_count, 10),
+      totalBreaks: parseInt(r.total_breaks, 10),
+    };
+  } catch (err: any) {
+    logger.warn(MOD, 'getStabilitySummary failed (non-fatal)', { error: err.message });
+    return { trackedSelectors: 0, avgStability: 1, stablePct: 100, flakySelectors: 0, totalBreaks: 0 };
+  }
+}
+
+/** Upsert an insight into the polymorphic ledger (Loops L2–L5). */
+export async function upsertInsight(input: {
+  insightType: string;
+  scopeKey?: string | null;
+  payload: Record<string, any>;
+  confidence?: number;
+  evidenceCount?: number;
+  companyId?: number | null;
+  projectId?: number | null;
+}): Promise<void> {
+  try {
+    await getPool().query(
+      `INSERT INTO intelligence_insights
+         (company_id, project_id, insight_type, scope_key, payload, confidence, evidence_count, status, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, 'active', NOW(), NOW())
+       ON CONFLICT (COALESCE(company_id, 0), COALESCE(project_id, 0), insight_type, COALESCE(scope_key, ''))
+       DO UPDATE SET
+         payload = EXCLUDED.payload,
+         confidence = EXCLUDED.confidence,
+         evidence_count = intelligence_insights.evidence_count + 1,
+         status = 'active',
+         updated_at = NOW()`,
+      [
+        input.companyId ?? null,
+        input.projectId ?? null,
+        input.insightType,
+        input.scopeKey ?? null,
+        JSON.stringify(input.payload || {}),
+        input.confidence ?? 0,
+        input.evidenceCount ?? 1,
+      ],
+    );
+  } catch (err: any) {
+    logger.warn(MOD, 'upsertInsight failed (non-fatal)', { error: err.message, type: input.insightType });
+  }
+}
+
+/** Read insights (optionally filtered by type) for a scope. */
+export async function getInsights(input: {
+  insightType?: string;
+  companyId?: number | null;
+  projectId?: number | null;
+  limit?: number;
+} = {}): Promise<Array<{
+  id: number;
+  insight_type: string;
+  scope_key: string | null;
+  payload: Record<string, any>;
+  confidence: number;
+  evidence_count: number;
+  status: string;
+  updated_at: string;
+}>> {
+  try {
+    const params: any[] = [input.companyId ?? null, input.projectId ?? null];
+    let typeClause = '';
+    if (input.insightType) {
+      params.push(input.insightType);
+      typeClause = `AND insight_type = $${params.length}`;
+    }
+    params.push(input.limit ?? 100);
+    const result = await getPool().query(
+      `SELECT id, insight_type, scope_key, payload, confidence, evidence_count, status, updated_at
+       FROM intelligence_insights
+       WHERE (company_id IS NOT DISTINCT FROM $1 OR company_id IS NULL)
+         AND (project_id IS NOT DISTINCT FROM $2 OR project_id IS NULL)
+         AND status = 'active'
+         ${typeClause}
+       ORDER BY confidence DESC, evidence_count DESC, updated_at DESC
+       LIMIT $${params.length}`,
+      params,
+    );
+    return result.rows.map(r => ({
+      id: r.id,
+      insight_type: r.insight_type,
+      scope_key: r.scope_key,
+      payload: typeof r.payload === 'string' ? JSON.parse(r.payload) : r.payload,
+      confidence: parseFloat(r.confidence),
+      evidence_count: parseInt(r.evidence_count, 10),
+      status: r.status,
+      updated_at: r.updated_at,
+    }));
+  } catch (err: any) {
+    logger.warn(MOD, 'getInsights failed (non-fatal)', { error: err.message });
+    return [];
+  }
 }
 
 /* -------------------------------------------------------------------------- */
