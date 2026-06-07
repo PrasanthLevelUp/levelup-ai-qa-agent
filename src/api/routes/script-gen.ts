@@ -35,6 +35,7 @@ import {
   saveScriptVersion,
 } from '../../db/postgres';
 import { syncScript } from '../../services/script-sync';
+import { learnFromSyncChanges } from '../../services/maintenance-pattern-service';
 import {
   extractPreservedContent,
   mergeRegenerated,
@@ -1239,6 +1240,15 @@ export function createScriptGenRouter(): Router {
       }
 
       console.log(`[ScriptGen] 🔧 sync #${id} — ${result.outdatedCount} outdated, ${result.changes.length} repaired, applied=${applied}`);
+
+      // Loop 3: learn every confident old→new rewrite into the maintenance
+      // pattern library so the healing engine can reuse it instantly later.
+      // Fire-and-forget — never blocks or fails the sync response.
+      if (result.changes.length) {
+        learnFromSyncChanges(result.changes, { companyId, projectId }).catch((e) =>
+          console.warn(`[ScriptGen] sync: pattern learning failed: ${e?.message}`));
+      }
+
       res.json({
         success: true,
         data: {
@@ -1317,6 +1327,12 @@ export function createScriptGenRouter(): Router {
         apply: true,
       });
       const regenerated = sync.newScriptContent || script.script_content || '';
+
+      // Loop 3: regeneration also rewrites stale locators — learn those too.
+      if (sync.changes.length) {
+        learnFromSyncChanges(sync.changes, { companyId, projectId }).catch((e) =>
+          console.warn(`[ScriptGen] regenerate: pattern learning failed: ${e?.message}`));
+      }
 
       // 2. Parse old + new files; merge preserved logic per file.
       const oldFiles = parseScriptContent(script.script_content, script.files_generated);

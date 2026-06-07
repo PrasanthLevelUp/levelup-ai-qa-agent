@@ -38,7 +38,7 @@ export interface HealingAction {
   test_name: string;
   failed_locator: string;
   healed_locator?: string;
-  healing_strategy: 'rule_based' | 'database_pattern' | 'ai_reasoning';
+  healing_strategy: 'rule_based' | 'database_pattern' | 'ai_reasoning' | 'maintenance-pattern';
   ai_tokens_used?: number;
   success?: boolean;
   confidence?: number;
@@ -137,6 +137,8 @@ const REQUIRED_TABLES = [
   'selector_stability', 'intelligence_insights',
   // Observable metrics (investor-grade KPIs) + Loop 2 (failures → crawl intelligence) + privacy
   'metrics_snapshots', 'learning_settings', 'page_failures', 'crawl_adaptations',
+  // Loop 3 (maintenance → healing): learned old→new selector pattern library
+  'maintenance_patterns',
   // Maintenance suite: migration assistant + smart-regeneration backups
   'migrations', 'script_versions',
   // Projects
@@ -1504,9 +1506,22 @@ async function migrateDefaultCompany(client: PoolClient): Promise<void> {
     total_tests_run INTEGER DEFAULT 0,
     total_heals_performed INTEGER DEFAULT 0,
     total_failures INTEGER DEFAULT 0,
+    mttr_minutes REAL DEFAULT 0,
+    mttr_manual_minutes REAL DEFAULT 210,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW()
   )`);
+  // MTTR columns (Mean Time To Repair) — additive for deployments whose
+  // metrics_snapshots predates Loop 3. mttr_minutes = avg autonomous repair
+  // time; mttr_manual_minutes = the manual baseline (3.5h = 210min default).
+  await safeExec(client, 'metrics_snapshots_mttr_cols', `DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='metrics_snapshots' AND column_name='mttr_minutes') THEN
+      ALTER TABLE metrics_snapshots ADD COLUMN mttr_minutes REAL DEFAULT 0;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='metrics_snapshots' AND column_name='mttr_manual_minutes') THEN
+      ALTER TABLE metrics_snapshots ADD COLUMN mttr_manual_minutes REAL DEFAULT 210;
+    END IF;
+  END $$;`);
   await safeExec(client, 'uq_metrics_snapshots',
     `CREATE UNIQUE INDEX IF NOT EXISTS uq_metrics_snapshots
        ON metrics_snapshots(COALESCE(company_id, 0), COALESCE(project_id, 0), snapshot_date)`);
@@ -1583,6 +1598,39 @@ async function migrateDefaultCompany(client: PoolClient): Promise<void> {
   await safeExec(client, 'idx_crawl_adaptations_scope',
     `CREATE INDEX IF NOT EXISTS idx_crawl_adaptations_scope
        ON crawl_adaptations(COALESCE(company_id, 0), COALESCE(project_id, 0))`);
+
+  // ── Loop 3: maintenance_patterns (learned old→new selector library) ──
+  // Every confident old→new selector rewrite observed during Script Sync or the
+  // Migration Assistant is distilled into a reusable pattern here. The healing
+  // engine consults this library BEFORE spending an AI call: a high-confidence
+  // match yields an instant, zero-cost fix. A feedback loop reinforces patterns
+  // that heal successfully and penalises those that don't, so the library is
+  // self-improving. Fully additive — readers tolerate an empty library.
+  console.log('🔧 [DB] Migration: maintenance_patterns table (Loop 3)...');
+  await safeExec(client, 'maintenance_patterns', `CREATE TABLE IF NOT EXISTS maintenance_patterns (
+    id SERIAL PRIMARY KEY,
+    company_id INTEGER,
+    project_id INTEGER,
+    old_selector TEXT NOT NULL,
+    new_selector TEXT NOT NULL,
+    source TEXT DEFAULT 'script-sync',
+    frequency INTEGER DEFAULT 1,
+    success_count INTEGER DEFAULT 0,
+    failure_count INTEGER DEFAULT 0,
+    confidence_score REAL DEFAULT 0.5,
+    last_seen_at TIMESTAMPTZ DEFAULT NOW(),
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+  )`);
+  await safeExec(client, 'uq_maintenance_patterns',
+    `CREATE UNIQUE INDEX IF NOT EXISTS uq_maintenance_patterns
+       ON maintenance_patterns(COALESCE(company_id, 0), COALESCE(project_id, 0), old_selector, new_selector)`);
+  await safeExec(client, 'idx_maintenance_patterns_lookup',
+    `CREATE INDEX IF NOT EXISTS idx_maintenance_patterns_lookup
+       ON maintenance_patterns(COALESCE(company_id, 0), COALESCE(project_id, 0), old_selector)`);
+  await safeExec(client, 'idx_maintenance_patterns_conf',
+    `CREATE INDEX IF NOT EXISTS idx_maintenance_patterns_conf
+       ON maintenance_patterns(confidence_score DESC)`);
 
   const projectIdIndexes = [
     `CREATE INDEX IF NOT EXISTS idx_pc_project ON project_contexts(project_id)`,
@@ -2351,6 +2399,22 @@ export async function logHealing(data: HealingAction, companyId?: number): Promi
           companyId: companyId ?? null,
           projectId: data.project_id ?? null,
         });
+      })
+      .catch(() => { /* non-fatal */ });
+  }
+
+  // Loop 3 feedback (Maintenance → Healing): if this heal was produced by the
+  // learned maintenance pattern library, feed the outcome back so the library
+  // self-improves — successful heals reinforce the pattern, failures penalise
+  // it. We match the pattern by its old→new selector pair within scope (the
+  // strategy string is set by the healing engine to 'maintenance-pattern').
+  // Fire-and-forget — never let learning break healing logging.
+  if (data.healing_strategy === 'maintenance-pattern' && data.failed_locator && data.healed_locator) {
+    void getMaintenancePattern(data.failed_locator, companyId ?? undefined, data.project_id ?? undefined)
+      .then((pattern) => {
+        if (pattern && pattern.new_selector === data.healed_locator) {
+          return recordMaintenancePatternOutcome(pattern.id, data.success === true);
+        }
       })
       .catch(() => { /* non-fatal */ });
   }
@@ -5534,6 +5598,10 @@ export interface MetricsSnapshot {
   total_tests_run: number;
   total_heals_performed: number;
   total_failures: number;
+  /** Mean Time To Repair (avg autonomous repair time, minutes). */
+  mttr_minutes: number;
+  /** Manual baseline MTTR without the platform (minutes; default 210 = 3.5h). */
+  mttr_manual_minutes: number;
 }
 
 /** Build a "scope filter" SQL fragment + params for COALESCE-based scope matching. */
@@ -5554,15 +5622,18 @@ export async function insertMetricsSnapshot(
       `INSERT INTO metrics_snapshots
         (company_id, project_id, snapshot_date, heal_rate, repeat_break_rate,
          stable_selector_percentage, first_run_pass_rate, manual_hours_saved,
-         total_tests_run, total_heals_performed, total_failures, created_at, updated_at)
-       VALUES ($1, $2, COALESCE($3::date, CURRENT_DATE), $4, $5, $6, $7, $8, $9, $10, $11, NOW(), NOW())
+         total_tests_run, total_heals_performed, total_failures,
+         mttr_minutes, mttr_manual_minutes, created_at, updated_at)
+       VALUES ($1, $2, COALESCE($3::date, CURRENT_DATE), $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NOW(), NOW())
        ON CONFLICT (COALESCE(company_id, 0), COALESCE(project_id, 0), snapshot_date)
        DO UPDATE SET heal_rate = $4, repeat_break_rate = $5, stable_selector_percentage = $6,
          first_run_pass_rate = $7, manual_hours_saved = $8, total_tests_run = $9,
-         total_heals_performed = $10, total_failures = $11, updated_at = NOW()`,
+         total_heals_performed = $10, total_failures = $11,
+         mttr_minutes = $12, mttr_manual_minutes = $13, updated_at = NOW()`,
       [companyId ?? null, projectId ?? null, snapshotDate ?? null,
        m.heal_rate, m.repeat_break_rate, m.stable_selector_percentage, m.first_run_pass_rate,
-       m.manual_hours_saved, m.total_tests_run, m.total_heals_performed, m.total_failures]
+       m.manual_hours_saved, m.total_tests_run, m.total_heals_performed, m.total_failures,
+       m.mttr_minutes ?? 0, m.mttr_manual_minutes ?? 210]
     );
   } catch (err: any) {
     if (err?.code === '42P01' || err?.message?.includes('does not exist')) return;
@@ -5601,6 +5672,150 @@ export async function getMetricsTrends(days: number, companyId?: number, project
     return r.rows;
   } catch (err: any) {
     if (err?.code === '42P01' || err?.message?.includes('does not exist')) return [];
+    throw err;
+  }
+}
+
+/* ────────────────────────────────────────────────────────────────────────── */
+/*  Loop 3 — maintenance_patterns (learned old→new selector library)            */
+/* ────────────────────────────────────────────────────────────────────────── */
+
+export interface MaintenancePattern {
+  id: number;
+  company_id: number | null;
+  project_id: number | null;
+  old_selector: string;
+  new_selector: string;
+  source: string;
+  frequency: number;
+  success_count: number;
+  failure_count: number;
+  confidence_score: number;
+  last_seen_at: string;
+  created_at: string;
+  updated_at: string;
+}
+
+/**
+ * Upsert a learned old→new selector pattern. On conflict (same scope + same
+ * old→new pair) the frequency is incremented, last_seen_at is refreshed, and
+ * confidence is nudged up (capped at 0.95) — repeated independent observations
+ * of the same rewrite increase our trust in it. Never throws on a missing table.
+ *
+ * @param confidenceHint optional 0..1 seed confidence for a brand-new pattern
+ *        (e.g. derived from the sync/migration confidence). Defaults to 0.6.
+ */
+export async function upsertMaintenancePattern(
+  oldSelector: string,
+  newSelector: string,
+  opts: { companyId?: number; projectId?: number; source?: string; confidenceHint?: number } = {}
+): Promise<void> {
+  if (!oldSelector || !newSelector || oldSelector === newSelector) return;
+  const pool = getPool();
+  const seed = Math.max(0.1, Math.min(opts.confidenceHint ?? 0.6, 0.9));
+  try {
+    await pool.query(
+      `INSERT INTO maintenance_patterns
+        (company_id, project_id, old_selector, new_selector, source,
+         frequency, confidence_score, last_seen_at, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, 1, $6, NOW(), NOW(), NOW())
+       ON CONFLICT (COALESCE(company_id, 0), COALESCE(project_id, 0), old_selector, new_selector)
+       DO UPDATE SET
+         frequency = maintenance_patterns.frequency + 1,
+         confidence_score = LEAST(0.95, maintenance_patterns.confidence_score + 0.05),
+         source = EXCLUDED.source,
+         last_seen_at = NOW(),
+         updated_at = NOW()`,
+      [opts.companyId ?? null, opts.projectId ?? null, oldSelector, newSelector,
+       opts.source ?? 'script-sync', seed]
+    );
+  } catch (err: any) {
+    if (err?.code === '42P01' || err?.message?.includes('does not exist')) return;
+    throw err;
+  }
+}
+
+/**
+ * Best learned replacement for a broken selector within a scope. Returns the
+ * highest-confidence, most-frequently-seen pattern whose old_selector matches.
+ * Never throws on a missing table (returns null).
+ */
+export async function getMaintenancePattern(
+  oldSelector: string, companyId?: number, projectId?: number
+): Promise<MaintenancePattern | null> {
+  if (!oldSelector) return null;
+  const pool = getPool();
+  const sf = scopeFilter(companyId, projectId);
+  try {
+    const r = await pool.query(
+      `SELECT * FROM maintenance_patterns
+       WHERE ${sf.sql} AND old_selector = $${sf.params.length + 1}
+       ORDER BY confidence_score DESC, frequency DESC, last_seen_at DESC
+       LIMIT 1`,
+      [...sf.params, oldSelector]
+    );
+    return (r.rows[0] as MaintenancePattern) || null;
+  } catch (err: any) {
+    if (err?.code === '42P01' || err?.message?.includes('does not exist')) return null;
+    throw err;
+  }
+}
+
+/** List learned patterns for a scope (highest confidence first). */
+export async function getMaintenancePatterns(
+  companyId?: number, projectId?: number, limit = 100
+): Promise<MaintenancePattern[]> {
+  const pool = getPool();
+  const sf = scopeFilter(companyId, projectId);
+  const safeLimit = Math.max(1, Math.min(limit || 100, 500));
+  try {
+    const r = await pool.query(
+      `SELECT * FROM maintenance_patterns
+       WHERE ${sf.sql}
+       ORDER BY confidence_score DESC, frequency DESC, last_seen_at DESC
+       LIMIT ${safeLimit}`,
+      sf.params
+    );
+    return (r.rows as MaintenancePattern[]) || [];
+  } catch (err: any) {
+    if (err?.code === '42P01' || err?.message?.includes('does not exist')) return [];
+    throw err;
+  }
+}
+
+/**
+ * Feedback loop: adjust a pattern's confidence after it is used to heal.
+ * `success=true` reinforces (bumps confidence + success_count); `false`
+ * penalises (drops confidence + failure_count). Confidence is clamped to
+ * [0.05, 0.99]. Never throws on a missing table.
+ */
+export async function recordMaintenancePatternOutcome(
+  patternId: number, success: boolean
+): Promise<void> {
+  if (!patternId) return;
+  const pool = getPool();
+  try {
+    if (success) {
+      await pool.query(
+        `UPDATE maintenance_patterns
+           SET success_count = success_count + 1,
+               confidence_score = LEAST(0.99, confidence_score + 0.05),
+               updated_at = NOW()
+         WHERE id = $1`,
+        [patternId]
+      );
+    } else {
+      await pool.query(
+        `UPDATE maintenance_patterns
+           SET failure_count = failure_count + 1,
+               confidence_score = GREATEST(0.05, confidence_score - 0.15),
+               updated_at = NOW()
+         WHERE id = $1`,
+        [patternId]
+      );
+    }
+  } catch (err: any) {
+    if (err?.code === '42P01' || err?.message?.includes('does not exist')) return;
     throw err;
   }
 }
