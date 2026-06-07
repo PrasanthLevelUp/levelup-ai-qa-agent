@@ -135,6 +135,8 @@ const REQUIRED_TABLES = [
   'crawl_snapshots',
   // Intelligence Learning System (cross-system learning flywheel)
   'selector_stability', 'intelligence_insights',
+  // Observable metrics (investor-grade KPIs) + Loop 2 (failures → crawl intelligence) + privacy
+  'metrics_snapshots', 'learning_settings', 'page_failures', 'crawl_adaptations',
   // Maintenance suite: migration assistant + smart-regeneration backups
   'migrations', 'script_versions',
   // Projects
@@ -1484,6 +1486,104 @@ async function migrateDefaultCompany(client: PoolClient): Promise<void> {
   await safeExec(client, 'idx_intelligence_insights_type',
     `CREATE INDEX IF NOT EXISTS idx_intelligence_insights_type ON intelligence_insights(insight_type, status)`);
 
+  // ── Observable Metrics: metrics_snapshots (investor-grade KPI time series) ──
+  // One row per (scope, day). Captures the five north-star metrics plus the raw
+  // counters they derive from so we can prove measurable improvement over time.
+  // Fully additive — absence simply means "no history yet".
+  console.log('🔧 [DB] Migration: metrics_snapshots table (Observable Metrics)...');
+  await safeExec(client, 'metrics_snapshots', `CREATE TABLE IF NOT EXISTS metrics_snapshots (
+    id SERIAL PRIMARY KEY,
+    company_id INTEGER,
+    project_id INTEGER,
+    snapshot_date DATE NOT NULL DEFAULT CURRENT_DATE,
+    heal_rate REAL DEFAULT 0,
+    repeat_break_rate REAL DEFAULT 0,
+    stable_selector_percentage REAL DEFAULT 0,
+    first_run_pass_rate REAL DEFAULT 0,
+    manual_hours_saved NUMERIC(12,2) DEFAULT 0,
+    total_tests_run INTEGER DEFAULT 0,
+    total_heals_performed INTEGER DEFAULT 0,
+    total_failures INTEGER DEFAULT 0,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+  )`);
+  await safeExec(client, 'uq_metrics_snapshots',
+    `CREATE UNIQUE INDEX IF NOT EXISTS uq_metrics_snapshots
+       ON metrics_snapshots(COALESCE(company_id, 0), COALESCE(project_id, 0), snapshot_date)`);
+  await safeExec(client, 'idx_metrics_snapshots_scope_date',
+    `CREATE INDEX IF NOT EXISTS idx_metrics_snapshots_scope_date
+       ON metrics_snapshots(COALESCE(company_id, 0), COALESCE(project_id, 0), snapshot_date DESC)`);
+
+  // ── Privacy Controls: learning_settings (cross-project learning scope) ──
+  // learning_scope ∈ {project | company | disabled}. Default 'project' keeps
+  // every customer's learning isolated to a single project. Enterprises that
+  // require zero shared learning set 'disabled'. Modeled on healing_settings:
+  // JSONB blob, scoped upsert, never throws on a missing table.
+  console.log('🔧 [DB] Migration: learning_settings table (Privacy Controls)...');
+  await safeExec(client, 'learning_settings', `CREATE TABLE IF NOT EXISTS learning_settings (
+    id SERIAL PRIMARY KEY,
+    company_id INTEGER,
+    project_id INTEGER,
+    settings JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+  )`);
+  await safeExec(client, 'idx_learning_settings_scope',
+    `CREATE UNIQUE INDEX IF NOT EXISTS idx_learning_settings_scope
+       ON learning_settings(COALESCE(company_id, 0), COALESCE(project_id, 0))`);
+
+  // ── Loop 2: page_failures (raw failure ledger feeding crawl intelligence) ──
+  // Every selector that breaks in production is logged here with its page so
+  // CrawlAdaptationService can learn which pages are flaky and which elements
+  // are volatile. Additive — readers tolerate an empty ledger.
+  console.log('🔧 [DB] Migration: page_failures table (Loop 2)...');
+  await safeExec(client, 'page_failures', `CREATE TABLE IF NOT EXISTS page_failures (
+    id SERIAL PRIMARY KEY,
+    company_id INTEGER,
+    project_id INTEGER,
+    page_url TEXT NOT NULL,
+    test_name TEXT,
+    failed_selector TEXT,
+    element_type TEXT,
+    error_type TEXT,
+    test_execution_id INTEGER,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+  )`);
+  await safeExec(client, 'idx_page_failures_scope_page',
+    `CREATE INDEX IF NOT EXISTS idx_page_failures_scope_page
+       ON page_failures(COALESCE(company_id, 0), COALESCE(project_id, 0), page_url)`);
+  await safeExec(client, 'idx_page_failures_created',
+    `CREATE INDEX IF NOT EXISTS idx_page_failures_created ON page_failures(created_at DESC)`);
+
+  // ── Loop 2: crawl_adaptations (learned per-page crawl configuration) ──
+  // The distilled output of analyzing page_failures: for each flaky page we
+  // store a recommended crawl depth (raised 3→5), whether to capture loading
+  // states / wait for animations, the volatile elements, and alternative
+  // selector strategies to retry. script-gen-engine merges these at crawl time.
+  console.log('🔧 [DB] Migration: crawl_adaptations table (Loop 2)...');
+  await safeExec(client, 'crawl_adaptations', `CREATE TABLE IF NOT EXISTS crawl_adaptations (
+    id SERIAL PRIMARY KEY,
+    company_id INTEGER,
+    project_id INTEGER,
+    page_url TEXT NOT NULL,
+    failure_count INTEGER DEFAULT 0,
+    is_flaky BOOLEAN DEFAULT FALSE,
+    recommended_depth INTEGER DEFAULT 3,
+    capture_loading_states BOOLEAN DEFAULT FALSE,
+    wait_for_animations BOOLEAN DEFAULT FALSE,
+    recommended_wait_ms INTEGER DEFAULT 2000,
+    volatile_elements JSONB NOT NULL DEFAULT '[]'::jsonb,
+    alternative_strategies JSONB NOT NULL DEFAULT '[]'::jsonb,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+  )`);
+  await safeExec(client, 'uq_crawl_adaptations',
+    `CREATE UNIQUE INDEX IF NOT EXISTS uq_crawl_adaptations
+       ON crawl_adaptations(COALESCE(company_id, 0), COALESCE(project_id, 0), page_url)`);
+  await safeExec(client, 'idx_crawl_adaptations_scope',
+    `CREATE INDEX IF NOT EXISTS idx_crawl_adaptations_scope
+       ON crawl_adaptations(COALESCE(company_id, 0), COALESCE(project_id, 0))`);
+
   const projectIdIndexes = [
     `CREATE INDEX IF NOT EXISTS idx_pc_project ON project_contexts(project_id)`,
     `CREATE INDEX IF NOT EXISTS idx_gs_project ON generated_scripts(project_id)`,
@@ -2229,6 +2329,30 @@ export async function logHealing(data: HealingAction, companyId?: number): Promi
       companyId: companyId ?? null,
       projectId: data.project_id ?? null,
     }).catch(() => { /* non-fatal */ });
+  }
+
+  // Loop 2 (Test Failures → Crawl Intelligence): a heal means a selector broke
+  // on some page. Record it in the page-level failure ledger so the
+  // CrawlAdaptationService can later learn which pages are flaky. healing_actions
+  // has no page_url column, so we key by page_url when supplied (data.page_url),
+  // otherwise fall back to test_name. Gated by learning_scope (no-op when
+  // 'disabled'). Fire-and-forget — never let learning break healing logging.
+  const failurePageKey = (data as any).page_url || data.test_name;
+  if (failurePageKey) {
+    void getLearningScope(companyId ?? undefined, data.project_id ?? undefined)
+      .then((scope) => {
+        if (scope === 'disabled') return;
+        return recordPageFailure({
+          pageUrl: failurePageKey,
+          testName: data.test_name ?? null,
+          failedSelector: data.failed_locator ?? null,
+          errorType: data.error_context ?? null,
+          testExecutionId: data.test_execution_id ?? null,
+          companyId: companyId ?? null,
+          projectId: data.project_id ?? null,
+        });
+      })
+      .catch(() => { /* non-fatal */ });
   }
 
   return result.rows[0].id;
@@ -5332,6 +5456,304 @@ export async function upsertHealingSettings(
     [companyId ?? null, projectId ?? null, JSON.stringify(merged)]
   );
   return merged;
+}
+
+/* ────────────────────────────────────────────────────────────────────────── */
+/*  Privacy Controls — learning_settings (cross-project learning scope)         */
+/*  learning_scope: 'project' (default, isolated) | 'company' | 'disabled'.     */
+/*  Modeled on healing_settings: JSONB blob, scoped upsert, never throws on a   */
+/*  missing table. Enterprises that forbid shared learning set 'disabled'.      */
+/* ────────────────────────────────────────────────────────────────────────── */
+
+export type LearningScope = 'project' | 'company' | 'disabled';
+
+export interface LearningSettings {
+  /** How widely learning (failures, adaptations, patterns) may be shared. */
+  learningScope: LearningScope;
+}
+
+export const DEFAULT_LEARNING_SETTINGS: LearningSettings = {
+  // Default isolates every customer's learning to a single project.
+  learningScope: 'project',
+};
+
+/** Read learning settings for a scope, merged over defaults (never throws on missing table). */
+export async function getLearningSettings(companyId?: number, projectId?: number): Promise<LearningSettings> {
+  const pool = getPool();
+  try {
+    const r = await pool.query(
+      `SELECT settings FROM learning_settings
+       WHERE COALESCE(company_id, 0) = COALESCE($1, 0)
+         AND COALESCE(project_id, 0) = COALESCE($2, 0)
+       LIMIT 1`,
+      [companyId ?? null, projectId ?? null]
+    );
+    const stored = r.rows[0]?.settings || {};
+    return { ...DEFAULT_LEARNING_SETTINGS, ...stored };
+  } catch (err: any) {
+    if (err?.code === '42P01' || err?.message?.includes('does not exist')) {
+      return { ...DEFAULT_LEARNING_SETTINGS };
+    }
+    throw err;
+  }
+}
+
+/** Convenience: just the effective learning scope for a (company, project). */
+export async function getLearningScope(companyId?: number, projectId?: number): Promise<LearningScope> {
+  const s = await getLearningSettings(companyId, projectId);
+  return s.learningScope;
+}
+
+/** Upsert learning settings for a scope. Returns the merged effective settings. */
+export async function upsertLearningSettings(
+  settings: Partial<LearningSettings>, companyId?: number, projectId?: number
+): Promise<LearningSettings> {
+  const pool = getPool();
+  const current = await getLearningSettings(companyId, projectId);
+  const merged: LearningSettings = { ...current, ...settings };
+  await pool.query(
+    `INSERT INTO learning_settings (company_id, project_id, settings, created_at, updated_at)
+     VALUES ($1, $2, $3::jsonb, NOW(), NOW())
+     ON CONFLICT (COALESCE(company_id, 0), COALESCE(project_id, 0))
+     DO UPDATE SET settings = $3::jsonb, updated_at = NOW()`,
+    [companyId ?? null, projectId ?? null, JSON.stringify(merged)]
+  );
+  return merged;
+}
+
+/* ────────────────────────────────────────────────────────────────────────── */
+/*  Observable Metrics — metrics_snapshots                                      */
+/* ────────────────────────────────────────────────────────────────────────── */
+
+export interface MetricsSnapshot {
+  heal_rate: number;
+  repeat_break_rate: number;
+  stable_selector_percentage: number;
+  first_run_pass_rate: number;
+  manual_hours_saved: number;
+  total_tests_run: number;
+  total_heals_performed: number;
+  total_failures: number;
+}
+
+/** Build a "scope filter" SQL fragment + params for COALESCE-based scope matching. */
+function scopeFilter(companyId?: number, projectId?: number, startIdx = 1): { sql: string; params: any[] } {
+  return {
+    sql: `COALESCE(company_id, 0) = COALESCE($${startIdx}, 0) AND COALESCE(project_id, 0) = COALESCE($${startIdx + 1}, 0)`,
+    params: [companyId ?? null, projectId ?? null],
+  };
+}
+
+/** Idempotent daily upsert of a metrics snapshot for a (company, project) scope. */
+export async function insertMetricsSnapshot(
+  m: MetricsSnapshot, companyId?: number, projectId?: number, snapshotDate?: string
+): Promise<void> {
+  const pool = getPool();
+  try {
+    await pool.query(
+      `INSERT INTO metrics_snapshots
+        (company_id, project_id, snapshot_date, heal_rate, repeat_break_rate,
+         stable_selector_percentage, first_run_pass_rate, manual_hours_saved,
+         total_tests_run, total_heals_performed, total_failures, created_at, updated_at)
+       VALUES ($1, $2, COALESCE($3::date, CURRENT_DATE), $4, $5, $6, $7, $8, $9, $10, $11, NOW(), NOW())
+       ON CONFLICT (COALESCE(company_id, 0), COALESCE(project_id, 0), snapshot_date)
+       DO UPDATE SET heal_rate = $4, repeat_break_rate = $5, stable_selector_percentage = $6,
+         first_run_pass_rate = $7, manual_hours_saved = $8, total_tests_run = $9,
+         total_heals_performed = $10, total_failures = $11, updated_at = NOW()`,
+      [companyId ?? null, projectId ?? null, snapshotDate ?? null,
+       m.heal_rate, m.repeat_break_rate, m.stable_selector_percentage, m.first_run_pass_rate,
+       m.manual_hours_saved, m.total_tests_run, m.total_heals_performed, m.total_failures]
+    );
+  } catch (err: any) {
+    if (err?.code === '42P01' || err?.message?.includes('does not exist')) return;
+    throw err;
+  }
+}
+
+/** Most recent stored snapshot for a scope, or null. */
+export async function getLatestMetricsSnapshot(companyId?: number, projectId?: number): Promise<any | null> {
+  const pool = getPool();
+  const sf = scopeFilter(companyId, projectId);
+  try {
+    const r = await pool.query(
+      `SELECT * FROM metrics_snapshots WHERE ${sf.sql} ORDER BY snapshot_date DESC LIMIT 1`,
+      sf.params
+    );
+    return r.rows[0] || null;
+  } catch (err: any) {
+    if (err?.code === '42P01' || err?.message?.includes('does not exist')) return null;
+    throw err;
+  }
+}
+
+/** Daily snapshots for the last N days for a scope (oldest → newest). */
+export async function getMetricsTrends(days: number, companyId?: number, projectId?: number): Promise<any[]> {
+  const pool = getPool();
+  const sf = scopeFilter(companyId, projectId);
+  const safeDays = Math.max(1, Math.min(days || 30, 365));
+  try {
+    const r = await pool.query(
+      `SELECT * FROM metrics_snapshots
+       WHERE ${sf.sql} AND snapshot_date >= CURRENT_DATE - ($3::int - 1)
+       ORDER BY snapshot_date ASC`,
+      [...sf.params, safeDays]
+    );
+    return r.rows;
+  } catch (err: any) {
+    if (err?.code === '42P01' || err?.message?.includes('does not exist')) return [];
+    throw err;
+  }
+}
+
+/* ────────────────────────────────────────────────────────────────────────── */
+/*  Loop 2 — page_failures (raw ledger) + crawl_adaptations (learned config)    */
+/* ────────────────────────────────────────────────────────────────────────── */
+
+export interface PageFailureInput {
+  pageUrl: string;
+  testName?: string | null;
+  failedSelector?: string | null;
+  elementType?: string | null;
+  errorType?: string | null;
+  testExecutionId?: number | null;
+  companyId?: number | null;
+  projectId?: number | null;
+}
+
+/** Append a page-level failure. Fire-and-forget safe — never throws on missing table. */
+export async function recordPageFailure(f: PageFailureInput): Promise<void> {
+  if (!f.pageUrl) return;
+  const pool = getPool();
+  try {
+    await pool.query(
+      `INSERT INTO page_failures
+        (company_id, project_id, page_url, test_name, failed_selector, element_type, error_type, test_execution_id, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())`,
+      [f.companyId ?? null, f.projectId ?? null, f.pageUrl, f.testName ?? null,
+       f.failedSelector ?? null, f.elementType ?? null, f.errorType ?? null, f.testExecutionId ?? null]
+    );
+  } catch (err: any) {
+    if (err?.code === '42P01' || err?.message?.includes('does not exist')) return;
+    // Never let failure logging break the caller.
+    logger.warn(MOD, `recordPageFailure failed: ${err?.message || err}`);
+  }
+}
+
+/** Aggregate failure stats per page for a scope within the last N days. */
+export async function getPageFailureStats(
+  days: number, companyId?: number, projectId?: number
+): Promise<Array<{ page_url: string; failure_count: number; distinct_selectors: number;
+                   volatile_selectors: Array<{ selector: string; count: number }> }>> {
+  const pool = getPool();
+  const sf = scopeFilter(companyId, projectId);
+  const safeDays = Math.max(1, Math.min(days || 30, 365));
+  try {
+    const r = await pool.query(
+      `SELECT page_url,
+              COUNT(*)::int AS failure_count,
+              COUNT(DISTINCT failed_selector)::int AS distinct_selectors
+       FROM page_failures
+       WHERE ${sf.sql} AND created_at >= NOW() - ($3::int || ' days')::interval
+       GROUP BY page_url
+       ORDER BY failure_count DESC`,
+      [...sf.params, safeDays]
+    );
+    const out: Array<{ page_url: string; failure_count: number; distinct_selectors: number;
+                       volatile_selectors: Array<{ selector: string; count: number }> }> = [];
+    for (const row of r.rows) {
+      const sel = await pool.query(
+        `SELECT failed_selector AS selector, COUNT(*)::int AS count
+         FROM page_failures
+         WHERE ${sf.sql} AND page_url = $3 AND failed_selector IS NOT NULL
+           AND created_at >= NOW() - ($4::int || ' days')::interval
+         GROUP BY failed_selector ORDER BY count DESC LIMIT 10`,
+        [...sf.params, row.page_url, safeDays]
+      );
+      out.push({
+        page_url: row.page_url,
+        failure_count: row.failure_count,
+        distinct_selectors: row.distinct_selectors,
+        volatile_selectors: sel.rows,
+      });
+    }
+    return out;
+  } catch (err: any) {
+    if (err?.code === '42P01' || err?.message?.includes('does not exist')) return [];
+    throw err;
+  }
+}
+
+export interface CrawlAdaptationInput {
+  pageUrl: string;
+  failureCount: number;
+  isFlaky: boolean;
+  recommendedDepth: number;
+  captureLoadingStates: boolean;
+  waitForAnimations: boolean;
+  recommendedWaitMs: number;
+  volatileElements: Array<{ selector: string; count: number }>;
+  alternativeStrategies: string[];
+  companyId?: number | null;
+  projectId?: number | null;
+}
+
+/** Upsert a learned crawl adaptation for a page (unique per scope+page_url). */
+export async function upsertCrawlAdaptation(a: CrawlAdaptationInput): Promise<void> {
+  const pool = getPool();
+  try {
+    await pool.query(
+      `INSERT INTO crawl_adaptations
+        (company_id, project_id, page_url, failure_count, is_flaky, recommended_depth,
+         capture_loading_states, wait_for_animations, recommended_wait_ms,
+         volatile_elements, alternative_strategies, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11::jsonb, NOW(), NOW())
+       ON CONFLICT (COALESCE(company_id, 0), COALESCE(project_id, 0), page_url)
+       DO UPDATE SET failure_count = $4, is_flaky = $5, recommended_depth = $6,
+         capture_loading_states = $7, wait_for_animations = $8, recommended_wait_ms = $9,
+         volatile_elements = $10::jsonb, alternative_strategies = $11::jsonb, updated_at = NOW()`,
+      [a.companyId ?? null, a.projectId ?? null, a.pageUrl, a.failureCount, a.isFlaky,
+       a.recommendedDepth, a.captureLoadingStates, a.waitForAnimations, a.recommendedWaitMs,
+       JSON.stringify(a.volatileElements ?? []), JSON.stringify(a.alternativeStrategies ?? [])]
+    );
+  } catch (err: any) {
+    if (err?.code === '42P01' || err?.message?.includes('does not exist')) return;
+    throw err;
+  }
+}
+
+/** Read the learned adaptation for a single page URL (or null). Never throws on missing table. */
+export async function getCrawlAdaptation(
+  pageUrl: string, companyId?: number, projectId?: number
+): Promise<any | null> {
+  if (!pageUrl) return null;
+  const pool = getPool();
+  const sf = scopeFilter(companyId, projectId);
+  try {
+    const r = await pool.query(
+      `SELECT * FROM crawl_adaptations WHERE ${sf.sql} AND page_url = $3 LIMIT 1`,
+      [...sf.params, pageUrl]
+    );
+    return r.rows[0] || null;
+  } catch (err: any) {
+    if (err?.code === '42P01' || err?.message?.includes('does not exist')) return null;
+    throw err;
+  }
+}
+
+/** List all learned adaptations for a scope (most-recently updated first). */
+export async function getCrawlAdaptations(companyId?: number, projectId?: number): Promise<any[]> {
+  const pool = getPool();
+  const sf = scopeFilter(companyId, projectId);
+  try {
+    const r = await pool.query(
+      `SELECT * FROM crawl_adaptations WHERE ${sf.sql} ORDER BY updated_at DESC`,
+      sf.params
+    );
+    return r.rows;
+  } catch (err: any) {
+    if (err?.code === '42P01' || err?.message?.includes('does not exist')) return [];
+    throw err;
+  }
 }
 
 /**
