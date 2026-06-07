@@ -36,6 +36,7 @@ import {
   type EmbeddingProvider,
 } from '../../services/script-migration';
 import { updateScriptContent, saveScriptVersion } from '../../db/postgres';
+import { learnFromMigrationReplacements } from '../../services/maintenance-pattern-service';
 
 const MOD = 'Migrations';
 
@@ -266,6 +267,17 @@ export function createMigrationsRouter(): Router {
             const ok = await updateScriptContent(sid, diff.newScriptContent, r.files_generated, companyId, projectId);
             if (ok) updatedCount++;
           }
+        }
+      }
+
+      // Loop 3: a real (non-dry-run) migration is a rich source of confident
+      // old→new selector rewrites — learn them all into the pattern library so
+      // the healing engine can reuse them instantly. Fire-and-forget.
+      if (!dryRun && diffs.length) {
+        const replacements = diffs.flatMap((d: any) => Array.isArray(d.replacements) ? d.replacements : []);
+        if (replacements.length) {
+          learnFromMigrationReplacements(replacements, { companyId, projectId }).catch((e) =>
+            logger.warn(MOD, 'pattern learning failed', { error: e?.message }));
         }
       }
 

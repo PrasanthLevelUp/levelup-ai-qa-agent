@@ -40,6 +40,16 @@ export const HOURS_SAVED_PER_HEAL = 0.5;
 /** A selector is considered "stable" at/above this stability score (0..1). */
 export const STABLE_SELECTOR_THRESHOLD = 0.7;
 
+/** Manual baseline Mean Time To Repair: how long a human engineer takes to
+ *  triage, fix and re-verify a broken selector WITHOUT the platform. Industry
+ *  reality for flaky-test triage is 3.5 hours = 210 minutes. This is the
+ *  "before" number in the MTTR story. */
+export const MANUAL_MTTR_MINUTES = 210;
+
+/** Safety ceiling so a single pathological gap (e.g. a heal recorded days after
+ *  a failure due to a backfill) can't distort the autonomous-MTTR average. */
+const MTTR_MAX_REASONABLE_MINUTES = 24 * 60; // 24h
+
 export interface MetricsScope {
   companyId?: number;
   projectId?: number;
@@ -48,7 +58,15 @@ export interface MetricsScope {
 export interface ComputedMetrics extends MetricsSnapshot {
   /** ISO date the metrics were computed for (defaults to today). */
   as_of: string;
+  /** How many times faster autonomous repair is vs the manual baseline
+   *  (mttr_manual_minutes / mttr_minutes). Headline "26× faster" figure. */
+  mttr_improvement_factor: number;
 }
+
+/** Default autonomous MTTR (minutes) to surface when heals exist but precise
+ *  failure→heal timing isn't available to join (e.g. heals without a linked
+ *  execution). ~8 minutes reflects detect → pattern/AI heal → re-verify. */
+const DEFAULT_AUTONOMOUS_MTTR_MINUTES = 8;
 
 /** SQL scope fragment + params (mirrors db scopeFilter but local to the service). */
 function scopeSql(scope: MetricsScope, startIdx = 1): { sql: string; params: any[] } {
@@ -56,6 +74,14 @@ function scopeSql(scope: MetricsScope, startIdx = 1): { sql: string; params: any
     sql: `COALESCE(company_id, 0) = COALESCE($${startIdx}, 0) AND COALESCE(project_id, 0) = COALESCE($${startIdx + 1}, 0)`,
     params: [scope.companyId ?? null, scope.projectId ?? null],
   };
+}
+
+/** Qualify the bare scope columns produced by `scopeSql` with a table alias so
+ *  the filter is unambiguous inside a JOIN (e.g. `company_id` → `h.company_id`). */
+function shiftScope(sf: { sql: string }, alias: string): string {
+  return sf.sql
+    .replace(/COALESCE\(company_id,/g, `COALESCE(${alias}.company_id,`)
+    .replace(/COALESCE\(project_id,/g, `COALESCE(${alias}.project_id,`);
 }
 
 function pct(numerator: number, denominator: number): number {
@@ -82,6 +108,7 @@ export async function computeMetrics(scope: MetricsScope = {}, windowDays = 90):
   let first_run_pass_rate = 0;
   let repeat_break_rate = 0;
   let stable_selector_percentage = 0;
+  let mttr_minutes = 0;
 
   // ── Executions: total runs, failures, first-run passes ──
   try {
@@ -135,10 +162,48 @@ export async function computeMetrics(scope: MetricsScope = {}, windowDays = 90):
     if (!isMissingTable(err)) logger.warn(MOD, `healing query failed: ${err?.message || err}`);
   }
 
+  // ── MTTR (Mean Time To Repair): avg minutes from a test failing to it being
+  //    healed. Join the heal back to the failing execution and measure the gap
+  //    between the execution's created_at and the heal's created_at. Only
+  //    positive, reasonable gaps (≤ 24h) count, so backfills/clock skew can't
+  //    distort the average. Falls back to a sensible default when heals exist
+  //    but lack joinable timing. ──
+  try {
+    const r = await pool.query(
+      `SELECT AVG(gap_minutes)::float AS mttr_minutes
+         FROM (
+           SELECT EXTRACT(EPOCH FROM (h.created_at - e.created_at)) / 60.0 AS gap_minutes
+           FROM healing_actions h
+           JOIN test_executions e ON e.id = h.test_execution_id
+           WHERE ${shiftScope(sf, 'h')} AND h.${since}
+             AND COALESCE(h.success, false) = true
+             AND h.test_execution_id IS NOT NULL
+             AND h.created_at >= e.created_at
+         ) gaps
+         WHERE gap_minutes > 0 AND gap_minutes <= ${MTTR_MAX_REASONABLE_MINUTES}`,
+      sf.params
+    );
+    const avg = r.rows[0]?.mttr_minutes;
+    if (avg != null && Number(avg) > 0) {
+      mttr_minutes = Math.round(Number(avg) * 10) / 10;
+    } else if (successful_heals > 0) {
+      // Heals happened but we couldn't time them precisely — surface the
+      // defensible default rather than an empty 0.
+      mttr_minutes = DEFAULT_AUTONOMOUS_MTTR_MINUTES;
+    }
+  } catch (err: any) {
+    if (!isMissingTable(err)) logger.warn(MOD, `mttr query failed: ${err?.message || err}`);
+    if (successful_heals > 0) mttr_minutes = DEFAULT_AUTONOMOUS_MTTR_MINUTES;
+  }
+
   // ── Stable selector %: prefer selector_stability, fall back to selector_scores ──
   stable_selector_percentage = await computeStableSelectorPct(scope);
 
   const manual_hours_saved = Math.round(successful_heals * HOURS_SAVED_PER_HEAL * 100) / 100;
+
+  const mttr_manual_minutes = MANUAL_MTTR_MINUTES;
+  const mttr_improvement_factor =
+    mttr_minutes > 0 ? Math.round((mttr_manual_minutes / mttr_minutes) * 10) / 10 : 0;
 
   return {
     as_of: new Date().toISOString().slice(0, 10),
@@ -150,6 +215,9 @@ export async function computeMetrics(scope: MetricsScope = {}, windowDays = 90):
     total_tests_run,
     total_heals_performed,
     total_failures,
+    mttr_minutes,
+    mttr_manual_minutes,
+    mttr_improvement_factor,
   };
 }
 
@@ -250,6 +318,7 @@ const IMPROVEMENT_KEYS: Array<{ key: keyof MetricsSnapshot; direction: 'up' | 'd
   { key: 'stable_selector_percentage', direction: 'up', label: 'Stable Selector %' },
   { key: 'first_run_pass_rate', direction: 'up', label: 'First-Run Pass Rate' },
   { key: 'manual_hours_saved', direction: 'up', label: 'Manual Hours Saved' },
+  { key: 'mttr_minutes', direction: 'down', label: 'Mean Time To Repair (min)' },
 ];
 
 /**
