@@ -51,23 +51,6 @@ export interface CrawlConfig {
    * by the callback are swallowed so logging can never break a crawl.
    */
   onLog?: (message: string) => void;
-
-  /**
-   * Loop 2 (Test Failures → Crawl Intelligence): when set, this crawl is using
-   * a LEARNED adaptation for a page that has proven flaky in production. It
-   * raises the depth cap from 3 → 5 so deep/dynamic flows get captured, and
-   * allows a longer post-load wait. Set automatically by the generation engine
-   * when CrawlAdaptationService recommends it; defaults off (behaviour unchanged).
-   */
-  adaptive?: boolean;
-  /**
-   * When `adaptive` is set, capture loading states (the crawler already waits
-   * for networkidle; this also applies the longer `waitAfterLoad`) so dynamic
-   * content has settled before extraction.
-   */
-  captureLoadingStates?: boolean;
-  /** When `adaptive` is set, give animations extra time to finish before extracting. */
-  waitForAnimations?: boolean;
 }
 
 /**
@@ -634,16 +617,11 @@ export class PageCrawler {
   };
 
   constructor(config: CrawlConfig) {
-    // Loop 2: flaky pages get an adaptive crawl — a deeper depth cap (5 instead
-    // of 3) and a longer post-load wait cap so dynamic content / animations have
-    // time to settle. Non-adaptive crawls keep the original, conservative caps.
-    const depthCap = config.adaptive ? 5 : 3;
-    const waitCap = config.adaptive ? 8000 : 5000;
     this.config = {
       ...config,
-      maxDepth: Math.min(config.maxDepth ?? 1, depthCap),
+      maxDepth: Math.min(config.maxDepth ?? 1, 3), // cap depth at 3 to bound deep crawls
       timeout: Math.min(config.timeout ?? 15000, 30000), // cap at 30s
-      waitAfterLoad: Math.min(config.waitAfterLoad ?? 2000, waitCap),
+      waitAfterLoad: Math.min(config.waitAfterLoad ?? 2000, 5000),
       captureScreenshot: config.captureScreenshot ?? true,
       followLinks: config.followLinks ?? false,
       maxPages: Math.min(config.maxPages ?? 5, 15), // cap at 15 pages
@@ -1155,6 +1133,22 @@ export class PageCrawler {
 
     let elements: PageElement[] = [];
     try { const raw = await runPageScript(page, EXTRACT_ELEMENTS_SCRIPT); elements = Array.isArray(raw) ? raw : []; } catch (e) { errors.push(`Element extraction: ${(e as Error).message}`); }
+
+    // SPA resilience: heavy Angular/React apps (e.g. OrangeHRM) often finish
+    // rendering interactive content AFTER networkidle + the fixed settle delay.
+    // If the first extraction found nothing, give the framework more time and
+    // try once more before giving up — this is the common cause of "0 elements".
+    if (elements.length === 0) {
+      try {
+        await page.waitForSelector('a,button,input,select,textarea,[role="button"]', { timeout: 8000 }).catch(() => {});
+        await page.waitForTimeout(2500);
+        const raw = await runPageScript(page, EXTRACT_ELEMENTS_SCRIPT);
+        elements = Array.isArray(raw) ? raw : [];
+        if (elements.length > 0) {
+          logger.info(MOD, 'SPA re-extraction recovered elements', { url, count: elements.length });
+        }
+      } catch (e) { errors.push(`Element re-extraction: ${(e as Error).message}`); }
+    }
 
     let formInfos: any[] = [];
     try { const raw = await runPageScript(page, EXTRACT_FORMS_SCRIPT); formInfos = Array.isArray(raw) ? raw : []; } catch (e) { errors.push(`Form extraction: ${(e as Error).message}`); }

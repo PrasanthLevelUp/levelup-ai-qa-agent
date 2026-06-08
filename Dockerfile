@@ -1,4 +1,8 @@
-FROM mcr.microsoft.com/playwright:v1.52.0-jammy
+# IMPORTANT: keep this image tag in lock-step with the "playwright" version in
+# package.json. A mismatch (e.g. image v1.52 + npm 1.59) ships a chromium build
+# that the installed Playwright can't launch ("Executable doesn't exist…"),
+# which made deep crawls fail intermittently in production.
+FROM mcr.microsoft.com/playwright:v1.59.1-jammy
 
 WORKDIR /app
 
