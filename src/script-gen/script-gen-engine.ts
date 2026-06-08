@@ -248,12 +248,12 @@ export class ScriptGenEngine {
           projectId: config.projectId ?? undefined,
         });
         if (adaptation && adaptation.isFlaky) {
-          crawlConfig.adaptive = true;
+          (crawlConfig as any).adaptive = true;
           crawlConfig.maxDepth = adaptation.recommendedDepth;
           crawlConfig.maxPages = Math.max(crawlConfig.maxPages ?? 3, adaptation.recommendedDepth);
           crawlConfig.waitAfterLoad = adaptation.recommendedWaitMs;
-          crawlConfig.captureLoadingStates = adaptation.captureLoadingStates;
-          crawlConfig.waitForAnimations = adaptation.waitForAnimations;
+          (crawlConfig as any).captureLoadingStates = adaptation.captureLoadingStates;
+          (crawlConfig as any).waitForAnimations = adaptation.waitForAnimations;
           logger.info(MOD, '🧭 Applying learned crawl adaptation (flaky page)', {
             url: config.url,
             recommendedDepth: adaptation.recommendedDepth,
