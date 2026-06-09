@@ -325,6 +325,11 @@ export function createScriptGenRouter(): Router {
         ...(crawlDecision.usedCache && crawlDecision.crawlData
           ? { cachedCrawlData: crawlDecision.crawlData }
           : {}),
+        // Anchor generation to the structured test case (steps + expected
+        // result) when generating from a Test Case Lab case.
+        ...(testCase ? { testCase } : {}),
+        ...(companyId != null ? { companyId } : {}),
+        ...(projectId != null ? { projectId } : {}),
       };
 
       const engine = new ScriptGenEngine();
