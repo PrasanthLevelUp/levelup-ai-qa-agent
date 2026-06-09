@@ -37,6 +37,7 @@ import {
   deleteRequirementTestCases,
   setRequirementGenerationState,
   getApplicationProfileForGeneration,
+  getProfileById,
 } from '../../db/postgres';
 import { buildApplicationProfileContext } from '../../utils/application-profile-context';
 import { ExportService } from '../../services/export-service';
@@ -65,6 +66,8 @@ export function createTestCoverageRouter(): Router {
         includeCoverageGaps,
         requirementId,
         force,
+        useAppProfile,   // optional: explicitly disable (false) the application-profile grounding
+        appProfileId,    // optional: pin a specific crawled profile instead of auto-picking the freshest
       } = req.body;
 
       if (!title || !description) {
@@ -182,7 +185,27 @@ export function createTestCoverageRouter(): Router {
       // to the previous generic behaviour.
       let appProfileUsed: { id: string; name?: string | null; pageCount?: number; totalElements?: number; totalForms?: number } | null = null;
       try {
-        const profile = await getApplicationProfileForGeneration(companyId, projectId);
+        // Profile selection precedence:
+        //   1. useAppProfile === false → skip grounding entirely (user opted out)
+        //   2. appProfileId provided    → pin that specific crawled profile (scope-checked)
+        //   3. default                  → auto-pick the freshest profile for this project
+        let profile = null;
+        if (useAppProfile === false) {
+          profile = null;
+        } else if (appProfileId) {
+          const pinned = await getProfileById(String(appProfileId));
+          // Scope guard: only honour a pinned profile that belongs to this company/project
+          const sameCompany = !pinned?.company_id || pinned.company_id === companyId;
+          const sameProject = !projectId || !pinned?.project_id || pinned.project_id === projectId;
+          if (pinned && sameCompany && sameProject) {
+            profile = pinned;
+          } else {
+            logger.warn(MOD, 'Requested appProfileId not accessible — falling back to auto-pick', { appProfileId });
+            profile = await getApplicationProfileForGeneration(companyId, projectId);
+          }
+        } else {
+          profile = await getApplicationProfileForGeneration(companyId, projectId);
+        }
         const profileCtx = buildApplicationProfileContext(profile);
         if (profile && profileCtx) {
           knowledge.applicationProfile = profileCtx;
