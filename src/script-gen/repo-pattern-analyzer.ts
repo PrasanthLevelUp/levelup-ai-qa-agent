@@ -32,6 +32,7 @@
  *   when there's nothing useful, so callers fall back to generic generation).
  */
 
+import * as crypto from 'crypto';
 import type {
   RepositoryProfile,
   ClassInfo,
@@ -96,19 +97,45 @@ const CACHE = new Map<string, CacheEntry>();
 const CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutes — profiles change rarely
 const CACHE_MAX = 100;
 
-/** Cheap fingerprint of the fields that affect the distilled guide. */
+/**
+ * CONTENT fingerprint of the fields that affect the distilled guide.
+ *
+ * SECURITY / CORRECTNESS — why we hash actual content (not just counts):
+ * `RepositoryProfile` carries NO tenant identifiers (no company/project/repo id),
+ * so the cache key MUST be derived from the profile's content alone. An earlier
+ * version keyed only on *counts* (e.g. `helperFunctions.length`), which meant two
+ * different repositories that happened to share framework/language/style and the
+ * same number of helpers/page-objects/fixtures would collide — and the cached
+ * guide embeds the FIRST repo's real helper names, page-object names and file
+ * paths. That is a cross-tenant data-leak: tenant B's generation prompt could be
+ * seeded with tenant A's repo internals.
+ *
+ * We therefore fold the *identifying content* (names + file paths + locator
+ * patterns/examples + folder layout + style) into a SHA-256 digest. Different
+ * repositories produce different digests, so a collision is cryptographically
+ * improbable while identical profiles still hit the cache (the optimisation we
+ * actually want). Only stable, guide-affecting fields are included.
+ */
 function fingerprint(profile: RepositoryProfile): string {
   const s = profile.codingStyle;
-  return [
-    profile.framework, profile.language, profile.testPattern, profile.locatorStrategy,
-    profile.assertionLibrary,
-    profile.helperFunctions?.length ?? 0,
-    profile.pageObjects?.length ?? 0,
-    profile.fixtures?.length ?? 0,
-    (profile.preferredLocators?.length ?? 0),
-    s ? `${s.namingConvention}|${s.testNaming}|${s.stepStyle}|${s.quoteStyle}|${s.semicolons}|${s.tagConvention}` : 'no-style',
-    profile.folderStructure?.testFolder ?? '',
-  ].join('::');
+  const sig = {
+    framework: profile.framework,
+    language: profile.language,
+    testPattern: profile.testPattern,
+    locatorStrategy: profile.locatorStrategy,
+    assertionLibrary: profile.assertionLibrary,
+    // Actual identifying content — names + paths, not just counts.
+    helpers: (profile.helperFunctions || []).map((h) => `${h.name}@${h.filePath}`),
+    pageObjects: (profile.pageObjects || []).map((p) => `${p.name}@${p.filePath}`),
+    fixtures: (profile.fixtures || []).map((f) => `${f.name}@${f.filePath}`),
+    preferredLocators: (profile.preferredLocators || []).map((l) => `${l.pattern}|${l.example ?? ''}`),
+    avoidPatterns: profile.avoidPatterns || [],
+    style: s
+      ? `${s.namingConvention}|${s.testNaming}|${s.stepStyle}|${s.quoteStyle}|${s.semicolons}|${s.tagConvention}`
+      : 'no-style',
+    folders: profile.folderStructure || null,
+  };
+  return crypto.createHash('sha256').update(JSON.stringify(sig)).digest('hex');
 }
 
 /* -------------------------------------------------------------------------- */

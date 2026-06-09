@@ -131,6 +131,56 @@ const g1 = analyzeRepoPatterns(baseProfile);
 const g2 = analyzeRepoPatterns(baseProfile);
 assert(g1 === g2, 'same profile fingerprint returns the cached guide instance');
 
+console.log('\n=== Cache isolation: same shape, different content must NOT collide ===');
+// Two repos that share framework/language/style AND identical counts
+// (1 helper, 1 page object, 1 fixture, 2 preferred locators) but reference
+// completely different helper/page-object names + file paths. The old
+// count-based fingerprint would have collided and leaked repo A's internals
+// into repo B's guide. The content fingerprint must keep them separate.
+clearRepoPatternCache();
+const tenantA: RepositoryProfile = {
+  ...baseProfile,
+  helperFunctions: [
+    { name: 'loginAsAdmin', filePath: 'utils/admin-auth.ts', params: ['page'], returnType: 'Promise<void>', isExported: true, isAsync: true, lineNumber: 1 } as any,
+  ],
+  pageObjects: [
+    { name: 'AdminDashboardPage', filePath: 'pages/admin-dashboard.page.ts', isExported: true, baseClass: null, methods: [{ name: 'openSettings' } as any], properties: [], category: 'page-object', lineNumber: 1 } as any,
+  ],
+  fixtures: [{ name: 'adminSession', filePath: 'fixtures/admin.ts' } as any],
+} as RepositoryProfile;
+
+const tenantB: RepositoryProfile = {
+  ...baseProfile,
+  helperFunctions: [
+    { name: 'checkoutCart', filePath: 'utils/checkout.ts', params: ['page'], returnType: 'Promise<void>', isExported: true, isAsync: true, lineNumber: 1 } as any,
+  ],
+  pageObjects: [
+    { name: 'StorefrontPage', filePath: 'pages/storefront.page.ts', isExported: true, baseClass: null, methods: [{ name: 'addToCart' } as any], properties: [], category: 'page-object', lineNumber: 1 } as any,
+  ],
+  fixtures: [{ name: 'guestSession', filePath: 'fixtures/guest.ts' } as any],
+} as RepositoryProfile;
+
+const guideA = analyzeRepoPatterns(tenantA);
+const guideB = analyzeRepoPatterns(tenantB);
+assert(!!guideA && !!guideB, 'both tenant guides produced');
+assert(guideA !== guideB, 'different content yields different cached instances (no collision)');
+assert(
+  guideA!.promptBlock.includes('loginAsAdmin') && guideA!.promptBlock.includes('AdminDashboardPage'),
+  "tenant A guide contains ONLY tenant A's helpers/page-objects",
+);
+assert(
+  !guideA!.promptBlock.includes('checkoutCart') && !guideA!.promptBlock.includes('StorefrontPage'),
+  "tenant A guide does NOT leak tenant B's repo internals",
+);
+assert(
+  guideB!.promptBlock.includes('checkoutCart') && guideB!.promptBlock.includes('StorefrontPage'),
+  "tenant B guide contains ONLY tenant B's helpers/page-objects",
+);
+assert(
+  !guideB!.promptBlock.includes('loginAsAdmin') && !guideB!.promptBlock.includes('AdminDashboardPage'),
+  "tenant B guide does NOT leak tenant A's repo internals",
+);
+
 /* ------------------------------------------------------------------ */
 /*  Summary                                                            */
 /* ------------------------------------------------------------------ */
