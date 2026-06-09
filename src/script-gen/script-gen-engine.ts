@@ -429,6 +429,10 @@ export class ScriptGenEngine {
    */
   private buildRepoPatternBlock(config: GenerationConfig): string {
     if (!config.repoProfile) return '';
+    // Token optimization: `repoIntelligence` (the freeform context) already
+    // carries the repo's conventions. Only add the distilled guide when that
+    // freeform block is absent, so we never pay for the same info twice.
+    if (config.repoIntelligence) return '';
     try {
       const guide = analyzeRepoPatterns(config.repoProfile);
       if (!guide) return '';
