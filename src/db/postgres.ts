@@ -1547,6 +1547,24 @@ async function migrateDefaultCompany(client: PoolClient): Promise<void> {
     `CREATE UNIQUE INDEX IF NOT EXISTS idx_learning_settings_scope
        ON learning_settings(COALESCE(company_id, 0), COALESCE(project_id, 0))`);
 
+  // ── Privacy Controls: learning_settings_audit (governance trail) ──
+  // Immutable append-only log of every learning-scope change: who, when, and
+  // the old→new transition. Enterprises need this for compliance reviews.
+  console.log('🔧 [DB] Migration: learning_settings_audit table (Privacy Controls audit)...');
+  await safeExec(client, 'learning_settings_audit', `CREATE TABLE IF NOT EXISTS learning_settings_audit (
+    id SERIAL PRIMARY KEY,
+    company_id INTEGER,
+    project_id INTEGER,
+    old_scope TEXT,
+    new_scope TEXT NOT NULL,
+    changed_by_user_id INTEGER,
+    changed_by_username TEXT,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+  )`);
+  await safeExec(client, 'idx_learning_settings_audit_scope',
+    `CREATE INDEX IF NOT EXISTS idx_learning_settings_audit_scope
+       ON learning_settings_audit(COALESCE(company_id, 0), COALESCE(project_id, 0), created_at DESC)`);
+
   // ── Loop 2: page_failures (raw failure ledger feeding crawl intelligence) ──
   // Every selector that breaks in production is logged here with its page so
   // CrawlAdaptationService can learn which pages are flaky and which elements
@@ -5629,6 +5647,74 @@ export async function upsertLearningSettings(
     [companyId ?? null, projectId ?? null, JSON.stringify(merged)]
   );
   return merged;
+}
+
+export interface LearningScopeAuditEntry {
+  id: number;
+  companyId: number | null;
+  projectId: number | null;
+  oldScope: LearningScope | null;
+  newScope: LearningScope;
+  changedByUserId: number | null;
+  changedByUsername: string | null;
+  createdAt: string;
+}
+
+/** Append an immutable audit record for a learning-scope change (never throws). */
+export async function recordLearningScopeChange(input: {
+  companyId?: number; projectId?: number;
+  oldScope?: LearningScope | null; newScope: LearningScope;
+  changedByUserId?: number | null; changedByUsername?: string | null;
+}): Promise<void> {
+  try {
+    await getPool().query(
+      `INSERT INTO learning_settings_audit
+         (company_id, project_id, old_scope, new_scope, changed_by_user_id, changed_by_username)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [
+        input.companyId ?? null, input.projectId ?? null,
+        input.oldScope ?? null, input.newScope,
+        input.changedByUserId ?? null, input.changedByUsername ?? null,
+      ]
+    );
+  } catch (err: any) {
+    // Audit must never break the actual settings change.
+    if (err?.code !== '42P01') {
+      logger.warn('postgres', 'recordLearningScopeChange failed (non-fatal)', { error: err?.message });
+    }
+  }
+}
+
+/** Read the learning-scope change history for a scope (most recent first). */
+export async function getLearningScopeAudit(
+  companyId?: number, projectId?: number, limit = 25
+): Promise<LearningScopeAuditEntry[]> {
+  try {
+    const lim = Math.min(Math.max(limit, 1), 200);
+    const r = await getPool().query(
+      `SELECT id, company_id, project_id, old_scope, new_scope,
+              changed_by_user_id, changed_by_username, created_at
+         FROM learning_settings_audit
+        WHERE COALESCE(company_id, 0) = COALESCE($1, 0)
+          AND COALESCE(project_id, 0) = COALESCE($2, 0)
+        ORDER BY created_at DESC
+        LIMIT $3`,
+      [companyId ?? null, projectId ?? null, lim]
+    );
+    return r.rows.map((row: any) => ({
+      id: row.id,
+      companyId: row.company_id,
+      projectId: row.project_id,
+      oldScope: row.old_scope,
+      newScope: row.new_scope,
+      changedByUserId: row.changed_by_user_id,
+      changedByUsername: row.changed_by_username,
+      createdAt: row.created_at,
+    }));
+  } catch (err: any) {
+    if (err?.code === '42P01' || err?.message?.includes('does not exist')) return [];
+    throw err;
+  }
 }
 
 /* ────────────────────────────────────────────────────────────────────────── */
