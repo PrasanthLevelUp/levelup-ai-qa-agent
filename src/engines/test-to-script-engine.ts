@@ -47,6 +47,28 @@ const MOD = 'test-to-script-engine';
 /** Maximum number of tests allowed in a single spec file before it is split. */
 const MAX_TESTS_PER_FILE = 20;
 
+/**
+ * Minimum locator confidence (0–100) the LocatorResolver must reach before a
+ * resolved locator is accepted instead of falling through to the next cascade
+ * level. Overridable per-deployment via the `SCRIPTGEN_LOCATOR_MIN_CONFIDENCE`
+ * env var (clamped to 0–100); defaults to 50.
+ */
+const LOCATOR_MIN_CONFIDENCE = (() => {
+  const raw = Number(process.env.SCRIPTGEN_LOCATOR_MIN_CONFIDENCE);
+  return Number.isFinite(raw) ? Math.min(100, Math.max(0, raw)) : 50;
+})();
+
+/**
+ * Fallback base URL used only when a generation request supplies none. Kept
+ * configurable via `SCRIPTGEN_DEFAULT_BASE_URL` so no environment-specific host
+ * is hardcoded into the engine. The generated `page.goto` is overwritten by the
+ * real target whenever one is provided.
+ */
+const DEFAULT_BASE_URL = process.env.SCRIPTGEN_DEFAULT_BASE_URL || 'http://localhost:3000';
+
+/** Max app-knowledge modules folded into the narrative prompt context. */
+const MAX_KNOWLEDGE_CONTEXT_ITEMS = 5;
+
 /* -------------------------------------------------------------------------- */
 /*  Types                                                                     */
 /* -------------------------------------------------------------------------- */
@@ -186,7 +208,7 @@ export class TestToScriptEngine {
       if (knowledge.length) {
         knowledgeItems = knowledge as KnowledgeItem[];
         knowledgeContext = knowledge
-          .slice(0, 5)
+          .slice(0, MAX_KNOWLEDGE_CONTEXT_ITEMS)
           .map((k: any) => `Module: ${k.module}\nWorkflow: ${k.workflow || ''}\nBusiness Rules: ${k.business_rules || ''}`)
           .join('\n---\n');
       }
@@ -229,7 +251,7 @@ export class TestToScriptEngine {
         group,
         requirement,
         framework,
-        input.baseUrl || 'http://localhost:3000',
+        input.baseUrl || DEFAULT_BASE_URL,
         outputDir,
         knowledgeContext,
         intel,
@@ -360,7 +382,7 @@ export class TestToScriptEngine {
         crawlData,
         knowledgeItems,
         repoProfile,
-        minConfidence: 50,
+        minConfidence: LOCATOR_MIN_CONFIDENCE,
       });
     } catch (err: any) {
       logger.warn(MOD, 'LocatorResolver init failed (non-blocking)', { error: err?.message });

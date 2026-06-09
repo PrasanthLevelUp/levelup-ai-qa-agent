@@ -278,7 +278,8 @@ describe('CrawlOrchestrator', () => {
       };
 
       const profile = await orchestrator.saveCrawlResult('https://example.com', crawlResult, 1);
-      expect(profile.id).toBe('prof-1');
+      expect(profile).not.toBeNull();
+      expect(profile!.id).toBe('prof-1');
       expect(mockDb.upsertProfile).toHaveBeenCalled();
     });
   });
