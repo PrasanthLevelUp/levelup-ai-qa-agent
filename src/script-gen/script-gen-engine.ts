@@ -248,12 +248,15 @@ export class ScriptGenEngine {
           projectId: config.projectId ?? undefined,
         });
         if (adaptation && adaptation.isFlaky) {
-          (crawlConfig as any).adaptive = true;
+          // These fields are now first-class on CrawlConfig again and honoured by
+          // PageCrawler's constructor (depth 3→5, wait 5s→8s). The `as any` casts
+          // that masked the dropped fields after aa19046/473189d are removed.
+          crawlConfig.adaptive = true;
           crawlConfig.maxDepth = adaptation.recommendedDepth;
           crawlConfig.maxPages = Math.max(crawlConfig.maxPages ?? 3, adaptation.recommendedDepth);
           crawlConfig.waitAfterLoad = adaptation.recommendedWaitMs;
-          (crawlConfig as any).captureLoadingStates = adaptation.captureLoadingStates;
-          (crawlConfig as any).waitForAnimations = adaptation.waitForAnimations;
+          crawlConfig.captureLoadingStates = adaptation.captureLoadingStates;
+          crawlConfig.waitForAnimations = adaptation.waitForAnimations;
           logger.info(MOD, '🧭 Applying learned crawl adaptation (flaky page)', {
             url: config.url,
             recommendedDepth: adaptation.recommendedDepth,
