@@ -3394,6 +3394,7 @@ export async function getStrategyStability(scope: StabilityScope = {}): Promise<
 /** Aggregate stability KPI for the "getting smarter over time" dashboard. */
 export async function getStabilitySummary(scope: StabilityScope = {}): Promise<{
   trackedSelectors: number;
+  stableSelectors: number;
   avgStability: number;
   stablePct: number;
   flakySelectors: number;
@@ -3413,16 +3414,61 @@ export async function getStabilitySummary(scope: StabilityScope = {}): Promise<{
     );
     const r = result.rows[0];
     const tracked = parseInt(r.tracked, 10);
+    const stable = parseInt(r.stable_count, 10);
     return {
       trackedSelectors: tracked,
+      stableSelectors: stable,
       avgStability: parseFloat(parseFloat(r.avg_stability).toFixed(4)),
-      stablePct: tracked > 0 ? parseFloat(((parseInt(r.stable_count, 10) / tracked) * 100).toFixed(1)) : 100,
+      stablePct: tracked > 0 ? parseFloat(((stable / tracked) * 100).toFixed(1)) : 100,
       flakySelectors: parseInt(r.flaky_count, 10),
       totalBreaks: parseInt(r.total_breaks, 10),
     };
   } catch (err: any) {
     logger.warn(MOD, 'getStabilitySummary failed (non-fatal)', { error: err.message });
-    return { trackedSelectors: 0, avgStability: 1, stablePct: 100, flakySelectors: 0, totalBreaks: 0 };
+    return { trackedSelectors: 0, stableSelectors: 0, avgStability: 1, stablePct: 100, flakySelectors: 0, totalBreaks: 0 };
+  }
+}
+
+/**
+ * Daily healing-success-rate time series for the "getting smarter over time"
+ * dashboard. Each point is one calendar day in the trailing window with the
+ * number of heal attempts, the number that succeeded, and the success rate (%).
+ * Scoped by company/project. Fail-safe: a missing table / empty history yields
+ * an empty array rather than throwing.
+ */
+export async function getHealingSuccessTrend(
+  scope: StabilityScope = {},
+  days = 30,
+): Promise<Array<{ date: string; attempts: number; healed: number; rate: number }>> {
+  const windowDays = Math.max(1, Math.min(days || 30, 365));
+  try {
+    const params: any[] = [];
+    const where: string[] = [`created_at >= NOW() - INTERVAL '${windowDays} days'`];
+    if (scope.companyId != null) { params.push(scope.companyId); where.push(`company_id = $${params.length}`); }
+    if (scope.projectId != null) { params.push(scope.projectId); where.push(`project_id = $${params.length}`); }
+    const result = await getPool().query(
+      `SELECT to_char(date_trunc('day', created_at), 'YYYY-MM-DD') AS date,
+              COUNT(*) AS attempts,
+              COALESCE(SUM(CASE WHEN success THEN 1 ELSE 0 END), 0) AS healed
+       FROM healing_actions
+       WHERE ${where.join(' AND ')}
+       GROUP BY 1
+       ORDER BY 1 ASC`,
+      params,
+    );
+    return result.rows.map((r: any) => {
+      const attempts = parseInt(r.attempts, 10);
+      const healed = parseInt(r.healed, 10);
+      return {
+        date: r.date,
+        attempts,
+        healed,
+        rate: attempts > 0 ? parseFloat(((healed / attempts) * 100).toFixed(1)) : 0,
+      };
+    });
+  } catch (err: any) {
+    logger.warn(MOD, 'getHealingSuccessTrend failed (non-fatal)', { error: err.message });
+    return [];
   }
 }
 
