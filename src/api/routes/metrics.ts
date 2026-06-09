@@ -42,6 +42,9 @@ import { listMaintenancePatterns } from '../../services/maintenance-pattern-serv
 import {
   getLearningSettings,
   upsertLearningSettings,
+  recordLearningScopeChange,
+  getLearningScopeAudit,
+  DEFAULT_LEARNING_SETTINGS,
   type LearningScope,
 } from '../../db/postgres';
 import { logger } from '../../utils/logger';
@@ -143,11 +146,51 @@ export function createMetricsRouter(): Router {
 
   /* ── Privacy Controls: learning scope ───────────────────────────────────── */
 
+  // Static catalogue of selectable scopes + governance metadata. Surfaced to
+  // the settings UI so option copy lives in one place (backend = source of truth).
+  const LEARNING_SCOPE_OPTIONS = [
+    {
+      value: 'project',
+      label: 'Project Learning',
+      recommended: true,
+      summary: "Learn only from this project's test execution data.",
+      benefits: ['Maximum data isolation', 'Project-specific patterns only', 'No cross-project data sharing'],
+      dataUsed: "This project's failures, healing actions and selector patterns.",
+      isolation: 'strict',
+    },
+    {
+      value: 'company',
+      label: 'Company Learning',
+      recommended: false,
+      summary: 'Learn from all projects across your organization.',
+      benefits: ['Faster learning through shared knowledge', 'Organization-wide pattern recognition', 'Higher reuse of proven fixes'],
+      dataUsed: 'Failures, healing actions and patterns from every project in your company.',
+      isolation: 'company',
+    },
+    {
+      value: 'disabled',
+      label: 'Disabled',
+      recommended: false,
+      summary: 'Disable all learning capabilities.',
+      benefits: ['No data collected for learning', 'Static intelligence only', 'Maximum privacy posture'],
+      dataUsed: 'Nothing — no execution data is mined or stored for learning.',
+      isolation: 'none',
+    },
+  ];
+
   router.get('/learning-scope', async (req: Request, res: Response) => {
     try {
       const { companyId, projectId } = scopeOf(req);
       const settings = await getLearningSettings(companyId, projectId);
-      res.json({ success: true, data: settings });
+      res.json({
+        success: true,
+        data: {
+          ...settings,
+          options: LEARNING_SCOPE_OPTIONS,
+          defaultScope: DEFAULT_LEARNING_SETTINGS.learningScope,
+          scope: { companyId: companyId ?? null, projectId: projectId ?? null },
+        },
+      });
     } catch (err: any) {
       logger.error(MOD, `learning-scope get error: ${err?.message || err}`);
       res.status(500).json({ success: false, error: err.message });
@@ -162,11 +205,38 @@ export function createMetricsRouter(): Router {
       if (!allowed.includes(requested)) {
         return res.status(400).json({ success: false, error: `learningScope must be one of: ${allowed.join(', ')}` });
       }
+      const previous = await getLearningSettings(companyId, projectId);
       const settings = await upsertLearningSettings({ learningScope: requested }, companyId, projectId);
-      logger.info(MOD, '🔒 Learning scope updated', { companyId, projectId, learningScope: requested });
+
+      // Append an immutable governance record (non-fatal if audit table missing).
+      if (previous.learningScope !== requested) {
+        await recordLearningScopeChange({
+          companyId, projectId,
+          oldScope: previous.learningScope,
+          newScope: requested,
+          changedByUserId: (req as any).userId ?? null,
+          changedByUsername: (req as any).username ?? null,
+        });
+      }
+      logger.info(MOD, '🔒 Learning scope updated', {
+        companyId, projectId, from: previous.learningScope, to: requested,
+        by: (req as any).username || (req as any).userId || 'unknown',
+      });
       res.json({ success: true, data: settings });
     } catch (err: any) {
       logger.error(MOD, `learning-scope put error: ${err?.message || err}`);
+      res.status(500).json({ success: false, error: err.message });
+    }
+  });
+
+  router.get('/learning-scope/audit', async (req: Request, res: Response) => {
+    try {
+      const { companyId, projectId } = scopeOf(req);
+      const limit = parseInt(String(req.query.limit ?? '25'), 10);
+      const entries = await getLearningScopeAudit(companyId, projectId, Number.isFinite(limit) ? limit : 25);
+      res.json({ success: true, data: { entries, total: entries.length } });
+    } catch (err: any) {
+      logger.error(MOD, `learning-scope audit error: ${err?.message || err}`);
       res.status(500).json({ success: false, error: err.message });
     }
   });
