@@ -596,6 +596,8 @@ export function createTestCoverageRouter(): Router {
           totalTests: scriptResult.totalTests,
           totalFiles: scriptResult.totalFiles,
           coverage: scriptResult.coverage,
+          // Audit of which intelligence layers grounded the generated scripts.
+          intelligence: scriptResult.intelligence,
           github: {
             prUrl: prResult.prUrl,
             prNumber: prResult.prNumber,
@@ -820,7 +822,18 @@ export function createTestCoverageRouter(): Router {
 /* -------------------------------------------------------------------------- */
 
 function buildTestScriptPRBody(
-  result: { requirementTitle: string; files: Array<{ filePath: string; testCount: number }>; totalTests: number; totalFiles: number },
+  result: {
+    requirementTitle: string;
+    files: Array<{ filePath: string; testCount: number }>;
+    totalTests: number;
+    totalFiles: number;
+    intelligence?: {
+      appProfileUsed: boolean;
+      appKnowledgeUsed: boolean;
+      repoPatternsUsed: boolean;
+      locatorReport?: { totalLocators: number; validatedCount: number; avgConfidence: number; todoCount: number };
+    };
+  },
   requirementId: number,
   coverage?: {
     totalTestCases: number; totalTestsGenerated: number; covered: number;
@@ -867,9 +880,31 @@ ${badge}
 ${perFileRows}${missingNote}${extraNote}`;
   }
 
+  // Intelligence section: shows which grounding layers were applied so
+  // reviewers can trust the scripts are based on real app/repo data.
+  let intelligenceSection = '';
+  const intel = result.intelligence;
+  if (intel) {
+    const mark = (b: boolean) => (b ? '✅' : '—');
+    const lr = intel.locatorReport;
+    const lrRow = lr
+      ? `\n| **Locators resolved** | ${lr.totalLocators} (validated ${lr.validatedCount}, avg confidence ${lr.avgConfidence}%, ${lr.todoCount} to verify) |`
+      : '';
+    intelligenceSection = `
+
+### 🧠 Intelligence Applied
+
+| Layer | Used |
+|-------|------|
+| **Application Profile (real DOM/selectors)** | ${mark(intel.appProfileUsed)} |
+| **Application Knowledge** | ${mark(intel.appKnowledgeUsed)} |
+| **Repository Patterns** | ${mark(intel.repoPatternsUsed)} |${lrRow}`;
+  }
+
   return `## 🧪 AI-Generated Test Scripts
 
 > Automated PR created by [LevelUp AI QA](https://app.leveluptesting.in) Test-to-Script Engine.
+${intelligenceSection}
 
 ### 📋 Source
 

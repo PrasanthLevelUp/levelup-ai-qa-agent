@@ -51,6 +51,29 @@ export interface CrawlConfig {
    * by the callback are swallowed so logging can never break a crawl.
    */
   onLog?: (message: string) => void;
+
+  /**
+   * Loop 2 (Test Failures → Crawl Intelligence): when set, this crawl is using
+   * a LEARNED adaptation for a page that has proven flaky/dynamic in production.
+   * It raises the depth cap from 3 → 5 so deep/dynamic flows get captured, and
+   * allows a longer post-load wait. Set automatically by the generation engine
+   * when CrawlAdaptationService recommends it; defaults off (behaviour unchanged).
+   *
+   * REGRESSION FIX (restored after commits aa19046/473189d silently dropped it):
+   * previously these fields were removed from CrawlConfig while the generation
+   * engine still set them — so `recommendedDepth = 5` was thrown away and deep
+   * flows were never crawled. They are now honoured again by the constructor and
+   * the post-load settle logic below.
+   */
+  adaptive?: boolean;
+  /**
+   * When `adaptive` is set, capture loading states: the crawler already waits
+   * for networkidle; this also applies the longer `waitAfterLoad` cap so dynamic
+   * content has settled before extraction.
+   */
+  captureLoadingStates?: boolean;
+  /** When `adaptive` is set, give animations extra time to finish before extracting. */
+  waitForAnimations?: boolean;
 }
 
 /**
@@ -614,19 +637,57 @@ export class PageCrawler {
     followLinks: boolean;
     maxPages: number;
     viewport: { width: number; height: number };
+    adaptive: boolean;
+    captureLoadingStates: boolean;
+    waitForAnimations: boolean;
   };
 
   constructor(config: CrawlConfig) {
+    // Loop 2 (REGRESSION FIX): flaky/dynamic pages get an adaptive crawl — a
+    // deeper depth cap (5 instead of 3) and a longer post-load wait cap (8s
+    // instead of 5s) so deep flows / animated content have time to settle before
+    // extraction. Non-adaptive crawls keep the original, conservative caps so
+    // default behaviour is unchanged. This restores the depth/wait honouring
+    // that commits aa19046/473189d silently broke (the engine set
+    // recommendedDepth=5 but the constructor capped it back to 3).
+    const adaptive = config.adaptive === true;
+    const depthCap = adaptive ? 5 : 3;
+    const waitCap = adaptive ? 8000 : 5000;
     this.config = {
       ...config,
-      maxDepth: Math.min(config.maxDepth ?? 1, 3), // cap depth at 3 to bound deep crawls
+      maxDepth: Math.min(config.maxDepth ?? 1, depthCap),
       timeout: Math.min(config.timeout ?? 15000, 30000), // cap at 30s
-      waitAfterLoad: Math.min(config.waitAfterLoad ?? 2000, 5000),
+      waitAfterLoad: Math.min(config.waitAfterLoad ?? 2000, waitCap),
       captureScreenshot: config.captureScreenshot ?? true,
       followLinks: config.followLinks ?? false,
       maxPages: Math.min(config.maxPages ?? 5, 15), // cap at 15 pages
       viewport: config.viewport ?? { width: 1280, height: 720 },
+      adaptive,
+      captureLoadingStates: config.captureLoadingStates ?? false,
+      waitForAnimations: config.waitForAnimations ?? false,
     };
+    if (adaptive) {
+      this.progress('🧭 Adaptive crawl enabled (learned flaky-page settings)', {
+        maxDepth: this.config.maxDepth,
+        waitAfterLoad: this.config.waitAfterLoad,
+        captureLoadingStates: this.config.captureLoadingStates,
+        waitForAnimations: this.config.waitForAnimations,
+      });
+    }
+  }
+
+  /**
+   * Post-load settle: always honours `waitAfterLoad`; when an adaptive crawl
+   * asks to wait for animations, add an extra settle window (bounded) so
+   * transitions/spinners finish before we extract. Centralised here so both the
+   * single-page and authenticated-session crawl paths behave identically.
+   */
+  private async settleAfterLoad(page: any): Promise<void> {
+    await page.waitForTimeout(this.config.waitAfterLoad);
+    if (this.config.adaptive && this.config.waitForAnimations) {
+      // Bounded extra settle for animations/transitions on dynamic pages.
+      try { await page.waitForTimeout(Math.min(1500, this.config.waitAfterLoad)); } catch { /* non-fatal */ }
+    }
   }
 
   /**
@@ -720,8 +781,8 @@ export class PageCrawler {
         // networkidle timeout is non-fatal; SPA may keep polling
       }
 
-      // Wait for dynamic content
-      await page.waitForTimeout(this.config.waitAfterLoad);
+      // Wait for dynamic content (adaptive: also waits out animations)
+      await this.settleAfterLoad(page);
 
       // Extract data
       const title = await page.title();
@@ -1124,7 +1185,7 @@ export class PageCrawler {
     logger.info(MOD, 'Crawling page in session', { url });
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: this.config.timeout });
     try { await page.waitForLoadState('networkidle', { timeout: Math.min(this.config.timeout, 10000) }); } catch { /* SPA */ }
-    await page.waitForTimeout(this.config.waitAfterLoad);
+    await this.settleAfterLoad(page);
 
     const title = await page.title();
     const finalUrl = page.url();

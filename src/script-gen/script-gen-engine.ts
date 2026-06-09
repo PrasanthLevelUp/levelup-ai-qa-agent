@@ -32,6 +32,7 @@ import type { RepositoryProfile, ClassInfo } from '../context/types';
 import { extractSelectorInfo } from '../context/ast-analyzer';
 import { analyzeRepoStructure, buildPageObjectFileName, buildSpecFileName } from './repo-analyzer';
 import type { RepoStructureAnalysis } from './repo-analyzer';
+import { analyzeRepoPatterns } from './repo-pattern-analyzer';
 import { adaptiveGenerateFiles } from './adaptive-codegen';
 
 const MOD = 'script-gen-engine';
@@ -170,6 +171,23 @@ export interface GenerationConfig {
    * still applied, and when no stability data exists generation is unchanged. */
   companyId?: number | null;
   projectId?: number | null;
+  /**
+   * Structured test case (from Test Case Lab) to automate. When present the
+   * generated test plan is ANCHORED to these steps + expected results instead
+   * of being inferred purely from the crawl — so the script actually exercises
+   * what the test case describes. Shape is the `generated_test_cases` row
+   * (title / steps / expected_result / preconditions / test_data).
+   */
+  testCase?: {
+    id?: number;
+    title?: string;
+    steps?: any;
+    expected_result?: string;
+    preconditions?: string;
+    test_data?: string;
+    scenario?: string;
+    [k: string]: any;
+  };
 }
 
 /* -------------------------------------------------------------------------- */
@@ -248,12 +266,15 @@ export class ScriptGenEngine {
           projectId: config.projectId ?? undefined,
         });
         if (adaptation && adaptation.isFlaky) {
-          (crawlConfig as any).adaptive = true;
+          // These fields are now first-class on CrawlConfig again and honoured by
+          // PageCrawler's constructor (depth 3→5, wait 5s→8s). The `as any` casts
+          // that masked the dropped fields after aa19046/473189d are removed.
+          crawlConfig.adaptive = true;
           crawlConfig.maxDepth = adaptation.recommendedDepth;
           crawlConfig.maxPages = Math.max(crawlConfig.maxPages ?? 3, adaptation.recommendedDepth);
           crawlConfig.waitAfterLoad = adaptation.recommendedWaitMs;
-          (crawlConfig as any).captureLoadingStates = adaptation.captureLoadingStates;
-          (crawlConfig as any).waitForAnimations = adaptation.waitForAnimations;
+          crawlConfig.captureLoadingStates = adaptation.captureLoadingStates;
+          crawlConfig.waitForAnimations = adaptation.waitForAnimations;
           logger.info(MOD, '🧭 Applying learned crawl adaptation (flaky page)', {
             url: config.url,
             recommendedDepth: adaptation.recommendedDepth,
@@ -398,6 +419,62 @@ export class ScriptGenEngine {
   /*  Step 4: AI Test Plan Generation                                        */
   /* ──────────────────────────────────────────────────────────────────────── */
 
+  /**
+   * Build a compact, token-budgeted repo-pattern guide block from the repo
+   * profile (coding style, idiomatic imports, helpers/page-objects to reuse,
+   * locator conventions). Distinct from `repoIntelligence` (a freeform dump):
+   * this is the distilled, structured guide from `analyzeRepoPatterns`, so the
+   * model follows the repo's conventions without re-deriving them.
+   * Returns '' when there is no repo profile or it isn't confident enough.
+   */
+  private buildRepoPatternBlock(config: GenerationConfig): string {
+    if (!config.repoProfile) return '';
+    // Token optimization: `repoIntelligence` (the freeform context) already
+    // carries the repo's conventions. Only add the distilled guide when that
+    // freeform block is absent, so we never pay for the same info twice.
+    if (config.repoIntelligence) return '';
+    try {
+      const guide = analyzeRepoPatterns(config.repoProfile);
+      if (!guide) return '';
+      return `\n--- REPO PATTERN GUIDE ---\n${guide.promptBlock}\n--- END REPO PATTERN GUIDE ---`;
+    } catch (err: any) {
+      logger.warn(MOD, 'Repo pattern analysis failed (non-blocking)', { error: err?.message });
+      return '';
+    }
+  }
+
+  /**
+   * Build the "TEST CASE TO AUTOMATE" anchor block. When generating from a Test
+   * Case Lab case, the flows must mirror the case's steps + expected result
+   * rather than being inferred purely from the crawl. Returns '' for url-based
+   * generation (no test case), leaving the original behaviour untouched.
+   */
+  private buildTestCaseAnchorBlock(config: GenerationConfig): string {
+    const tc = config.testCase;
+    if (!tc) return '';
+    let steps: any = tc.steps;
+    if (typeof steps === 'string') {
+      try { steps = JSON.parse(steps); } catch { /* leave as string */ }
+    }
+    const stepLines = Array.isArray(steps)
+      ? steps.map((s: any, i: number) => {
+          const text = typeof s === 'string' ? s : (s?.action ?? s?.step ?? s?.description ?? JSON.stringify(s));
+          return `  ${i + 1}. ${text}`;
+        }).join('\n')
+      : (typeof steps === 'string' ? steps : '');
+
+    return [
+      '\n--- TEST CASE TO AUTOMATE ---',
+      tc.title ? `Title: ${tc.title}` : '',
+      tc.scenario ? `Scenario: ${tc.scenario}` : '',
+      tc.preconditions ? `Preconditions: ${tc.preconditions}` : '',
+      stepLines ? `Steps:\n${stepLines}` : '',
+      tc.expected_result ? `Expected Result: ${tc.expected_result}` : '',
+      tc.test_data ? `Test Data: ${tc.test_data}` : '',
+      '--- END TEST CASE TO AUTOMATE ---',
+    ].filter(Boolean).join('\n');
+  }
+
   private async generateTestPlan(
     crawl: CrawlResult,
     workflowMap: WorkflowMap,
@@ -492,8 +569,12 @@ ${(() => {
   return '';
 })()}
 ${config.fusionContext ? `\n--- FUSED INTELLIGENCE ---\nAdditional intelligence from across the platform. Use it to improve reliability:\n\n${config.fusionContext}\n--- END FUSED INTELLIGENCE ---` : ''}
+${this.buildRepoPatternBlock(config)}
+${this.buildTestCaseAnchorBlock(config)}
 
-Generate comprehensive test flows covering all detected functionality.`;
+${config.testCase
+  ? 'Generate test flows that AUTOMATE THE TEST CASE ABOVE — one flow whose steps map 1:1 to the test-case steps and whose assertions verify its Expected Result. You may add closely-related supporting flows only if clearly implied.'
+  : 'Generate comprehensive test flows covering all detected functionality.'}`;
 
     try {
       const response = await this.openai.chat.completions.create({

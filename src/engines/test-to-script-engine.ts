@@ -26,7 +26,21 @@ import {
   getTestCasesByRequirement,
   getApplicationKnowledge,
   getRepository,
+  getApplicationProfileForGeneration,
+  getRepositoryContext,
 } from '../db/postgres';
+import {
+  LocatorResolver,
+  type CrawlDataLike,
+  type LocatorReport,
+  type ResolvedLocator,
+} from '../services/locator-resolver';
+import { buildApplicationProfileContext } from '../utils/application-profile-context';
+import { analyzeRepoPatterns, type RepoPatternGuide } from '../script-gen/repo-pattern-analyzer';
+import { extractElementDescriptions } from '../utils/element-descriptions';
+import type { KnowledgeItem } from '../ai/knowledge-optimizer';
+import type { RepositoryProfile } from '../context/types';
+import type { ApplicationProfileContext } from './test-coverage-engine';
 
 const MOD = 'test-to-script-engine';
 
@@ -82,6 +96,41 @@ export interface TestToScriptResult {
   totalTests: number;
   totalFiles: number;
   coverage: CoverageReport;
+  /** Which intelligence layers were available + applied during generation. */
+  intelligence?: IntelligenceUsage;
+}
+
+/**
+ * Audit of which intelligence layers were loaded and used. Surfaced so callers
+ * (and the report endpoint) can confirm scripts were grounded in real data
+ * rather than generic guesses.
+ */
+export interface IntelligenceUsage {
+  appProfileUsed: boolean;
+  appKnowledgeUsed: boolean;
+  repoPatternsUsed: boolean;
+  /** Aggregated locator-resolution quality across all generated files. */
+  locatorReport?: LocatorReport;
+}
+
+/**
+ * Bundle of pre-loaded, cached intelligence shared across all feature groups in
+ * a single generation run. Built ONCE in `generate()` so the cascade
+ * (App Profile DOM → App Knowledge → Repo patterns) is reused for every file
+ * without re-querying or re-crawling — keeping the run token- and IO-cheap.
+ *
+ * Every field is optional: generation must degrade gracefully when a layer is
+ * unavailable, never throw. This is the core of "use all intelligence layers".
+ */
+interface IntelligenceBundle {
+  /** Resolves element descriptions → Playwright locators via the full cascade. */
+  locatorResolver?: LocatorResolver;
+  /** Compact App-Profile context (real pages/forms/selectors) for the prompt. */
+  appProfileBlock?: string;
+  appProfileUsed: boolean;
+  appKnowledgeUsed: boolean;
+  /** Repo coding-style / locator / helper guide distilled from the repo profile. */
+  repoGuide?: RepoPatternGuide;
 }
 
 /** Internal: a set of related test cases that will become one spec file. */
@@ -127,11 +176,15 @@ export class TestToScriptEngine {
       throw new Error(`No test cases found for requirement #${requirementId}`);
     }
 
-    // 2. Fetch app knowledge for richer context
+    // 2. Fetch app knowledge for richer context. Keep both the prompt string
+    //    (for narrative context) and the raw items (so the LocatorResolver can
+    //    mine any documented selectors from them).
     let knowledgeContext = '';
+    let knowledgeItems: KnowledgeItem[] = [];
     try {
       const knowledge = await getApplicationKnowledge(companyId);
       if (knowledge.length) {
+        knowledgeItems = knowledge as KnowledgeItem[];
         knowledgeContext = knowledge
           .slice(0, 5)
           .map((k: any) => `Module: ${k.module}\nWorkflow: ${k.workflow || ''}\nBusiness Rules: ${k.business_rules || ''}`)
@@ -139,12 +192,19 @@ export class TestToScriptEngine {
       }
     } catch { /* non-critical */ }
 
-    // 3. Fetch repository info for output path context
+    // 3. Fetch repository info for output path context (non-blocking).
     if (input.repositoryId) {
       try {
         await getRepository(input.repositoryId, companyId);
       } catch { /* non-critical */ }
     }
+
+    // 3b. INTELLIGENCE — load every available layer ONCE and build a shared
+    //     bundle (App Profile DOM + App Knowledge + Repo patterns). This is the
+    //     core fix: previously this engine ignored the App Profile, the
+    //     LocatorResolver and repo patterns entirely, so generated scripts were
+    //     generic guesses. All loads are defensive and non-blocking.
+    const intel = await this.loadIntelligence(input, companyId, knowledgeItems);
 
     // 4. SMART GROUPING — gather related cases into feature-cohesive files
     const groups = this.buildFeatureGroups(testCases, requirement);
@@ -162,18 +222,21 @@ export class TestToScriptEngine {
     const outputDir = input.outputDir || 'tests/generated';
     const files: GeneratedScriptFile[] = [];
     const perFile: FileCoverage[] = [];
+    const locatorReports: LocatorReport[] = [];
 
     for (const group of groups) {
-      const { file, coverage } = await this.generateScriptForGroup(
+      const { file, coverage, locatorReport } = await this.generateScriptForGroup(
         group,
         requirement,
         framework,
         input.baseUrl || 'http://localhost:3000',
         outputDir,
         knowledgeContext,
+        intel,
       );
       files.push(file);
       perFile.push(coverage);
+      if (locatorReport) locatorReports.push(locatorReport);
     }
 
     // 6. Generate shared helpers file (not counted as coverage)
@@ -198,6 +261,23 @@ export class TestToScriptEngine {
       });
     }
 
+    // 🧠 Summarise intelligence usage so callers can prove scripts were
+    //    grounded in real data (and so token/quality wins are observable).
+    const mergedLocatorReport = this.mergeLocatorReports(locatorReports);
+    const intelligence: IntelligenceUsage = {
+      appProfileUsed: intel.appProfileUsed,
+      appKnowledgeUsed: intel.appKnowledgeUsed,
+      repoPatternsUsed: !!intel.repoGuide,
+      locatorReport: mergedLocatorReport,
+    };
+    logger.info(MOD, '🧠 Intelligence usage', {
+      appProfile: intelligence.appProfileUsed,
+      appKnowledge: intelligence.appKnowledgeUsed,
+      repoPatterns: intelligence.repoPatternsUsed,
+      locatorsResolved: mergedLocatorReport?.totalLocators ?? 0,
+      avgLocatorConfidence: mergedLocatorReport?.avgConfidence ?? 0,
+    });
+
     return {
       requirementId,
       requirementTitle: requirement.title,
@@ -205,7 +285,147 @@ export class TestToScriptEngine {
       totalTests,
       totalFiles: files.length,
       coverage,
+      intelligence,
     };
+  }
+
+  /* ── intelligence loading ────────────────────────────────── */
+
+  /**
+   * Load and assemble every available intelligence layer ONCE for the whole
+   * run. Each step is independently guarded so a failure in one layer never
+   * blocks generation — the engine simply falls back to whatever is available
+   * (down to generic generation when nothing is).
+   */
+  private async loadIntelligence(
+    input: TestToScriptInput,
+    companyId: number,
+    knowledgeItems: KnowledgeItem[],
+  ): Promise<IntelligenceBundle> {
+    const bundle: IntelligenceBundle = {
+      appProfileUsed: false,
+      appKnowledgeUsed: knowledgeItems.length > 0,
+    };
+
+    // 1. Application Profile → cached DOM (crawl_data) + compact prompt context.
+    let crawlData: CrawlDataLike | null = null;
+    try {
+      const profile = await getApplicationProfileForGeneration(companyId, input.projectId);
+      if (profile?.crawl_data) {
+        crawlData = profile.crawl_data as CrawlDataLike;
+        const ctx = buildApplicationProfileContext(profile);
+        if (ctx) {
+          bundle.appProfileBlock = this.formatAppProfileBlock(ctx);
+          bundle.appProfileUsed = true;
+        }
+        logger.info(MOD, '✅ App Profile loaded for grounding', {
+          baseUrl: profile.base_url,
+          pages: profile.page_count,
+          elements: profile.total_elements,
+          forms: profile.total_forms,
+        });
+      } else {
+        logger.info(MOD, 'ℹ️ No Application Profile available — locators fall back to knowledge/repo/heuristics');
+      }
+    } catch (err: any) {
+      logger.warn(MOD, 'App Profile load failed (non-blocking)', { error: err?.message });
+    }
+
+    // 2. Repository profile → repo-consistent coding style / locator / helper guide.
+    let repoProfile: RepositoryProfile | null = null;
+    if (input.repositoryId) {
+      try {
+        repoProfile = await getRepositoryContext(String(input.repositoryId), companyId);
+        if (repoProfile) {
+          bundle.repoGuide = analyzeRepoPatterns(repoProfile);
+          if (bundle.repoGuide) {
+            logger.info(MOD, '✅ Repo patterns loaded for grounding', {
+              framework: bundle.repoGuide.summary.framework,
+              language: bundle.repoGuide.summary.language,
+              confidence: bundle.repoGuide.summary.confidence,
+              helpers: bundle.repoGuide.summary.helpers.length,
+              pageObjects: bundle.repoGuide.summary.pageObjects.length,
+            });
+          }
+        }
+      } catch (err: any) {
+        logger.warn(MOD, 'Repo context load failed (non-blocking)', { error: err?.message });
+      }
+    }
+
+    // 3. Build the LocatorResolver from whatever layers we got. Even with no
+    //    crawl data it still resolves via knowledge → repo → smart fallback.
+    try {
+      bundle.locatorResolver = new LocatorResolver({
+        crawlData,
+        knowledgeItems,
+        repoProfile,
+        minConfidence: 50,
+      });
+    } catch (err: any) {
+      logger.warn(MOD, 'LocatorResolver init failed (non-blocking)', { error: err?.message });
+    }
+
+    return bundle;
+  }
+
+  /** Format the compact App-Profile projection into a token-budgeted prompt block. */
+  private formatAppProfileBlock(ctx: ApplicationProfileContext): string {
+    const lines: string[] = ['## Real Application Structure (use these EXACT selectors)'];
+
+    for (const form of (ctx.forms || []).slice(0, 4)) {
+      const where = form.page ? ` on ${form.page}` : '';
+      lines.push(`\n### Form${where}`);
+      for (const f of (form.fields || []).slice(0, 10)) {
+        const sel = f.selector ? ` → \`${f.selector}\`` : '';
+        const req = f.required ? ' (required)' : '';
+        lines.push(`- ${f.label || f.name || f.type}${req}${sel}`);
+      }
+      if (form.submitSelector) lines.push(`- Submit → \`${form.submitSelector}\``);
+    }
+
+    const keyEls = (ctx.keyElements || []).filter(e => e.selector).slice(0, 18);
+    if (keyEls.length) {
+      lines.push('\n### Key Elements');
+      for (const e of keyEls) {
+        lines.push(`- ${e.label || e.role || e.tag} → \`${e.selector}\``);
+      }
+    }
+
+    return lines.length > 1 ? lines.join('\n') : '';
+  }
+
+  /** Merge per-file locator reports into one run-level summary (for the audit). */
+  private mergeLocatorReports(reports: LocatorReport[]): LocatorReport | undefined {
+    if (!reports.length) return undefined;
+    const merged: LocatorReport = {
+      totalLocators: 0,
+      validatedCount: 0,
+      todoCount: 0,
+      avgConfidence: 0,
+      sources: { app_profile: 0, app_knowledge: 0, repo_patterns: 0, smart_fallback: 0 },
+      locators: [],
+      warnings: [],
+    };
+    let confidenceSum = 0;
+    for (const r of reports) {
+      merged.totalLocators += r.totalLocators;
+      merged.validatedCount += r.validatedCount;
+      merged.todoCount += r.todoCount;
+      confidenceSum += r.avgConfidence * r.totalLocators;
+      for (const k of Object.keys(r.sources) as Array<keyof typeof r.sources>) {
+        merged.sources[k] += r.sources[k];
+      }
+      merged.locators.push(...r.locators);
+      merged.warnings.push(...r.warnings);
+    }
+    merged.avgConfidence = merged.totalLocators
+      ? Math.round(confidenceSum / merged.totalLocators)
+      : 0;
+    // Keep the stored detail compact.
+    merged.locators = merged.locators.slice(0, 100);
+    merged.warnings = [...new Set(merged.warnings)].slice(0, 25);
+    return merged;
   }
 
   /* ── grouping ────────────────────────────────────────────── */
@@ -323,15 +543,62 @@ export class TestToScriptEngine {
     baseUrl: string,
     outputDir: string,
     knowledgeContext: string,
-  ): Promise<{ file: GeneratedScriptFile; coverage: FileCoverage }> {
+    intel: IntelligenceBundle,
+  ): Promise<{ file: GeneratedScriptFile; coverage: FileCoverage; locatorReport?: LocatorReport }> {
+    // Use the repo's own file-naming convention when we have a repo guide so the
+    // committed file looks native to the target codebase; otherwise default.
     const partSuffix = group.part && (group.totalParts || 1) > 1 ? `.part${group.part}` : '';
-    const fileName = `${this.slugify(group.feature)}${partSuffix}`;
-    const filePath = `${outputDir}/${fileName}.spec.ts`;
+    const slug = `${this.slugify(group.feature)}${partSuffix}`;
+    const fileName = intel.repoGuide
+      ? intel.repoGuide.buildFileName(slug)
+      : `${slug}.spec.ts`;
+    const filePath = `${outputDir}/${fileName}`;
     const caseIds: number[] = group.cases.map((c: any) => c.id);
+
+    // ── LOCATOR RESOLUTION ──────────────────────────────────────────────
+    // For every test case, turn its natural-language steps into concrete
+    // Playwright locators via the cascade (App Profile DOM → Knowledge →
+    // Repo patterns → smart fallback). The resolved locators are (a) fed to
+    // the AI as ground truth and (b) used by the deterministic template
+    // fallback so even auto-filled tests carry real selectors + assertions.
+    const resolvedByCase = new Map<number, ResolvedLocator[]>();
+    let locatorReport: LocatorReport | undefined;
+    if (intel.locatorResolver) {
+      try {
+        const allResolved: ResolvedLocator[] = [];
+        for (const tc of group.cases) {
+          const descriptions = extractElementDescriptions(
+            tc,
+            [tc.title, tc.expected_result, tc.test_data].filter(Boolean).join('. '),
+          );
+          if (!descriptions.length) continue;
+          const { resolved } = intel.locatorResolver.resolveAll(descriptions);
+          if (resolved.length) {
+            resolvedByCase.set(tc.id, resolved);
+            allResolved.push(...resolved);
+          }
+        }
+        if (allResolved.length) {
+          // Build a single quality report over everything we resolved for this file.
+          locatorReport = this.buildGroupLocatorReport(allResolved);
+        }
+      } catch (err: any) {
+        logger.warn(MOD, 'Locator resolution failed for group (non-blocking)', {
+          feature: group.feature, error: err?.message,
+        });
+      }
+    }
 
     // Build the prompt with explicit per-case anchors and a strict contract.
     const testCaseDescriptions = group.cases.map((tc: any, i: number) => {
       const steps = this.parseJson(tc.steps, []);
+      const resolved = resolvedByCase.get(tc.id) || [];
+      const locatorHints = resolved.length
+        ? `Resolved Locators (use these EXACT locators):\n${resolved
+            .slice(0, 12)
+            .map(r => `  - ${r.elementDescription} → ${r.locator}${r.confidence < 60 ? '  // verify' : ''}`)
+            .join('\n')}`
+        : '';
       return [
         `### Test Case TC${tc.id} (#${i + 1}): ${tc.title}`,
         `Scenario: ${tc.scenario || group.feature}`,
@@ -340,8 +607,15 @@ export class TestToScriptEngine {
         steps.length ? `Steps:\n${steps.map((s: string, j: number) => `  ${j + 1}. ${s}`).join('\n')}` : '',
         `Expected Result: ${tc.expected_result}`,
         tc.test_data ? `Test Data: ${tc.test_data}` : '',
+        locatorHints,
       ].filter(Boolean).join('\n');
     }).join('\n\n');
+
+    // Repo-pattern guidance (coding style, imports, helpers to reuse) and the
+    // real app structure are injected so output matches the target codebase and
+    // points at real selectors instead of guesses.
+    const repoBlock = intel.repoGuide ? `\n${intel.repoGuide.promptBlock}` : '';
+    const appProfileBlock = intel.appProfileBlock ? `\n${intel.appProfileBlock}` : '';
 
     const prompt = `You are an expert Playwright test automation engineer.
 
@@ -354,7 +628,7 @@ Generate ONE complete, runnable Playwright TypeScript test file for the feature 
 - Coverage Type: ${group.coverageType}
 - Base URL: ${baseUrl}
 - Framework: Playwright with TypeScript
-${knowledgeContext ? `\n## Application Knowledge\n${knowledgeContext}` : ''}
+${knowledgeContext ? `\n## Application Knowledge\n${knowledgeContext}` : ''}${appProfileBlock}${repoBlock}
 
 ## Test Cases to Automate (${group.cases.length})
 
@@ -371,8 +645,10 @@ ${testCaseDescriptions}
 ## Quality Requirements
 - Import \`test\` and \`expect\` from '@playwright/test'.
 - Add a \`test.beforeEach\` that navigates to the base URL.
-- Use semantic selectors: prefer data-testid, then role, then text, then placeholder.
-- Add assertions that match each Expected Result.
+- When "Resolved Locators" are provided for a case, USE THOSE EXACT locators — do not invent new ones.
+- Otherwise prefer semantic selectors: data-testid, then role, then text, then placeholder.
+- Add MEANINGFUL assertions that verify each Expected Result (assert on real elements/state).
+  NEVER emit no-op assertions such as \`await expect(page).toHaveURL(/.*/)\`.
 - Use smart waits (NEVER use \`waitForTimeout\`).
 - Make each test independent and runnable in isolation.
 - Add a short JSDoc/comment describing each test.
@@ -401,7 +677,7 @@ Return ONLY the TypeScript code. No markdown fences, no explanations.`;
     }
 
     // ── Reconcile: which test cases did the AI actually cover? ──
-    const reconciled = this.reconcileCoverage(aiCode, group, requirement, baseUrl);
+    const reconciled = this.reconcileCoverage(aiCode, group, requirement, baseUrl, resolvedByCase);
 
     const coverage: FileCoverage = {
       filePath,
@@ -435,6 +711,40 @@ Return ONLY the TypeScript code. No markdown fences, no explanations.`;
         testCaseIds: caseIds,
       },
       coverage,
+      locatorReport,
+    };
+  }
+
+  /** Build a compact LocatorReport from a flat list of resolved locators. */
+  private buildGroupLocatorReport(resolved: ResolvedLocator[]): LocatorReport {
+    const sources: LocatorReport['sources'] = {
+      app_profile: 0, app_knowledge: 0, repo_patterns: 0, smart_fallback: 0,
+    };
+    let confidenceSum = 0;
+    let validatedCount = 0;
+    let todoCount = 0;
+    const locators: LocatorReport['locators'] = [];
+    for (const r of resolved) {
+      sources[r.source] = (sources[r.source] || 0) + 1;
+      confidenceSum += r.confidence;
+      if (r.validated) validatedCount++;
+      if (r.todoComment) todoCount++;
+      locators.push({
+        elementDescription: r.elementDescription,
+        locator: r.locator,
+        source: r.source,
+        confidence: r.confidence,
+        validated: r.validated,
+      });
+    }
+    return {
+      totalLocators: resolved.length,
+      validatedCount,
+      todoCount,
+      avgConfidence: resolved.length ? Math.round(confidenceSum / resolved.length) : 0,
+      sources,
+      locators,
+      warnings: [],
     };
   }
 
@@ -450,13 +760,14 @@ Return ONLY the TypeScript code. No markdown fences, no explanations.`;
     group: FileGroup,
     requirement: any,
     baseUrl: string,
+    resolvedByCase: Map<number, ResolvedLocator[]>,
   ): { content: string; actualTests: number; coveredIds: number[]; missingFilled: number[]; extra: number } {
     const inputIds = group.cases.map((c: any) => c.id);
 
     // No usable AI output → deterministic template file (guaranteed 1:1).
     const looksValid = aiCode && /\btest\s*\(/.test(aiCode) && aiCode.includes('@playwright/test');
     if (!looksValid) {
-      const content = this.buildTemplateFile(group, requirement, baseUrl, group.cases);
+      const content = this.buildTemplateFile(group, requirement, baseUrl, group.cases, resolvedByCase);
       return {
         content,
         actualTests: group.cases.length,
@@ -477,7 +788,7 @@ Return ONLY the TypeScript code. No markdown fences, no explanations.`;
     let content = aiCode;
     if (missing.length) {
       const missingCases = group.cases.filter((c: any) => missing.includes(c.id));
-      content = this.injectTemplateTests(aiCode, group, missingCases);
+      content = this.injectTemplateTests(aiCode, group, missingCases, resolvedByCase);
     }
 
     const actualTests = this.countTests(content);
@@ -513,10 +824,15 @@ Return ONLY the TypeScript code. No markdown fences, no explanations.`;
    * describe block just before the final closing of the top-level describe;
    * if that can't be located, appends a standalone describe at the end.
    */
-  private injectTemplateTests(aiCode: string, group: FileGroup, missingCases: any[]): string {
+  private injectTemplateTests(
+    aiCode: string,
+    group: FileGroup,
+    missingCases: any[],
+    resolvedByCase: Map<number, ResolvedLocator[]>,
+  ): string {
     const block = [
       `  test.describe('Coverage (auto-filled)', () => {`,
-      missingCases.map(tc => this.buildTemplateTest(tc, 2)).join('\n\n'),
+      missingCases.map(tc => this.buildTemplateTest(tc, 2, resolvedByCase.get(tc.id))).join('\n\n'),
       `  });`,
     ].join('\n');
 
@@ -525,23 +841,52 @@ Return ONLY the TypeScript code. No markdown fences, no explanations.`;
       return `${aiCode.slice(0, lastClose)}\n${block}\n${aiCode.slice(lastClose)}`;
     }
     // Fallback: wrap as a standalone describe appended to the file.
-    return `${aiCode}\n\ntest.describe('${this.escapeStr(group.feature)} — Coverage (auto-filled)', () => {\n${missingCases.map(tc => this.buildTemplateTest(tc, 1)).join('\n\n')}\n});\n`;
+    return `${aiCode}\n\ntest.describe('${this.escapeStr(group.feature)} — Coverage (auto-filled)', () => {\n${missingCases.map(tc => this.buildTemplateTest(tc, 1, resolvedByCase.get(tc.id))).join('\n\n')}\n});\n`;
   }
 
-  /** Build a single deterministic template test (always carries its marker). */
-  private buildTemplateTest(tc: any, indentLevel = 1): string {
+  /**
+   * Build a single deterministic template test (always carries its marker).
+   *
+   * Quality fix (Phase 3): the old template emitted a no-op "match any URL"
+   * assertion that ALWAYS passes — a fake-green test.
+   * Now:
+   *   • If the LocatorResolver produced concrete locators for this case, we
+   *     emit real `await expect(<locator>).toBeVisible()` assertions grounded
+   *     in the actual app, plus a low-confidence `// verify` note where needed.
+   *   • If NO locators could be resolved, we emit `test.fixme(...)` so the test
+   *     is honestly reported as "not yet implemented" instead of falsely
+   *     passing. Coverage is still tracked via the `// @tc:` marker.
+   */
+  private buildTemplateTest(tc: any, indentLevel = 1, resolved?: ResolvedLocator[]): string {
     const pad = '  '.repeat(indentLevel);
     const steps = this.parseJson(tc.steps, []);
     const stepsComment = steps.length
       ? steps.map((s: string, i: number) => `${pad}  // Step ${i + 1}: ${this.escapeStr(String(s))}`).join('\n')
       : `${pad}  // TODO: implement test steps`;
 
-    return `${pad}test('${this.escapeStr(tc.title)}', async ({ page }) => {
+    const usable = (resolved || []).filter(r => r.confidence >= 40).slice(0, 3);
+
+    if (usable.length) {
+      // Real, meaningful assertions on resolved locators.
+      const assertions = usable.map(r => {
+        const note = r.confidence < 60 ? '  // verify: low-confidence locator' : '';
+        return `${pad}  await expect(${r.locator}).toBeVisible();${note}`;
+      }).join('\n');
+
+      return `${pad}test('${this.escapeStr(tc.title)}', async ({ page }) => {
 ${pad}  // @tc:TC${tc.id}
 ${stepsComment}
 ${pad}  // Expected: ${this.escapeStr(tc.expected_result || 'Verify expected behavior')}
-${pad}  // TODO: add real selectors + assertions for this test case
-${pad}  await expect(page).toHaveURL(/.*/, { timeout: 10000 });
+${assertions}
+${pad}});`;
+    }
+
+    // No locators resolved → mark as not-yet-implemented rather than fake-pass.
+    return `${pad}test.fixme('${this.escapeStr(tc.title)}', async ({ page }) => {
+${pad}  // @tc:TC${tc.id}
+${stepsComment}
+${pad}  // Expected: ${this.escapeStr(tc.expected_result || 'Verify expected behavior')}
+${pad}  // TODO: no locators could be resolved automatically — add real selectors + assertions.
 ${pad}});`;
   }
 
@@ -549,7 +894,13 @@ ${pad}});`;
    * Build a fully deterministic spec file for a group with nested describe
    * blocks grouped by scenario. Guarantees exactly one test per input case.
    */
-  private buildTemplateFile(group: FileGroup, requirement: any, baseUrl: string, cases: any[]): string {
+  private buildTemplateFile(
+    group: FileGroup,
+    requirement: any,
+    baseUrl: string,
+    cases: any[],
+    resolvedByCase: Map<number, ResolvedLocator[]>,
+  ): string {
     // Sub-group cases by scenario name for nested describe blocks.
     const byScenario = new Map<string, any[]>();
     for (const tc of cases) {
@@ -559,7 +910,7 @@ ${pad}});`;
     }
 
     const inner = [...byScenario.entries()].map(([scenario, scCases]) => {
-      const tests = scCases.map(tc => this.buildTemplateTest(tc, 2)).join('\n\n');
+      const tests = scCases.map(tc => this.buildTemplateTest(tc, 2, resolvedByCase.get(tc.id))).join('\n\n');
       return `  test.describe('${this.escapeStr(scenario)}', () => {\n${tests}\n  });`;
     }).join('\n\n');
 
