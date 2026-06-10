@@ -153,6 +153,19 @@ export function createIntelligenceRouter(): Router {
 
       res.status(201).json({ success: true, data: profile });
     } catch (err) {
+      // A Postgres unique-violation (SQLSTATE 23505) means a profile for this base_url
+      // already exists in a scope that collided with the upsert (e.g. a legacy
+      // (base_url, company_id) constraint left on older databases). Surface a friendly,
+      // actionable 409 instead of a raw 500 so the UI can guide the user to edit/delete
+      // the existing profile rather than showing an opaque database error.
+      if ((err as any)?.code === '23505') {
+        return res.status(409).json({
+          success: false,
+          code: 'DUPLICATE_PROFILE',
+          error:
+            'An application profile for this URL already exists. Open the existing profile to edit it, or delete it before creating a new one.',
+        });
+      }
       res.status(500).json({ success: false, error: (err as Error).message });
     }
   });

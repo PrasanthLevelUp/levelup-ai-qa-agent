@@ -976,14 +976,17 @@ async function initSchema(client: PoolClient): Promise<void> {
     error_message TEXT,
     company_id INTEGER REFERENCES companies(id),
     created_at TIMESTAMPTZ DEFAULT NOW(),
-    updated_at TIMESTAMPTZ DEFAULT NOW(),
-    UNIQUE(base_url, company_id)
+    updated_at TIMESTAMPTZ DEFAULT NOW()
   )`);
-  // NOTE: A previous version used `UNIQUE(base_url, COALESCE(company_id, 0))` here, which is
-  // INVALID SQL — PostgreSQL does not allow expressions in table-level UNIQUE constraints. That
-  // syntax error caused the entire CREATE TABLE to fail on fresh databases, so application_profiles
-  // was never created and no profiles could ever be saved. The real per-project uniqueness is
-  // enforced by the expression index `uq_app_profile_url_project` created later in Phase 12.
+  // NOTE: We deliberately do NOT declare a table-level `UNIQUE(base_url, company_id)` here.
+  // That constraint ignores project_id and conflicts with the project-scoped upsert in
+  // upsertProfile() (`ON CONFLICT (base_url, COALESCE(project_id,-1), COALESCE(company_id,0))`):
+  // creating a profile for a URL that already exists under a *different* project would slip past
+  // the project-scoped ON CONFLICT and then trip the (base_url, company_id) constraint, raising
+  // `duplicate key value violates unique constraint "application_profiles_base_url_company_id_key"`.
+  // The real per-project uniqueness is enforced by the expression index `uq_app_profile_url_project`
+  // created in Phase 12, and any legacy (base_url, company_id) constraint left on older databases is
+  // dropped by the `drop_old_app_profiles_unique` migration in Phase 12.
   await safeExec(client, 'idx_app_profiles_base_url',
     `CREATE INDEX IF NOT EXISTS idx_app_profiles_base_url ON application_profiles(base_url)`);
   await safeExec(client, 'idx_app_profiles_company',
@@ -1114,16 +1117,36 @@ async function initSchema(client: PoolClient): Promise<void> {
 
   // Drop the old (base_url, company_id) constraint that conflicts with the
   // project-scoped unique index above — the new index fully supersedes it.
-  await safeExec(client, 'drop_old_app_profiles_unique', `DO $$ BEGIN
-    IF EXISTS (
-      SELECT 1 FROM pg_constraint
-      WHERE conrelid = 'application_profiles'::regclass
-        AND contype = 'u'
-        AND conname LIKE '%base_url%'
-        AND array_length(conkey, 1) = 2
-    ) THEN
-      ALTER TABLE application_profiles DROP CONSTRAINT IF EXISTS application_profiles_base_url_coalesce_key;
-    END IF;
+  //
+  // IMPORTANT: A previous version of this migration hard-coded the constraint name
+  // `application_profiles_base_url_coalesce_key`, but PostgreSQL auto-names the
+  // constraint created by `UNIQUE(base_url, company_id)` as
+  // `application_profiles_base_url_company_id_key`. The hard-coded DROP therefore
+  // never removed the real constraint, leaving it to raise duplicate-key errors when
+  // creating a profile for a URL that already existed under a different project.
+  //
+  // This version dynamically finds and drops ANY unique constraint whose columns are
+  // exactly (base_url, company_id), regardless of its auto-generated name, so it is
+  // robust across databases created by either schema version.
+  await safeExec(client, 'drop_old_app_profiles_unique', `DO $$
+  DECLARE
+    c RECORD;
+  BEGIN
+    FOR c IN
+      SELECT con.conname
+      FROM pg_constraint con
+      WHERE con.conrelid = 'application_profiles'::regclass
+        AND con.contype = 'u'
+        AND (
+          SELECT array_agg(att.attname ORDER BY att.attname)
+          FROM unnest(con.conkey) AS k(attnum)
+          JOIN pg_attribute att
+            ON att.attrelid = con.conrelid AND att.attnum = k.attnum
+        ) = ARRAY['base_url','company_id']::name[]
+    LOOP
+      EXECUTE format('ALTER TABLE application_profiles DROP CONSTRAINT IF EXISTS %I', c.conname);
+      RAISE NOTICE 'Dropped legacy app_profiles unique constraint: %', c.conname;
+    END LOOP;
   END $$`);
 
   // Add intelligence_metadata JSONB column to generated_scripts for tracking
