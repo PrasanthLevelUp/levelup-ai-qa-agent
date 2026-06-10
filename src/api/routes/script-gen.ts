@@ -121,6 +121,11 @@ export function createScriptGenRouter(): Router {
         authConfig: rawAuthConfig,
         additionalUrls,
         forceFreshCrawl,
+        // Opt-in: persist a NEW application profile from this generation's crawl.
+        // Default false — generation will refresh an EXISTING profile but never
+        // silently create a brand-new one, so profile creation stays predictable
+        // (one explicit "Create Profile" action = one profile).
+        persistProfile,
         testCaseId,
         // ── Sprint 4: Enterprise Script Generation Enhancement ──
         requirementId,
@@ -335,15 +340,33 @@ export function createScriptGenRouter(): Router {
       const engine = new ScriptGenEngine();
       const result: GenerationResult = await engine.generate(config);
 
-      // Save crawl data to profile if a fresh crawl was performed
+      // Save crawl data to profile if a fresh crawl was performed.
+      //
+      // IMPORTANT — predictable profile creation: by default we only REFRESH an
+      // existing profile here. We do NOT silently create a brand-new profile for
+      // the generated URL, because users found it confusing that generating a
+      // script auto-spawned extra App Profiles they never explicitly created.
+      // A new profile is created only when the caller explicitly opts in via
+      // `persistProfile: true` (e.g. a future "save as profile" toggle in the UI).
+      // An existing profile already present for this URL is detected by
+      // decideCrawlStrategy and is always refreshed.
       if (!crawlDecision.usedCache && result.rawCrawlData) {
         try {
-          await crawlOrchestrator.saveCrawlResult(url, result.rawCrawlData, companyId, {
-            authConfig: sanitizedAuthConfig,
-          }, projectId);
-          // Learn patterns from the crawl (project-scoped)
+          const allowCreate = persistProfile === true || !!crawlDecision.profile;
+          const saved = await crawlOrchestrator.saveCrawlResult(
+            url,
+            result.rawCrawlData,
+            companyId,
+            { authConfig: sanitizedAuthConfig },
+            projectId,
+            { allowCreate, source: 'auto' },
+          );
+          // Learn patterns from the crawl (project-scoped) regardless — pattern
+          // learning is independent of whether a profile row was persisted.
           await patternMatcher.learnPatterns(result.rawCrawlData, companyId, projectId);
-          console.log(`[ScriptGen] Profile saved + patterns learned for: ${url}`);
+          console.log(
+            `[ScriptGen] Patterns learned for ${url}; profile ${saved ? `saved (id=${saved.id})` : 'not created (predictable mode — no existing profile, persistProfile not set)'}`,
+          );
         } catch (profileErr: any) {
           console.warn(`[ScriptGen] Could not save profile (non-blocking): ${profileErr.message}`);
         }

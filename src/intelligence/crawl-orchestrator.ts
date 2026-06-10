@@ -165,10 +165,12 @@ export class CrawlOrchestrator {
     companyId?: number,
     config?: OrchestratorConfig,
     projectId?: number,
+    options?: { allowCreate?: boolean; source?: string },
   ): Promise<ApplicationProfile | null> {
     const input: SaveProfileInput = {
       baseUrl,
       crawlData: crawlResult,
+      source: options?.source,
       authRequired: !!config?.authConfig,
       authConfig: config?.authConfig,
       totalElements: crawlResult?.elements?.length ?? 0,
@@ -197,8 +199,19 @@ export class CrawlOrchestrator {
     };
 
     try {
-      console.log(`[CrawlOrchestrator] 💾 Saving profile for ${baseUrl} (project=${projectId ?? 'none'}, company=${companyId ?? 'none'}, elements=${input.totalElements}, forms=${input.totalForms})`);
-      const profile = await this.profileService.saveProfile(input, companyId, projectId);
+      console.log(`[CrawlOrchestrator] 💾 Saving profile for ${baseUrl} (project=${projectId ?? 'none'}, company=${companyId ?? 'none'}, elements=${input.totalElements}, forms=${input.totalForms}, allowCreate=${options?.allowCreate ?? true})`);
+      const profile = await this.profileService.saveProfile(input, companyId, projectId, {
+        allowCreate: options?.allowCreate,
+      });
+      if (!profile) {
+        // allowCreate was false and no existing profile — intentionally skipped.
+        console.log(`[CrawlOrchestrator] ⏭️  Skipped profile creation for ${baseUrl} (no existing profile; auto-create disabled)`);
+        logger.info(MOD, 'Crawl result not persisted — auto-create disabled and no existing profile', {
+          url: baseUrl,
+          projectId,
+        });
+        return null;
+      }
       console.log(`[CrawlOrchestrator] ✅ Profile saved: id=${profile.id}, status=${profile.status}`);
       logger.info(MOD, 'Crawl result saved to profile', {
         profileId: profile.id,
@@ -317,6 +330,10 @@ export class CrawlOrchestrator {
     try {
       console.log(`[CrawlOrchestrator] 💾 Saving DEEP crawl for ${baseUrl} (pages=${pages.length}, elements=${totalElements}, forms=${totalForms}, authed=${!!multi?.authenticated})`);
       const profile = await this.profileService.saveProfile(input, companyId, projectId);
+      if (!profile) {
+        console.log(`[CrawlOrchestrator] ⏭️  Deep crawl not persisted for ${baseUrl}`);
+        return null;
+      }
       console.log(`[CrawlOrchestrator] ✅ Deep profile saved: id=${profile.id}, status=${profile.status}, pages=${pages.length}`);
       logger.info(MOD, 'Deep crawl result saved to profile', { profileId: profile.id, url: baseUrl, pages: pages.length, projectId });
       await this.captureSnapshot(profile, baseUrl, crawlData, companyId, projectId);
