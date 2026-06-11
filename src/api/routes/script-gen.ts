@@ -27,6 +27,7 @@ import {
   getKnowledgeItem,
   autoLinkScriptTraceability,
   getTestCaseById,
+  getTestCasesForRequirement,
   getRequirement,
   getProfileByUrl,
   markTestCaseAutomated,
@@ -207,6 +208,21 @@ export function createScriptGenRouter(): Router {
         }
       }
 
+      // ── Requirement-based generation: load ALL test cases for the requirement ──
+      // When a requirementId is supplied WITHOUT a specific testCaseId, fetch
+      // every test case linked to that requirement so the engine can produce one
+      // grounded, deterministic spec per case (no LLM, no project-context
+      // credential contamination). This is the REQ-001 (10 test cases) flow.
+      let requirementTestCases: any[] = [];
+      if (!testCase && requirementId != null && companyId != null) {
+        try {
+          requirementTestCases = await getTestCasesForRequirement(String(requirementId), companyId);
+          console.log(`[ScriptGen] 📋 Requirement ${requirementId} → ${requirementTestCases.length} test case(s) loaded for deterministic batch generation`);
+        } catch (reqErr: any) {
+          console.warn(`[ScriptGen] Could not load requirement test cases (non-blocking): ${reqErr?.message}`);
+        }
+      }
+
       // Resolve the generation provenance. Explicit value wins; otherwise infer
       // from what the caller supplied (test case / requirement / url).
       const generationSource: string =
@@ -333,9 +349,23 @@ export function createScriptGenRouter(): Router {
         // Anchor generation to the structured test case (steps + expected
         // result) when generating from a Test Case Lab case.
         ...(testCase ? { testCase } : {}),
+        // Requirement-based batch: one deterministic spec per linked test case.
+        ...(requirementTestCases.length > 0 ? { testCases: requirementTestCases } : {}),
         ...(companyId != null ? { companyId } : {}),
         ...(projectId != null ? { projectId } : {}),
       };
+
+      // Log which generation path will run (no credentials ever logged).
+      console.log('[ScriptGen] Generation mode:', JSON.stringify({
+        requirementId: requirementId ?? null,
+        testCaseId: testCaseId ?? null,
+        requirementTestCaseCount: requirementTestCases.length,
+        path: requirementTestCases.length > 0
+          ? 'requirement-batch-deterministic'
+          : testCase
+            ? 'testcase-deterministic'
+            : 'llm-fallback',
+      }));
 
       const engine = new ScriptGenEngine();
       const result: GenerationResult = await engine.generate(config);

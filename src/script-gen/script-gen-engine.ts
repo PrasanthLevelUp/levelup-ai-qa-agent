@@ -188,6 +188,23 @@ export interface GenerationConfig {
     scenario?: string;
     [k: string]: any;
   };
+  /**
+   * Requirement-based generation: a batch of structured test cases (e.g. all
+   * cases linked to one RTM requirement). When present, the engine produces one
+   * grounded Playwright spec PER test case via the deterministic path — no LLM,
+   * no project-context contamination. Each element has the same shape as
+   * `testCase`. Takes precedence over a single `testCase`.
+   */
+  testCases?: Array<{
+    id?: number;
+    title?: string;
+    steps?: any;
+    expected_result?: string;
+    preconditions?: string;
+    test_data?: string;
+    scenario?: string;
+    [k: string]: any;
+  }>;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -360,6 +377,25 @@ export class ScriptGenEngine {
     // Instead we translate the case's steps + test data + expected result
     // directly into grounded Playwright code, resolving selectors against the
     // real crawled DOM. This is reliable, reproducible and needs no API key.
+    // Requirement-based batch: one grounded spec per test case (no LLM).
+    if (Array.isArray(config.testCases) && config.testCases.length > 0) {
+      try {
+        const batch = this.generateFromTestCases(config, crawlResult);
+        if (batch && batch.generatedFiles.length > 0) {
+          const batchResult: GenerationResult = {
+            ...batch,
+            ...(authResult ? { authResult } : {}),
+            ...(!config.cachedCrawlData ? { rawCrawlData: crawlResult } : {}),
+          };
+          logger.info(MOD, 'Script generation complete (deterministic requirement-batch path)', batchResult.stats);
+          return batchResult;
+        }
+        logger.warn(MOD, 'Deterministic requirement-batch generation produced nothing — falling back');
+      } catch (batchErr: any) {
+        logger.warn(MOD, `Deterministic requirement-batch generation failed (${batchErr?.message}) — falling back`);
+      }
+    }
+
     if (config.testCase) {
       try {
         const deterministic = this.generateFromTestCase(config, crawlResult);
@@ -578,6 +614,88 @@ ${assertions.map(l => `    ${l}`).join('\n')}
         model: 'deterministic-test-case',
       },
       errors: [],
+    };
+  }
+
+  /**
+   * Requirement-based batch generation. Produces one grounded Playwright spec
+   * per test case in `config.testCases` using the same deterministic translator
+   * as the single-case path — purely from the case's own steps + test data +
+   * expected result and the crawled DOM. No LLM, no project-context creds, so
+   * cross-project contamination (e.g. OrangeHRM creds in a SauceDemo run) is
+   * impossible. File names are de-duplicated to keep the bundle stable.
+   */
+  private generateFromTestCases(config: GenerationConfig, crawl: CrawlResult): GenerationResult | null {
+    const startTime = Date.now();
+    const cases = config.testCases || [];
+    const generatedFiles: GeneratedFile[] = [];
+    const usedNames = new Set<string>();
+    const flows: TestPlan['flows'] = [];
+    let totalAssertions = 0;
+    let totalTests = 0;
+    const errors: string[] = [];
+
+    for (const tc of cases) {
+      try {
+        // Reuse the single-case translator by scoping config to this case.
+        const single = this.generateFromTestCase({ ...config, testCase: tc, testCases: undefined }, crawl);
+        if (!single || single.generatedFiles.length === 0) {
+          errors.push(`Test case ${tc.id ?? tc.title ?? '?'} produced no script`);
+          continue;
+        }
+        for (const f of single.generatedFiles) {
+          // De-duplicate file names within the batch (e.g. similar titles).
+          let path = f.path;
+          if (usedNames.has(path)) {
+            const idTag = tc.id != null ? `-tc${tc.id}` : `-${usedNames.size + 1}`;
+            path = path.replace(/\.spec\.ts$/, `${idTag}.spec.ts`);
+          }
+          usedNames.add(path);
+          generatedFiles.push({ ...f, path });
+        }
+        totalAssertions += single.stats.totalAssertions;
+        totalTests += single.stats.totalTests;
+        if (single.testPlan.flows[0]) flows.push(single.testPlan.flows[0]);
+      } catch (err: any) {
+        errors.push(`Test case ${tc.id ?? tc.title ?? '?'}: ${err?.message}`);
+      }
+    }
+
+    if (generatedFiles.length === 0) return null;
+
+    const reqLabel = cases[0]?.requirement_id ? `requirement ${cases[0].requirement_id}` : 'requirement';
+    const testPlan: TestPlan = {
+      name: `Test Plan: ${reqLabel} (${generatedFiles.length} cases)`,
+      description: `Deterministic requirement-based automation — ${generatedFiles.length} test cases`,
+      baseUrl: config.url,
+      pageType: crawl.pageType,
+      flows,
+      fixtures: [],
+      pageObjects: [],
+      metadata: {
+        generatedAt: new Date().toISOString(),
+        crawlTimeMs: crawl.crawlTimeMs,
+        totalElements: crawl.elements.length,
+        selectorQuality: 0,
+        model: 'deterministic-requirement-batch',
+        tokensUsed: 0,
+      },
+    };
+
+    return {
+      testPlan,
+      generatedFiles,
+      stats: {
+        totalTests,
+        totalAssertions,
+        avgSelectorScore: 0,
+        pageObjectsGenerated: 0,
+        crawlTimeMs: crawl.crawlTimeMs,
+        generationTimeMs: Date.now() - startTime,
+        tokensUsed: 0,
+        model: 'deterministic-requirement-batch',
+      },
+      errors,
     };
   }
 
