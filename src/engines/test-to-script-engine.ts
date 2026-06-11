@@ -153,6 +153,21 @@ interface IntelligenceBundle {
   appKnowledgeUsed: boolean;
   /** Repo coding-style / locator / helper guide distilled from the repo profile. */
   repoGuide?: RepoPatternGuide;
+  /**
+   * Real base URL from the Application Profile (e.g. https://www.saucedemo.com/).
+   * Used to overwrite the generated `page.goto(...)` so scripts never navigate
+   * to a hallucinated or placeholder URL.
+   */
+  appBaseUrl?: string;
+  /** Real login URL from the profile's auth config, when configured. */
+  loginUrl?: string;
+  /**
+   * Real test credentials from the profile's auth config. Injected into the
+   * generation prompt + deterministic templates so login-dependent scripts use
+   * working credentials instead of guesses like Admin/admin123. These belong to
+   * the user's own test environment and are committed only to the user's repo.
+   */
+  credentials?: { username?: string; password?: string };
 }
 
 /** Internal: a set of related test cases that will become one spec file. */
@@ -246,12 +261,28 @@ export class TestToScriptEngine {
     const perFile: FileCoverage[] = [];
     const locatorReports: LocatorReport[] = [];
 
+    // Resolve the effective base URL (fixes review issue C1 — hallucinated /
+    // placeholder URLs). Prefer the REAL App Profile base URL over the caller's
+    // value whenever the caller did not pass one or only passed the generic
+    // localhost default (routes hardcode 'http://localhost:3000'). This way the
+    // crawled production/staging host wins and scripts navigate to a real page.
+    const callerBaseUrl = (input.baseUrl || '').trim();
+    const callerIsDefault = !callerBaseUrl || /^https?:\/\/localhost(:\d+)?\/?$/i.test(callerBaseUrl);
+    const effectiveBaseUrl = (callerIsDefault && intel.appBaseUrl)
+      ? intel.appBaseUrl
+      : (callerBaseUrl || intel.appBaseUrl || DEFAULT_BASE_URL);
+    logger.info(MOD, 'Resolved base URL for generation', {
+      callerBaseUrl: callerBaseUrl || '(none)',
+      appProfileBaseUrl: intel.appBaseUrl || '(none)',
+      effectiveBaseUrl,
+    });
+
     for (const group of groups) {
       const { file, coverage, locatorReport } = await this.generateScriptForGroup(
         group,
         requirement,
         framework,
-        input.baseUrl || DEFAULT_BASE_URL,
+        effectiveBaseUrl,
         outputDir,
         knowledgeContext,
         intel,
@@ -333,11 +364,29 @@ export class TestToScriptEngine {
     let crawlData: CrawlDataLike | null = null;
     try {
       const profile = await getApplicationProfileForGeneration(companyId, input.projectId);
+      if (profile) {
+        // Capture the REAL base/login URLs and test credentials so generated
+        // scripts navigate to the actual app and log in with working creds
+        // (fixes hallucinated URLs/credentials — review issues C1 & C2). The
+        // raw auth_config is read here (not via the sanitized context) because
+        // executable scripts genuinely need the password; it is committed only
+        // to the user's own repository.
+        const authConfig: any = profile.auth_config || {};
+        const creds = authConfig.credentials || authConfig || {};
+        if (profile.base_url) bundle.appBaseUrl = profile.base_url;
+        if (authConfig.loginUrl) bundle.loginUrl = authConfig.loginUrl;
+        if (creds.username || creds.password) {
+          bundle.credentials = {
+            username: creds.username || undefined,
+            password: creds.password || undefined,
+          };
+        }
+      }
       if (profile?.crawl_data) {
         crawlData = profile.crawl_data as CrawlDataLike;
         const ctx = buildApplicationProfileContext(profile);
         if (ctx) {
-          bundle.appProfileBlock = this.formatAppProfileBlock(ctx);
+          bundle.appProfileBlock = this.formatAppProfileBlock(ctx, bundle);
           bundle.appProfileUsed = true;
         }
         logger.info(MOD, '✅ App Profile loaded for grounding', {
@@ -345,6 +394,15 @@ export class TestToScriptEngine {
           pages: profile.page_count,
           elements: profile.total_elements,
           forms: profile.total_forms,
+          hasCredentials: !!bundle.credentials,
+        });
+      } else if (bundle.appBaseUrl || bundle.credentials) {
+        // Profile exists but hasn't been crawled yet — still surface the URLs
+        // and credentials so scripts are grounded even without a DOM snapshot.
+        bundle.appProfileBlock = this.formatAppProfileBlock(undefined, bundle);
+        bundle.appProfileUsed = true;
+        logger.info(MOD, '✅ App Profile (no crawl) loaded for URL/credential grounding', {
+          baseUrl: bundle.appBaseUrl, hasCredentials: !!bundle.credentials,
         });
       } else {
         logger.info(MOD, 'ℹ️ No Application Profile available — locators fall back to knowledge/repo/heuristics');
@@ -391,9 +449,36 @@ export class TestToScriptEngine {
     return bundle;
   }
 
-  /** Format the compact App-Profile projection into a token-budgeted prompt block. */
-  private formatAppProfileBlock(ctx: ApplicationProfileContext): string {
-    const lines: string[] = ['## Real Application Structure (use these EXACT selectors)'];
+  /**
+   * Format the App-Profile projection into a token-budgeted prompt block.
+   *
+   * The block now leads with the REAL base/login URLs and test credentials
+   * (from `bundle`) so the model can never fall back to placeholder URLs or
+   * invented credentials, followed by the real form/element selectors.
+   */
+  private formatAppProfileBlock(
+    ctx: ApplicationProfileContext | undefined,
+    bundle?: Pick<IntelligenceBundle, 'appBaseUrl' | 'loginUrl' | 'credentials'>,
+  ): string {
+    const lines: string[] = [];
+
+    // ── Real URLs + credentials (ground truth — must be used verbatim) ──
+    const urlCredLines: string[] = [];
+    if (bundle?.appBaseUrl) urlCredLines.push(`- Base URL: ${bundle.appBaseUrl}`);
+    if (bundle?.loginUrl) urlCredLines.push(`- Login URL: ${bundle.loginUrl}`);
+    if (bundle?.credentials?.username) urlCredLines.push(`- Username: ${bundle.credentials.username}`);
+    if (bundle?.credentials?.password) urlCredLines.push(`- Password: ${bundle.credentials.password}`);
+    if (urlCredLines.length) {
+      lines.push('## Real Application URLs & Test Credentials (use these EXACT values — never invent)');
+      lines.push(...urlCredLines);
+      lines.push('');
+    }
+
+    if (!ctx) {
+      return lines.length ? lines.join('\n').trimEnd() : '';
+    }
+
+    lines.push('## Real Application Structure (use these EXACT selectors)');
 
     for (const form of (ctx.forms || []).slice(0, 4)) {
       const where = form.page ? ` on ${form.page}` : '';
@@ -621,6 +706,13 @@ export class TestToScriptEngine {
             .map(r => `  - ${r.elementDescription} → ${r.locator}${r.confidence < 60 ? '  // verify' : ''}`)
             .join('\n')}`
         : '';
+      // H1 — map this case's Expected Result into concrete assertion guidance so
+      // the AI emits a real expect(...) for every expected outcome instead of a
+      // no-op. The derived hints are suggestions; the AI still writes the code.
+      const assertionHints = this.deriveRequiredAssertions(tc, baseUrl);
+      const assertionBlock = assertionHints.length
+        ? `Required Assertions (map each Expected Result to a real expect):\n${assertionHints.map(a => `  - ${a}`).join('\n')}`
+        : '';
       return [
         `### Test Case TC${tc.id} (#${i + 1}): ${tc.title}`,
         `Scenario: ${tc.scenario || group.feature}`,
@@ -630,6 +722,7 @@ export class TestToScriptEngine {
         `Expected Result: ${tc.expected_result}`,
         tc.test_data ? `Test Data: ${tc.test_data}` : '',
         locatorHints,
+        assertionBlock,
       ].filter(Boolean).join('\n');
     }).join('\n\n');
 
@@ -678,8 +771,8 @@ ${testCaseDescriptions}
 Return ONLY the TypeScript code. No markdown fences, no explanations.`;
 
     let aiCode = '';
+    const maxTokens = Math.min(8000, 1500 + group.cases.length * 600);
     try {
-      const maxTokens = Math.min(8000, 1500 + group.cases.length * 600);
       const response = await this.openai.chat.completions.create({
         model: this.model,
         messages: [{ role: 'user', content: prompt }],
@@ -696,6 +789,48 @@ Return ONLY the TypeScript code. No markdown fences, no explanations.`;
         error: error.message, feature: group.feature,
       });
       aiCode = '';
+    }
+
+    // ── PHASE 5: POST-GENERATION VALIDATION + ONE CORRECTIVE RETRY ──────────
+    // Scan the AI output for the exact defects the review flagged (placeholder
+    // URLs, hallucinated credentials, no-op assertions, hard waits). If the
+    // output is usable but has fixable issues, do ONE bounded corrective pass
+    // with the concrete problems listed. Never throw — fall through to the
+    // deterministic template reconciliation either way (review issue C4/H1).
+    if (aiCode) {
+      const issues = this.validateGeneratedScript(aiCode, baseUrl, intel);
+      if (issues.length) {
+        logger.warn(MOD, '⚠️ Generated script failed validation — attempting corrective retry', {
+          feature: group.feature, issues,
+        });
+        try {
+          const fixPrompt = `${prompt}\n\n## PREVIOUS ATTEMPT FAILED VALIDATION\nYour previous output had these defects that MUST be fixed:\n${issues.map(i => `- ${i}`).join('\n')}\n\nRegenerate the COMPLETE file fixing ALL of the above. Use the real Base URL "${baseUrl}" verbatim in navigation. Use ONLY the provided credentials and locators. Every Expected Result must map to a concrete, meaningful expect(...). Return ONLY TypeScript code.`;
+          const retry = await this.openai.chat.completions.create({
+            model: this.model,
+            messages: [{ role: 'user', content: fixPrompt }],
+            temperature: 0.1,
+            max_tokens: maxTokens,
+          });
+          let retryCode = retry.choices[0]?.message?.content?.trim() || '';
+          retryCode = retryCode.replace(/^```(?:typescript|ts)?\n?/m, '').replace(/\n?```$/m, '').trim();
+          if (retryCode && !retryCode.startsWith('import')) {
+            retryCode = `import { test, expect } from '@playwright/test';\n\n${retryCode}`;
+          }
+          if (retryCode) {
+            const remaining = this.validateGeneratedScript(retryCode, baseUrl, intel);
+            if (remaining.length < issues.length) {
+              aiCode = retryCode;
+              logger.info(MOD, '✅ Corrective retry improved script', {
+                feature: group.feature, before: issues.length, after: remaining.length,
+              });
+            }
+          }
+        } catch (err: any) {
+          logger.warn(MOD, 'Corrective retry failed (non-blocking)', {
+            feature: group.feature, error: err?.message,
+          });
+        }
+      }
     }
 
     // ── Reconcile: which test cases did the AI actually cover? ──
@@ -768,6 +903,113 @@ Return ONLY the TypeScript code. No markdown fences, no explanations.`;
       locators,
       warnings: [],
     };
+  }
+
+  /**
+   * H1 — Derive concrete assertion guidance from a test case's Expected Result.
+   * Maps common outcome phrasings to real Playwright assertions so the AI (and,
+   * indirectly, reviewers) can see exactly which expect(...) each case needs.
+   * Returns human-readable hints (not code) that are injected into the prompt.
+   */
+  private deriveRequiredAssertions(tc: any, baseUrl: string): string[] {
+    const expected = `${tc?.expected_result || ''}`.trim();
+    if (!expected) return [];
+    const lc = expected.toLowerCase();
+    const hints: string[] = [];
+
+    // Navigation / redirect outcomes → toHaveURL with a real path.
+    if (/\b(redirect|navigate|land on|taken to|go to|sent to)\b/.test(lc) ||
+        /\b(dashboard|home ?page|inventory|profile|cart|checkout|landing)\b/.test(lc)) {
+      hints.push(`Assert navigation with \`await expect(page).toHaveURL(/<real-path>/)\` (derive the path from the destination named in the Expected Result; base URL is "${baseUrl}"). Do NOT use \`toHaveURL(/.*/)\`.`);
+    }
+    // Error / validation messages → toContainText / toBeVisible on the message.
+    if (/\b(error|invalid|fail|not allowed|denied|required|warning|message|alert|toast)\b/.test(lc)) {
+      hints.push('Assert the exact message text is visible, e.g. `await expect(page.getByText(/<message>/i)).toBeVisible()` or `toContainText("<message>")`.');
+    }
+    // Visibility / presence outcomes.
+    if (/\b(display|shown|appear|visible|see|present|render)\b/.test(lc)) {
+      hints.push('Assert the relevant element is visible with `await expect(<locator>).toBeVisible()`.');
+    }
+    // Disappearance / hidden outcomes.
+    if (/\b(hidden|disappear|removed|not (?:be )?(?:visible|shown|displayed)|no longer)\b/.test(lc)) {
+      hints.push('Assert the element is gone with `await expect(<locator>).toBeHidden()` or `.toHaveCount(0)`.');
+    }
+    // Count / quantity outcomes.
+    if (/\b(\d+\s+(?:items?|results?|rows?|products?|entries|records?))\b/.test(lc) || /\bcount\b/.test(lc)) {
+      hints.push('Assert the expected quantity with `await expect(<locator>).toHaveCount(<n>)`.');
+    }
+    // Enabled/disabled state.
+    if (/\b(enabled|disabled|clickable|greyed|grayed)\b/.test(lc)) {
+      hints.push('Assert control state with `await expect(<locator>).toBeEnabled()` or `.toBeDisabled()`.');
+    }
+    // Value / field content.
+    if (/\b(value|contains|equals|set to|populated|pre-?filled|text)\b/.test(lc)) {
+      hints.push('Assert content with `await expect(<locator>).toHaveText(...)` / `.toHaveValue(...)` matching the Expected Result.');
+    }
+
+    // Always require at least one meaningful assertion tied to the outcome.
+    if (!hints.length) {
+      hints.push(`Add at least one meaningful assertion that verifies: "${expected.slice(0, 160)}". Never use a no-op like \`toHaveURL(/.*/)\`.`);
+    }
+    return hints;
+  }
+
+  /**
+   * PHASE 5 — Validate a generated script against the review's defect list.
+   * Returns a list of human-readable issues (empty = clean). Detects:
+   *  - placeholder / hallucinated navigation targets (e.g. goto('login page'))
+   *  - hallucinated credentials when real ones are available
+   *  - no-op assertions (toHaveURL(/.*\/)/)
+   *  - hard waits (waitForTimeout)
+   *  - missing assertions entirely
+   * Purely heuristic + non-throwing; used only to decide on a corrective retry.
+   */
+  private validateGeneratedScript(code: string, baseUrl: string, intel: IntelligenceBundle): string[] {
+    const issues: string[] = [];
+    if (!code) return issues;
+
+    // 1. Placeholder navigation targets — goto() must point at a real URL/path,
+    //    never an English phrase like 'login page' or 'the dashboard'.
+    const gotoMatches = [...code.matchAll(/\.goto\(\s*[`'"]([^`'"]*)[`'"]/g)];
+    for (const m of gotoMatches) {
+      const target = (m[1] || '').trim();
+      const looksLikeUrl = /^https?:\/\//i.test(target) || target.startsWith('/') || target === '' || target.includes('${') || target.startsWith('.');
+      const looksLikePhrase = /\s/.test(target) || /^(the\s|login|dashboard|home|sign[\s-]?in|landing)\b/i.test(target);
+      if (!looksLikeUrl && looksLikePhrase) {
+        issues.push(`page.goto("${target}") is a placeholder phrase, not a URL. Navigate to the real Base URL "${baseUrl}" or a real path.`);
+      }
+    }
+
+    // 2. Hallucinated credentials — if the profile gave us real creds, the
+    //    common invented defaults must not appear.
+    if (intel.credentials?.username || intel.credentials?.password) {
+      const realU = (intel.credentials.username || '').toLowerCase();
+      const realP = (intel.credentials.password || '').toLowerCase();
+      const lc = code.toLowerCase();
+      const invented = ['admin123', 'password123', 'test@test.com', 'user@example.com', 'admin@admin.com'];
+      for (const bad of invented) {
+        if (lc.includes(bad) && bad !== realU && bad !== realP) {
+          issues.push(`Found likely hallucinated credential "${bad}". Use ONLY the provided test credentials.`);
+        }
+      }
+    }
+
+    // 3. No-op assertions.
+    if (/toHaveURL\(\s*\/\.\*\/\s*\)/.test(code) || /toHaveURL\(\s*[`'"]?\s*[`'"]?\s*\)/.test(code)) {
+      issues.push('Contains a no-op assertion `toHaveURL(/.*/)`. Replace with a real, specific assertion.');
+    }
+
+    // 4. Hard waits.
+    if (/waitForTimeout\s*\(/.test(code)) {
+      issues.push('Uses `waitForTimeout` (hard wait). Use web-first assertions / auto-waiting locators instead.');
+    }
+
+    // 5. Missing assertions entirely.
+    if (!/\bexpect\s*\(/.test(code)) {
+      issues.push('No `expect(...)` assertions found. Every test must verify its Expected Result.');
+    }
+
+    return issues;
   }
 
   /**

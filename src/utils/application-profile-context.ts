@@ -81,7 +81,9 @@ export function buildApplicationProfileContext(profile: AnyObj | null | undefine
     totalElements: profile.total_elements ?? undefined,
     totalForms: profile.total_forms ?? undefined,
     loginUrl: authConfig.loginUrl || undefined,
-    username: authConfig.username || undefined,
+    // auth_config stores credentials as { credentials: { username, password } };
+    // older/looser rows may store username at the top level. Read both shapes.
+    username: authConfig.credentials?.username || authConfig.username || undefined,
     pages: [],
     forms: [],
     keyElements: [],
