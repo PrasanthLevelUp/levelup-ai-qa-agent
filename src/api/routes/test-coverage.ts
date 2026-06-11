@@ -555,7 +555,11 @@ export function createTestCoverageRouter(): Router {
         repositoryId,
         projectId,
         framework: framework as 'playwright',
-        baseUrl: baseUrl || 'http://localhost:3000',
+        // Pass the caller's baseUrl through as-is (may be empty). The engine
+        // resolves the effective base URL, preferring the REAL App Profile
+        // base_url over the generic localhost default so generated scripts
+        // navigate to a real host (fixes review issue C1 — placeholder URLs).
+        baseUrl: baseUrl || undefined,
         outputDir: outputDir || 'tests/generated',
       });
 
