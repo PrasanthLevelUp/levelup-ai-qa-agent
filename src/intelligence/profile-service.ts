@@ -62,6 +62,19 @@ export interface SaveProfileInput {
   totalForms?: number;
   totalInteractive?: number;
   ttlDays?: number;
+  /** 'manual' (user-created) or 'auto' (background-created). Defaults to 'manual'. */
+  source?: string;
+}
+
+export interface SaveProfileOptions {
+  /**
+   * When false, a profile is saved ONLY if one already exists for this URL/scope
+   * (i.e. a refresh of cached crawl data). If no profile exists yet, the save is
+   * skipped and `null` is returned — preventing background flows (such as URL
+   * script generation) from silently creating brand-new profiles the user never
+   * explicitly asked for. Defaults to true to preserve existing callers.
+   */
+  allowCreate?: boolean;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -103,15 +116,35 @@ export class ProfileService {
   /**
    * Save crawl results as an application profile with page snapshots.
    */
-  async saveProfile(input: SaveProfileInput, companyId?: number, projectId?: number): Promise<ApplicationProfile> {
+  async saveProfile(
+    input: SaveProfileInput,
+    companyId?: number,
+    projectId?: number,
+    options?: SaveProfileOptions,
+  ): Promise<ApplicationProfile | null> {
     const normalizedUrl = this.normalizeUrl(input.baseUrl);
     const fingerprint = this.computeFingerprint(input.crawlData);
+
+    // Guard against silent auto-creation: when allowCreate is explicitly false,
+    // only refresh an EXISTING profile. If none exists, skip the save entirely so
+    // background flows never spawn profiles the user did not explicitly create.
+    if (options?.allowCreate === false) {
+      const existing = await getProfileByUrl(normalizedUrl, companyId, projectId);
+      if (!existing) {
+        logger.info(MOD, 'Skipping profile save — no existing profile and allowCreate=false', {
+          url: normalizedUrl,
+          projectId,
+        });
+        return null;
+      }
+    }
 
     logger.info(MOD, 'Saving application profile', {
       url: normalizedUrl,
       fingerprint,
       pages: input.pages?.length ?? 0,
       projectId,
+      source: input.source ?? 'manual',
     });
 
     const profile = await upsertProfile({
@@ -127,6 +160,7 @@ export class ProfileService {
       status: 'fresh',
       ttlDays: input.ttlDays ?? 30,
       projectId,
+      source: input.source,
     }, companyId);
 
     // Save page snapshots

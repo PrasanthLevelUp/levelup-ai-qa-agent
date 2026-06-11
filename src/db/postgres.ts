@@ -976,7 +976,11 @@ async function initSchema(client: PoolClient): Promise<void> {
     error_message TEXT,
     company_id INTEGER REFERENCES companies(id),
     created_at TIMESTAMPTZ DEFAULT NOW(),
-    updated_at TIMESTAMPTZ DEFAULT NOW()
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    -- How the profile was created: 'manual' (user via Profiles UI) or 'auto'
+    -- (background flow such as opt-in URL script generation). Lets the UI clearly
+    -- label auto-created profiles so one user action never silently yields several.
+    source VARCHAR(20) DEFAULT 'manual'
   )`);
   // NOTE: We deliberately do NOT declare a table-level `UNIQUE(base_url, company_id)` here.
   // That constraint ignores project_id and conflicts with the project-scoped upsert in
@@ -1171,7 +1175,8 @@ async function initSchema(client: PoolClient): Promise<void> {
       ADD COLUMN IF NOT EXISTS form_fields JSONB DEFAULT '[]',
       ADD COLUMN IF NOT EXISTS custom_metadata JSONB DEFAULT '{}',
       ADD COLUMN IF NOT EXISTS notes TEXT,
-      ADD COLUMN IF NOT EXISTS tags VARCHAR(255)[]
+      ADD COLUMN IF NOT EXISTS tags VARCHAR(255)[],
+      ADD COLUMN IF NOT EXISTS source VARCHAR(20) DEFAULT 'manual'
   `);
   await safeExec(client, 'idx_app_profiles_tags',
     `CREATE INDEX IF NOT EXISTS idx_app_profiles_tags ON application_profiles USING GIN(tags)`);
@@ -8007,6 +8012,14 @@ export interface ApplicationProfile {
   custom_metadata?: any | null;
   notes?: string | null;
   tags?: string[] | null;
+  /**
+   * How this profile came to exist:
+   *  - 'manual'     → explicitly created by a user via the Profiles UI / POST /profiles
+   *  - 'auto'       → auto-created by a background flow (e.g. opt-in URL script generation)
+   * Defaults to 'manual'. Used by the UI to clearly label auto-created profiles so a
+   * single user "Create Profile" action never silently produces multiple profiles.
+   */
+  source?: 'manual' | 'auto' | string | null;
 }
 
 export async function getProfileByUrl(baseUrl: string, companyId?: number, projectId?: number): Promise<ApplicationProfile | null> {
@@ -8106,6 +8119,8 @@ export async function upsertProfile(data: {
   customMetadata?: any;
   notes?: string;
   tags?: string[];
+  /** 'manual' (default) for user-created profiles, 'auto' for background-created ones. */
+  source?: string;
 }, companyId?: number): Promise<ApplicationProfile> {
   const pool = getPool();
   const ttl = data.ttlDays || 30;
@@ -8121,10 +8136,10 @@ export async function upsertProfile(data: {
         crawled_at, expires_at, page_count, total_elements, total_forms,
         total_interactive, status, error_message, company_id, project_id,
         name, description, screenshots, business_flows, url_patterns,
-        form_fields, custom_metadata, notes, tags)
+        form_fields, custom_metadata, notes, tags, source)
      VALUES ($1, $2, $3, $4, $5, NOW(), NOW() + ($6 || ' days')::INTERVAL,
              $7, $8, $9, $10, $11, $12, $13, $14,
-             $15, $16, $17, $18, $19, $20, $21, $22, $23)
+             $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)
      ON CONFLICT (base_url, COALESCE(project_id, -1), COALESCE(company_id, 0)) DO UPDATE SET
        app_fingerprint = EXCLUDED.app_fingerprint,
        crawl_data = EXCLUDED.crawl_data,
@@ -8147,6 +8162,9 @@ export async function upsertProfile(data: {
        custom_metadata = COALESCE(EXCLUDED.custom_metadata, application_profiles.custom_metadata),
        notes = COALESCE(EXCLUDED.notes, application_profiles.notes),
        tags = COALESCE(EXCLUDED.tags, application_profiles.tags),
+       -- Preserve the ORIGINAL source: a later auto-refresh of a user-created
+       -- profile must never relabel it as 'auto' (and vice versa).
+       source = COALESCE(application_profiles.source, EXCLUDED.source),
        updated_at = NOW()
      RETURNING *`,
     [
@@ -8173,9 +8191,10 @@ export async function upsertProfile(data: {
       data.customMetadata ? JSON.stringify(data.customMetadata) : null,
       data.notes || null,
       data.tags && data.tags.length > 0 ? data.tags : null,
+      data.source || 'manual',
     ],
   );
-  console.log(`[DB] upsertProfile: ${data.baseUrl} → id=${rows[0]?.id}, project=${data.projectId ?? 'none'}, company=${companyId ?? 'none'}`);
+  console.log(`[DB] upsertProfile: ${data.baseUrl} → id=${rows[0]?.id}, project=${data.projectId ?? 'none'}, company=${companyId ?? 'none'}, source=${data.source || 'manual'}`);
   return rows[0];
 }
 
