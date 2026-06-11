@@ -5474,10 +5474,80 @@ export async function getTestRequirement(id: number, companyId?: number): Promis
   return r.rows[0] || null;
 }
 
-export async function deleteTestRequirement(id: number): Promise<boolean> {
+/**
+ * Hard-delete a Test Case Lab requirement. Its scenarios + cases cascade away
+ * (ON DELETE CASCADE), so this can drop the coverage of any linked RTM
+ * requirement. Runs in a transaction and explicitly recomputes the affected
+ * RTM requirements' coverage (in addition to the AFTER DELETE triggers) so the
+ * Requirements page / RTM dashboard never show stale coverage.
+ */
+export async function deleteTestRequirement(id: number, companyId?: number): Promise<boolean> {
   const pool = getPool();
-  const r = await pool.query('DELETE FROM test_requirements WHERE id = $1', [id]);
-  return (r.rowCount ?? 0) > 0;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    if (companyId) {
+      const own = await client.query(
+        'SELECT 1 FROM test_requirements WHERE id = $1 AND company_id = $2',
+        [id, companyId],
+      );
+      if (own.rowCount === 0) {
+        await client.query('ROLLBACK');
+        return false;
+      }
+    }
+
+    // Capture linked RTM requirement UUIDs before the cases cascade away.
+    const affected = await client.query<{ requirement_id: string }>(
+      `SELECT DISTINCT tc.requirement_id
+         FROM generated_test_cases tc
+         JOIN generated_test_scenarios gs ON tc.scenario_id = gs.id
+        WHERE gs.requirement_id = $1
+          AND tc.requirement_id IS NOT NULL`,
+      [id],
+    );
+    const reqIds = affected.rows.map((r) => r.requirement_id).filter(Boolean);
+
+    const r = await client.query('DELETE FROM test_requirements WHERE id = $1', [id]);
+
+    for (const reqId of reqIds) {
+      await client.query(
+        `UPDATE requirements r
+         SET coverage_percentage = sub.cov, status = sub.stat, updated_at = NOW()
+         FROM (
+           SELECT
+             CASE
+               WHEN COUNT(DISTINCT te.id) > 0 THEN 100
+               WHEN COUNT(DISTINCT gs.id) > 0 THEN 66
+               WHEN COUNT(DISTINCT tc.id) > 0 THEN 33
+               ELSE 0
+             END AS cov,
+             CASE
+               WHEN COUNT(DISTINCT te.id) FILTER (WHERE te.status = 'passed') > 0 THEN 'Passed'
+               WHEN COUNT(DISTINCT te.id) FILTER (WHERE te.status = 'failed') > 0 THEN 'Failed'
+               WHEN COUNT(DISTINCT gs.id) > 0 THEN 'In Progress'
+               ELSE 'Not Tested'
+             END AS stat
+           FROM requirements req
+           LEFT JOIN generated_test_cases tc ON tc.requirement_id = req.id
+           LEFT JOIN generated_scripts gs ON (gs.test_case_id = tc.id OR gs.requirement_id = req.id) AND gs.deleted_at IS NULL
+           LEFT JOIN rtm_test_executions te ON te.requirement_id = req.id
+           WHERE req.id = $1
+         ) sub
+         WHERE r.id = $1 AND r.deleted_at IS NULL`,
+        [reqId],
+      );
+    }
+
+    await client.query('COMMIT');
+    return (r.rowCount ?? 0) > 0;
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
 }
 
 // ---- Test Case Lab: duplicate prevention + generation state ----
@@ -5519,20 +5589,115 @@ export async function findExistingRequirementBySignature(args: {
 /**
  * Delete all generated scenarios + cases for a requirement and mark it 'deleted'
  * so it can be regenerated. Scenarios cascade-delete their cases.
+ *
+ * IMPORTANT (coverage integrity): the generated test cases removed here may be
+ * linked to an RTM `requirements` row via generated_test_cases.requirement_id
+ * (a UUID, distinct from the Test Case Lab's integer requirement id). Deleting
+ * them must drop that requirement's STORED coverage_percentage / status back to
+ * the live value (e.g. 33% → 0% "Not Tested" when the last case is removed).
+ *
+ * Two safety layers guarantee this:
+ *   1. AFTER DELETE triggers on generated_test_cases (rtm-schema.ts) recompute
+ *      coverage automatically, even for cascaded deletes.
+ *   2. This function ALSO recomputes the affected RTM requirements explicitly
+ *      inside the same transaction — belt-and-suspenders so the fix holds even
+ *      on an environment where the new triggers haven't been applied yet.
+ *
+ * The whole operation runs in a single transaction so a partial failure never
+ * leaves orphaned cases or stale coverage behind. Returns the number of
+ * scenarios deleted and the RTM requirement UUIDs whose coverage was refreshed.
  */
-export async function deleteRequirementTestCases(id: number, companyId?: number): Promise<{ deletedScenarios: number }> {
+export async function deleteRequirementTestCases(
+  id: number,
+  companyId?: number,
+): Promise<{ deletedScenarios: number; recalculatedRequirements: string[] }> {
   const pool = getPool();
-  // Verify ownership when companyId is provided
-  if (companyId) {
-    const own = await pool.query('SELECT 1 FROM test_requirements WHERE id = $1 AND company_id = $2', [id, companyId]);
-    if (own.rowCount === 0) return { deletedScenarios: 0 };
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    // Verify ownership when companyId is provided.
+    if (companyId) {
+      const own = await client.query(
+        'SELECT 1 FROM test_requirements WHERE id = $1 AND company_id = $2',
+        [id, companyId],
+      );
+      if (own.rowCount === 0) {
+        await client.query('ROLLBACK');
+        return { deletedScenarios: 0, recalculatedRequirements: [] };
+      }
+    }
+
+    // Capture the RTM requirement UUIDs linked to the cases we are about to
+    // delete, BEFORE the rows disappear, so we can recompute their coverage.
+    const affected = await client.query<{ requirement_id: string }>(
+      `SELECT DISTINCT tc.requirement_id
+         FROM generated_test_cases tc
+         JOIN generated_test_scenarios gs ON tc.scenario_id = gs.id
+        WHERE gs.requirement_id = $1
+          AND tc.requirement_id IS NOT NULL`,
+      [id],
+    );
+    const reqIds = affected.rows.map((r) => r.requirement_id).filter(Boolean);
+
+    // Delete the scenarios — generated_test_cases cascade-delete via the
+    // scenario_id FK (ON DELETE CASCADE).
+    const del = await client.query(
+      'DELETE FROM generated_test_scenarios WHERE requirement_id = $1',
+      [id],
+    );
+
+    // Mark the Test Case Lab requirement deleted so it can be regenerated.
+    await client.query(
+      `UPDATE test_requirements
+          SET generation_state = 'deleted', last_generated_count = 0, updated_at = NOW()
+        WHERE id = $1`,
+      [id],
+    );
+
+    // Explicitly recompute coverage for each affected RTM requirement from the
+    // now-live rows, using the canonical coverage maths (mirrors the triggers
+    // and recalculateRequirementCoverage). Idempotent.
+    for (const reqId of reqIds) {
+      await client.query(
+        `UPDATE requirements r
+         SET
+           coverage_percentage = sub.cov,
+           status = sub.stat,
+           updated_at = NOW()
+         FROM (
+           SELECT
+             CASE
+               WHEN COUNT(DISTINCT te.id) > 0 THEN 100
+               WHEN COUNT(DISTINCT gs.id) > 0 THEN 66
+               WHEN COUNT(DISTINCT tc.id) > 0 THEN 33
+               ELSE 0
+             END AS cov,
+             CASE
+               WHEN COUNT(DISTINCT te.id) FILTER (WHERE te.status = 'passed') > 0 THEN 'Passed'
+               WHEN COUNT(DISTINCT te.id) FILTER (WHERE te.status = 'failed') > 0 THEN 'Failed'
+               WHEN COUNT(DISTINCT gs.id) > 0 THEN 'In Progress'
+               ELSE 'Not Tested'
+             END AS stat
+           FROM requirements req
+           LEFT JOIN generated_test_cases tc ON tc.requirement_id = req.id
+           LEFT JOIN generated_scripts gs ON (gs.test_case_id = tc.id OR gs.requirement_id = req.id) AND gs.deleted_at IS NULL
+           LEFT JOIN rtm_test_executions te ON te.requirement_id = req.id
+           WHERE req.id = $1
+         ) sub
+         WHERE r.id = $1 AND r.deleted_at IS NULL`,
+        [reqId],
+      );
+    }
+
+    await client.query('COMMIT');
+    return { deletedScenarios: del.rowCount ?? 0, recalculatedRequirements: reqIds };
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
   }
-  const del = await pool.query('DELETE FROM generated_test_scenarios WHERE requirement_id = $1', [id]);
-  await pool.query(
-    `UPDATE test_requirements SET generation_state = 'deleted', last_generated_count = 0, updated_at = NOW() WHERE id = $1`,
-    [id]
-  );
-  return { deletedScenarios: del.rowCount ?? 0 };
 }
 
 /** Update lifecycle state/count after a (re)generation or deletion. */
@@ -9332,6 +9497,65 @@ export async function recalculateRequirementCoverage(
     [id, companyId],
   );
   return getRequirement(id, companyId);
+}
+
+/**
+ * Recompute coverage_percentage / status for EVERY requirement from the live
+ * joins, repairing any rows whose stored value drifted (e.g. coverage left
+ * stale at 33% after test cases were deleted before the AFTER DELETE triggers
+ * existed). Scope to a company/project when provided. Only rows that actually
+ * change are written (IS DISTINCT FROM), so it is cheap and idempotent.
+ * Returns the number of requirement rows updated.
+ */
+export async function recalculateAllRequirementCoverage(
+  companyId?: number,
+  projectId?: number,
+): Promise<number> {
+  const pool = getPool();
+  const conditions: string[] = ['req.deleted_at IS NULL'];
+  const params: any[] = [];
+  if (companyId !== undefined && companyId !== null) {
+    params.push(companyId);
+    conditions.push(`req.company_id = $${params.length}`);
+  }
+  if (projectId !== undefined && projectId !== null) {
+    params.push(projectId);
+    conditions.push(`(req.project_id = $${params.length} OR req.project_id IS NULL)`);
+  }
+  const where = conditions.join(' AND ');
+  const result = await pool.query(
+    `UPDATE requirements r
+     SET coverage_percentage = sub.cov, status = sub.stat, updated_at = NOW()
+     FROM (
+       SELECT
+         req.id AS rid,
+         CASE
+           WHEN COUNT(DISTINCT te.id) > 0 THEN 100
+           WHEN COUNT(DISTINCT gs.id) > 0 THEN 66
+           WHEN COUNT(DISTINCT tc.id) > 0 THEN 33
+           ELSE 0
+         END AS cov,
+         CASE
+           WHEN COUNT(DISTINCT te.id) FILTER (WHERE te.status = 'passed') > 0 THEN 'Passed'
+           WHEN COUNT(DISTINCT te.id) FILTER (WHERE te.status = 'failed') > 0 THEN 'Failed'
+           WHEN COUNT(DISTINCT gs.id) > 0 THEN 'In Progress'
+           ELSE 'Not Tested'
+         END AS stat
+       FROM requirements req
+       LEFT JOIN generated_test_cases tc ON tc.requirement_id = req.id
+       LEFT JOIN generated_scripts gs ON (gs.test_case_id = tc.id OR gs.requirement_id = req.id) AND gs.deleted_at IS NULL
+       LEFT JOIN rtm_test_executions te ON te.requirement_id = req.id
+       WHERE ${where}
+       GROUP BY req.id
+     ) sub
+     WHERE r.id = sub.rid
+       AND (
+         r.coverage_percentage IS DISTINCT FROM sub.cov
+         OR r.status IS DISTINCT FROM sub.stat
+       )`,
+    params,
+  );
+  return result.rowCount ?? 0;
 }
 
 /**

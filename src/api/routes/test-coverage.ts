@@ -424,7 +424,8 @@ export function createTestCoverageRouter(): Router {
   router.delete('/requirements/:id', async (req: Request, res: Response) => {
     try {
       const id = parseInt(String(req.params.id), 10);
-      const deleted = await deleteTestRequirement(id);
+      const companyId = (req as any).companyId;
+      const deleted = await deleteTestRequirement(id, companyId);
       return res.json({ deleted });
     } catch (err: any) {
       return res.status(500).json({ error: 'Failed to delete', details: err.message });
@@ -439,9 +440,17 @@ export function createTestCoverageRouter(): Router {
       const id = parseInt(String(req.params.id), 10);
       if (Number.isNaN(id)) return res.status(400).json({ error: 'Invalid requirement id' });
       const companyId = (req as any).companyId;
-      const { deletedScenarios } = await deleteRequirementTestCases(id, companyId);
-      logger.info(MOD, '🗑️ Cleared generated test cases for regeneration', { requirementId: id, deletedScenarios });
-      return res.json({ cleared: true, requirementId: id, deletedScenarios, generationState: 'deleted' });
+      const { deletedScenarios, recalculatedRequirements } = await deleteRequirementTestCases(id, companyId);
+      logger.info(MOD, '🗑️ Cleared generated test cases for regeneration', {
+        requirementId: id, deletedScenarios, recalculatedRequirements,
+      });
+      return res.json({
+        cleared: true,
+        requirementId: id,
+        deletedScenarios,
+        recalculatedRequirements,
+        generationState: 'deleted',
+      });
     } catch (err: any) {
       logger.error(MOD, 'Failed to clear test cases', { error: err.message });
       return res.status(500).json({ error: 'Failed to clear test cases', details: err.message });

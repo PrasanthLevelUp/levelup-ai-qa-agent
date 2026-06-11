@@ -23,6 +23,7 @@ import {
   getCoverageSummary,
   getTestCasesForRequirement,
   getRequirementAutomationCoverage,
+  recalculateAllRequirementCoverage,
 } from '../../db/postgres';
 
 const MOD = 'requirements-routes';
@@ -42,6 +43,23 @@ export function createRequirementsRouter(): Router {
     } catch (error: any) {
       logger.error(MOD, 'Failed to get coverage summary', { error: error?.message });
       res.status(500).json({ success: false, error: 'Failed to get coverage summary' });
+    }
+  });
+
+  /* ─── Recalculate coverage (STATIC — must precede /:id) ──────────────
+   * Repairs stored coverage_percentage / status for all requirements in scope
+   * from the live state. Useful to immediately fix historical drift (e.g.
+   * coverage stuck at 33% after test cases were deleted) without a redeploy. */
+  router.post('/coverage/recalculate', async (req: Request, res: Response) => {
+    try {
+      const companyId = (req as any).companyId;
+      const projectId = (req as any).projectId ?? null;
+      const updated = await recalculateAllRequirementCoverage(companyId, projectId);
+      logger.info(MOD, 'Recalculated requirement coverage', { companyId, projectId, updated });
+      res.json({ success: true, data: { updated } });
+    } catch (error: any) {
+      logger.error(MOD, 'Failed to recalculate coverage', { error: error?.message });
+      res.status(500).json({ success: false, error: 'Failed to recalculate coverage' });
     }
   });
 

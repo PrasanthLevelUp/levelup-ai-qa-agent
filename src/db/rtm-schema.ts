@@ -517,6 +517,207 @@ export const RTM_STATEMENTS: RtmStatement[] = [
       END IF;
     END $$`,
   },
+
+  /* ─── 10. DELETE coverage triggers ─────────────────────────────────────
+   * BUG FIX: the original section-6/7/8 triggers only fired AFTER INSERT OR
+   * UPDATE, so deleting test cases / scripts / executions left the STORED
+   * requirements.coverage_percentage (and status) stale — e.g. a requirement
+   * stayed at 33% "covered" with zero test cases. These AFTER DELETE triggers
+   * recompute the owning requirement from the *live* rows that remain (the
+   * deleted row is already gone in an AFTER trigger), so coverage correctly
+   * falls back to 66 / 33 / 0 and status to "Not Tested" when the last
+   * artefact is removed. They reuse the exact same coverage maths as the
+   * insert/update path. All resolve the requirement from OLD.* and are
+   * idempotent (DROP TRIGGER IF EXISTS before CREATE). */
+  {
+    label: 'fn_update_rtm_coverage_on_delete',
+    sql: `CREATE OR REPLACE FUNCTION update_rtm_coverage_on_delete()
+    RETURNS TRIGGER AS $$
+    DECLARE
+      v_req UUID := OLD.requirement_id;
+    BEGIN
+      IF v_req IS NULL THEN
+        RETURN OLD;
+      END IF;
+
+      UPDATE requirements r
+      SET
+        coverage_percentage = (
+          SELECT
+            CASE
+              WHEN COUNT(DISTINCT te.id) > 0 THEN 100
+              WHEN COUNT(DISTINCT gs.id) > 0 THEN 66
+              WHEN COUNT(DISTINCT tc.id) > 0 THEN 33
+              ELSE 0
+            END
+          FROM requirements req
+          LEFT JOIN generated_test_cases tc ON tc.requirement_id = req.id
+          LEFT JOIN generated_scripts gs ON (gs.test_case_id = tc.id OR gs.requirement_id = req.id) AND gs.deleted_at IS NULL
+          LEFT JOIN rtm_test_executions te ON te.requirement_id = req.id
+          WHERE req.id = v_req
+        ),
+        status = (
+          SELECT
+            CASE
+              WHEN COUNT(DISTINCT te.id) FILTER (WHERE te.status = 'passed') > 0 THEN 'Passed'
+              WHEN COUNT(DISTINCT te.id) FILTER (WHERE te.status = 'failed') > 0 THEN 'Failed'
+              WHEN COUNT(DISTINCT gs.id) > 0 THEN 'In Progress'
+              ELSE 'Not Tested'
+            END
+          FROM requirements req
+          LEFT JOIN generated_test_cases tc ON tc.requirement_id = req.id
+          LEFT JOIN generated_scripts gs ON (gs.test_case_id = tc.id OR gs.requirement_id = req.id) AND gs.deleted_at IS NULL
+          LEFT JOIN rtm_test_executions te ON te.requirement_id = req.id
+          WHERE req.id = v_req
+        ),
+        updated_at = NOW()
+      WHERE r.id = v_req;
+
+      RETURN OLD;
+    END;
+    $$ LANGUAGE plpgsql`,
+  },
+  {
+    label: 'trg_coverage_on_testcase_delete_drop',
+    sql: `DROP TRIGGER IF EXISTS trigger_rtm_coverage_on_testcase_delete ON generated_test_cases`,
+  },
+  {
+    label: 'trg_coverage_on_testcase_delete',
+    sql: `CREATE TRIGGER trigger_rtm_coverage_on_testcase_delete
+      AFTER DELETE ON generated_test_cases
+      FOR EACH ROW
+      WHEN (OLD.requirement_id IS NOT NULL)
+      EXECUTE FUNCTION update_rtm_coverage_on_delete()`,
+  },
+  {
+    label: 'trg_coverage_on_execution_delete_drop',
+    sql: `DROP TRIGGER IF EXISTS trigger_rtm_coverage_on_execution_delete ON rtm_test_executions`,
+  },
+  {
+    label: 'trg_coverage_on_execution_delete',
+    sql: `CREATE TRIGGER trigger_rtm_coverage_on_execution_delete
+      AFTER DELETE ON rtm_test_executions
+      FOR EACH ROW
+      WHEN (OLD.requirement_id IS NOT NULL)
+      EXECUTE FUNCTION update_rtm_coverage_on_delete()`,
+  },
+
+  /* Script deletes need to resolve the requirement from OLD: directly via
+   * OLD.requirement_id, else via the (possibly still-present) test case. If a
+   * test case was deleted first, its own AFTER DELETE trigger already handled
+   * the requirement, so a NULL resolution here is harmless. */
+  {
+    label: 'fn_update_rtm_coverage_on_script_delete',
+    sql: `CREATE OR REPLACE FUNCTION update_rtm_coverage_on_script_delete()
+    RETURNS TRIGGER AS $$
+    DECLARE
+      v_req UUID;
+    BEGIN
+      v_req := OLD.requirement_id;
+
+      IF v_req IS NULL AND OLD.test_case_id IS NOT NULL THEN
+        SELECT requirement_id INTO v_req
+        FROM generated_test_cases
+        WHERE id = OLD.test_case_id;
+      END IF;
+
+      IF v_req IS NULL THEN
+        RETURN OLD;
+      END IF;
+
+      UPDATE requirements r
+      SET
+        coverage_percentage = (
+          SELECT
+            CASE
+              WHEN COUNT(DISTINCT te.id) > 0 THEN 100
+              WHEN COUNT(DISTINCT gs.id) > 0 THEN 66
+              WHEN COUNT(DISTINCT tc.id) > 0 THEN 33
+              ELSE 0
+            END
+          FROM requirements req
+          LEFT JOIN generated_test_cases tc ON tc.requirement_id = req.id
+          LEFT JOIN generated_scripts gs ON (gs.test_case_id = tc.id OR gs.requirement_id = req.id) AND gs.deleted_at IS NULL
+          LEFT JOIN rtm_test_executions te ON te.requirement_id = req.id
+          WHERE req.id = v_req
+        ),
+        status = (
+          SELECT
+            CASE
+              WHEN COUNT(DISTINCT te.id) FILTER (WHERE te.status = 'passed') > 0 THEN 'Passed'
+              WHEN COUNT(DISTINCT te.id) FILTER (WHERE te.status = 'failed') > 0 THEN 'Failed'
+              WHEN COUNT(DISTINCT gs.id) > 0 THEN 'In Progress'
+              ELSE 'Not Tested'
+            END
+          FROM requirements req
+          LEFT JOIN generated_test_cases tc ON tc.requirement_id = req.id
+          LEFT JOIN generated_scripts gs ON (gs.test_case_id = tc.id OR gs.requirement_id = req.id) AND gs.deleted_at IS NULL
+          LEFT JOIN rtm_test_executions te ON te.requirement_id = req.id
+          WHERE req.id = v_req
+        ),
+        updated_at = NOW()
+      WHERE r.id = v_req;
+
+      RETURN OLD;
+    END;
+    $$ LANGUAGE plpgsql`,
+  },
+  {
+    label: 'trg_coverage_on_script_delete_drop',
+    sql: `DROP TRIGGER IF EXISTS trigger_rtm_coverage_on_script_delete ON generated_scripts`,
+  },
+  {
+    label: 'trg_coverage_on_script_delete',
+    sql: `CREATE TRIGGER trigger_rtm_coverage_on_script_delete
+      AFTER DELETE ON generated_scripts
+      FOR EACH ROW
+      WHEN (OLD.test_case_id IS NOT NULL OR OLD.requirement_id IS NOT NULL)
+      EXECUTE FUNCTION update_rtm_coverage_on_script_delete()`,
+  },
+
+  /* ─── 11. One-time backfill of stale coverage ──────────────────────────
+   * Repairs requirements whose STORED coverage_percentage / status drifted
+   * from the live state because deletes happened before the AFTER DELETE
+   * triggers above existed (the original demo bug: a requirement showing 33%
+   * with zero test cases). Recomputes every non-deleted requirement from the
+   * live joins using the canonical coverage maths, and only writes rows that
+   * actually changed (IS DISTINCT FROM) so it is cheap and fully idempotent —
+   * safe to run on every startup. */
+  {
+    label: 'backfill_rtm_requirement_coverage',
+    sql: `UPDATE requirements r
+    SET
+      coverage_percentage = sub.cov,
+      status = sub.stat,
+      updated_at = NOW()
+    FROM (
+      SELECT
+        req.id AS rid,
+        CASE
+          WHEN COUNT(DISTINCT te.id) > 0 THEN 100
+          WHEN COUNT(DISTINCT gs.id) > 0 THEN 66
+          WHEN COUNT(DISTINCT tc.id) > 0 THEN 33
+          ELSE 0
+        END AS cov,
+        CASE
+          WHEN COUNT(DISTINCT te.id) FILTER (WHERE te.status = 'passed') > 0 THEN 'Passed'
+          WHEN COUNT(DISTINCT te.id) FILTER (WHERE te.status = 'failed') > 0 THEN 'Failed'
+          WHEN COUNT(DISTINCT gs.id) > 0 THEN 'In Progress'
+          ELSE 'Not Tested'
+        END AS stat
+      FROM requirements req
+      LEFT JOIN generated_test_cases tc ON tc.requirement_id = req.id
+      LEFT JOIN generated_scripts gs ON (gs.test_case_id = tc.id OR gs.requirement_id = req.id) AND gs.deleted_at IS NULL
+      LEFT JOIN rtm_test_executions te ON te.requirement_id = req.id
+      WHERE req.deleted_at IS NULL
+      GROUP BY req.id
+    ) sub
+    WHERE r.id = sub.rid
+      AND (
+        r.coverage_percentage IS DISTINCT FROM sub.cov
+        OR r.status IS DISTINCT FROM sub.stat
+      )`,
+  },
 ];
 
 /** Table names RTM adds — surfaced to verifySchema / health checks. */
