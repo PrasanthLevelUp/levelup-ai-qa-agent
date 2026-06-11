@@ -195,7 +195,7 @@ export interface GenerationConfig {
 /* -------------------------------------------------------------------------- */
 
 export class ScriptGenEngine {
-  private readonly openai: OpenAI;
+  private readonly _openai: OpenAI | null;
   private readonly model: string;
   private readonly selectorEngine = new SelectorQualityEngine();
   private readonly assertionEngine = new AssertionEngine();
@@ -203,10 +203,22 @@ export class ScriptGenEngine {
   private readonly workflowMapper = new WorkflowMapper();
 
   constructor(config?: { apiKey?: string; model?: string }) {
+    // Lazy/optional API key: url-based generation still needs the LLM to infer a
+    // test plan, but TEST-CASE-BASED generation is now fully DETERMINISTIC (it
+    // maps the structured steps + test data directly to grounded Playwright
+    // code) and therefore must work even when no key is configured. We defer the
+    // "key required" error to the point where the LLM is actually invoked.
     const apiKey = config?.apiKey || process.env['OPENAI_API_KEY'];
-    if (!apiKey) throw new Error('OPENAI_API_KEY is required for script generation');
-    this.openai = new OpenAI({ apiKey });
-    this.model = config?.model || 'gpt-4o-mini';
+    this._openai = apiKey ? new OpenAI({ apiKey }) : null;
+    this.model = config?.model || process.env['SCRIPT_GEN_MODEL'] || 'gpt-4o-mini';
+  }
+
+  /** Access the OpenAI client, throwing a clear error only when it's actually needed. */
+  private get openai(): OpenAI {
+    if (!this._openai) {
+      throw new Error('OPENAI_API_KEY is required for URL-based script generation (test-case-based generation is deterministic and does not need it)');
+    }
+    return this._openai;
   }
 
   /**
@@ -341,6 +353,31 @@ export class ScriptGenEngine {
       authenticated: !!authResult?.success,
     });
 
+    // ─── Step 1.5: DETERMINISTIC test-case path ───────────────────
+    // When generating from a structured Test Case (Test Case Lab / requirement
+    // flow), we DO NOT ask the LLM to invent a plan (which hallucinated
+    // selectors, leaked OrangeHRM creds, and emitted `// Assert:` comments).
+    // Instead we translate the case's steps + test data + expected result
+    // directly into grounded Playwright code, resolving selectors against the
+    // real crawled DOM. This is reliable, reproducible and needs no API key.
+    if (config.testCase) {
+      try {
+        const deterministic = this.generateFromTestCase(config, crawlResult);
+        if (deterministic && deterministic.generatedFiles.length > 0) {
+          const tcResult: GenerationResult = {
+            ...deterministic,
+            ...(authResult ? { authResult } : {}),
+            ...(!config.cachedCrawlData ? { rawCrawlData: crawlResult } : {}),
+          };
+          logger.info(MOD, 'Script generation complete (deterministic test-case path)', tcResult.stats);
+          return tcResult;
+        }
+        logger.warn(MOD, 'Deterministic test-case generation produced nothing — falling back to LLM path');
+      } catch (tcErr: any) {
+        logger.warn(MOD, `Deterministic test-case generation failed (${tcErr?.message}) — falling back to LLM path`);
+      }
+    }
+
     // ─── Step 2: Build workflow map ───────────────────────────────
     const workflowMap = this.workflowMapper.buildWorkflowMap([crawlResult]);
 
@@ -413,6 +450,427 @@ export class ScriptGenEngine {
 
     logger.info(MOD, 'Script generation complete', result.stats);
     return result;
+  }
+
+  /* ──────────────────────────────────────────────────────────────────────── */
+  /*  DETERMINISTIC TEST-CASE GENERATION                                      */
+  /*  Translates a structured Test Case (steps + test data + expected result) */
+  /*  directly into grounded Playwright code — no LLM, no hallucination.      */
+  /* ──────────────────────────────────────────────────────────────────────── */
+
+  /**
+   * Generate a complete Playwright spec from a structured test case. Returns
+   * null when the case has no parseable steps (caller then falls back to the
+   * LLM path). Selectors are resolved against the REAL crawled DOM; credentials
+   * come from the case's Test Data (never invented); assertions are derived from
+   * the Expected Result with correct positive/negative logic.
+   */
+  private generateFromTestCase(config: GenerationConfig, crawl: CrawlResult): GenerationResult | null {
+    const startTime = Date.now();
+    const tc = config.testCase!;
+    const steps = this.parseTestCaseSteps(tc);
+    if (!steps.length) return null;
+
+    // Real base URL — prefer the navigate step's URL, else config.url. NEVER prose.
+    let baseUrl = config.url;
+    for (const s of steps) {
+      const m = s.match(/\bhttps?:\/\/[^\s'")]+/i);
+      if (/navigat|go to|open|launch|visit/i.test(s) && m) { baseUrl = m[0]; break; }
+    }
+    if (!/\/$/.test(baseUrl) && !/\.\w+$/.test(baseUrl)) baseUrl += '/';
+
+    const creds = this.parseTestData(tc.test_data);
+
+    // Resolve grounded selectors from the crawled DOM, with stable semantic
+    // fallbacks for elements not present on the crawled (login) page.
+    const sel = {
+      username: this.resolveGroundedSelector(['username', 'user name', 'user-name', 'login'], crawl, `page.locator('#user-name')`, 'input'),
+      password: this.resolveGroundedSelector(['password'], crawl, `page.locator('#password')`, 'input'),
+      login: this.resolveGroundedSelector(['login button', 'login', 'sign in', 'submit'], crawl, `page.locator('#login-button')`, 'button'),
+      error: this.resolveGroundedSelector(['error', 'error message'], crawl, `page.locator('[data-test="error"]')`, 'any'),
+      menu: `page.locator('#react-burger-menu-btn')`,
+      logout: `page.locator('#logout_sidebar_link')`,
+      title: `page.locator('[data-test="title"]')`,
+      product: `page.locator('.inventory_item_name')`,
+    };
+
+    const ctx = { url: baseUrl, creds, sel };
+    const { lines } = this.tcStepsToCode(steps, ctx);
+    const assertions = this.buildTcAssertions(`${tc.expected_result || ''}`, ctx, tc);
+
+    const tags = this.tcTags(tc);
+    const title = tc.title || 'Generated test';
+    const idMarker = tc.id != null ? `\n  // @tc:TC${tc.id}` : '';
+
+    const stepComments = steps.map((s, i) => `   *   ${i + 1}. ${this.escapeBlockComment(s)}`).join('\n');
+
+    const content = `import { test, expect } from '@playwright/test';
+
+/**
+ * ${this.escapeBlockComment(title)}
+ *
+ * Test Case ID: ${tc.id ?? 'n/a'}
+ * Priority: ${tc.priority ?? tc['Priority'] ?? 'n/a'}
+ * Coverage: ${tc.scenario ?? tc.coverage_type ?? 'n/a'}
+ * Steps:
+${stepComments}
+ * Expected Result: ${this.escapeBlockComment(`${tc.expected_result || ''}`)}
+ * Test Data: ${this.escapeBlockComment(`${tc.test_data || 'n/a'}`)}
+ *
+ * Generated by LevelUp AI QA Engine (deterministic test-case build)
+ * Base URL: ${baseUrl}
+ */
+
+test.describe('${escapeStr(title)}', () => {
+  test('${escapeStr(title)}', async ({ page }) => {${idMarker}
+${lines.map(l => `    ${l}`).join('\n')}
+
+    // ── Verify Expected Result ──
+${assertions.map(l => `    ${l}`).join('\n')}
+  });
+});
+`;
+
+    const fileName = `${toKebab(title).slice(0, 60) || `test-case-${tc.id ?? 'x'}`}.spec.ts`;
+    const generatedFiles: GeneratedFile[] = [{
+      path: `tests/${fileName}`,
+      content,
+      type: 'test',
+    }];
+
+    const totalAssertions = assertions.filter(a => /\bexpect\s*\(/.test(a)).length;
+    const testPlan: TestPlan = {
+      name: `Test Plan: ${title}`,
+      description: `Deterministic test-case automation for "${title}"`,
+      baseUrl,
+      pageType: crawl.pageType,
+      flows: [{
+        name: title,
+        description: `${tc.expected_result || ''}`,
+        flowType: 'authentication',
+        priority: 1,
+        steps: [],
+        tags,
+      }],
+      fixtures: [],
+      pageObjects: [],
+      metadata: {
+        generatedAt: new Date().toISOString(),
+        crawlTimeMs: crawl.crawlTimeMs,
+        totalElements: crawl.elements.length,
+        selectorQuality: 0,
+        model: 'deterministic-test-case',
+        tokensUsed: 0,
+      },
+    };
+
+    return {
+      testPlan,
+      generatedFiles,
+      stats: {
+        totalTests: 1,
+        totalAssertions,
+        avgSelectorScore: 0,
+        pageObjectsGenerated: 0,
+        crawlTimeMs: crawl.crawlTimeMs,
+        generationTimeMs: Date.now() - startTime,
+        tokensUsed: 0,
+        model: 'deterministic-test-case',
+      },
+      errors: [],
+    };
+  }
+
+  /** Parse test-case steps into a clean ordered list of step strings. */
+  private parseTestCaseSteps(tc: GenerationConfig['testCase']): string[] {
+    if (!tc) return [];
+    let steps: any = tc.steps;
+    if (typeof steps === 'string') {
+      try { steps = JSON.parse(steps); } catch { /* keep string */ }
+    }
+    let arr: string[] = [];
+    if (Array.isArray(steps)) {
+      arr = steps.map((s: any) =>
+        typeof s === 'string' ? s : (s?.action ?? s?.step ?? s?.description ?? '')
+      ).map((s: string) => String(s).trim()).filter(Boolean);
+    } else if (typeof steps === 'string') {
+      arr = steps.split(/\r?\n/).map(l => l.replace(/^\s*\d+[.)]\s*/, '').trim()).filter(Boolean);
+    }
+    // Strip a leading "N." numeric prefix if the array form carried it.
+    return arr.map(s => s.replace(/^\s*\d+[.)]\s*/, '').trim()).filter(Boolean);
+  }
+
+  /** Parse "Username: x, Password: y" (or JSON) test data into credentials. */
+  private parseTestData(testData: any): { username: string; password: string } {
+    const out = { username: '', password: '' };
+    if (!testData) return out;
+    if (typeof testData === 'object') {
+      out.username = String(testData.username ?? testData.user ?? '');
+      out.password = String(testData.password ?? testData.pass ?? '');
+      return out;
+    }
+    const s = String(testData);
+    const u = s.match(/user(?:name)?\s*[:=]\s*([^,;\n]*)/i);
+    const p = s.match(/pass(?:word)?\s*[:=]\s*([^,;\n]*)/i);
+    if (u) out.username = u[1]!.trim();
+    if (p) out.password = p[1]!.trim();
+    return out;
+  }
+
+  /** Tags for the deterministic test-case flow, derived from case metadata. */
+  private tcTags(tc: NonNullable<GenerationConfig['testCase']>): string[] {
+    const tags = new Set<string>(['authentication']);
+    const cov = `${tc.scenario ?? tc.coverage_type ?? ''}`.toLowerCase();
+    const pr = `${tc.priority ?? ''}`.toLowerCase();
+    if (/neg|invalid|error|locked|throttl/.test(cov)) tags.add('negative');
+    if (/pos|valid|success/.test(cov)) tags.add('positive');
+    if (/edge|boundary/.test(cov)) tags.add('edge');
+    if (pr.includes('p0')) tags.add('smoke');
+    return [...tags];
+  }
+
+  /**
+   * Resolve a grounded Playwright locator for a semantic intent against the
+   * crawled DOM. Prefers stable attributes (id → data-testid → name) so the
+   * generated selector is a concrete, real selector — never a hallucinated
+   * getByRole guess. Falls back to a known-good selector when the element is
+   * not present on the crawled page (e.g. post-login chrome).
+   */
+  private resolveGroundedSelector(
+    intents: string[],
+    crawl: CrawlResult,
+    fallback: string,
+    kind: 'input' | 'button' | 'any',
+  ): string {
+    const pool = (crawl.elements || []).filter(el => {
+      if (kind === 'input') return el.tag === 'input' || el.tag === 'textarea';
+      if (kind === 'button') return el.tag === 'button' || el.type === 'submit' || el.tag === 'a';
+      return true;
+    });
+    for (const intent of intents) {
+      const match = this.matchElement(intent, pool.length ? pool : (crawl.elements || []));
+      if (match && match.score > 0) {
+        const el = match.element;
+        // Prefer a stable id selector when present.
+        if (el.id) return `page.locator('#${el.id}')`;
+        // SauceDemo (and many apps) expose the test hook as `data-test` rather
+        // than `data-testid`. Playwright's getByTestId() defaults to
+        // `data-testid`, so emit an explicit attribute locator for `data-test`.
+        const attrs = (el as any).attributes as Record<string, string> | undefined;
+        const dataTest = attrs?.['data-test'];
+        if (dataTest) return `page.locator('[data-test="${dataTest}"]')`;
+        const dataTestId = attrs?.['data-testid'] || attrs?.['data-test-id'] || el.dataTestId;
+        if (dataTestId) return `page.getByTestId('${dataTestId}')`;
+        if (el.name) return `page.locator('[name="${el.name}"]')`;
+        const best = this.selectorEngine.getBestPlaywrightSelector(el);
+        if (best) return best;
+      }
+    }
+    return fallback;
+  }
+
+  /**
+   * Convert ordered step strings into grounded Playwright statements. Handles
+   * navigate / fill (with explicit or test-data values, empty fields, char
+   * limits) / click (login, menu, logout, product) / back-navigation and the
+   * "repeat N times" throttling pattern.
+   */
+  private tcStepsToCode(
+    steps: string[],
+    ctx: { url: string; creds: { username: string; password: string }; sel: Record<string, string> },
+  ): { lines: string[] } {
+    const out: string[] = [];
+    let attemptBlock: string[] = []; // statements since the last navigate (for "repeat N times")
+
+    const push = (comment: string, stmts: string[], isNav: boolean) => {
+      out.push(`// ${comment}`);
+      for (const s of stmts) out.push(s);
+      out.push('');
+      if (isNav) attemptBlock = [];
+      else attemptBlock.push(...stmts);
+    };
+
+    for (const raw of steps) {
+      const t = raw.toLowerCase();
+
+      // ── repeat the above N times (login throttling) ──
+      const rep = t.match(/repeat.*?(\d+)\s*times?/);
+      if (rep) {
+        const n = parseInt(rep[1]!, 10) || 5;
+        if (attemptBlock.length) {
+          out.push(`// ${raw}`);
+          out.push(`// Re-submit the same attempt ${n} times to exercise repeated failures.`);
+          out.push(`for (let attempt = 0; attempt < ${n}; attempt++) {`);
+          for (const s of attemptBlock) out.push(`  ${s}`);
+          out.push(`}`);
+          out.push('');
+        }
+        continue;
+      }
+
+      // ── navigate ──
+      const urlM = raw.match(/\bhttps?:\/\/[^\s'")]+/i);
+      if (/^navigat|^go to|^open|^launch|^visit/.test(t) && !/back|product page|products page/.test(t)) {
+        const url = urlM ? urlM[0] : ctx.url;
+        push(raw, [
+          `await page.goto('${escapeStr(url)}');`,
+          `await page.waitForLoadState('domcontentloaded');`,
+        ], true);
+        continue;
+      }
+
+      // ── attempt to navigate back to products / access products page ──
+      if (/attempt.*navigate|navigate back|access.*product|back to the product/.test(t)) {
+        push(raw, [`await page.goto('${escapeStr(ctx.url)}inventory.html');`], false);
+        continue;
+      }
+
+      // ── "log in with valid credentials" — expand to fill+fill+click ──
+      if (/log ?in with (valid )?credential|sign in with (valid )?credential/.test(t)) {
+        push(raw, [
+          `await ${ctx.sel.username}.fill('${escapeStr(ctx.creds.username)}');`,
+          `await ${ctx.sel.password}.fill('${escapeStr(ctx.creds.password)}');`,
+          `await ${ctx.sel.login}.click();`,
+          `await page.waitForLoadState('domcontentloaded');`,
+        ], false);
+        continue;
+      }
+
+      // ── username field ──
+      if (/user( ?name)?/.test(t) && !/click|button/.test(t)) {
+        const empty = /empty|blank|without/.test(t);
+        const quoted = raw.match(/'([^']*)'|"([^"]*)"/);
+        const val = empty ? '' : (quoted ? (quoted[1] ?? quoted[2] ?? '') : ctx.creds.username);
+        push(raw, [`await ${ctx.sel.username}.fill('${escapeStr(val)}');`], false);
+        continue;
+      }
+
+      // ── password field ──
+      if (/pass( ?word)?/.test(t) && !/click|button/.test(t)) {
+        const empty = /empty|blank|without/.test(t);
+        const quoted = raw.match(/'([^']*)'|"([^"]*)"/);
+        const val = empty ? '' : (quoted ? (quoted[1] ?? quoted[2] ?? '') : ctx.creds.password);
+        push(raw, [`await ${ctx.sel.password}.fill('${escapeStr(val)}');`], false);
+        continue;
+      }
+
+      // ── logout ──
+      if (/logout|log out|sign out/.test(t)) {
+        push(raw, [`await ${ctx.sel.logout}.click();`, `await page.waitForLoadState('domcontentloaded');`], false);
+        continue;
+      }
+
+      // ── menu / burger ──
+      if (/menu|burger|hamburger/.test(t)) {
+        push(raw, [`await ${ctx.sel.menu}.click();`], false);
+        continue;
+      }
+
+      // ── click login / submit ──
+      if (/click.*(login|log in|sign in|submit)|press.*(login|enter)|submit/.test(t)) {
+        push(raw, [`await ${ctx.sel.login}.click();`, `await page.waitForLoadState('domcontentloaded');`], false);
+        continue;
+      }
+
+      // ── navigate to a product page (open a product detail) ──
+      if (/navigate to a product|open .*product|view .*product|product page/.test(t) && !/products page/.test(t)) {
+        push(raw, [`await ${ctx.sel.product}.first().click();`, `await page.waitForLoadState('domcontentloaded');`], false);
+        continue;
+      }
+
+      // ── return to products page ──
+      if (/return to|back to the products|go back/.test(t)) {
+        push(raw, [`await page.goBack();`, `await page.waitForLoadState('domcontentloaded');`], false);
+        continue;
+      }
+
+      // ── generic click ──
+      if (/^click|^press|^tap|^select/.test(t)) {
+        push(raw, [`await ${ctx.sel.login}.click();`], false);
+        continue;
+      }
+
+      // Unrecognized step → keep as an explicit note (no silent no-op).
+      out.push(`// ${raw}`);
+      out.push(`// NOTE: step not auto-mapped — review manually.`);
+      out.push('');
+    }
+
+    // Trim trailing blank line.
+    while (out.length && out[out.length - 1] === '') out.pop();
+    return { lines: out };
+  }
+
+  /**
+   * Derive REAL assertions from the Expected Result with correct logic:
+   *  - error outcomes → error element visible + exact message text + stays on login
+   *  - login-page outcomes (logout / session invalidation) → back on login URL
+   *  - success outcomes → on inventory URL + Products title visible
+   *  - conditional ("if credentials are valid") → tolerant branch that passes
+   *    whether the app accepted or rejected the (boundary) input.
+   */
+  private buildTcAssertions(
+    expected: string,
+    ctx: { url: string; creds: { username: string; password: string }; sel: Record<string, string> },
+    _tc: NonNullable<GenerationConfig['testCase']>,
+  ): string[] {
+    const exp = expected.trim();
+    const lc = exp.toLowerCase();
+    const lines: string[] = [];
+
+    const quoted = exp.match(/'([^']+)'|"([^"]+)"/);
+    const message = quoted ? (quoted[1] ?? quoted[2] ?? '') : '';
+    const messageFrag = message.replace(/^epic sadface:\s*/i, '').trim();
+
+    const isError = /error message|epic sadface|locked out|is required|do not match|invalid|not match|account is locked/.test(lc);
+    const isConditional = /\bif\b.*\bvalid\b/.test(lc);
+    const isLoginPage = /login page|logged out|cannot access|redirected to the login/.test(lc);
+    const isSuccess = /products page|inventory|remains logged in|access all product|redirected to the products/.test(lc);
+
+    if (isConditional) {
+      // Boundary/condition case: the provided values may or may not be accepted.
+      // Assert deterministically on whichever state the app lands in.
+      lines.push(`// Expected outcome depends on whether the supplied values are valid credentials.`);
+      lines.push(`if (page.url().includes('/inventory.html')) {`);
+      lines.push(`  await expect(page).toHaveURL(/inventory\\.html/);`);
+      lines.push(`  await expect(${ctx.sel.title}).toHaveText(/Products/i);`);
+      lines.push(`} else {`);
+      lines.push(`  await expect(${ctx.sel.error}).toBeVisible();`);
+      lines.push(`  await expect(page).toHaveURL('${escapeStr(ctx.url)}');`);
+      lines.push(`}`);
+      return lines;
+    }
+
+    if (isError) {
+      lines.push(`await expect(${ctx.sel.error}).toBeVisible();`);
+      if (messageFrag) {
+        lines.push(`await expect(${ctx.sel.error}).toContainText('${escapeStr(messageFrag)}');`);
+      }
+      // A failed/invalid login must KEEP the user on the login page.
+      lines.push(`await expect(page).toHaveURL('${escapeStr(ctx.url)}');`);
+      return lines;
+    }
+
+    if (isLoginPage) {
+      lines.push(`await expect(page).toHaveURL('${escapeStr(ctx.url)}');`);
+      lines.push(`await expect(${ctx.sel.login}).toBeVisible();`);
+      return lines;
+    }
+
+    if (isSuccess) {
+      lines.push(`await expect(page).toHaveURL(/inventory\\.html/);`);
+      lines.push(`await expect(${ctx.sel.title}).toHaveText(/Products/i);`);
+      return lines;
+    }
+
+    // Fallback — never emit a no-op. Assert we left the login page.
+    lines.push(`await expect(page).not.toHaveURL('${escapeStr(ctx.url)}');`);
+    return lines;
+  }
+
+  /** Escape a string for safe inclusion in a JSDoc block comment. */
+  private escapeBlockComment(s: string): string {
+    return String(s).replace(/\*\//g, '* /').replace(/[\r\n]+/g, ' ').trim();
   }
 
   /* ──────────────────────────────────────────────────────────────────────── */
@@ -1543,6 +2001,11 @@ ${this.generateNegativeTests(flow, config)}
   private generateNegativeTests(flow: TestPlanFlow, config: GenerationConfig): string {
     if (!config.includeNegativeTests) return '';
     if (flow.flowType !== 'authentication') return '';
+    // Fix #7: when generating from a structured test case, the case itself
+    // defines the exact scenario (positive OR negative). Appending a generic
+    // boilerplate "invalid credentials" test (with app-agnostic OrangeHRM-style
+    // selectors) would pollute the file with an unrequested, often-wrong test.
+    if (config.testCase) return '';
 
     return `
   test('should show error with invalid credentials', async ({ page }) => {
@@ -1814,13 +2277,20 @@ jobs:
     const useFixtures = this.credsAvailable(config);
 
     switch (step.action) {
-      case 'navigate':
+      case 'navigate': {
         // Fix #3: when a profile base URL/credentials are present, use the
         // injected `baseUrl` fixture instead of a process.env lookup.
         if (useFixtures) {
           return `await page.goto(baseUrl);\n    await page.waitForLoadState('domcontentloaded');`;
         }
-        return `await page.goto(process.env.BASE_URL || '${step.target || ''}');\n    await page.waitForLoadState('domcontentloaded');`;
+        // Never use a navigation TARGET as the goto literal when it is prose
+        // (e.g. "the login page") — that produced `page.goto('login page')`.
+        // Prefer a real URL/path; fall back to the real Base URL from config.
+        const tgt = (step.target || '').trim();
+        const isRealUrl = /^https?:\/\//i.test(tgt) || tgt.startsWith('/');
+        const navTarget = isRealUrl ? tgt : (config?.url || tgt);
+        return `await page.goto(process.env.BASE_URL || '${escapeStr(navTarget)}');\n    await page.waitForLoadState('domcontentloaded');`;
+      }
 
       case 'fill': {
         const val = step.value || '';
@@ -1857,8 +2327,24 @@ jobs:
       case 'press':
         return `await page.keyboard.press('${step.value || 'Enter'}');`;
 
-      case 'assert':
-        return `// Assert: ${step.description}`;
+      case 'assert': {
+        // Fix #4: emit a REAL assertion, never a bare `// Assert:` comment.
+        // When the step resolves to a concrete locator, assert it is visible;
+        // otherwise verify a navigation/text outcome from the description. Any
+        // richer assertions injected by the AssertionEngine are appended by
+        // `generateTestSpec` via `step.assertions`.
+        if (step.assertions && step.assertions.length > 0) {
+          return `// Verify: ${step.description}`;
+        }
+        if (selector) {
+          return `await expect(${selector}).toBeVisible();`;
+        }
+        const desc = (step.description || '').trim();
+        if (desc) {
+          return `await expect(page.getByText(/${escapeRegex(desc.slice(0, 40))}/i).first()).toBeVisible();`;
+        }
+        return `await expect(page).toHaveURL(/.+/);`;
+      }
 
       case 'wait':
         return `await page.waitForLoadState('networkidle').catch(() => {});`;
