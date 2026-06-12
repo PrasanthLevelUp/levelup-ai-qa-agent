@@ -80,6 +80,47 @@ export const FEATURE_FLAGS = {
      * Enable with: ENABLE_REPO_WEBHOOKS=true
      */
     GITHUB_WEBHOOKS: envBool('ENABLE_REPO_WEBHOOKS', false),
+
+    /**
+     * Method Intelligence Engine — Phase 3.
+     *
+     * When enabled, a repository scan additionally extracts every method /
+     * helper / function (signature, source, JSDoc, called-method edges) into
+     * the `repository_methods` + `method_dependencies` tables, building a
+     * searchable method index and a call-dependency graph. Requires the
+     * (idempotent, non-fatal) method-intelligence migration. Default off: scans
+     * behave exactly as before and the new tables are never written.
+     *
+     * Enable with: ENABLE_METHOD_INTELLIGENCE=true
+     */
+    METHOD_INTELLIGENCE: envBool('ENABLE_METHOD_INTELLIGENCE', false),
+
+    /**
+     * True Reuse Engine — Phase 3.
+     *
+     * When enabled, script generation consults the method index to surface
+     * existing helpers that already satisfy a step (and to flag exact-duplicate
+     * code) so the model reuses them instead of writing new ones. Builds on
+     * METHOD_INTELLIGENCE (the index must exist to find anything). Default off:
+     * the generation prompt is unchanged.
+     *
+     * Enable with: ENABLE_TRUE_REUSE=true
+     */
+    TRUE_REUSE: envBool('ENABLE_TRUE_REUSE', false),
+
+    /**
+     * Multi-Language Support (tree-sitter) — Phase 3.
+     *
+     * When enabled, repositories in Java / Python / C# are parsed with
+     * tree-sitter to extract classes/methods/imports and detect the testing
+     * framework, instead of failing the language guard. Requires the optional
+     * tree-sitter parser packages to be installed; if they are absent the
+     * analyzer degrades gracefully (reports unavailable) rather than crashing.
+     * Default off: the TS/JS-only language guard is preserved.
+     *
+     * Enable with: ENABLE_MULTI_LANGUAGE=true
+     */
+    MULTI_LANGUAGE: envBool('ENABLE_MULTI_LANGUAGE', false),
   },
 } as const;
 

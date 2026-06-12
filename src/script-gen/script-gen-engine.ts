@@ -35,6 +35,7 @@ import type { RepoStructureAnalysis } from './repo-analyzer';
 import { analyzeRepoPatterns } from './repo-pattern-analyzer';
 import { adaptiveGenerateFiles } from './adaptive-codegen';
 import { getRAGService } from '../services/rag-service';
+import { TrueReuseEngine } from '../services/true-reuse-engine';
 
 const MOD = 'script-gen-engine';
 
@@ -1074,6 +1075,61 @@ ${assertions.map(l => `    ${l}`).join('\n')}
   }
 
   /**
+   * Phase 3 — True Reuse: list existing repo helpers the model should CALL
+   * instead of re-implementing. Fully gated: returns '' unless a repoContextId
+   * is present, the TRUE_REUSE flag is on, and the method index is available.
+   * Any failure degrades to '' so generation is never blocked.
+   */
+  private async buildReuseBlock(
+    config: GenerationConfig,
+    crawl: CrawlResult,
+    workflowMap: WorkflowMap,
+  ): Promise<string> {
+    if (!config.repoContextId) return '';
+    if (!TrueReuseEngine.isEnabled()) return '';
+
+    // Assemble candidate "step" phrases from the strongest intent signals.
+    const steps: string[] = [];
+    if (config.testCase?.title) steps.push(config.testCase.title);
+    if (config.instructions) steps.push(config.instructions);
+    if (crawl?.pageType) steps.push(`${crawl.pageType} page`);
+    for (const f of workflowMap.flows) {
+      steps.push(f.name);
+      for (const s of f.steps) {
+        for (const a of s.actions) steps.push(a.description);
+      }
+    }
+    // Pull explicit test-case steps when present.
+    let tcSteps: any = config.testCase?.steps;
+    if (typeof tcSteps === 'string') {
+      try { tcSteps = JSON.parse(tcSteps); } catch { /* leave as string */ }
+    }
+    if (Array.isArray(tcSteps)) {
+      for (const s of tcSteps) {
+        if (typeof s === 'string') steps.push(s);
+        else if (s?.action || s?.description) steps.push(`${s.action ?? ''} ${s.description ?? ''}`.trim());
+      }
+    }
+
+    const unique = Array.from(new Set(steps.filter(Boolean))).slice(0, 25);
+    if (unique.length === 0) return '';
+
+    try {
+      const engine = new TrueReuseEngine();
+      const block = await engine.buildReuseContext(unique, config.repoContextId, { maxHelpers: 8 });
+      if (!block) return '';
+      logger.info(MOD, 'Injecting true-reuse helper context into prompt', {
+        repoContextId: config.repoContextId,
+      });
+      console.log('[ScriptGenEngine] ♻️  True-reuse: existing helpers injected into prompt');
+      return `\n--- EXISTING REUSABLE HELPERS (PHASE 3) ---\n${block}\n--- END EXISTING REUSABLE HELPERS ---`;
+    } catch (err: any) {
+      logger.warn(MOD, 'True-reuse context failed (non-blocking)', { error: err?.message });
+      return '';
+    }
+  }
+
+  /**
    * Build the "TEST CASE TO AUTOMATE" anchor block. When generating from a Test
    * Case Lab case, the flows must mirror the case's steps + expected result
    * rather than being inferred purely from the crawl. Returns '' for url-based
@@ -1115,6 +1171,8 @@ ${assertions.map(l => `    ${l}`).join('\n')}
     const domSummary = this.buildDOMSummary(crawl);
     // Phase 2: RAG few-shot block (similar existing tests). '' when RAG is off.
     const fewShotBlock = await this.buildFewShotBlock(config, crawl);
+    // Phase 3: True-reuse block (existing helpers to call). '' when TRUE_REUSE off.
+    const reuseBlock = await this.buildReuseBlock(config, crawl, workflowMap);
     const flowSummary = workflowMap.flows.map(f => ({
       name: f.name,
       type: f.flowType,
@@ -1203,6 +1261,7 @@ ${(() => {
 ${config.fusionContext ? `\n--- FUSED INTELLIGENCE ---\nAdditional intelligence from across the platform. Use it to improve reliability:\n\n${config.fusionContext}\n--- END FUSED INTELLIGENCE ---` : ''}
 ${this.buildRepoPatternBlock(config)}
 ${fewShotBlock}
+${reuseBlock}
 ${this.buildTestCaseAnchorBlock(config)}
 
 ${config.testCase

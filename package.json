@@ -51,6 +51,12 @@
     "ts-morph": "^21.0.1",
     "uuid": "^9.0.0"
   },
+  "optionalDependencies": {
+    "tree-sitter": "^0.25.0",
+    "tree-sitter-c-sharp": "^0.21.3",
+    "tree-sitter-java": "^0.23.5",
+    "tree-sitter-python": "^0.25.0"
+  },
   "devDependencies": {
     "@playwright/test": "^1.59.1",
     "@types/bcrypt": "^6.0.0",

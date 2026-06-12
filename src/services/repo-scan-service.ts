@@ -23,6 +23,7 @@ import * as os from 'os';
 import { execSync } from 'child_process';
 import { RepositoryContextEngine } from '../context/repository-context-engine';
 import { saveRepositoryContext, saveCodeChunks } from '../db/postgres';
+import { MethodIntelligenceService } from './method-intelligence-service';
 import { createCodeChunkEmbedder, type EmbedProgress } from './code-chunk-embedder';
 import { FEATURE_FLAGS } from '../config/features';
 import { logger } from '../utils/logger';
@@ -115,6 +116,13 @@ export interface ScanAndPersistResult {
   chunksInserted: number;
   scanDurationMs: number;
   embed?: EmbedProgress;
+  /** Method Intelligence pass result (Phase 3). Present only when enabled. */
+  methodIntel?: {
+    methodsStored: number;
+    dependenciesStored: number;
+    filesScanned: number;
+    durationMs: number;
+  };
 }
 
 /**
@@ -171,6 +179,34 @@ export async function scanAndPersistRepo(input: ScanAndPersistInput): Promise<Sc
       result.embed = await embedder.embedRepositoryContext(contextId, async (p) => {
         await input.onProgress?.('embedding', { processed: p.processed, total: p.total });
       });
+    }
+
+    // Optional Method Intelligence pass (Phase 3). Builds the searchable method
+    // index + dependency graph. Fully gated inside the service (flag + schema).
+    if (MethodIntelligenceService.isEnabled()) {
+      try {
+        await input.onProgress?.('method-intelligence', { contextId });
+        const methodSvc = new MethodIntelligenceService();
+        const mi = await methodSvc.analyzeRepository(scanPath, contextId);
+        if (mi.analyzed) {
+          result.methodIntel = {
+            methodsStored: mi.methodsStored,
+            dependenciesStored: mi.dependenciesStored,
+            filesScanned: mi.filesScanned,
+            durationMs: mi.durationMs,
+          };
+          logger.info(
+            MOD,
+            `Method intelligence for ${input.repoId}: ${mi.methodsStored} methods, ` +
+              `${mi.dependenciesStored} dependencies in ${mi.durationMs}ms`,
+          );
+        }
+      } catch (err) {
+        // Non-fatal: method intelligence must never break a scan.
+        logger.warn(MOD, 'Method intelligence pass failed (non-fatal)', {
+          error: (err as Error).message,
+        });
+      }
     }
 
     await input.onProgress?.('done', { contextId, chunksInserted });
