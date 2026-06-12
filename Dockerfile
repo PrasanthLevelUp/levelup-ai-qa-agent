@@ -6,8 +6,9 @@ FROM mcr.microsoft.com/playwright:v1.59.1-jammy
 
 WORKDIR /app
 
-# Copy package files
-COPY package.json package-lock.json ./
+# Copy package files (.npmrc carries legacy-peer-deps for the optional
+# tree-sitter parsers whose peer ranges conflict with tree-sitter@^0.25.0)
+COPY package.json package-lock.json .npmrc ./
 
 # Install dependencies
 RUN npm ci
