@@ -121,6 +121,47 @@ export const FEATURE_FLAGS = {
      * Enable with: ENABLE_MULTI_LANGUAGE=true
      */
     MULTI_LANGUAGE: envBool('ENABLE_MULTI_LANGUAGE', false),
+
+    /**
+     * Repository Health Intelligence — Phase 3C.
+     *
+     * When enabled, the agent computes a weighted repository health score
+     * (0-100) from quality / coverage / reuse / complexity / duplication
+     * sub-scores, persists daily snapshots, derives trends and detects
+     * code-quality issues. Reads from the Phase 3 `repository_methods` /
+     * `method_dependencies` tables and writes to three new health tables
+     * (gated by this flag). Default off: no health tables are created and the
+     * health API returns 404/unavailable when the flag is absent.
+     *
+     * Enable with: ENABLE_HEALTH_INTELLIGENCE=true
+     */
+    HEALTH_INTELLIGENCE: envBool('ENABLE_HEALTH_INTELLIGENCE', false),
+
+    /**
+     * Impact Analysis Engine — Phase 3C.
+     *
+     * When enabled, the agent answers "what breaks if I change X?" by
+     * traversing `method_dependencies` with PostgreSQL recursive CTEs to find
+     * affected methods/tests, blast radius and dependency chains. Read-only —
+     * creates no new tables; requires METHOD_INTELLIGENCE schema to be useful.
+     * Default off: the impact API returns unavailable when the flag is absent.
+     *
+     * Enable with: ENABLE_IMPACT_ANALYSIS=true
+     */
+    IMPACT_ANALYSIS: envBool('ENABLE_IMPACT_ANALYSIS', false),
+
+    /**
+     * Knowledge Graph Lite — Phase 3C.
+     *
+     * When enabled, the agent maps method->method / file->file / test->code
+     * relationships using pure PostgreSQL recursive queries (NO Neo4j) and
+     * exports a JSON graph (nodes/edges) plus a D3.js-friendly format.
+     * Read-only — creates no new tables; requires METHOD_INTELLIGENCE schema.
+     * Default off: the graph API returns unavailable when the flag is absent.
+     *
+     * Enable with: ENABLE_KNOWLEDGE_GRAPH=true
+     */
+    KNOWLEDGE_GRAPH: envBool('ENABLE_KNOWLEDGE_GRAPH', false),
   },
 } as const;
 

@@ -183,6 +183,12 @@ export async function initDb(): Promise<void> {
     // index + dependency-graph tables. Gated behind METHOD_INTELLIGENCE,
     // idempotent and non-fatal.
     await migrateMethodIntelligence(client);
+
+    // Phase 3C (Repo Intelligence — Health Intelligence): create the health
+    // snapshot / trend / quality-issue tables. Gated behind HEALTH_INTELLIGENCE,
+    // idempotent and non-fatal. Impact Analysis + Knowledge Graph need no new
+    // tables (they query the existing method_dependencies graph).
+    await migrateRepositoryHealth(client);
   } catch (err: any) {
     console.error('⚠️ [DB] initDb encountered errors:', err?.message, err?.code, err?.detail);
     logger.error(MOD, 'initDb encountered errors (non-fatal — server continues)', {
@@ -408,6 +414,110 @@ async function migrateMethodIntelligence(client: PoolClient): Promise<void> {
   methodIntelAvailable = true;
   console.log('✅ [DB] Method Intelligence migration complete');
   logger.info(MOD, 'Method Intelligence available', { trigram: methodTrgmAvailable });
+}
+
+/* -------------------------------------------------------------------------- */
+/*  Phase 3C — Repository Health Intelligence schema                          */
+/* -------------------------------------------------------------------------- */
+
+let healthIntelAvailable: boolean | null = null;
+
+/** Whether the Phase 3C health tables exist and are usable at runtime. */
+export function isHealthIntelAvailable(): boolean {
+  return healthIntelAvailable === true;
+}
+
+/**
+ * Phase 3C (Repo Intelligence — Health Intelligence): create the
+ * `repository_health_snapshots`, `repository_health_trends` and
+ * `code_quality_issues` tables.
+ *
+ * Gated behind the HEALTH_INTELLIGENCE flag so a database is never touched by
+ * default. Fully idempotent and non-fatal: if any table fails the feature is
+ * marked unavailable and the rest of the app keeps working. All indexes are
+ * declared as separate `CREATE INDEX` statements (Postgres has no inline
+ * INDEX(...) syntax inside CREATE TABLE).
+ */
+async function migrateRepositoryHealth(client: PoolClient): Promise<void> {
+  if (!FEATURE_FLAGS.REPO_INTELLIGENCE.HEALTH_INTELLIGENCE) {
+    healthIntelAvailable = false;
+    return;
+  }
+
+  console.log('🔧 [DB] Phase 3C: Repository Health migration...');
+
+  // 1) Daily health snapshots — one weighted score + its sub-scores per run.
+  const snapOk = await safeExec(client, 'repository_health_snapshots', `
+    CREATE TABLE IF NOT EXISTS repository_health_snapshots (
+      id SERIAL PRIMARY KEY,
+      repository_context_id INTEGER REFERENCES repository_contexts(id) ON DELETE CASCADE,
+      overall_score NUMERIC(5,2) NOT NULL,
+      quality_score NUMERIC(5,2),
+      coverage_score NUMERIC(5,2),
+      reuse_score NUMERIC(5,2),
+      complexity_score NUMERIC(5,2),
+      duplication_score NUMERIC(5,2),
+      total_methods INTEGER DEFAULT 0,
+      total_tests INTEGER DEFAULT 0,
+      total_dependencies INTEGER DEFAULT 0,
+      metrics JSONB DEFAULT '{}',
+      snapshot_date DATE NOT NULL DEFAULT CURRENT_DATE,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      UNIQUE(repository_context_id, snapshot_date)
+    )`);
+
+  // 2) Health trends — derived deltas between consecutive snapshots.
+  const trendOk = await safeExec(client, 'repository_health_trends', `
+    CREATE TABLE IF NOT EXISTS repository_health_trends (
+      id SERIAL PRIMARY KEY,
+      repository_context_id INTEGER REFERENCES repository_contexts(id) ON DELETE CASCADE,
+      metric VARCHAR(50) NOT NULL,
+      previous_value NUMERIC(5,2),
+      current_value NUMERIC(5,2),
+      delta NUMERIC(6,2),
+      direction VARCHAR(10),
+      period_start DATE,
+      period_end DATE,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    )`);
+
+  // 3) Code quality issues — detected per snapshot (high_complexity / duplicate
+  //    / unused / missing_tests).
+  const issueOk = await safeExec(client, 'code_quality_issues', `
+    CREATE TABLE IF NOT EXISTS code_quality_issues (
+      id SERIAL PRIMARY KEY,
+      repository_context_id INTEGER REFERENCES repository_contexts(id) ON DELETE CASCADE,
+      method_id INTEGER REFERENCES repository_methods(id) ON DELETE CASCADE,
+      issue_type VARCHAR(50) NOT NULL,
+      severity VARCHAR(20) DEFAULT 'medium',
+      file_path TEXT,
+      method_name VARCHAR(255),
+      details JSONB DEFAULT '{}',
+      detected_at TIMESTAMPTZ DEFAULT NOW()
+    )`);
+
+  if (!snapOk || !trendOk || !issueOk) {
+    healthIntelAvailable = false;
+    logger.warn(MOD, 'Repository Health tables unavailable — health intelligence disabled at runtime');
+    console.warn('⚠️ [DB] Repository Health tables unavailable — health intelligence disabled');
+    return;
+  }
+
+  // Indexes (separate statements — Postgres has no inline INDEX(...)).
+  await safeExec(client, 'idx_health_snap_context',
+    `CREATE INDEX IF NOT EXISTS idx_health_snap_context ON repository_health_snapshots(repository_context_id)`);
+  await safeExec(client, 'idx_health_snap_date',
+    `CREATE INDEX IF NOT EXISTS idx_health_snap_date ON repository_health_snapshots(snapshot_date)`);
+  await safeExec(client, 'idx_health_trend_context',
+    `CREATE INDEX IF NOT EXISTS idx_health_trend_context ON repository_health_trends(repository_context_id)`);
+  await safeExec(client, 'idx_quality_issue_context',
+    `CREATE INDEX IF NOT EXISTS idx_quality_issue_context ON code_quality_issues(repository_context_id)`);
+  await safeExec(client, 'idx_quality_issue_type',
+    `CREATE INDEX IF NOT EXISTS idx_quality_issue_type ON code_quality_issues(issue_type)`);
+
+  healthIntelAvailable = true;
+  console.log('✅ [DB] Repository Health migration complete');
+  logger.info(MOD, 'Repository Health intelligence available');
 }
 
 /**
@@ -7701,6 +7811,220 @@ export async function getMethodIntelStats(
     [repoContextId],
   );
   return { totalMethods, byType, dependencies: deps.rows[0]?.c ?? 0 };
+}
+
+
+/* ========================================================================== */
+/*  Phase 3C — Repository Health persistence helpers                          */
+/* ========================================================================== */
+
+export interface HealthSnapshotInput {
+  repositoryContextId: number;
+  overallScore: number;
+  qualityScore: number;
+  coverageScore: number;
+  reuseScore: number;
+  complexityScore: number;
+  duplicationScore: number;
+  totalMethods: number;
+  totalTests: number;
+  totalDependencies: number;
+  metrics?: Record<string, unknown>;
+}
+
+export interface HealthSnapshotRecord extends HealthSnapshotInput {
+  id: number;
+  snapshotDate: string;
+  createdAt: string;
+}
+
+export interface QualityIssueInput {
+  repositoryContextId: number;
+  methodId?: number | null;
+  issueType: string;
+  severity?: string;
+  filePath?: string | null;
+  methodName?: string | null;
+  details?: Record<string, unknown>;
+}
+
+/**
+ * Persist (upsert) a daily health snapshot. One row per (context, date); a
+ * re-run on the same day overwrites the scores. Returns the snapshot id, or
+ * null when health intelligence is unavailable.
+ */
+export async function saveHealthSnapshot(input: HealthSnapshotInput): Promise<number | null> {
+  if (!isHealthIntelAvailable()) return null;
+  const p = getPool();
+  const res = await p.query(
+    `INSERT INTO repository_health_snapshots (
+       repository_context_id, overall_score, quality_score, coverage_score,
+       reuse_score, complexity_score, duplication_score,
+       total_methods, total_tests, total_dependencies, metrics
+     )
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+     ON CONFLICT (repository_context_id, snapshot_date)
+     DO UPDATE SET overall_score = EXCLUDED.overall_score,
+                   quality_score = EXCLUDED.quality_score,
+                   coverage_score = EXCLUDED.coverage_score,
+                   reuse_score = EXCLUDED.reuse_score,
+                   complexity_score = EXCLUDED.complexity_score,
+                   duplication_score = EXCLUDED.duplication_score,
+                   total_methods = EXCLUDED.total_methods,
+                   total_tests = EXCLUDED.total_tests,
+                   total_dependencies = EXCLUDED.total_dependencies,
+                   metrics = EXCLUDED.metrics,
+                   created_at = NOW()
+     RETURNING id`,
+    [
+      input.repositoryContextId,
+      input.overallScore,
+      input.qualityScore,
+      input.coverageScore,
+      input.reuseScore,
+      input.complexityScore,
+      input.duplicationScore,
+      input.totalMethods,
+      input.totalTests,
+      input.totalDependencies,
+      JSON.stringify(input.metrics ?? {}),
+    ],
+  );
+  return res.rows[0]?.id ?? null;
+}
+
+function mapHealthSnapshot(r: any): HealthSnapshotRecord {
+  return {
+    id: r.id,
+    repositoryContextId: r.repository_context_id,
+    overallScore: Number(r.overall_score),
+    qualityScore: Number(r.quality_score),
+    coverageScore: Number(r.coverage_score),
+    reuseScore: Number(r.reuse_score),
+    complexityScore: Number(r.complexity_score),
+    duplicationScore: Number(r.duplication_score),
+    totalMethods: Number(r.total_methods ?? 0),
+    totalTests: Number(r.total_tests ?? 0),
+    totalDependencies: Number(r.total_dependencies ?? 0),
+    metrics: typeof r.metrics === 'string' ? JSON.parse(r.metrics) : (r.metrics ?? {}),
+    snapshotDate: r.snapshot_date instanceof Date ? r.snapshot_date.toISOString().slice(0, 10) : String(r.snapshot_date),
+    createdAt: r.created_at instanceof Date ? r.created_at.toISOString() : String(r.created_at),
+  };
+}
+
+/** Most recent N health snapshots for a context, newest first. [] when unavailable. */
+export async function getHealthSnapshots(
+  repoContextId: number,
+  limit = 30,
+): Promise<HealthSnapshotRecord[]> {
+  if (!isHealthIntelAvailable()) return [];
+  const p = getPool();
+  const res = await p.query(
+    `SELECT * FROM repository_health_snapshots
+      WHERE repository_context_id = $1
+      ORDER BY snapshot_date DESC
+      LIMIT ${Number(limit)}`,
+    [repoContextId],
+  );
+  return res.rows.map(mapHealthSnapshot);
+}
+
+/** The single latest health snapshot, or null. */
+export async function getLatestHealthSnapshot(
+  repoContextId: number,
+): Promise<HealthSnapshotRecord | null> {
+  const rows = await getHealthSnapshots(repoContextId, 1);
+  return rows[0] ?? null;
+}
+
+/** Replace the detected quality issues for a context (clears old, bulk inserts). */
+export async function replaceQualityIssues(
+  repoContextId: number,
+  issues: QualityIssueInput[],
+): Promise<number> {
+  if (!isHealthIntelAvailable()) return 0;
+  const p = getPool();
+  await p.query(`DELETE FROM code_quality_issues WHERE repository_context_id = $1`, [repoContextId]);
+  let stored = 0;
+  for (const issue of issues) {
+    await p.query(
+      `INSERT INTO code_quality_issues (
+         repository_context_id, method_id, issue_type, severity,
+         file_path, method_name, details
+       ) VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+      [
+        repoContextId,
+        issue.methodId ?? null,
+        issue.issueType,
+        issue.severity ?? 'medium',
+        issue.filePath ?? null,
+        issue.methodName ?? null,
+        JSON.stringify(issue.details ?? {}),
+      ],
+    );
+    stored++;
+  }
+  return stored;
+}
+
+/** Detected quality issues for a context, newest first. [] when unavailable. */
+export async function getQualityIssues(
+  repoContextId: number,
+  opts: { issueType?: string; limit?: number } = {},
+): Promise<Array<{
+  id: number; methodId: number | null; issueType: string; severity: string;
+  filePath: string | null; methodName: string | null; details: Record<string, unknown>; detectedAt: string;
+}>> {
+  if (!isHealthIntelAvailable()) return [];
+  const p = getPool();
+  const params: any[] = [repoContextId];
+  let typeClause = '';
+  if (opts.issueType) {
+    params.push(opts.issueType);
+    typeClause = `AND issue_type = $${params.length}`;
+  }
+  const res = await p.query(
+    `SELECT * FROM code_quality_issues
+      WHERE repository_context_id = $1 ${typeClause}
+      ORDER BY detected_at DESC
+      LIMIT ${Number(opts.limit ?? 200)}`,
+    params,
+  );
+  return res.rows.map((r: any) => ({
+    id: r.id,
+    methodId: r.method_id ?? null,
+    issueType: r.issue_type,
+    severity: r.severity ?? 'medium',
+    filePath: r.file_path ?? null,
+    methodName: r.method_name ?? null,
+    details: typeof r.details === 'string' ? JSON.parse(r.details) : (r.details ?? {}),
+    detectedAt: r.detected_at instanceof Date ? r.detected_at.toISOString() : String(r.detected_at),
+  }));
+}
+
+/** Record a single health trend delta row. No-op when unavailable. */
+export async function saveHealthTrend(trend: {
+  repositoryContextId: number;
+  metric: string;
+  previousValue: number;
+  currentValue: number;
+  delta: number;
+  direction: string;
+  periodStart?: string | null;
+  periodEnd?: string | null;
+}): Promise<void> {
+  if (!isHealthIntelAvailable()) return;
+  const p = getPool();
+  await p.query(
+    `INSERT INTO repository_health_trends (
+       repository_context_id, metric, previous_value, current_value,
+       delta, direction, period_start, period_end
+     ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+    [
+      trend.repositoryContextId, trend.metric, trend.previousValue, trend.currentValue,
+      trend.delta, trend.direction, trend.periodStart ?? null, trend.periodEnd ?? null,
+    ],
+  );
 }
 
 
