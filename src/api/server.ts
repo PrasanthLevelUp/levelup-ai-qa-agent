@@ -63,6 +63,7 @@ import { createIngestRouter } from './routes/ingest';
 import { apiKeysRouter } from './routes/api-keys';
 import { hooksRouter } from './routes/hooks';
 import { createRepoIntelligenceRouter } from './routes/repo-intelligence';
+import { createRepoIntelligence3CRouter } from './routes/repo-intelligence-3c';
 import { createRepoIntelWebhookRouter } from './routes/repo-intel-webhook';
 import { FEATURE_FLAGS } from '../config/features';
 import { startRepoWorker, stopRepoWorker } from '../jobs/workers/repo-analysis-worker';
@@ -219,6 +220,10 @@ export function createServer(): express.Application {
   app.use('/api/billing', authMiddleware, companyMiddleware, sessionMiddleware, createBillingRouter());
   app.use('/api/keys', authMiddleware, companyMiddleware, sessionMiddleware, apiKeysRouter);
   app.use('/api/repo-intelligence', authMiddleware, companyMiddleware, sessionMiddleware, createRepoIntelligenceRouter());
+  // Phase 3C: Health Intelligence + Impact Analysis + Knowledge Graph Lite.
+  // Each route group is internally gated by its own feature flag (returns 404
+  // when off), so mounting is unconditional and the default surface is unchanged.
+  app.use('/api/repo-intelligence-3c', authMiddleware, companyMiddleware, sessionMiddleware, createRepoIntelligence3CRouter());
   app.use('/api/knowledge', authMiddleware, companyMiddleware, sessionMiddleware, projectContextMiddleware, contextMiddleware, createKnowledgeRouter());
   app.use('/api/dashboard', authMiddleware, companyMiddleware, sessionMiddleware, createDashboardRouter());
   // Nested project-scoped routers (Phase 1 Foundation). Mounted before the
