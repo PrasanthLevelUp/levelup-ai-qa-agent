@@ -252,6 +252,16 @@ REPORT_DIR=/home/ubuntu/healing_reports
 LOG_LEVEL=info                     # debug, info, warn, error
 GITHUB_WEBHOOK_SECRET=             # Optional webhook signature validation
 ENABLE_CODE_CHUNKS=false           # Repo Intelligence: store code_chunks (Phase 2/RAG; off by default)
+
+# ── Repository Intelligence Phase 2 (all OFF by default) ──
+ENABLE_REPO_VECTOR_SEARCH=false    # pgvector migration + embedding generation + similarity search
+ENABLE_REPO_RAG=false              # Inject retrieved few-shot examples into script generation (needs VECTOR_SEARCH)
+ENABLE_REPO_WORKERS=false          # Async scans/embeddings via BullMQ (needs Redis)
+ENABLE_REPO_WEBHOOKS=false         # Mount the GitHub push webhook for incremental re-scans
+REDIS_URL=redis://localhost:6379   # Used only when ENABLE_REPO_WORKERS=true
+REPO_WORKER_CONCURRENCY=2          # Max concurrent repo jobs per worker
+REPO_WEBHOOK_BRANCHES=             # Comma-separated branch allow-list (default: repo default branch)
+OPENAI_EMBEDDING_MODEL=text-embedding-3-small  # Embedding model (1536 dims)
 ```
 
 ## Repository Intelligence (Phase 1)
@@ -289,6 +299,65 @@ and RCA. Phase 1 hardened the following:
   with a graceful fallback to company-wide (`project_id IS NULL`) profiles.
 - Pass `projectId` in the `POST /api/repo-intelligence/scan` body to link a scan
   to a project.
+
+## Repository Intelligence (Phase 2 — RAG, Workers, Webhooks, Few-Shot)
+
+Phase 2 adds semantic retrieval, asynchronous scanning, and incremental
+re-scans. **Every Phase 2 capability is gated behind a feature flag that is OFF
+by default.** With no flags set (and no Redis / pgvector / embedding model
+configured), behaviour is byte-for-byte identical to Phase 1 — scans run
+synchronously, no Redis connection is opened, the pgvector migration is skipped,
+and script generation produces the same prompt. Flip flags on incrementally as
+the supporting infrastructure becomes available.
+
+### 1. Vector Search & Embeddings (`ENABLE_REPO_VECTOR_SEARCH`)
+- On startup, runs an **idempotent, non-fatal** migration that enables the
+  `vector` extension and adds `embedding vector(1536)`, `embedding_model`,
+  `embedded_at`, and `token_count` columns (plus an `ivfflat` cosine index) to
+  `code_chunks`. If the database lacks the `vector` extension, the migration is
+  skipped and the system continues with vector search disabled.
+- Embeddings are generated via the existing `OpenAIClient`
+  (`OPENAI_EMBEDDING_MODEL`, default `text-embedding-3-small`, 1536 dims) and
+  stored per chunk. Requires `OPENAI_API_KEY`; without it, embedding is a no-op.
+- New DB helpers: `getUnembeddedChunks`, `updateChunkEmbedding`,
+  `getEmbeddingStats`, `searchSimilarChunks` (cosine `<=>`).
+
+### 2. RAG / Few-Shot Learning (`ENABLE_REPO_RAG` + `ENABLE_REPO_VECTOR_SEARCH`)
+- When both flags are on, script generation retrieves the most semantically
+  similar **existing tests** from the repo's embedded chunks and injects them
+  into the prompt as concrete few-shot examples, so generated tests match the
+  repo's real style and helpers.
+- Pass `repoContextId` in the generation config to scope retrieval. If retrieval
+  is disabled or finds nothing, the prompt is unchanged (empty block).
+
+### 3. Background Workers (`ENABLE_REPO_WORKERS`, needs Redis)
+- `POST /api/repo-intelligence/scan` with `{ "async": true }` enqueues a BullMQ
+  job and returns `202` with a `jobId` and `statusUrl` instead of blocking.
+- Poll progress at `GET /api/repo-intelligence/scan/status/:jobId`.
+- Worker handles `scan`, `rescan`, and `embed` jobs. Unsupported-language errors
+  fail fast (non-retryable); transient errors are retried. Concurrency via
+  `REPO_WORKER_CONCURRENCY`. When the flag is off, no Redis connection is opened
+  and the synchronous path is used.
+
+### 4. GitHub Push Webhooks (`ENABLE_REPO_WEBHOOKS`)
+- Mounts `POST /api/repo-intel-webhook/github`, validating the
+  `x-hub-signature-256` HMAC against `GITHUB_WEBHOOK_SECRET` (constant-time, no
+  throw on length mismatch).
+- Only re-scans repositories already tracked in `repository_contexts` (matched
+  against the payload's `full_name` / clone / ssh / html URLs). Branch filtering
+  via `REPO_WEBHOOK_BRANCHES` (defaults to the repo's default branch).
+- If workers are enabled the re-scan is enqueued; otherwise it runs inline,
+  fire-and-forget. When the flag is off the route is not mounted, so no
+  unauthenticated surface is exposed.
+
+### Tests
+```bash
+# Gating + pure-function unit tests (no infra needed)
+npx tsx tests/unit/repo-intelligence-phase2.test.ts
+```
+The real-infrastructure paths (BullMQ against Redis, and the pgvector similarity
+search against Postgres) were additionally validated end-to-end during
+development — see `repo_intelligence_phase2_implementation.md`.
 
 ## Running
 

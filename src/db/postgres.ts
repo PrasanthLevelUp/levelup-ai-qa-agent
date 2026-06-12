@@ -11,8 +11,12 @@ import {
   ENV_SPRINT_TABLES,
   applyEnvSprintSchema,
 } from './environment-sprint-schema';
+import { FEATURE_FLAGS } from '../config/features';
 
 const MOD = 'postgres';
+
+/** Embedding vector dimensionality for OpenAI text-embedding-3-small. */
+export const EMBEDDING_DIMENSIONS = 1536;
 
 export interface TestExecution {
   test_name: string;
@@ -168,6 +172,12 @@ export async function initDb(): Promise<void> {
 
     // Verify all required tables exist post-init
     await verifySchema(client);
+
+    // Phase 2 (Repo Intelligence RAG): pgvector migration. Gated behind the
+    // VECTOR_SEARCH flag so a database without the `vector` extension is never
+    // touched by default. Fully idempotent and non-fatal if the extension is
+    // unavailable (e.g. managed Postgres without pgvector).
+    await migratePgVector(client);
   } catch (err: any) {
     console.error('⚠️ [DB] initDb encountered errors:', err?.message, err?.code, err?.detail);
     logger.error(MOD, 'initDb encountered errors (non-fatal — server continues)', {
@@ -198,6 +208,90 @@ async function verifySchema(client: PoolClient): Promise<void> {
   } else {
     logger.info(MOD, `✅ All ${REQUIRED_TABLES.length} required tables verified`, { total: REQUIRED_TABLES.length });
   }
+}
+
+/**
+ * Track whether pgvector is actually available in the connected database.
+ * `null` = not yet probed, `true`/`false` = probed result. Used to short-circuit
+ * vector queries when the extension/column could not be created.
+ */
+let pgVectorAvailable: boolean | null = null;
+
+export function isPgVectorAvailable(): boolean {
+  return pgVectorAvailable === true;
+}
+
+/**
+ * Phase 2 (Repo Intelligence — RAG): install pgvector and add the embedding
+ * column + ANN index to `code_chunks`.
+ *
+ * Design notes:
+ *  - Entirely gated behind FEATURE_FLAGS.REPO_INTELLIGENCE.VECTOR_SEARCH. When
+ *    the flag is off this is a no-op, so default deployments never require the
+ *    `vector` extension.
+ *  - Idempotent: safe to run on every boot (uses IF NOT EXISTS guards).
+ *  - Non-fatal: if `CREATE EXTENSION vector` fails (extension not installed on
+ *    the server, or insufficient privileges) we log and disable vector search
+ *    rather than crashing init. RAG retrieval degrades to "no results".
+ *  - Schema adapted to the REAL table: `code_chunks(id SERIAL, content TEXT,
+ *    repo_context_id INTEGER ...)` — NOT the illustrative UUID/chunk_content
+ *    schema from the design spec.
+ */
+async function migratePgVector(client: PoolClient): Promise<void> {
+  if (!FEATURE_FLAGS.REPO_INTELLIGENCE.VECTOR_SEARCH) {
+    pgVectorAvailable = false;
+    return;
+  }
+
+  console.log('🔧 [DB] Phase 2: pgvector / RAG migration...');
+
+  // 1) Extension — if this fails, vector search is unavailable but the rest of
+  //    the app keeps working.
+  const extOk = await safeExec(client, 'create_extension_vector',
+    `CREATE EXTENSION IF NOT EXISTS vector`);
+  if (!extOk) {
+    pgVectorAvailable = false;
+    logger.warn(MOD, 'pgvector extension unavailable — RAG/vector search disabled at runtime');
+    console.warn('⚠️ [DB] pgvector unavailable — vector search will be disabled');
+    return;
+  }
+
+  // 2) Embedding column + bookkeeping columns on code_chunks.
+  const colOk = await safeExec(client, 'code_chunks_embedding_cols', `DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='code_chunks' AND column_name='embedding') THEN
+      ALTER TABLE code_chunks ADD COLUMN embedding vector(${EMBEDDING_DIMENSIONS});
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='code_chunks' AND column_name='embedding_model') THEN
+      ALTER TABLE code_chunks ADD COLUMN embedding_model VARCHAR(100);
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='code_chunks' AND column_name='embedded_at') THEN
+      ALTER TABLE code_chunks ADD COLUMN embedded_at TIMESTAMPTZ;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='code_chunks' AND column_name='token_count') THEN
+      ALTER TABLE code_chunks ADD COLUMN token_count INTEGER;
+    END IF;
+  END $$`);
+
+  if (!colOk) {
+    pgVectorAvailable = false;
+    logger.warn(MOD, 'Failed to add embedding columns — RAG/vector search disabled at runtime');
+    return;
+  }
+
+  // 3) Approximate-nearest-neighbour index (ivfflat, cosine). Non-fatal: a
+  //    missing ANN index just means slower exact scans, not a failure.
+  await safeExec(client, 'idx_code_chunks_embedding',
+    `CREATE INDEX IF NOT EXISTS idx_code_chunks_embedding
+       ON code_chunks USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100)`);
+
+  // Partial index to quickly find not-yet-embedded chunks during batch jobs.
+  await safeExec(client, 'idx_code_chunks_unembedded',
+    `CREATE INDEX IF NOT EXISTS idx_code_chunks_unembedded
+       ON code_chunks(repo_context_id) WHERE embedding IS NULL`);
+
+  pgVectorAvailable = true;
+  console.log('✅ [DB] pgvector / RAG migration complete');
+  logger.info(MOD, 'pgvector available — RAG/vector search enabled');
 }
 
 /**
@@ -7009,6 +7103,169 @@ export async function searchCodeChunks(
   }));
 }
 
+/* ========================================================================== */
+/*  Repository Intelligence – RAG / Vector Search (Phase 2)                   */
+/* ========================================================================== */
+
+/** A code chunk row with the columns needed for embedding generation. */
+export interface UnembeddedChunk {
+  id: number;
+  filePath: string;
+  chunkType: string;
+  chunkName: string;
+  content: string;
+}
+
+/** A semantic-search hit: a chunk plus its cosine similarity to the query. */
+export interface SimilarChunk {
+  id: number;
+  repoContextId: number;
+  filePath: string;
+  chunkType: string;
+  chunkName: string;
+  content: string;
+  lineStart: number | null;
+  lineEnd: number | null;
+  metadata: Record<string, any>;
+  /** Cosine similarity in [0,1]; 1 = identical direction. */
+  similarity: number;
+}
+
+/**
+ * Serialise a JS number[] into the textual literal pgvector expects, e.g.
+ * `[0.1,0.2,0.3]`. Used for parameter binding (`$1::vector`).
+ */
+export function toVectorLiteral(embedding: number[]): string {
+  return `[${embedding.join(',')}]`;
+}
+
+/**
+ * Fetch chunks for a repository context that do not yet have an embedding.
+ * Returns an empty array if vector search is unavailable.
+ */
+export async function getUnembeddedChunks(
+  repoContextId: number,
+  limit = 500,
+): Promise<UnembeddedChunk[]> {
+  if (!isPgVectorAvailable()) return [];
+  const p = getPool();
+  const res = await p.query(
+    `SELECT id, file_path, chunk_type, chunk_name, content
+       FROM code_chunks
+      WHERE repo_context_id = $1 AND embedding IS NULL
+      ORDER BY id
+      LIMIT $2`,
+    [repoContextId, limit],
+  );
+  return res.rows.map((r: any) => ({
+    id: r.id,
+    filePath: r.file_path,
+    chunkType: r.chunk_type,
+    chunkName: r.chunk_name,
+    content: r.content,
+  }));
+}
+
+/**
+ * Persist an embedding for a single chunk. No-op if vector search unavailable.
+ */
+export async function updateChunkEmbedding(
+  chunkId: number,
+  embedding: number[],
+  model: string,
+  tokenCount?: number,
+): Promise<void> {
+  if (!isPgVectorAvailable()) return;
+  const p = getPool();
+  await p.query(
+    `UPDATE code_chunks
+        SET embedding = $1::vector,
+            embedding_model = $2,
+            embedded_at = NOW(),
+            token_count = $3
+      WHERE id = $4`,
+    [toVectorLiteral(embedding), model, tokenCount ?? null, chunkId],
+  );
+}
+
+/**
+ * Count embedded vs total chunks for a repository context.
+ */
+export async function getEmbeddingStats(
+  repoContextId: number,
+): Promise<{ total: number; embedded: number; pending: number }> {
+  const p = getPool();
+  const res = await p.query(
+    `SELECT COUNT(*)::int AS total,
+            COUNT(embedding)::int AS embedded
+       FROM code_chunks
+      WHERE repo_context_id = $1`,
+    [repoContextId],
+  );
+  const total = res.rows[0]?.total ?? 0;
+  const embedded = res.rows[0]?.embedded ?? 0;
+  return { total, embedded, pending: Math.max(0, total - embedded) };
+}
+
+/**
+ * Semantic nearest-neighbour search within a repository context using the
+ * pgvector cosine-distance operator (`<=>`). Returns hits ordered by descending
+ * similarity. Empty array if vector search is unavailable.
+ *
+ * @param repoContextId  scope the search to a single repository context
+ * @param queryEmbedding the embedded query vector
+ * @param opts.limit     max hits (default 5)
+ * @param opts.type      optional chunk_type filter (e.g. 'function', 'test')
+ * @param opts.minSimilarity minimum cosine similarity to include (default 0)
+ */
+export async function searchSimilarChunks(
+  repoContextId: number,
+  queryEmbedding: number[],
+  opts: { limit?: number; type?: string; minSimilarity?: number } = {},
+): Promise<SimilarChunk[]> {
+  if (!isPgVectorAvailable()) return [];
+  const p = getPool();
+  const limit = opts.limit ?? 5;
+  const minSim = opts.minSimilarity ?? 0;
+  const vec = toVectorLiteral(queryEmbedding);
+
+  const params: any[] = [vec, repoContextId];
+  let typeClause = '';
+  if (opts.type) {
+    params.push(opts.type);
+    typeClause = `AND chunk_type = $${params.length}`;
+  }
+
+  // (1 - cosine_distance) = cosine similarity. Only consider embedded rows.
+  const res = await p.query(
+    `SELECT id, repo_context_id, file_path, chunk_type, chunk_name, content,
+            line_start, line_end, metadata,
+            1 - (embedding <=> $1::vector) AS similarity
+       FROM code_chunks
+      WHERE repo_context_id = $2
+        AND embedding IS NOT NULL
+        ${typeClause}
+      ORDER BY embedding <=> $1::vector
+      LIMIT ${limit}`,
+    params,
+  );
+
+  return res.rows
+    .map((r: any) => ({
+      id: r.id,
+      repoContextId: r.repo_context_id,
+      filePath: r.file_path,
+      chunkType: r.chunk_type,
+      chunkName: r.chunk_name,
+      content: r.content,
+      lineStart: r.line_start,
+      lineEnd: r.line_end,
+      metadata: r.metadata ?? {},
+      similarity: typeof r.similarity === 'number' ? r.similarity : Number(r.similarity),
+    }))
+    .filter((r: SimilarChunk) => r.similarity >= minSim);
+}
+
 export async function listRepositoryContexts(
   companyId?: number,
 ): Promise<Array<{ id: number; repoId: string; framework: string; testPattern: string; updatedAt: string; version: number }>> {
@@ -7027,6 +7284,34 @@ export async function listRepositoryContexts(
     testPattern: r.profile?.testPattern ?? 'unknown',
     updatedAt: r.updated_at,
     version: r.profile_version ?? 1,
+  }));
+}
+
+/**
+ * Phase 2 (Webhooks): find already-tracked repository contexts whose stored
+ * repo_id matches ANY of the supplied candidate identifiers. Used by the GitHub
+ * push webhook to re-scan ONLY repositories we already know about (never an
+ * arbitrary repo from an unsolicited webhook). Returns lightweight rows needed
+ * to enqueue/run a re-scan.
+ */
+export async function findTrackedReposByCandidates(
+  candidates: string[],
+): Promise<Array<{ id: number; repoId: string; companyId: number | null; projectId: number | null }>> {
+  const cleaned = Array.from(new Set(candidates.filter((c) => !!c && c.trim().length > 0)));
+  if (cleaned.length === 0) return [];
+  const p = getPool();
+  const res = await p.query(
+    `SELECT id, repo_id, company_id, project_id
+       FROM repository_contexts
+      WHERE repo_id = ANY($1::text[])
+      ORDER BY updated_at DESC`,
+    [cleaned],
+  );
+  return res.rows.map((r: any) => ({
+    id: r.id,
+    repoId: r.repo_id,
+    companyId: r.company_id ?? null,
+    projectId: r.project_id ?? null,
   }));
 }
 
