@@ -15,6 +15,7 @@
 import * as path from 'path';
 import * as fs from 'fs';
 import { logger } from '../utils/logger';
+import { FEATURE_FLAGS } from '../config/features';
 import { ASTAnalyzer } from './ast-analyzer';
 import type {
   RepositoryProfile,
@@ -93,6 +94,102 @@ function detectPrimaryLanguage(analyses: FileAnalysis[]): Language {
   for (const a of analyses) counts[a.language]++;
   return (Object.entries(counts)
     .sort((a, b) => b[1] - a[1])[0]?.[0] || 'unknown') as Language;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Pre-scan Language Guard (Phase 1)                                  */
+/* ------------------------------------------------------------------ */
+
+/** Languages the AST analyzer can actually parse today. */
+export const SUPPORTED_LANGUAGES: Language[] = ['typescript', 'javascript'];
+
+/** Marker error so the API layer can map this to a 400 / UNSUPPORTED_LANGUAGE. */
+export class UnsupportedLanguageError extends Error {
+  readonly detectedLanguage: Language;
+  readonly supportedLanguages: Language[];
+  constructor(detectedLanguage: Language) {
+    super(
+      `Repository language '${detectedLanguage}' is not currently supported.\n` +
+      `Supported languages: ${SUPPORTED_LANGUAGES.join(', ')}.\n` +
+      `Support for Python, Java, and C# is planned for a future phase.`
+    );
+    this.name = 'UnsupportedLanguageError';
+    this.detectedLanguage = detectedLanguage;
+    this.supportedLanguages = SUPPORTED_LANGUAGES;
+  }
+}
+
+/**
+ * Detect a repository's primary language from project marker files *before*
+ * running AST analysis. The AST analyzer only walks .ts/.tsx/.js/.jsx/.mjs/.cjs,
+ * so a Python/Java/C# repo would otherwise scan to an empty, misleading profile
+ * (Repo Intelligence Audit, Finding F2). This guard lets us fail loudly instead.
+ *
+ * Precedence: explicit JS/TS markers win (package.json / tsconfig / lockfiles),
+ * then Python, Java, C# markers. Falls back to a shallow source-file extension
+ * scan, and finally 'unknown'.
+ */
+export function detectRepoLanguage(repoRoot: string): Language {
+  const has = (rel: string): boolean => {
+    try { return fs.existsSync(path.join(repoRoot, rel)); } catch { return false; }
+  };
+
+  // 1) JavaScript / TypeScript — strongest signals.
+  if (has('tsconfig.json')) return 'typescript';
+  if (has('package.json')) {
+    // A package.json with a typescript dep / tsconfig means TS, else JS.
+    try {
+      const pkg = JSON.parse(fs.readFileSync(path.join(repoRoot, 'package.json'), 'utf-8'));
+      const deps = { ...pkg.dependencies, ...pkg.devDependencies };
+      if (deps && (deps.typescript || deps['ts-node'])) return 'typescript';
+    } catch { /* ignore malformed package.json */ }
+    return 'javascript';
+  }
+
+  // 2) Python markers.
+  if (has('requirements.txt') || has('setup.py') || has('pyproject.toml') || has('Pipfile')) {
+    return 'python';
+  }
+
+  // 3) Java markers.
+  if (has('pom.xml') || has('build.gradle') || has('build.gradle.kts')) {
+    return 'java';
+  }
+
+  // 4) C# markers (glob — *.csproj / *.sln at repo root).
+  try {
+    const rootEntries = fs.readdirSync(repoRoot);
+    if (rootEntries.some(f => f.endsWith('.csproj') || f.endsWith('.sln'))) return 'csharp';
+  } catch { /* ignore */ }
+
+  // 5) Fallback: shallow scan for the dominant source extension.
+  const extCounts: Record<Language, number> = {
+    typescript: 0, javascript: 0, python: 0, java: 0, csharp: 0, unknown: 0,
+  };
+  const SKIP = new Set(['node_modules', '.git', 'dist', 'build', 'coverage', '.next', 'out']);
+  const walk = (dir: string, depth: number): void => {
+    if (depth > 3) return;
+    let entries: fs.Dirent[];
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      if (e.name.startsWith('.') && e.isDirectory()) continue;
+      if (e.isDirectory()) {
+        if (SKIP.has(e.name)) continue;
+        walk(path.join(dir, e.name), depth + 1);
+      } else {
+        const n = e.name.toLowerCase();
+        if (/\.(ts|tsx)$/.test(n)) extCounts.typescript++;
+        else if (/\.(js|jsx|mjs|cjs)$/.test(n)) extCounts.javascript++;
+        else if (/\.py$/.test(n)) extCounts.python++;
+        else if (/\.java$/.test(n)) extCounts.java++;
+        else if (/\.cs$/.test(n)) extCounts.csharp++;
+      }
+    }
+  };
+  walk(repoRoot, 0);
+  const top = (Object.entries(extCounts) as Array<[Language, number]>)
+    .sort((a, b) => b[1] - a[1])[0];
+  return top && top[1] > 0 ? top[0] : 'unknown';
 }
 
 /* ------------------------------------------------------------------ */
@@ -317,25 +414,67 @@ function detectCodingStyle(repoRoot: string, analyses: FileAnalysis[]): CodingSt
     if (/\.tag\(/.test(content)) { tagConvention = 'playwright-tag()'; break; }
   }
 
-  // Indent/quote/semicolon from first test file content
-  let indentStyle: CodingStyle['indentStyle'] = 'spaces-2';
-  let quoteStyle: CodingStyle['quoteStyle'] = 'single';
-  let semicolons = true;
-  if (testFiles.length > 0) {
-    const samplePath = path.join(repoRoot, testFiles[0].relativePath);
-    if (fs.existsSync(samplePath)) {
-      const sample = fs.readFileSync(samplePath, 'utf-8').slice(0, 2000);
-      if (/^\t/m.test(sample)) indentStyle = 'tabs';
-      else if (/^    /m.test(sample)) indentStyle = 'spaces-4';
-      const singles = (sample.match(/'/g) || []).length;
-      const doubles = (sample.match(/"/g) || []).length;
-      quoteStyle = doubles > singles * 1.5 ? 'double' : singles > doubles * 1.5 ? 'single' : 'mixed';
-      // Sample lines for semicolons
-      const lines = sample.split('\n').filter(l => l.trim().length > 10);
+  // Indent/quote/semicolon via majority vote across multiple sampled files
+  // (Repo Intelligence Audit, Finding F5 — single-file sampling was unreliable).
+  // Prefer test files; fall back to any analysed source files so non-test repos
+  // still get a useful read. Each file casts one vote per dimension.
+  const styleSampleSource = (testFiles.length > 0 ? testFiles : analyses);
+  const sampleFiles = styleSampleSource.slice(0, 10);
+
+  const votes = {
+    indent: { 'spaces-2': 0, 'spaces-4': 0, tabs: 0 } as Record<CodingStyle['indentStyle'], number>,
+    quote: { single: 0, double: 0, mixed: 0 } as Record<CodingStyle['quoteStyle'], number>,
+    semicolons: 0,
+    noSemicolons: 0,
+  };
+
+  for (const f of sampleFiles) {
+    const fp = path.join(repoRoot, f.relativePath);
+    if (!fs.existsSync(fp)) continue;
+    let content = '';
+    try { content = fs.readFileSync(fp, 'utf-8'); } catch { continue; }
+    if (!content.trim()) continue;
+
+    // Indentation: count indented lines by kind, vote for this file's dominant.
+    const tabIndent = (content.match(/^\t+\S/gm) || []).length;
+    const fourIndent = (content.match(/^ {4}\S/gm) || []).length;
+    const twoIndent = (content.match(/^ {2}\S/gm) || []).length;
+    if (tabIndent > fourIndent && tabIndent > twoIndent) votes.indent.tabs++;
+    else if (fourIndent > twoIndent) votes.indent['spaces-4']++;
+    else votes.indent['spaces-2']++;
+
+    // Quotes: per-file majority, with a 'mixed' bucket when neither dominates.
+    const singles = (content.match(/'/g) || []).length;
+    const doubles = (content.match(/"/g) || []).length;
+    if (doubles > singles * 1.5) votes.quote.double++;
+    else if (singles > doubles * 1.5) votes.quote.single++;
+    else votes.quote.mixed++;
+
+    // Semicolons: share of meaningful lines ending in ';'.
+    const lines = content.split('\n').filter(l => l.trim().length > 10);
+    if (lines.length > 0) {
       const withSemi = lines.filter(l => l.trimEnd().endsWith(';')).length;
-      semicolons = withSemi > lines.length * 0.4;
+      if (withSemi > lines.length * 0.4) votes.semicolons++;
+      else votes.noSemicolons++;
     }
   }
+
+  const pickMax = <T extends string>(rec: Record<T, number>, fallback: T): T => {
+    let best = fallback; let bestN = -1;
+    for (const [k, n] of Object.entries(rec) as Array<[T, number]>) {
+      if (n > bestN) { bestN = n; best = k; }
+    }
+    return best;
+  };
+
+  const indentStyle: CodingStyle['indentStyle'] = pickMax(votes.indent, 'spaces-2');
+  const quoteStyle: CodingStyle['quoteStyle'] = pickMax(votes.quote, 'single');
+  const semicolons = votes.semicolons >= votes.noSemicolons;
+
+  logger.info(MOD, 'Coding-style detection (multi-file majority vote)', {
+    filesSampled: sampleFiles.length,
+    indentStyle, quoteStyle, semicolons, votes,
+  });
 
   return {
     namingConvention,
@@ -634,6 +773,16 @@ export class RepositoryContextEngine {
     const start = Date.now();
     logger.info(MOD, 'Starting repository intelligence scan', { repoRoot });
 
+    // Phase 0: Language guard. Fail loudly for repos the AST analyzer can't
+    // parse (Python/Java/C#) instead of silently producing an empty profile.
+    const detectedLanguage = detectRepoLanguage(repoRoot);
+    if (!SUPPORTED_LANGUAGES.includes(detectedLanguage)) {
+      logger.warn(MOD, 'Unsupported repository language — aborting scan', {
+        repoRoot, detectedLanguage, supported: SUPPORTED_LANGUAGES,
+      });
+      throw new UnsupportedLanguageError(detectedLanguage);
+    }
+
     // Phase 1: AST Analysis
     const analyses = this.astAnalyzer.analyzeRepo(repoRoot);
     logger.info(MOD, 'Phase 1 complete: AST analysis', {
@@ -700,8 +849,16 @@ export class RepositoryContextEngine {
       /screenshot|visual|percy|applitools|backstop/.test(i.module)
     );
 
-    // Phase 4: Code chunks for future embedding
-    const chunks = extractCodeChunks(repoRoot, analyses);
+    // Phase 4: Code chunks for future embedding (RAG/vector search — Phase 2).
+    // Gated off by default: chunks are not yet consumed by any retrieval path,
+    // so extraction + storage is pure overhead until the RAG layer lands.
+    // Re-enable with ENABLE_CODE_CHUNKS=true (see src/config/features.ts).
+    const chunks: CodeChunk[] = FEATURE_FLAGS.REPO_INTELLIGENCE.CODE_CHUNKS_STORAGE
+      ? extractCodeChunks(repoRoot, analyses)
+      : [];
+    if (!FEATURE_FLAGS.REPO_INTELLIGENCE.CODE_CHUNKS_STORAGE) {
+      logger.info(MOD, 'Code chunks storage disabled (Phase 2 / RAG) — skipping extraction');
+    }
 
     const durationMs = Date.now() - start;
 

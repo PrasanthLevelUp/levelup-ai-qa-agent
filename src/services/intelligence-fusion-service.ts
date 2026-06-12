@@ -383,16 +383,22 @@ export class IntelligenceFusionService {
 
     // Most-recent repository_contexts.profile for this scope.
     try {
+      // Always scope by company. When a project is supplied, prefer a
+      // project-scoped profile but gracefully fall back to a company-wide
+      // (project_id IS NULL) profile so legacy / unlinked scans still resolve.
+      // ORDER BY puts the exact project match first, NULL-project rows next.
       const conds = ['company_id = $1'];
       const vals: any[] = [companyId];
+      let orderBy = 'updated_at DESC';
       if (projectId) {
-        conds.push('project_id = $2');
+        conds.push('(project_id = $2 OR project_id IS NULL)');
         vals.push(projectId);
+        orderBy = '(project_id = $2) DESC, updated_at DESC';
       }
       const ctx = await this.pool.query(
         `SELECT profile FROM repository_contexts
          WHERE ${conds.join(' AND ')}
-         ORDER BY updated_at DESC LIMIT 1`,
+         ORDER BY ${orderBy} LIMIT 1`,
         vals
       );
       if (ctx.rows.length > 0) {

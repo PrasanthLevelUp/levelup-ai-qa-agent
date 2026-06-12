@@ -251,7 +251,44 @@ DATABASE_URL=postgresql://user:password@host:5432/levelup_qa
 REPORT_DIR=/home/ubuntu/healing_reports
 LOG_LEVEL=info                     # debug, info, warn, error
 GITHUB_WEBHOOK_SECRET=             # Optional webhook signature validation
+ENABLE_CODE_CHUNKS=false           # Repo Intelligence: store code_chunks (Phase 2/RAG; off by default)
 ```
+
+## Repository Intelligence (Phase 1)
+
+The Repository Intelligence engine scans a connected repo, runs AST analysis,
+and produces a `RepositoryProfile` that enriches script generation, healing,
+and RCA. Phase 1 hardened the following:
+
+### Language Support
+- **Currently supported:** JavaScript, TypeScript.
+- Coming in a later phase: Python, Java, C#.
+- A scan of an unsupported repo now **fails loudly** with HTTP `400`
+  (`errorType: "UNSUPPORTED_LANGUAGE"`) instead of silently producing an empty
+  profile. The detected language and the supported list are returned in the
+  response.
+
+### Code Chunks Storage
+- Temporarily **disabled by default** until the RAG / vector-search retrieval
+  path lands (Phase 2). Today `code_chunks` are only read by the read-only
+  `/chunks` API and are not used in generation/healing/RCA, so extracting and
+  storing them is pure overhead.
+- Enable with: `ENABLE_CODE_CHUNKS=true` (see `src/config/features.ts`).
+
+### Coding-Style Detection
+- Now samples **up to 10 files** (preferring test files) and uses a
+  **majority vote** for:
+  - Semicolons usage
+  - Quote style (single / double / mixed)
+  - Indentation (2 spaces, 4 spaces, tabs)
+- Previously inferred from the first 2 KB of a single file.
+
+### Project Scoping
+- `repository_contexts.project_id` links a profile to a specific project so the
+  intelligence-fusion service can scope lookups by `(company_id, project_id)`,
+  with a graceful fallback to company-wide (`project_id IS NULL`) profiles.
+- Pass `projectId` in the `POST /api/repo-intelligence/scan` body to link a scan
+  to a project.
 
 ## Running
 

@@ -1692,6 +1692,11 @@ async function migrateDefaultCompany(client: PoolClient): Promise<void> {
     await safeExec(client, idx.match(/idx_\w+/)?.[0] || 'project_index', idx);
   }
 
+  // Phase 1 (Repo Intelligence): document the repository_contexts.project_id link.
+  await safeExec(client, 'comment_repo_ctx_project',
+    `COMMENT ON COLUMN repository_contexts.project_id IS
+     'Links repository intelligence to a specific project for scoped access (Phase 1). NULL = company-wide.'`);
+
   // ── Script history: add deleted_at for soft deletes ──
   console.log('🔧 [DB] Migration: Adding script history columns...');
   await safeExec(client, 'gs_deleted_at', `DO $$ BEGIN
@@ -6867,9 +6872,11 @@ export async function saveRepositoryContext(
   profile: RepositoryProfile,
   scanDurationMs: number,
   companyId?: number,
+  projectId?: number,
 ): Promise<number> {
   const p = getPool();
   const cid = companyId ?? null;
+  const pid = projectId ?? null;
   const profileJson = JSON.stringify(profile);
 
   // Upsert – update if same repo+company exists
@@ -6882,18 +6889,21 @@ export async function saveRepositoryContext(
   if (existing.rows.length > 0) {
     const row = existing.rows[0];
     const newVersion = (row.profile_version ?? 1) + 1;
+    // Only overwrite project_id when a concrete value is supplied, so a
+    // company-wide re-scan never clobbers an existing project link.
     await p.query(
       `UPDATE repository_contexts SET profile=$1, scan_duration_ms=$2,
-       profile_version=$3, updated_at=NOW() WHERE id=$4`,
-      [profileJson, scanDurationMs, newVersion, row.id],
+       profile_version=$3, project_id=COALESCE($4, project_id), updated_at=NOW()
+       WHERE id=$5`,
+      [profileJson, scanDurationMs, newVersion, pid, row.id],
     );
     return row.id;
   }
 
   const res = await p.query(
-    `INSERT INTO repository_contexts (repo_id, company_id, profile, scan_duration_ms)
-     VALUES ($1,$2,$3,$4) RETURNING id`,
-    [repoId, cid, profileJson, scanDurationMs],
+    `INSERT INTO repository_contexts (repo_id, company_id, profile, scan_duration_ms, project_id)
+     VALUES ($1,$2,$3,$4,$5) RETURNING id`,
+    [repoId, cid, profileJson, scanDurationMs, pid],
   );
   return res.rows[0].id;
 }
