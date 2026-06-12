@@ -267,6 +267,11 @@ OPENAI_EMBEDDING_MODEL=text-embedding-3-small  # Embedding model (1536 dims)
 ENABLE_METHOD_INTELLIGENCE=false   # Build the method index + call-dependency graph during scans
 ENABLE_TRUE_REUSE=false            # Suggest existing helpers in generation (needs METHOD_INTELLIGENCE)
 ENABLE_MULTI_LANGUAGE=false        # Java/Python/C# analysis via tree-sitter (optional native grammars)
+
+# ── Repository Intelligence Phase 3C (all OFF by default) ──
+ENABLE_HEALTH_INTELLIGENCE=false   # Weighted health score + snapshots + trends + quality issues (needs METHOD_INTELLIGENCE)
+ENABLE_IMPACT_ANALYSIS=false       # "What breaks if I change X?" via recursive CTEs (needs METHOD_INTELLIGENCE)
+ENABLE_KNOWLEDGE_GRAPH=false       # method/file/test graph + D3 export, pure Postgres (needs METHOD_INTELLIGENCE)
 ```
 
 ## Repository Intelligence (Phase 1)
@@ -426,6 +431,70 @@ npx tsx tests/unit/repo-intelligence-phase3-multilang.test.ts
 The real-infrastructure path (method index + `pg_trgm` search + dependency graph
 against a live Postgres) was additionally validated end-to-end during
 development — see `repo_intelligence_phase3_implementation.md`.
+
+## Repository Intelligence (Phase 3C — Health, Impact, Knowledge Graph)
+
+Phase 3C turns the Phase 3 method index + dependency graph into three analytics
+products. **Every capability is gated behind a feature flag that is OFF by
+default**, so the standard product surface is byte-for-byte unchanged.
+
+### 1. Health Intelligence (`ENABLE_HEALTH_INTELLIGENCE`)
+A weighted repository **health score (0-100)** computed from five sub-scores:
+
+| Sub-score | Weight | What it measures |
+|-----------|:------:|------------------|
+| Quality | 0.25 | Documented methods + reasonable method size |
+| Coverage | 0.25 | Ratio of test methods to production methods |
+| Reuse | 0.20 | Share of methods actually called/reused |
+| Complexity | 0.15 | Mean per-method simplicity (size + fan-out) |
+| Duplication | 0.15 | Penalty for methods sharing a `code_hash` |
+
+The score is mapped to an A–F **grade**, persisted as a **daily snapshot**
+(`repository_health_snapshots`, one row per context per day), **trended**
+against the previous snapshot (`repository_health_trends`), and turned into
+**quality issues** (`code_quality_issues`): `high_complexity`, `duplicate`,
+`unused`, `missing_tests`. These three tables are created only when the flag is
+on (idempotent, non-fatal migration).
+
+### 2. Impact Analysis Engine (`ENABLE_IMPACT_ANALYSIS`)
+Answers **"what breaks if I change method X?"** by walking
+`method_dependencies` **backwards** with a PostgreSQL **recursive CTE** to find
+every transitive caller (the **blast radius**), the **breaking tests**, the
+affected files, and the shortest **dependency chains** (test → … → changed
+method). Also rolls up to **file-level impact**. Read-only — creates no tables.
+
+### 3. Knowledge Graph Lite (`ENABLE_KNOWLEDGE_GRAPH`)
+Maps **method→method / file→file / test→code** relationships using **pure
+PostgreSQL** (recursive queries) — **no Neo4j**. Emits a JSON `{ nodes, edges }`
+graph and a **D3.js-friendly** `{ nodes, links }` export consumed by the
+dashboard's force-directed visualization. A `/neighborhood` endpoint returns the
+subgraph around a single method to `depth` hops.
+
+### API (all under `/api/repo-intelligence-3c`, each group 404s when its flag is off)
+```
+GET /health/:contextId[?persist=true]      # compute (+ persist) health score
+GET /health/:contextId/snapshots[?limit=]  # historical snapshots
+GET /health/:contextId/trend[?persist=]    # latest-vs-previous deltas
+GET /health/:contextId/issues[?type=]      # detected quality issues
+GET /impact/method/:methodId               # blast radius + chains + tests
+GET /impact/method/:methodId/tests         # just the breaking tests
+GET /impact/file/:contextId?filePath=...   # file-level impact
+GET /graph/:contextId[?format=json|d3]     # full knowledge graph
+GET /graph/method/:methodId/neighborhood?depth=2
+```
+
+### Testing
+```bash
+# Gating + pure scoring/graph helpers (no infra needed)
+npx tsx tests/unit/repo-intelligence-phase3c.test.ts
+
+# Full health + recursive-CTE impact + graph build against a live Postgres
+DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5432/levelup_test \
+DATABASE_SSL=false npx tsx tests/unit/repo-intelligence-phase3c-db.test.ts
+```
+The live-Postgres suite seeds a synthetic method graph and asserts exact blast
+radii, dependency-chain ordering, snapshot upsert behaviour and graph
+node/edge counts. See `repo_intelligence_phase3c_implementation.md`.
 
 ## Running
 
