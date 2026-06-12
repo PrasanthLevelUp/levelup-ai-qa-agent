@@ -15,7 +15,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { execSync } from 'child_process';
-import { RepositoryContextEngine } from '../../context/repository-context-engine';
+import { RepositoryContextEngine, UnsupportedLanguageError, SUPPORTED_LANGUAGES } from '../../context/repository-context-engine';
 import { buildAIPromptContext } from '../../context/prompt-builder';
 import {
   saveRepositoryContext,
@@ -109,10 +109,11 @@ export function createRepoIntelligenceRouter(): Router {
     let tempCloneDir: string | null = null;
 
     try {
-      const { repoPath, repoId, branch } = req.body as {
+      const { repoPath, repoId, branch, projectId } = req.body as {
         repoPath?: string;
         repoId?: string;
         branch?: string;
+        projectId?: number;
       };
 
       if (!repoId) {
@@ -157,8 +158,8 @@ export function createRepoIntelligenceRouter(): Router {
       // Get company_id from request (set by companyMiddleware)
       const companyId = (req as any).companyId as number | undefined;
 
-      // Persist to DB
-      const contextId = await saveRepositoryContext(repoId, profile, scanDurationMs, companyId);
+      // Persist to DB (project_id links the profile to a project when supplied)
+      const contextId = await saveRepositoryContext(repoId, profile, scanDurationMs, companyId, projectId);
       const chunksInserted = await saveCodeChunks(contextId, chunks);
 
       logger.info(MOD, `Scan complete for ${repoId}: ${profile.totalFiles} files, ${profile.helperFunctions.length} helpers, ${chunks.length} chunks in ${scanDurationMs}ms`);
@@ -183,6 +184,17 @@ export function createRepoIntelligenceRouter(): Router {
         },
       });
     } catch (err: any) {
+      // Unsupported language → 400 with a structured, actionable payload.
+      if (err instanceof UnsupportedLanguageError) {
+        logger.warn(MOD, `Scan rejected — unsupported language: ${err.detectedLanguage}`);
+        return res.status(400).json({
+          success: false,
+          error: err.message,
+          errorType: 'UNSUPPORTED_LANGUAGE',
+          detectedLanguage: err.detectedLanguage,
+          supportedLanguages: SUPPORTED_LANGUAGES,
+        });
+      }
       logger.error(MOD, `Scan failed: ${err.message}`);
       return res.status(500).json({ success: false, error: err.message });
     } finally {
