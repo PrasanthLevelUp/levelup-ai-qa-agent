@@ -12,117 +12,48 @@
 
 import { Router, type Request, type Response } from 'express';
 import * as fs from 'fs';
-import * as path from 'path';
-import * as os from 'os';
-import { execSync } from 'child_process';
-import { RepositoryContextEngine, UnsupportedLanguageError, SUPPORTED_LANGUAGES } from '../../context/repository-context-engine';
+import { UnsupportedLanguageError, SUPPORTED_LANGUAGES } from '../../context/repository-context-engine';
 import { buildAIPromptContext } from '../../context/prompt-builder';
 import {
-  saveRepositoryContext,
   getRepositoryContext,
   getRepositoryContextById,
-  saveCodeChunks,
   searchCodeChunks,
   listRepositoryContexts,
 } from '../../db/postgres';
-import { extractCodeChunks } from '../../context/repository-context-engine';
+// Phase 2: the clone→scan→persist pipeline is shared with the background
+// worker via repo-scan-service so both paths behave identically.
+import { scanAndPersistRepo, isRemoteUrl } from '../../services/repo-scan-service';
+import { enqueueRepoJob, getRepoJobStatus } from '../../jobs/repo-jobs';
+import { workersEnabled } from '../../jobs/queue-config';
 import { logger } from '../../utils/logger';
 
 const MOD = 'repo-intelligence';
 
-/** Check if a string looks like a remote URL (GitHub, GitLab, etc.) */
-function isRemoteUrl(str: string): boolean {
-  return /^https?:\/\//.test(str) || /^git@/.test(str);
-}
-
-/**
- * Clone a remote repository to a temporary directory.
- * Returns the path to the cloned directory.
- * Supports GitHub authentication via GITHUB_TOKEN env var.
- */
-function cloneToTemp(repoUrl: string, branch: string = 'main'): string {
-  const tmpDir = path.join(os.tmpdir(), `repo_scan_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`);
-  fs.mkdirSync(tmpDir, { recursive: true });
-
-  // Inject GitHub token for private repos if available
-  let cloneUrl = repoUrl;
-  const ghToken = process.env.GITHUB_TOKEN || process.env.GH_TOKEN;
-  if (ghToken && repoUrl.includes('github.com') && repoUrl.startsWith('https://')) {
-    // https://github.com/owner/repo → https://<token>@github.com/owner/repo
-    cloneUrl = repoUrl.replace('https://github.com', `https://${ghToken}@github.com`);
-  }
-
-  // Ensure .git suffix for clone compatibility
-  if (!cloneUrl.endsWith('.git')) {
-    cloneUrl += '.git';
-  }
-
-  logger.info(MOD, `Cloning ${repoUrl} (branch: ${branch}) to temp dir...`);
-
-  try {
-    execSync(
-      `git clone --depth 1 --branch "${branch}" "${cloneUrl}" "${tmpDir}"`,
-      { encoding: 'utf-8', timeout: 120_000, stdio: 'pipe' }
-    );
-  } catch (err: any) {
-    // Clean up on failure
-    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* ignore */ }
-
-    const msg = err.stderr || err.message || String(err);
-    if (msg.includes('Authentication') || msg.includes('could not read Username')) {
-      throw new Error(
-        `GitHub authentication failed for ${repoUrl}. ` +
-        `To scan private repos, set GITHUB_TOKEN environment variable on Railway.`
-      );
-    }
-    if (msg.includes('not found') || msg.includes('does not exist')) {
-      throw new Error(`Repository not found: ${repoUrl}. Check the URL and branch name.`);
-    }
-    if (msg.includes('Remote branch') && msg.includes('not found')) {
-      throw new Error(`Branch "${branch}" not found in ${repoUrl}.`);
-    }
-    throw new Error(`Failed to clone repository: ${msg.slice(0, 500)}`);
-  }
-
-  logger.info(MOD, `Clone complete → ${tmpDir}`);
-  return tmpDir;
-}
-
-/** Safely remove a temp directory */
-function cleanupTemp(dirPath: string): void {
-  try {
-    if (dirPath.startsWith(os.tmpdir()) && fs.existsSync(dirPath)) {
-      fs.rmSync(dirPath, { recursive: true, force: true });
-      logger.info(MOD, `Cleaned up temp dir: ${dirPath}`);
-    }
-  } catch (err: any) {
-    logger.warn(MOD, `Failed to clean up temp dir ${dirPath}: ${err.message}`);
-  }
-}
-
 export function createRepoIntelligenceRouter(): Router {
   const router = Router();
 
-  /* ── POST /scan — Trigger repository scan ───────────── */
+  /* ── POST /scan — Trigger repository scan ─────────────
+   *
+   * Two modes:
+   *  - Synchronous (default, unchanged): clone → scan → persist → respond with
+   *    the profile summary. Preserves the exact Phase 1 contract.
+   *  - Asynchronous (opt-in): when background workers are enabled AND the
+   *    caller passes `async: true`, the scan is enqueued and the endpoint
+   *    returns 202 with a jobId to poll via GET /scan/status/:jobId.
+   */
   router.post('/scan', async (req: Request, res: Response) => {
-    const startTime = Date.now();
-    let tempCloneDir: string | null = null;
-
     try {
-      const { repoPath, repoId, branch, projectId } = req.body as {
+      const { repoPath, repoId, branch, projectId, async: asyncMode } = req.body as {
         repoPath?: string;
         repoId?: string;
         branch?: string;
         projectId?: number;
+        async?: boolean;
       };
 
       if (!repoId) {
-        return res.status(400).json({
-          success: false,
-          error: 'repoId is required',
-        });
+        return res.status(400).json({ success: false, error: 'repoId is required' });
       }
-
       if (!repoPath) {
         return res.status(400).json({
           success: false,
@@ -130,39 +61,51 @@ export function createRepoIntelligenceRouter(): Router {
         });
       }
 
-      let scanPath: string;
-
-      if (isRemoteUrl(repoPath)) {
-        // ── Remote repository: clone to temp directory ──
-        logger.info(MOD, `Remote URL detected for ${repoId}: ${repoPath}`);
-        tempCloneDir = cloneToTemp(repoPath, branch || 'main');
-        scanPath = tempCloneDir;
-      } else {
-        // ── Local path: use directly ──
-        if (!fs.existsSync(repoPath)) {
-          return res.status(400).json({
-            success: false,
-            error: `Repository path does not exist: ${repoPath}`,
-          });
-        }
-        scanPath = repoPath;
+      // Validate a local path early (remote URLs are validated at clone time).
+      if (!isRemoteUrl(repoPath) && !fs.existsSync(repoPath)) {
+        return res.status(400).json({
+          success: false,
+          error: `Repository path does not exist: ${repoPath}`,
+        });
       }
 
-      logger.info(MOD, `Starting scan for repo: ${repoId} at ${scanPath}`);
-
-      const engine = new RepositoryContextEngine();
-      const { profile, chunks } = engine.scan(scanPath);
-
-      const scanDurationMs = Date.now() - startTime;
-
-      // Get company_id from request (set by companyMiddleware)
       const companyId = (req as any).companyId as number | undefined;
 
-      // Persist to DB (project_id links the profile to a project when supplied)
-      const contextId = await saveRepositoryContext(repoId, profile, scanDurationMs, companyId, projectId);
-      const chunksInserted = await saveCodeChunks(contextId, chunks);
+      // ── Asynchronous path (opt-in, requires workers enabled) ──
+      if (asyncMode && workersEnabled()) {
+        const enq = await enqueueRepoJob({
+          type: 'scan',
+          repoId,
+          repoPath,
+          branch,
+          projectId,
+          companyId,
+          source: 'api',
+        });
+        if (enq) {
+          logger.info(MOD, `Scan enqueued for ${repoId}`, { jobId: enq.jobId });
+          return res.status(202).json({
+            success: true,
+            async: true,
+            jobId: enq.jobId,
+            statusUrl: `/api/repo-intelligence/scan/status/${enq.jobId}`,
+            message: 'Scan queued. Poll statusUrl for progress.',
+          });
+        }
+        // Enqueue failed (Redis down) → fall through to synchronous scan.
+        logger.warn(MOD, 'Async requested but enqueue failed — running synchronously');
+      }
 
-      logger.info(MOD, `Scan complete for ${repoId}: ${profile.totalFiles} files, ${profile.helperFunctions.length} helpers, ${chunks.length} chunks in ${scanDurationMs}ms`);
+      // ── Synchronous path (default; behaviour identical to Phase 1) ──
+      logger.info(MOD, `Starting synchronous scan for repo: ${repoId}`);
+      const result = await scanAndPersistRepo({
+        repoId,
+        repoPath,
+        branch,
+        projectId,
+        companyId,
+      });
+      const { profile, contextId, chunksInserted, scanDurationMs } = result;
 
       return res.json({
         success: true,
@@ -180,11 +123,11 @@ export function createRepoIntelligenceRouter(): Router {
           helperFunctions: profile.helperFunctions.length,
           pageObjects: profile.pageObjects.length,
           codeChunks: chunksInserted,
+          embedded: result.embed?.embedded,
           scanDurationMs,
         },
       });
     } catch (err: any) {
-      // Unsupported language → 400 with a structured, actionable payload.
       if (err instanceof UnsupportedLanguageError) {
         logger.warn(MOD, `Scan rejected — unsupported language: ${err.detectedLanguage}`);
         return res.status(400).json({
@@ -197,11 +140,26 @@ export function createRepoIntelligenceRouter(): Router {
       }
       logger.error(MOD, `Scan failed: ${err.message}`);
       return res.status(500).json({ success: false, error: err.message });
-    } finally {
-      // Always clean up temp clone
-      if (tempCloneDir) {
-        cleanupTemp(tempCloneDir);
+    }
+  });
+
+  /* ── GET /scan/status/:jobId — Poll async scan progress ─────────── */
+  router.get('/scan/status/:jobId', async (req: Request, res: Response) => {
+    if (!workersEnabled()) {
+      return res.status(404).json({
+        success: false,
+        error: 'Background workers are disabled. Scans run synchronously; there is no job to poll.',
+      });
+    }
+    try {
+      const status = await getRepoJobStatus(String(req.params.jobId));
+      if (!status) {
+        return res.status(404).json({ success: false, error: 'Job not found' });
       }
+      return res.json({ success: true, job: status });
+    } catch (err: any) {
+      logger.error(MOD, `Job status lookup failed: ${err.message}`);
+      return res.status(500).json({ success: false, error: err.message });
     }
   });
 

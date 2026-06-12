@@ -63,6 +63,9 @@ import { createIngestRouter } from './routes/ingest';
 import { apiKeysRouter } from './routes/api-keys';
 import { hooksRouter } from './routes/hooks';
 import { createRepoIntelligenceRouter } from './routes/repo-intelligence';
+import { createRepoIntelWebhookRouter } from './routes/repo-intel-webhook';
+import { FEATURE_FLAGS } from '../config/features';
+import { startRepoWorker, stopRepoWorker } from '../jobs/workers/repo-analysis-worker';
 import { createKnowledgeRouter } from './routes/knowledge';
 import { createDashboardRouter } from './routes/dashboard';
 import { createProjectsRouter } from './routes/projects';
@@ -168,6 +171,15 @@ export function createServer(): express.Application {
   // CI Webhooks — autonomous healing (no auth, uses HMAC signature)
   app.use('/api/ci-webhooks', createCIWebhookRouter(jobQueue));
 
+  // Repo Intelligence webhook — incremental re-scan on GitHub push (Phase 2).
+  // Unauthenticated (uses its own HMAC signature validation) and ONLY mounted
+  // when the GITHUB_WEBHOOKS feature flag is enabled, so it adds no surface by
+  // default.
+  if (FEATURE_FLAGS.REPO_INTELLIGENCE.GITHUB_WEBHOOKS) {
+    app.use('/api/repo-intel-webhook', createRepoIntelWebhookRouter());
+    logger.info(MOD, 'Repo-intelligence webhook mounted at /api/repo-intel-webhook');
+  }
+
   // Ingest API — uses its own API key auth (Bearer lvlp_live_xxx)
   // Must support both JSON and raw text/xml bodies
   app.use('/api/ingest', express.text({ type: ['text/xml', 'application/xml'], limit: '50mb' }), createIngestRouter(jobQueue));
@@ -264,10 +276,25 @@ export async function startAPIServer(): Promise<void> {
     // /api/health/database will show which tables are missing
   }
 
+  // Background workers (Phase 2) — start AFTER DB init so the pgvector
+  // availability flag is set. No-op unless the BACKGROUND_WORKERS flag is on;
+  // never connects to Redis by default.
+  if (FEATURE_FLAGS.REPO_INTELLIGENCE.BACKGROUND_WORKERS) {
+    try {
+      const worker = startRepoWorker();
+      if (worker) {
+        console.log('🧵 [Workers] Repo-analysis background worker started');
+      }
+    } catch (err: any) {
+      logger.warn(MOD, 'Failed to start repo worker (non-fatal)', { error: err?.message });
+    }
+  }
+
   // Graceful shutdown
   const shutdown = async () => {
     logger.info(MOD, 'Shutting down gracefully...');
     server.close(async () => {
+      await stopRepoWorker();
       await closeDb();
       process.exit(0);
     });

@@ -34,6 +34,7 @@ import { analyzeRepoStructure, buildPageObjectFileName, buildSpecFileName } from
 import type { RepoStructureAnalysis } from './repo-analyzer';
 import { analyzeRepoPatterns } from './repo-pattern-analyzer';
 import { adaptiveGenerateFiles } from './adaptive-codegen';
+import { getRAGService } from '../services/rag-service';
 
 const MOD = 'script-gen-engine';
 
@@ -147,6 +148,14 @@ export interface GenerationConfig {
   fusionContext?: string;
   /** Structured repository profile for adaptive code generation */
   repoProfile?: import('../context/types').RepositoryProfile;
+  /**
+   * Phase 2 (RAG / few-shot): the repository_contexts.id of the scanned repo.
+   * When present AND RAG is enabled, the engine retrieves the most similar
+   * existing tests from this repo's embedded code_chunks and injects them as
+   * few-shot examples. Optional and fully gated — absence (or RAG disabled)
+   * leaves generation behaviour unchanged.
+   */
+  repoContextId?: number;
   /** Authentication config for crawling behind login walls */
   authConfig?: AuthConfig;
   /** Additional URLs to crawl in the same authenticated session */
@@ -1020,6 +1029,51 @@ ${assertions.map(l => `    ${l}`).join('\n')}
   }
 
   /**
+   * Phase 2 (RAG / few-shot learning): retrieve the most similar EXISTING tests
+   * from the scanned repository's embedded code_chunks and format them as a
+   * few-shot example block for the generation prompt.
+   *
+   * Fully gated: returns '' immediately unless a repoContextId is present AND
+   * RAG retrieval is enabled AND the vector infra/embeddings are available.
+   * Any failure degrades to '' so generation never breaks. This is additive —
+   * with RAG off, behaviour is identical to before.
+   */
+  private async buildFewShotBlock(config: GenerationConfig, crawl: CrawlResult): Promise<string> {
+    if (!config.repoContextId) return '';
+    const rag = getRAGService();
+    if (!rag.isEnabled()) return '';
+
+    // Build a retrieval query from the strongest available signal of intent.
+    const queryParts = [
+      config.testCase?.title,
+      config.testCase?.scenario,
+      config.instructions,
+      config.testTypes?.join(', '),
+      crawl?.pageType ? `${crawl.pageType} page` : '',
+      crawl?.title,
+    ].filter(Boolean);
+    const query = queryParts.join('\n').trim();
+    if (!query) return '';
+
+    try {
+      const { block, examples } = await rag.buildFewShotBlock(config.repoContextId, query, {
+        limit: 3,
+        minSimilarity: 0.35,
+      });
+      if (!block) return '';
+      logger.info(MOD, 'Injecting RAG few-shot examples into prompt', {
+        repoContextId: config.repoContextId,
+        examples: examples.length,
+      });
+      console.log(`[ScriptGenEngine] 🔎 RAG few-shot: ${examples.length} similar test(s) injected`);
+      return `\n--- SIMILAR EXISTING TESTS (FEW-SHOT) ---\n${block}\n--- END SIMILAR EXISTING TESTS ---`;
+    } catch (err: any) {
+      logger.warn(MOD, 'Few-shot retrieval failed (non-blocking)', { error: err?.message });
+      return '';
+    }
+  }
+
+  /**
    * Build the "TEST CASE TO AUTOMATE" anchor block. When generating from a Test
    * Case Lab case, the flows must mirror the case's steps + expected result
    * rather than being inferred purely from the crawl. Returns '' for url-based
@@ -1059,6 +1113,8 @@ ${assertions.map(l => `    ${l}`).join('\n')}
   ): Promise<TestPlan> {
     // Build concise DOM summary for AI
     const domSummary = this.buildDOMSummary(crawl);
+    // Phase 2: RAG few-shot block (similar existing tests). '' when RAG is off.
+    const fewShotBlock = await this.buildFewShotBlock(config, crawl);
     const flowSummary = workflowMap.flows.map(f => ({
       name: f.name,
       type: f.flowType,
@@ -1146,6 +1202,7 @@ ${(() => {
 })()}
 ${config.fusionContext ? `\n--- FUSED INTELLIGENCE ---\nAdditional intelligence from across the platform. Use it to improve reliability:\n\n${config.fusionContext}\n--- END FUSED INTELLIGENCE ---` : ''}
 ${this.buildRepoPatternBlock(config)}
+${fewShotBlock}
 ${this.buildTestCaseAnchorBlock(config)}
 
 ${config.testCase
