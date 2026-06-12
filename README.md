@@ -262,6 +262,11 @@ REDIS_URL=redis://localhost:6379   # Used only when ENABLE_REPO_WORKERS=true
 REPO_WORKER_CONCURRENCY=2          # Max concurrent repo jobs per worker
 REPO_WEBHOOK_BRANCHES=             # Comma-separated branch allow-list (default: repo default branch)
 OPENAI_EMBEDDING_MODEL=text-embedding-3-small  # Embedding model (1536 dims)
+
+# ── Repository Intelligence Phase 3 (all OFF by default) ──
+ENABLE_METHOD_INTELLIGENCE=false   # Build the method index + call-dependency graph during scans
+ENABLE_TRUE_REUSE=false            # Suggest existing helpers in generation (needs METHOD_INTELLIGENCE)
+ENABLE_MULTI_LANGUAGE=false        # Java/Python/C# analysis via tree-sitter (optional native grammars)
 ```
 
 ## Repository Intelligence (Phase 1)
@@ -358,6 +363,69 @@ npx tsx tests/unit/repo-intelligence-phase2.test.ts
 The real-infrastructure paths (BullMQ against Redis, and the pgvector similarity
 search against Postgres) were additionally validated end-to-end during
 development — see `repo_intelligence_phase2_implementation.md`.
+
+## Repository Intelligence (Phase 3 — Method Intelligence, True Reuse, Multi-Language)
+
+Phase 3 makes generation *reuse-aware* and extends analysis beyond TS/JS.
+**Every Phase 3 capability is gated behind a feature flag that is OFF by
+default.** With the flags unset, behaviour is identical to Phase 2 — no new
+tables are created, no extra work runs during scans, and generation prompts are
+unchanged.
+
+### 1. Method Intelligence (`ENABLE_METHOD_INTELLIGENCE`)
+During a scan, the `MethodIntelligenceService` (built on the existing **ts-morph**
+analyzer) extracts every standalone function and class method — name,
+parameters, return type, async-ness, JSDoc, the **full source code**, a
+normalized SHA-256 `code_hash`, and the **list of methods each one calls**. It
+persists them into two new tables and builds a caller→callee **dependency graph**:
+
+- `repository_methods` — the searchable method index (classified as
+  `helper` / `page_object_method` / `test` / `utility`).
+- `method_dependencies` — the call graph (caller → callee, with call counts).
+
+Fuzzy name search uses Postgres **`pg_trgm`** (`similarity()` + a GIN trigram
+index). The migration is idempotent and non-fatal: if `pg_trgm` is unavailable
+on a managed Postgres, the tables are still created (exact-hash dedup still
+works) and search transparently degrades to an `ILIKE` fallback.
+
+### 2. True Reuse Engine (`ENABLE_TRUE_REUSE`, needs `ENABLE_METHOD_INTELLIGENCE`)
+Before the generator writes a new helper, the `TrueReuseEngine`:
+- maps natural-language test steps to action keywords (login/click/fill/verify/…),
+- searches the method index for matching existing helpers,
+- scores candidates by name relevance × log(usage),
+- injects an **"Existing Reusable Helpers"** block into the generation prompt so
+  the model calls existing helpers instead of producing near-duplicates, and
+- can flag exact duplicates by `code_hash`.
+
+When disabled (or the index is empty) it returns empty results and the prompt is
+unchanged.
+
+### 3. Multi-Language Analysis (`ENABLE_MULTI_LANGUAGE`)
+The `MultiLanguageAnalyzer` adds **Java / Python / C#** support via tree-sitter,
+extracting classes, methods, imports and detecting the test framework in use
+(JUnit/TestNG/Selenium, pytest/unittest/Playwright, NUnit/xUnit/MSTest, …).
+
+The tree-sitter grammars are an **optional, lazily-loaded native dependency**:
+they are `require()`d inside a try/catch, so the project compiles and runs
+whether or not they are installed. If the grammars are missing the analyzer
+reports `available: false` instead of throwing. Install them with:
+
+```bash
+npm install --legacy-peer-deps \
+  tree-sitter tree-sitter-java tree-sitter-python tree-sitter-c-sharp@0.21.3
+```
+
+### Tests
+```bash
+# Gating + pure-function unit tests (no infra needed)
+npx tsx tests/unit/repo-intelligence-phase3.test.ts
+
+# Real multi-language parsing (skips automatically if grammars not installed)
+npx tsx tests/unit/repo-intelligence-phase3-multilang.test.ts
+```
+The real-infrastructure path (method index + `pg_trgm` search + dependency graph
+against a live Postgres) was additionally validated end-to-end during
+development — see `repo_intelligence_phase3_implementation.md`.
 
 ## Running
 

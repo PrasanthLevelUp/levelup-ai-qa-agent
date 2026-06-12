@@ -178,6 +178,11 @@ export async function initDb(): Promise<void> {
     // touched by default. Fully idempotent and non-fatal if the extension is
     // unavailable (e.g. managed Postgres without pgvector).
     await migratePgVector(client);
+
+    // Phase 3 (Repo Intelligence — Method Intelligence): create the method
+    // index + dependency-graph tables. Gated behind METHOD_INTELLIGENCE,
+    // idempotent and non-fatal.
+    await migrateMethodIntelligence(client);
   } catch (err: any) {
     console.error('⚠️ [DB] initDb encountered errors:', err?.message, err?.code, err?.detail);
     logger.error(MOD, 'initDb encountered errors (non-fatal — server continues)', {
@@ -292,6 +297,117 @@ async function migratePgVector(client: PoolClient): Promise<void> {
   pgVectorAvailable = true;
   console.log('✅ [DB] pgvector / RAG migration complete');
   logger.info(MOD, 'pgvector available — RAG/vector search enabled');
+}
+
+/**
+ * Track whether the Method Intelligence schema (tables + pg_trgm) is available.
+ * `null` = not yet probed. Used to short-circuit method-index queries when the
+ * migration was skipped or failed (e.g. managed Postgres without pg_trgm).
+ */
+let methodIntelAvailable: boolean | null = null;
+
+/** Whether pg_trgm fuzzy search is available (else the query layer uses ILIKE). */
+let methodTrgmAvailable: boolean = false;
+
+export function isMethodIntelAvailable(): boolean {
+  return methodIntelAvailable === true;
+}
+
+export function isMethodTrgmAvailable(): boolean {
+  return methodTrgmAvailable === true;
+}
+
+/**
+ * Phase 3 (Repo Intelligence — Method Intelligence): create the
+ * `repository_methods` + `method_dependencies` tables and the pg_trgm-backed
+ * fuzzy-search helpers.
+ *
+ * Gated behind the METHOD_INTELLIGENCE flag so a database is never touched by
+ * default. Fully idempotent and non-fatal: if pg_trgm is unavailable the tables
+ * are still created (exact-hash dedup still works) and fuzzy search degrades to
+ * a LIKE fallback at the query layer.
+ */
+async function migrateMethodIntelligence(client: PoolClient): Promise<void> {
+  if (!FEATURE_FLAGS.REPO_INTELLIGENCE.METHOD_INTELLIGENCE) {
+    methodIntelAvailable = false;
+    return;
+  }
+
+  console.log('🔧 [DB] Phase 3: Method Intelligence migration...');
+
+  // 1) Tables. If these fail, method intelligence is unavailable but the rest
+  //    of the app keeps working.
+  const methodsOk = await safeExec(client, 'repository_methods', `
+    CREATE TABLE IF NOT EXISTS repository_methods (
+      id SERIAL PRIMARY KEY,
+      repository_context_id INTEGER REFERENCES repository_contexts(id) ON DELETE CASCADE,
+      method_name VARCHAR(255) NOT NULL,
+      file_path TEXT NOT NULL,
+      class_name VARCHAR(255),
+      parameters JSONB DEFAULT '[]',
+      return_type VARCHAR(255),
+      is_async BOOLEAN DEFAULT false,
+      method_type VARCHAR(50),
+      usage_count INTEGER DEFAULT 0,
+      last_used_at TIMESTAMPTZ,
+      source_code TEXT,
+      code_hash VARCHAR(64),
+      line_start INTEGER,
+      line_end INTEGER,
+      description TEXT,
+      tags JSONB DEFAULT '[]',
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      updated_at TIMESTAMPTZ DEFAULT NOW(),
+      UNIQUE(repository_context_id, file_path, method_name, code_hash)
+    )`);
+
+  const depsOk = await safeExec(client, 'method_dependencies', `
+    CREATE TABLE IF NOT EXISTS method_dependencies (
+      id SERIAL PRIMARY KEY,
+      caller_method_id INTEGER REFERENCES repository_methods(id) ON DELETE CASCADE,
+      callee_method_id INTEGER REFERENCES repository_methods(id) ON DELETE CASCADE,
+      call_count INTEGER DEFAULT 1,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      UNIQUE(caller_method_id, callee_method_id)
+    )`);
+
+  if (!methodsOk || !depsOk) {
+    methodIntelAvailable = false;
+    logger.warn(MOD, 'Method Intelligence tables unavailable — method index disabled at runtime');
+    console.warn('⚠️ [DB] Method Intelligence tables unavailable — method index disabled');
+    return;
+  }
+
+  // 2) Plain B-tree indexes (always safe).
+  await safeExec(client, 'idx_repo_methods_context',
+    `CREATE INDEX IF NOT EXISTS idx_repo_methods_context ON repository_methods(repository_context_id)`);
+  await safeExec(client, 'idx_repo_methods_name',
+    `CREATE INDEX IF NOT EXISTS idx_repo_methods_name ON repository_methods(method_name)`);
+  await safeExec(client, 'idx_repo_methods_type',
+    `CREATE INDEX IF NOT EXISTS idx_repo_methods_type ON repository_methods(method_type)`);
+  await safeExec(client, 'idx_repo_methods_hash',
+    `CREATE INDEX IF NOT EXISTS idx_repo_methods_hash ON repository_methods(code_hash)`);
+  await safeExec(client, 'idx_method_deps_caller',
+    `CREATE INDEX IF NOT EXISTS idx_method_deps_caller ON method_dependencies(caller_method_id)`);
+  await safeExec(client, 'idx_method_deps_callee',
+    `CREATE INDEX IF NOT EXISTS idx_method_deps_callee ON method_dependencies(callee_method_id)`);
+
+  // 3) pg_trgm for fuzzy name search. Non-fatal: a missing extension just means
+  //    the query layer falls back to ILIKE matching.
+  const trgmOk = await safeExec(client, 'create_extension_pg_trgm',
+    `CREATE EXTENSION IF NOT EXISTS pg_trgm`);
+  methodTrgmAvailable = trgmOk;
+  if (trgmOk) {
+    await safeExec(client, 'idx_repo_methods_name_trgm',
+      `CREATE INDEX IF NOT EXISTS idx_repo_methods_name_trgm
+         ON repository_methods USING gin (method_name gin_trgm_ops)`);
+  } else {
+    logger.warn(MOD, 'pg_trgm unavailable — method search will use ILIKE fallback');
+  }
+
+  methodIntelAvailable = true;
+  console.log('✅ [DB] Method Intelligence migration complete');
+  logger.info(MOD, 'Method Intelligence available', { trigram: methodTrgmAvailable });
 }
 
 /**
@@ -7315,6 +7431,277 @@ export async function findTrackedReposByCandidates(
   }));
 }
 
+
+/* ========================================================================== */
+/*  Method Intelligence (Phase 3) — method index + dependency graph           */
+/* ========================================================================== */
+
+export interface MethodRecord {
+  repositoryContextId: number;
+  methodName: string;
+  filePath: string;
+  className?: string | null;
+  parameters: Array<{ name: string; type: string }>;
+  returnType?: string | null;
+  isAsync: boolean;
+  methodType: string;
+  sourceCode: string;
+  codeHash: string;
+  lineStart?: number | null;
+  lineEnd?: number | null;
+  description?: string | null;
+  tags?: string[];
+}
+
+export interface MethodSearchHit {
+  id: number;
+  methodName: string;
+  filePath: string;
+  className: string | null;
+  methodType: string;
+  usageCount: number;
+  sourceCode: string;
+  similarity: number;
+}
+
+/**
+ * Upsert a single method into the index. On conflict (same context+file+name+
+ * hash) bumps usage_count. Returns the row id, or null if method intelligence
+ * is unavailable. No-op (null) when the tables don't exist.
+ */
+export async function upsertMethod(method: MethodRecord): Promise<number | null> {
+  if (!isMethodIntelAvailable()) return null;
+  const p = getPool();
+  const res = await p.query(
+    `INSERT INTO repository_methods (
+       repository_context_id, method_name, file_path, class_name,
+       parameters, return_type, is_async, method_type,
+       source_code, code_hash, line_start, line_end, description, tags
+     )
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+     ON CONFLICT (repository_context_id, file_path, method_name, code_hash)
+     DO UPDATE SET usage_count = repository_methods.usage_count + 1,
+                   updated_at = NOW()
+     RETURNING id`,
+    [
+      method.repositoryContextId,
+      method.methodName,
+      method.filePath,
+      method.className ?? null,
+      JSON.stringify(method.parameters ?? []),
+      method.returnType ?? null,
+      method.isAsync ?? false,
+      method.methodType,
+      method.sourceCode,
+      method.codeHash,
+      method.lineStart ?? null,
+      method.lineEnd ?? null,
+      method.description ?? null,
+      JSON.stringify(method.tags ?? []),
+    ],
+  );
+  return res.rows[0]?.id ?? null;
+}
+
+/**
+ * Replace all methods for a repository context (clears old rows then bulk
+ * inserts). Returns the number of methods stored and a name→id map for building
+ * the dependency graph. No-op when method intelligence is unavailable.
+ */
+export async function replaceRepositoryMethods(
+  repoContextId: number,
+  methods: MethodRecord[],
+): Promise<{ stored: number; idByName: Map<string, number> }> {
+  const idByName = new Map<string, number>();
+  if (!isMethodIntelAvailable()) return { stored: 0, idByName };
+  const p = getPool();
+  await p.query(`DELETE FROM repository_methods WHERE repository_context_id = $1`, [repoContextId]);
+  let stored = 0;
+  for (const m of methods) {
+    const id = await upsertMethod(m);
+    if (id != null) {
+      stored++;
+      // Last definition wins for the name→id map (sufficient for call edges).
+      idByName.set(m.methodName, id);
+    }
+  }
+  return { stored, idByName };
+}
+
+/**
+ * Insert a caller→callee dependency edge. On conflict bumps call_count.
+ * No-op when method intelligence is unavailable.
+ */
+export async function upsertMethodDependency(
+  callerId: number,
+  calleeId: number,
+): Promise<void> {
+  if (!isMethodIntelAvailable()) return;
+  if (callerId === calleeId) return; // ignore self-edges
+  const p = getPool();
+  await p.query(
+    `INSERT INTO method_dependencies (caller_method_id, callee_method_id)
+     VALUES ($1,$2)
+     ON CONFLICT (caller_method_id, callee_method_id)
+     DO UPDATE SET call_count = method_dependencies.call_count + 1`,
+    [callerId, calleeId],
+  );
+}
+
+/**
+ * Fuzzy method search by name. Uses pg_trgm similarity when available (ordered
+ * by similarity * usage), otherwise falls back to an ILIKE substring match.
+ * Returns [] when method intelligence is unavailable.
+ */
+export async function searchMethods(
+  repoContextId: number,
+  searchTerm: string,
+  opts: { methodType?: string; limit?: number; minSimilarity?: number } = {},
+): Promise<MethodSearchHit[]> {
+  if (!isMethodIntelAvailable() || !searchTerm?.trim()) return [];
+  const p = getPool();
+  const limit = opts.limit ?? 10;
+  const minSim = opts.minSimilarity ?? 0.3;
+  const params: any[] = [repoContextId, searchTerm];
+  let typeClause = '';
+  if (opts.methodType) {
+    params.push(opts.methodType);
+    typeClause = `AND method_type = $${params.length}`;
+  }
+
+  if (isMethodTrgmAvailable()) {
+    const res = await p.query(
+      `SELECT id, method_name, file_path, class_name, method_type,
+              usage_count, source_code,
+              similarity(method_name, $2) AS sim
+         FROM repository_methods
+        WHERE repository_context_id = $1
+          AND similarity(method_name, $2) > ${Number(minSim)}
+          ${typeClause}
+        ORDER BY sim DESC, usage_count DESC
+        LIMIT ${Number(limit)}`,
+      params,
+    );
+    return res.rows.map(mapMethodHit);
+  }
+
+  // ILIKE fallback — crude relevance score so callers still get ordering.
+  const res = await p.query(
+    `SELECT id, method_name, file_path, class_name, method_type,
+            usage_count, source_code
+       FROM repository_methods
+      WHERE repository_context_id = $1
+        AND method_name ILIKE '%' || $2 || '%'
+        ${typeClause}
+      ORDER BY usage_count DESC
+      LIMIT ${Number(limit)}`,
+    params,
+  );
+  return res.rows.map((r: any) => ({ ...mapMethodHit(r), similarity: estimateNameSimilarity(searchTerm, r.method_name) }));
+}
+
+function mapMethodHit(r: any): MethodSearchHit {
+  return {
+    id: r.id,
+    methodName: r.method_name,
+    filePath: r.file_path,
+    className: r.class_name ?? null,
+    methodType: r.method_type,
+    usageCount: r.usage_count ?? 0,
+    sourceCode: r.source_code ?? '',
+    similarity: typeof r.sim === 'number' ? r.sim : (r.sim != null ? Number(r.sim) : 0),
+  };
+}
+
+/** Cheap Dice-coefficient-ish bigram similarity for the ILIKE fallback path. */
+function estimateNameSimilarity(a: string, b: string): number {
+  const norm = (s: string) => s.toLowerCase();
+  const bigrams = (s: string) => {
+    const out = new Set<string>();
+    for (let i = 0; i < s.length - 1; i++) out.add(s.slice(i, i + 2));
+    return out;
+  };
+  const A = bigrams(norm(a));
+  const B = bigrams(norm(b));
+  if (A.size === 0 || B.size === 0) return 0;
+  let inter = 0;
+  for (const g of A) if (B.has(g)) inter++;
+  return (2 * inter) / (A.size + B.size);
+}
+
+/**
+ * Find an exact-duplicate method by code hash (scoped to a repo context).
+ * Returns the existing method or null. [] when unavailable.
+ */
+export async function findMethodByHash(
+  repoContextId: number,
+  codeHash: string,
+): Promise<MethodSearchHit | null> {
+  if (!isMethodIntelAvailable()) return null;
+  const p = getPool();
+  const res = await p.query(
+    `SELECT id, method_name, file_path, class_name, method_type,
+            usage_count, source_code
+       FROM repository_methods
+      WHERE repository_context_id = $1 AND code_hash = $2
+      LIMIT 1`,
+    [repoContextId, codeHash],
+  );
+  if (res.rows.length === 0) return null;
+  return { ...mapMethodHit(res.rows[0]), similarity: 1 };
+}
+
+/** Direct callees of a method (the method's outgoing dependency edges). */
+export async function getMethodDependencies(
+  methodId: number,
+): Promise<Array<{ id: number; methodName: string; filePath: string; methodType: string; callCount: number }>> {
+  if (!isMethodIntelAvailable()) return [];
+  const p = getPool();
+  const res = await p.query(
+    `SELECT rm.id, rm.method_name, rm.file_path, rm.method_type, md.call_count
+       FROM method_dependencies md
+       JOIN repository_methods rm ON md.callee_method_id = rm.id
+      WHERE md.caller_method_id = $1
+      ORDER BY md.call_count DESC`,
+    [methodId],
+  );
+  return res.rows.map((r: any) => ({
+    id: r.id,
+    methodName: r.method_name,
+    filePath: r.file_path,
+    methodType: r.method_type,
+    callCount: r.call_count ?? 0,
+  }));
+}
+
+/** Aggregate stats for a repository context's method index. */
+export async function getMethodIntelStats(
+  repoContextId: number,
+): Promise<{ totalMethods: number; byType: Record<string, number>; dependencies: number }> {
+  if (!isMethodIntelAvailable()) return { totalMethods: 0, byType: {}, dependencies: 0 };
+  const p = getPool();
+  const totals = await p.query(
+    `SELECT method_type, COUNT(*)::int AS c
+       FROM repository_methods
+      WHERE repository_context_id = $1
+      GROUP BY method_type`,
+    [repoContextId],
+  );
+  const byType: Record<string, number> = {};
+  let totalMethods = 0;
+  for (const r of totals.rows) {
+    byType[r.method_type ?? 'unknown'] = r.c;
+    totalMethods += r.c;
+  }
+  const deps = await p.query(
+    `SELECT COUNT(*)::int AS c
+       FROM method_dependencies md
+       JOIN repository_methods rm ON md.caller_method_id = rm.id
+      WHERE rm.repository_context_id = $1`,
+    [repoContextId],
+  );
+  return { totalMethods, byType, dependencies: deps.rows[0]?.c ?? 0 };
+}
 
 
 /* ========================================================================== */
