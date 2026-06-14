@@ -14,7 +14,7 @@
 import type { FailureDetails } from './failure-analyzer';
 import { HealingStrategySelector, type SelectedStrategy } from './healing-strategy-selector';
 import { RuleEngine } from '../engines/rule-engine';
-import { PatternEngine } from '../engines/pattern-engine';
+import { PatternEngine, type PatternTenantScope } from '../engines/pattern-engine';
 import { AIEngine } from '../engines/ai-engine';
 import { DOMCandidateExtractor, type DOMExtractionResult } from '../engines/dom-candidate-extractor';
 import { SemanticSimilarityEngine } from '../engines/semantic-similarity-engine';
@@ -23,6 +23,11 @@ import { ValidationEngine, type ValidationResult } from '../engines/validation-e
 import { PatchEngine, type PatchResult } from '../engines/patch-engine';
 import { RerunEngine, type RerunResult } from '../engines/rerun-engine';
 import { DOMMemoryQuery, type DOMMemoryInsight, type AlternativeSelector } from '../services/dom-memory-query';
+import {
+  HealingIntelligenceContext,
+  emptyHealingContext,
+  type HealingContextResult,
+} from '../services/healing-intelligence-context';
 import { logger } from '../utils/logger';
 import {
   logHealing,
@@ -30,6 +35,91 @@ import {
 } from '../db/postgres';
 
 const MOD = 'healing-orchestrator';
+
+/** Method types whose selectors are the most trustworthy grounding signal. */
+const PAGE_OBJECT_METHOD_TYPES = new Set(['page_object_method', 'helper']);
+
+/**
+ * Normalize a locator / source snippet for robust substring corroboration:
+ * lowercases, unifies quote styles, and strips all whitespace so cosmetic
+ * differences (spacing inside getByRole(...), single vs double quotes) don't
+ * defeat the "is this selector present in the repo?" check.
+ *
+ * Exported for unit testing.
+ */
+export function normalizeSelectorText(text: string): string {
+  return (text || '')
+    .toLowerCase()
+    .replace(/["'`]/g, '"')
+    .replace(/\s+/g, '');
+}
+
+/**
+ * Reduce a locator/source snippet to its "core" selector call for direction-
+ * insensitive corroboration: normalizes, then strips Playwright framework
+ * prefixes (`await`, `this.page.`, `page.`, `this.`) so an AI suggestion like
+ * `page.getByRole('button')` matches a page-object body written as
+ * `this.page.getByRole("button")`. Exported for unit testing.
+ */
+export function selectorCore(text: string): string {
+  return normalizeSelectorText(text)
+    .replace(/await/g, '')
+    .replace(/this\.page\./g, '')
+    .replace(/page\./g, '')
+    .replace(/this\./g, '');
+}
+
+/**
+ * Pure computation of the repository-aware confidence boost (Sprint 2.3).
+ * Given a proposed locator and the repository grounding evidence, returns the
+ * additive boost (0–1 scale, before capping) and human-readable reasons.
+ *
+ * Returns `{ boost: 0, reasons: [] }` when there is no evidence. Exported and
+ * side-effect-free so the scoring policy can be unit-tested without a DB.
+ */
+export function computeRepositoryConfidenceBoost(
+  newLocator: string,
+  repoContext: HealingContextResult,
+): { boost: number; reasons: string[] } {
+  if (!repoContext || !repoContext.hasEvidence) return { boost: 0, reasons: [] };
+
+  const target = selectorCore(newLocator);
+  if (!target) return { boost: 0, reasons: [] };
+
+  const matchingMethod = repoContext.methodHits.find((m) =>
+    selectorCore(m.sourceCode || '').includes(target),
+  );
+  const ragCorroborated = repoContext.ragExamples.some((e) =>
+    selectorCore(e.content || '').includes(target),
+  );
+
+  let boost = 0;
+  const reasons: string[] = [];
+
+  if (matchingMethod) {
+    if (PAGE_OBJECT_METHOD_TYPES.has(matchingMethod.methodType)) {
+      boost += 0.2;
+      reasons.push(`reuses page-object method ${matchingMethod.methodName}`);
+    } else {
+      boost += 0.15;
+      reasons.push(`matches indexed method ${matchingMethod.methodName}`);
+    }
+    if ((matchingMethod.usageCount || 0) > 0) {
+      boost += 0.1;
+      reasons.push(`used by ${matchingMethod.usageCount} existing test(s)`);
+    }
+  } else if (ragCorroborated) {
+    boost += 0.1;
+    reasons.push('found in related repository source');
+  } else {
+    // Grounding was available to the model but the exact locator was not found
+    // verbatim — a small, conservative boost only.
+    boost += 0.03;
+    reasons.push('repository grounding available');
+  }
+
+  return { boost, reasons };
+}
 
 /* -------------------------------------------------------------------------- */
 /*  Types                                                                     */
@@ -126,7 +216,12 @@ export class HealingOrchestrator {
     skipLocators?: Set<string>,
     projectId?: number,
     companyId?: number,
+    repoContext?: HealingContextResult,
   ): Promise<HealingOutcome> {
+    // Repository grounding (Sprint 2 — Healing Intelligence). Inert when the
+    // feature is OFF: the worker passes an empty context, so prompt building and
+    // confidence scoring below are byte-for-byte unchanged.
+    const repoCtx: HealingContextResult = repoContext ?? emptyHealingContext();
     const attemptedStrategies: HealingStrategy[] = [];
     let domCandidates: DOMExtractionResult | undefined;
     let domMemoryInsight: DOMMemoryInsight | undefined;
@@ -271,12 +366,18 @@ export class HealingOrchestrator {
       }
     }
 
+    // Tenant scope — propagated to every learned-pattern lookup so a healed
+    // locator from one company/project is never served to another (multi-tenant
+    // isolation fix).
+    const scope: PatternTenantScope = { companyId, projectId };
+
     // ── Step 1: Use strategy selector to determine best approach ──
     const selected = await this.strategySelector.selectStrategy(
       failure,
       this.ruleEngine,
       this.patternEngine,
       this.aiEngine,
+      scope,
     );
 
     logger.info(MOD, 'Strategy selected', {
@@ -288,10 +389,11 @@ export class HealingOrchestrator {
 
     // Step 2: Execute selected engine (or fall through all in priority order)
     if (selected.engine === 'none') {
-      const outcome = await this.healFallbackChain(failure, attemptedStrategies);
+      const outcome = await this.healFallbackChain(failure, attemptedStrategies, scope, repoCtx);
       // Enrich with stability scores
       if (outcome.suggestion) {
         await this.enrichWithStability(outcome.suggestion, domMemoryInsight);
+        this.applyRepositoryConfidenceBoost(outcome.suggestion, repoCtx, domMemoryInsight);
       }
       outcome.domMemoryInsight = domMemoryInsight;
       return outcome;
@@ -301,7 +403,7 @@ export class HealingOrchestrator {
     let suggestion: HealingSuggestion | null = null;
 
     if (selected.engine === 'rule' || selected.engine === 'pattern' || selected.engine === 'ai') {
-      suggestion = await this.tryEngine(selected.engine, failure, attemptedStrategies, skipLocators);
+      suggestion = await this.tryEngine(selected.engine, failure, attemptedStrategies, skipLocators, scope, repoCtx);
     }
 
     // If selected engine failed, try remaining engines
@@ -309,7 +411,7 @@ export class HealingOrchestrator {
       const engines: Array<'rule' | 'pattern' | 'ai'> = ['rule', 'pattern', 'ai'];
       for (const eng of engines) {
         if (attemptedStrategies.includes(this.engineToStrategy(eng))) continue;
-        suggestion = await this.tryEngine(eng, failure, attemptedStrategies, skipLocators);
+        suggestion = await this.tryEngine(eng, failure, attemptedStrategies, skipLocators, scope, repoCtx);
         if (suggestion) break;
       }
     }
@@ -338,6 +440,10 @@ export class HealingOrchestrator {
     // ── Enrich with DOM Memory stability data ──
     await this.enrichWithStability(suggestion, domMemoryInsight);
 
+    // ── Repository-aware confidence boost (Sprint 2.3) ──
+    // No-op when the feature is OFF (repoCtx is empty / has no evidence).
+    this.applyRepositoryConfidenceBoost(suggestion, repoCtx, domMemoryInsight);
+
     // Record token usage for AI calls
     if (suggestion.strategy === 'ai_reasoning' && suggestion.tokensUsed > 0) {
       await this.strategySelector.recordUsage('ai', suggestion.tokensUsed);
@@ -352,10 +458,12 @@ export class HealingOrchestrator {
   private async healFallbackChain(
     failure: FailureDetails,
     attemptedStrategies: HealingStrategy[],
+    scope: PatternTenantScope = {},
+    repoContext?: HealingContextResult,
   ): Promise<HealingOutcome> {
     // Try Rule → Pattern → AI
     for (const eng of ['rule', 'pattern', 'ai'] as const) {
-      const suggestion = await this.tryEngine(eng, failure, attemptedStrategies);
+      const suggestion = await this.tryEngine(eng, failure, attemptedStrategies, undefined, scope, repoContext);
       if (suggestion) {
         if (suggestion.strategy === 'ai_reasoning' && suggestion.tokensUsed > 0) {
           await this.strategySelector.recordUsage('ai', suggestion.tokensUsed);
@@ -375,6 +483,8 @@ export class HealingOrchestrator {
     failure: FailureDetails,
     attemptedStrategies: HealingStrategy[],
     skipLocators?: Set<string>,
+    scope: PatternTenantScope = {},
+    repoContext?: HealingContextResult,
   ): Promise<HealingSuggestion | null> {
     const strategy = this.engineToStrategy(engine);
     attemptedStrategies.push(strategy);
@@ -416,7 +526,7 @@ export class HealingOrchestrator {
       }
 
       case 'pattern': {
-        const patternResult = await this.patternEngine.findMatch(failure);
+        const patternResult = await this.patternEngine.findMatch(failure, scope);
         if (patternResult) {
           const validation = this.validationEngine.validate({
             newLocator: patternResult.newLocator,
@@ -444,7 +554,11 @@ export class HealingOrchestrator {
       }
 
       case 'ai': {
-        const aiResult = await this.aiEngine.suggest(failure);
+        // Inject repository grounding into the prompt when available (Sprint 2.2).
+        // promptBlock is '' unless the feature is enabled and the repo produced
+        // evidence, so the AI call is unchanged on the default path.
+        const grounding = repoContext?.promptBlock || undefined;
+        const aiResult = await this.aiEngine.suggest(failure, grounding);
         if (aiResult) {
           const validation = this.validationEngine.validate({
             newLocator: aiResult.newLocator,
@@ -535,6 +649,56 @@ export class HealingOrchestrator {
   }
 
   /**
+   * Repository-aware confidence boost (Sprint 2.3 — Healing Intelligence).
+   *
+   * Raises confidence in a proposed locator when the repository corroborates it:
+   *   • the locator text is present in a page-object/helper method  → strongest
+   *   • the locator text is present in the method index / RAG source
+   *   • the matching method is referenced by existing tests (usage_count)
+   *
+   * No-op when the feature is OFF or the repo produced no evidence — so the
+   * default confidence score is byte-for-byte unchanged. Boosts are additive on
+   * the 0–1 scale and capped at 1.0. This is intentionally separate from the DOM
+   * Memory stability boost in `enrichWithStability` (different signal source).
+   */
+  private applyRepositoryConfidenceBoost(
+    suggestion: HealingSuggestion,
+    repoContext: HealingContextResult,
+    _domMemoryInsight?: DOMMemoryInsight,
+  ): void {
+    if (!HealingIntelligenceContext.isEnabled()) return;
+    if (!repoContext || !repoContext.hasEvidence) return;
+
+    try {
+      const { boost, reasons } = computeRepositoryConfidenceBoost(
+        suggestion.newLocator,
+        repoContext,
+      );
+      if (boost <= 0) return;
+
+      const before = suggestion.confidence;
+      suggestion.confidence = Math.min(1.0, suggestion.confidence + boost);
+      const applied = suggestion.confidence - before;
+      if (applied <= 0) return;
+
+      const note = `[Repo-grounded +${applied.toFixed(2)}] ${reasons.join('; ')}`;
+      suggestion.reasoning = suggestion.reasoning
+        ? `${suggestion.reasoning} ${note}`
+        : note;
+
+      logger.info(MOD, 'Repository-aware confidence boost applied', {
+        selector: suggestion.newLocator.slice(0, 60),
+        boost: applied,
+        adjustedConfidence: suggestion.confidence,
+        reasons,
+      });
+    } catch (err: any) {
+      // Non-critical — never break healing on a scoring enhancement.
+      logger.debug(MOD, 'Repository confidence boost skipped (non-critical)', { error: err?.message });
+    }
+  }
+
+  /**
    * Record a successful heal into DOM Memory so future heals get smarter.
    *
    * The iterative worker in `api/server.ts` performs its own apply/validate/
@@ -605,7 +769,8 @@ export class HealingOrchestrator {
       patch_path: patch.patchPath,
     });
 
-    // Store learned pattern
+    // Store learned pattern — scoped to this tenant/project so it is only
+    // ever reused within the same company + project namespace.
     await storePattern({
       test_name: failure.testName,
       error_pattern: failure.errorPattern,
@@ -614,7 +779,7 @@ export class HealingOrchestrator {
       solution_strategy: suggestion.strategy,
       confidence: suggestion.confidence,
       avg_tokens_saved: suggestion.tokensUsed,
-    });
+    }, companyId ?? null, projectId ?? null);
 
     // ── Record to DOM Memory for future learning ──
     // This is how the system gets smarter over time

@@ -15,6 +15,14 @@ export interface LocatorSuggestionRequest {
   surroundingCode: string;
   failedLocator: string;
   testName: string;
+  /**
+   * Optional repository-grounding block (Sprint 2 — Healing Intelligence).
+   * When present, lists real selectors/methods that already exist in the
+   * repository so the model prefers reusing them. Built by
+   * HealingIntelligenceContext and only populated when the feature is enabled;
+   * absent => the prompt is byte-for-byte identical to the legacy prompt.
+   */
+  repoContext?: string;
 }
 
 export interface LocatorSuggestionResponse {
@@ -68,7 +76,9 @@ export class OpenAIClient {
         const completion = await this.client.chat.completions.create({
           model: this.model,
           temperature: 0.1,
-          max_tokens: 180,
+          // Slightly larger budget when grounded so the model can name the
+          // reused repository selector; unchanged for the legacy path.
+          max_tokens: req.repoContext ? 240 : 180,
           messages: [{ role: 'user', content: prompt }],
         });
 
@@ -101,7 +111,7 @@ export class OpenAIClient {
   }
 
   private buildPrompt(req: LocatorSuggestionRequest): string {
-    return [
+    const lines: string[] = [
       'Suggest a semantic Playwright locator to replace the broken one.',
       '',
       `Test: ${req.testName}`,
@@ -110,16 +120,35 @@ export class OpenAIClient {
       `Failed line: ${req.failedLine || 'N/A'}`,
       'Surrounding code:',
       req.surroundingCode.slice(0, 1200),
+    ];
+
+    // Repository grounding (Sprint 2). Only present when the feature is enabled
+    // AND the repository produced evidence — otherwise the prompt is unchanged.
+    if (req.repoContext && req.repoContext.trim()) {
+      lines.push(
+        '',
+        '----- REPOSITORY CONTEXT -----',
+        req.repoContext.slice(0, 4000),
+        '------------------------------',
+      );
+    }
+
+    lines.push(
       '',
       'Rules:',
       '- Return ONLY JSON (no markdown).',
       '- Prefer getByRole/getByLabel/getByText/getByPlaceholder.',
+      ...(req.repoContext && req.repoContext.trim()
+        ? ['- Prefer a selector/method already present in the repository context above when it fits.']
+        : []),
       '- Avoid CSS/XPath unless absolutely required.',
       '- Include confidence between 0 and 1.',
       '',
       'JSON schema:',
       '{"newLocator":"page.getByRole(...)","confidence":0.95,"reasoning":"short reason"}',
-    ].join('\n');
+    );
+
+    return lines.join('\n');
   }
 
   private parseResponse(content: string): Omit<LocatorSuggestionResponse, 'tokensUsed' | 'model'> {

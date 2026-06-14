@@ -30,6 +30,8 @@ import {
   isHealthIntelAvailable,
   isMethodIntelAvailable,
   getQualityIssues,
+  getRepositoryContextById,
+  getMethodOwnership,
 } from '../../db/postgres';
 import { repositoryHealthService } from '../../services/repository-health-service';
 import { impactAnalysisService } from '../../services/impact-analysis-service';
@@ -42,6 +44,53 @@ function parseIntParam(value: unknown): number | null {
   const raw = Array.isArray(value) ? value[0] : value;
   const n = Number(raw);
   return Number.isInteger(n) && n > 0 ? n : null;
+}
+
+/**
+ * SECURITY (IDOR fix): these routes take a contextId / methodId straight from
+ * the URL and previously passed them to the services with no tenant check, so
+ * any authenticated user could read another tenant's repository intelligence by
+ * guessing/iterating IDs. The helpers below verify the resource belongs to the
+ * caller's company (resolved by upstream auth + company middleware) before any
+ * data is returned. Resources with a NULL company are treated as global/legacy
+ * and remain readable; a non-null mismatch returns 403, a missing resource 404.
+ */
+async function verifyContextOwnership(
+  req: Request,
+  res: Response,
+  contextId: number,
+): Promise<boolean> {
+  const companyId = (req as any).companyId as number | undefined;
+  const ctx = await getRepositoryContextById(contextId);
+  if (!ctx) {
+    res.status(404).json({ error: 'repository context not found' });
+    return false;
+  }
+  if (ctx.companyId != null && ctx.companyId !== companyId) {
+    logger.warn(MOD, 'blocked cross-tenant context access', { contextId, owner: ctx.companyId, caller: companyId });
+    res.status(403).json({ error: 'forbidden: repository context belongs to another tenant' });
+    return false;
+  }
+  return true;
+}
+
+async function verifyMethodOwnership(
+  req: Request,
+  res: Response,
+  methodId: number,
+): Promise<boolean> {
+  const companyId = (req as any).companyId as number | undefined;
+  const owner = await getMethodOwnership(methodId);
+  if (!owner) {
+    res.status(404).json({ error: 'method not found' });
+    return false;
+  }
+  if (owner.companyId != null && owner.companyId !== companyId) {
+    logger.warn(MOD, 'blocked cross-tenant method access', { methodId, owner: owner.companyId, caller: companyId });
+    res.status(403).json({ error: 'forbidden: method belongs to another tenant' });
+    return false;
+  }
+  return true;
 }
 
 export function createRepoIntelligence3CRouter(): Router {
@@ -65,6 +114,7 @@ export function createRepoIntelligence3CRouter(): Router {
     if (!requireHealth(res)) return;
     const contextId = parseIntParam(req.params.contextId);
     if (!contextId) return res.status(400).json({ error: 'contextId must be a positive integer' });
+    if (!(await verifyContextOwnership(req, res, contextId))) return;
     const persist = req.query.persist === 'true';
     try {
       const score = await repositoryHealthService.calculateHealth(contextId, { persist });
@@ -79,6 +129,7 @@ export function createRepoIntelligence3CRouter(): Router {
     if (!requireHealth(res)) return;
     const contextId = parseIntParam(req.params.contextId);
     if (!contextId) return res.status(400).json({ error: 'contextId must be a positive integer' });
+    if (!(await verifyContextOwnership(req, res, contextId))) return;
     const limit = parseIntParam(req.query.limit as string) ?? 30;
     try {
       const snapshots = await repositoryHealthService.getSnapshots(contextId, limit);
@@ -92,6 +143,7 @@ export function createRepoIntelligence3CRouter(): Router {
     if (!requireHealth(res)) return;
     const contextId = parseIntParam(req.params.contextId);
     if (!contextId) return res.status(400).json({ error: 'contextId must be a positive integer' });
+    if (!(await verifyContextOwnership(req, res, contextId))) return;
     const persist = req.query.persist === 'true';
     try {
       const trend = await repositoryHealthService.getHealthTrend(contextId, { persist });
@@ -105,6 +157,7 @@ export function createRepoIntelligence3CRouter(): Router {
     if (!requireHealth(res)) return;
     const contextId = parseIntParam(req.params.contextId);
     if (!contextId) return res.status(400).json({ error: 'contextId must be a positive integer' });
+    if (!(await verifyContextOwnership(req, res, contextId))) return;
     const issueType = (req.query.type as string) || undefined;
     try {
       const issues = await getQualityIssues(contextId, { issueType });
@@ -132,6 +185,7 @@ export function createRepoIntelligence3CRouter(): Router {
     if (!requireImpact(res)) return;
     const methodId = parseIntParam(req.params.methodId);
     if (!methodId) return res.status(400).json({ error: 'methodId must be a positive integer' });
+    if (!(await verifyMethodOwnership(req, res, methodId))) return;
     try {
       const impact = await impactAnalysisService.analyzeMethodImpact(methodId);
       return res.json({ success: true, impact });
@@ -145,6 +199,7 @@ export function createRepoIntelligence3CRouter(): Router {
     if (!requireImpact(res)) return;
     const methodId = parseIntParam(req.params.methodId);
     if (!methodId) return res.status(400).json({ error: 'methodId must be a positive integer' });
+    if (!(await verifyMethodOwnership(req, res, methodId))) return;
     try {
       const tests = await impactAnalysisService.findBreakingTests(methodId);
       return res.json({ success: true, count: tests.length, tests });
@@ -157,6 +212,7 @@ export function createRepoIntelligence3CRouter(): Router {
     if (!requireImpact(res)) return;
     const contextId = parseIntParam(req.params.contextId);
     if (!contextId) return res.status(400).json({ error: 'contextId must be a positive integer' });
+    if (!(await verifyContextOwnership(req, res, contextId))) return;
     const filePath = (req.query.filePath as string) || '';
     if (!filePath) return res.status(400).json({ error: 'filePath query param is required' });
     try {
@@ -185,6 +241,7 @@ export function createRepoIntelligence3CRouter(): Router {
     if (!requireGraph(res)) return;
     const contextId = parseIntParam(req.params.contextId);
     if (!contextId) return res.status(400).json({ error: 'contextId must be a positive integer' });
+    if (!(await verifyContextOwnership(req, res, contextId))) return;
     try {
       const graph = await knowledgeGraphService.buildGraph(contextId);
       if (req.query.format === 'd3') {
@@ -201,6 +258,7 @@ export function createRepoIntelligence3CRouter(): Router {
     if (!requireGraph(res)) return;
     const methodId = parseIntParam(req.params.methodId);
     if (!methodId) return res.status(400).json({ error: 'methodId must be a positive integer' });
+    if (!(await verifyMethodOwnership(req, res, methodId))) return;
     const depth = parseIntParam(req.query.depth as string) ?? 2;
     try {
       const graph = await knowledgeGraphService.getMethodNeighborhood(methodId, depth);
