@@ -20,11 +20,10 @@ import {
   logAudit,
   listUsers,
 } from '../../db/postgres';
-
-const JWT_SECRET = process.env.JWT_SECRET || 'levelup-jwt-secret-change-in-production';
-const JWT_EXPIRY = '24h';
-const COOKIE_NAME = 'levelup_session';
-const COOKIE_MAX_AGE = 24 * 60 * 60 * 1000; // 24 hours
+// Single source of truth for the session secret + cookie config. Importing
+// these (rather than re-reading process.env here) guarantees this route signs
+// tokens with the exact same secret every verifier uses. See src/config/auth.ts.
+import { JWT_SECRET, JWT_EXPIRY, COOKIE_NAME, COOKIE_MAX_AGE } from '../../config/auth';
 
 /* -------------------------------------------------------------------------- */
 /*  In-Memory Rate Limiter (brute-force protection)                           */

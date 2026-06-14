@@ -12,10 +12,9 @@ import type { Request, Response, NextFunction } from 'express';
 import jwt from 'jsonwebtoken';
 import { getPool } from '../../db/postgres';
 import { logger } from '../../utils/logger';
+import { JWT_SECRET, COOKIE_NAME } from '../../config/auth';
 
 const MOD = 'company-middleware';
-const JWT_SECRET = process.env.JWT_SECRET || 'levelup-jwt-secret-change-in-production';
-const COOKIE_NAME = 'levelup_session';
 
 // Cache company name → id lookups to avoid repeated DB hits
 const companyCache = new Map<string, number>();
