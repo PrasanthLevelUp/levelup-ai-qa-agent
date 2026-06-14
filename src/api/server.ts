@@ -111,6 +111,13 @@ const MOD = 'api-server';
 export function createServer(): express.Application {
   const app = express();
 
+  // Trust the platform reverse proxy (Railway/Render/etc.) so req.ip and the
+  // X-Forwarded-For chain resolve to the real client address. Without this the
+  // login rate limiter can see every request as the proxy's single IP.
+  // Override with TRUST_PROXY (e.g. a hop count) if behind multiple proxies.
+  const trustProxy = process.env.TRUST_PROXY;
+  app.set('trust proxy', trustProxy ? (/^\d+$/.test(trustProxy) ? parseInt(trustProxy, 10) : trustProxy) : true);
+
   // Middleware
   app.use(cors({
     origin: process.env.DASHBOARD_URL || true,
