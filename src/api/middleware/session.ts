@@ -16,10 +16,9 @@ import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
 import { getPool } from '../../db/postgres';
 import { logger } from '../../utils/logger';
+import { JWT_SECRET, COOKIE_NAME } from '../../config/auth';
 
 const MOD = 'session-middleware';
-const JWT_SECRET = process.env.JWT_SECRET || 'levelup-jwt-secret-change-in-production';
-const COOKIE_NAME = 'levelup_session';
 
 export async function sessionMiddleware(
   req: Request,
