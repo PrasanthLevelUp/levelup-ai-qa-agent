@@ -1683,7 +1683,36 @@ async function migrateDefaultCompany(client: PoolClient): Promise<void> {
     IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='repository_contexts' AND column_name='project_id') THEN
       ALTER TABLE repository_contexts ADD COLUMN project_id INTEGER REFERENCES projects(id) ON DELETE SET NULL;
     END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='learned_patterns' AND column_name='project_id') THEN
+      ALTER TABLE learned_patterns ADD COLUMN project_id INTEGER REFERENCES projects(id) ON DELETE SET NULL;
+    END IF;
   END $$`);
+
+  // ── Healing Intelligence: tenant-isolate learned_patterns uniqueness ──
+  // SECURITY FIX: the original UNIQUE(test_name, error_pattern, failed_locator)
+  // constraint was GLOBAL — one tenant's healed locator could be served to
+  // another tenant (cross-tenant data leak) and cross-tenant writes collided.
+  // Re-key uniqueness on (test_name, error_pattern, failed_locator, company, project)
+  // so every tenant/project owns an isolated pattern namespace.
+  console.log('🔧 [DB] Migration: learned_patterns tenant isolation...');
+  await safeExec(client, 'learned_patterns_tenant_unique', `
+    DO $$ BEGIN
+      -- Drop the original global UNIQUE(test_name, error_pattern, failed_locator)
+      IF EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'learned_patterns_test_name_error_pattern_failed_locator_key'
+          AND conrelid = 'learned_patterns'::regclass
+      ) THEN
+        ALTER TABLE learned_patterns
+          DROP CONSTRAINT learned_patterns_test_name_error_pattern_failed_locator_key;
+      END IF;
+      -- Per-(test, error, locator, company, project) uniqueness
+      CREATE UNIQUE INDEX IF NOT EXISTS uq_pattern_tenant
+        ON learned_patterns (
+          test_name, error_pattern, failed_locator,
+          COALESCE(company_id, 0), COALESCE(project_id, 0)
+        );
+    END $$`);
 
   // ── Test Case Lab: generation state tracking (duplicate prevention) ──
   console.log('🔧 [DB] Migration: test_requirements generation state...');
@@ -2821,45 +2850,58 @@ export async function lookupPattern(input: {
   failed_locator: string;
   test_name: string;
   error_pattern: string;
+  // Tenant scope — REQUIRED for isolation. When omitted, only globally-shared
+  // (NULL company) patterns are matched, never another tenant's data.
+  company_id?: number | null;
+  project_id?: number | null;
 }): Promise<{
   healed_locator: string;
   confidence: number;
   strategy: string;
   usage_count: number;
 } | null> {
-  // Try exact match first
+  // SECURITY: every query is constrained to the caller's tenant namespace.
+  // COALESCE(...,0) mirrors the uq_pattern_tenant unique index so that patterns
+  // written by one company/project can never be read by another.
+  const companyId = input.company_id ?? null;
+  const projectId = input.project_id ?? null;
+  const tenantClause =
+    `COALESCE(company_id, 0) = COALESCE($4::int, 0) AND COALESCE(project_id, 0) = COALESCE($5::int, 0)`;
+
+  // Try exact match first (tenant-scoped)
   const exact = await getPool().query(
     `SELECT healed_locator, confidence, solution_strategy, usage_count
     FROM learned_patterns
-    WHERE failed_locator = $1 AND test_name = $2
+    WHERE failed_locator = $1 AND test_name = $2 AND ${tenantClause}
     ORDER BY success_count DESC, usage_count DESC, last_used DESC
     LIMIT 1`,
-    [input.failed_locator, input.test_name],
+    [input.failed_locator, input.test_name, null, companyId, projectId],
   );
 
   let row = exact.rows[0];
 
   if (!row) {
-    // Try fuzzy match
+    // Try fuzzy match (still tenant-scoped)
     const fuzzy = await getPool().query(
       `SELECT healed_locator, confidence, solution_strategy, usage_count
       FROM learned_patterns
-      WHERE failed_locator = $1 OR (test_name = $2 AND error_pattern LIKE $3)
+      WHERE (failed_locator = $1 OR (test_name = $2 AND error_pattern LIKE $3))
+        AND ${tenantClause}
       ORDER BY success_count DESC, usage_count DESC, last_used DESC
       LIMIT 1`,
-      [input.failed_locator, input.test_name, `%${input.error_pattern.slice(0, 120)}%`],
+      [input.failed_locator, input.test_name, `%${input.error_pattern.slice(0, 120)}%`, companyId, projectId],
     );
     row = fuzzy.rows[0];
   }
 
   if (!row) return null;
 
-  // Update usage count
+  // Update usage count (tenant-scoped so we only touch our own row)
   await getPool().query(
     `UPDATE learned_patterns
     SET usage_count = usage_count + 1, last_used = NOW()
-    WHERE failed_locator = $1 AND healed_locator = $2`,
-    [input.failed_locator, row.healed_locator],
+    WHERE failed_locator = $1 AND healed_locator = $2 AND ${tenantClause}`,
+    [input.failed_locator, row.healed_locator, null, companyId, projectId],
   );
 
   return {
@@ -2870,12 +2912,18 @@ export async function lookupPattern(input: {
   };
 }
 
-export async function storePattern(data: LearnedPattern, companyId?: number): Promise<number> {
+export async function storePattern(
+  data: LearnedPattern,
+  companyId?: number | null,
+  projectId?: number | null,
+): Promise<number> {
+  // ON CONFLICT target matches the uq_pattern_tenant expression index so that
+  // upserts stay isolated per (test, error, locator, company, project).
   const result = await getPool().query(
     `INSERT INTO learned_patterns
-      (test_name, error_pattern, failed_locator, healed_locator, solution_strategy, confidence, avg_tokens_saved, company_id)
-    VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-    ON CONFLICT(test_name, error_pattern, failed_locator)
+      (test_name, error_pattern, failed_locator, healed_locator, solution_strategy, confidence, avg_tokens_saved, company_id, project_id)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+    ON CONFLICT (test_name, error_pattern, failed_locator, COALESCE(company_id, 0), COALESCE(project_id, 0))
     DO UPDATE SET
       healed_locator = EXCLUDED.healed_locator,
       solution_strategy = EXCLUDED.solution_strategy,
@@ -2894,6 +2942,7 @@ export async function storePattern(data: LearnedPattern, companyId?: number): Pr
       data.confidence ?? 0,
       data.avg_tokens_saved ?? 0,
       companyId ?? null,
+      projectId ?? null,
     ],
   );
   return result.rows[0].id;
@@ -3362,6 +3411,75 @@ export async function getDomSnapshots(limit = 50, companyId?: number): Promise<a
   return result.rows;
 }
 
+/**
+ * Returns the most recent captured DOM HTML for a page URL, scoped to the
+ * caller's tenant. Used by the healing worker to re-enable DOM-grounded
+ * candidate extraction (the production reruns have no live Playwright page,
+ * so we ground locator healing on the last snapshot we captured for that page).
+ *
+ * Tenant scope is enforced via the generated_scripts join (company_id /
+ * project_id) so one tenant can never read another tenant's captured DOM.
+ * Tries an exact page_url match first, then an origin-prefix match.
+ */
+export async function getLatestDomHtmlForUrl(
+  pageUrl: string,
+  companyId?: number | null,
+  projectId?: number | null,
+): Promise<string | null> {
+  if (!pageUrl) return null;
+  const params: any[] = [pageUrl];
+  const conds: string[] = ['ds.html_snapshot IS NOT NULL'];
+  if (companyId != null) {
+    params.push(companyId);
+    conds.push(`gs.company_id = $${params.length}`);
+  }
+  if (projectId != null) {
+    params.push(projectId);
+    conds.push(`gs.project_id = $${params.length}`);
+  }
+
+  const baseSelect = `
+    SELECT ds.html_snapshot
+    FROM dom_snapshots ds
+    LEFT JOIN generated_scripts gs ON gs.id = ds.script_id`;
+
+  // 1) exact page_url match
+  const exact = await getPool().query(
+    `${baseSelect}
+     WHERE ds.page_url = $1 AND ${conds.join(' AND ')}
+     ORDER BY ds.created_at DESC
+     LIMIT 1`,
+    params,
+  );
+  if (exact.rows[0]?.html_snapshot) return exact.rows[0].html_snapshot;
+
+  // 2) origin/prefix match (handles query-string / hash differences)
+  try {
+    const origin = new URL(pageUrl).origin;
+    const prefixParams: any[] = [`${origin}%`];
+    const prefixConds: string[] = ['ds.html_snapshot IS NOT NULL'];
+    if (companyId != null) {
+      prefixParams.push(companyId);
+      prefixConds.push(`gs.company_id = $${prefixParams.length}`);
+    }
+    if (projectId != null) {
+      prefixParams.push(projectId);
+      prefixConds.push(`gs.project_id = $${prefixParams.length}`);
+    }
+    const prefix = await getPool().query(
+      `${baseSelect}
+       WHERE ds.page_url LIKE $1 AND ${prefixConds.join(' AND ')}
+       ORDER BY ds.created_at DESC
+       LIMIT 1`,
+      prefixParams,
+    );
+    if (prefix.rows[0]?.html_snapshot) return prefix.rows[0].html_snapshot;
+  } catch {
+    /* invalid URL — skip prefix fallback */
+  }
+  return null;
+}
+
 export async function getSelectorHealth(limit = 100, companyId?: number): Promise<any[]> {
   const cfJoin = companyId ? `JOIN generated_scripts gs ON gs.id = ss.script_id AND gs.company_id = ${companyId}` : '';
   const result = await getPool().query(
@@ -3405,6 +3523,141 @@ export async function getLocatorEvolution(limit = 50, companyId?: number): Promi
     [limit],
   );
   return result.rows;
+}
+
+/**
+ * Consolidated Healing Intelligence metrics for the dashboard (Sprint 1.4).
+ *
+ * Surfaces how much of the healing is driven by zero-token "intelligence"
+ * (rule / learned-pattern / DOM-memory / DOM-candidate) versus paid AI calls,
+ * plus learned-pattern reuse — all strictly scoped to the caller's tenant
+ * (company + optional project). Everything degrades to zeros on an empty DB so
+ * the endpoint is always safe to call.
+ */
+export interface HealingIntelligenceMetrics {
+  window: { since: string; until: string };
+  totals: {
+    totalHeals: number;
+    successfulHeals: number;
+    successRate: number;          // %
+    zeroTokenHeals: number;       // rule/pattern/dom_memory/dom_candidate
+    aiHeals: number;              // ai_reasoning
+    aiAvoidanceRate: number;      // % of heals that avoided AI
+    tokensUsed: number;
+    tokensSaved: number;          // vs all-AI baseline (500 tok/heal)
+  };
+  byStrategy: Array<{ strategy: string; count: number; successes: number; successRate: number; tokens: number }>;
+  patterns: {
+    totalPatterns: number;
+    totalReuse: number;           // SUM(usage_count)
+    avgConfidence: number;
+    topReused: Array<{ failedLocator: string; healedLocator: string; strategy: string; usageCount: number; successCount: number }>;
+  };
+}
+
+export async function getHealingIntelligenceMetrics(opts: {
+  companyId?: number | null;
+  projectId?: number | null;
+  since?: Date;
+  until?: Date;
+}): Promise<HealingIntelligenceMetrics> {
+  const pool = getPool();
+  const companyId = opts.companyId ?? null;
+  const projectId = opts.projectId ?? null;
+  const since = opts.since ?? new Date(Date.now() - 30 * 86400000);
+  const until = opts.until ?? new Date();
+
+  // Tenant filter shared across healing_actions queries.
+  const haParams: any[] = [since, until, companyId];
+  let haScope = `created_at >= $1 AND created_at < $2 AND ($3::int IS NULL OR company_id = $3)`;
+  if (projectId != null) {
+    haParams.push(projectId);
+    haScope += ` AND project_id = $${haParams.length}`;
+  }
+
+  const ZERO_TOKEN = ['rule_based', 'database_pattern', 'dom_memory', 'dom_candidate'];
+
+  const strategyRows = (await pool.query(
+    `SELECT COALESCE(healing_strategy, 'unknown') AS strategy,
+            COUNT(*)::int AS count,
+            COUNT(*) FILTER (WHERE success = true)::int AS successes,
+            COALESCE(SUM(ai_tokens_used), 0)::bigint AS tokens
+       FROM healing_actions
+      WHERE ${haScope}
+      GROUP BY COALESCE(healing_strategy, 'unknown')
+      ORDER BY count DESC`,
+    haParams,
+  )).rows;
+
+  let totalHeals = 0, successfulHeals = 0, zeroTokenHeals = 0, aiHeals = 0, tokensUsed = 0;
+  const byStrategy = strategyRows.map((r: any) => {
+    const count = Number(r.count);
+    const successes = Number(r.successes);
+    const tokens = Number(r.tokens);
+    totalHeals += count;
+    successfulHeals += successes;
+    tokensUsed += tokens;
+    if (ZERO_TOKEN.includes(r.strategy)) zeroTokenHeals += count;
+    if (r.strategy === 'ai_reasoning') aiHeals += count;
+    return {
+      strategy: r.strategy,
+      count,
+      successes,
+      successRate: count > 0 ? Math.round((successes / count) * 1000) / 10 : 0,
+      tokens,
+    };
+  });
+
+  // Learned-pattern reuse (tenant-scoped).
+  const patParams: any[] = [companyId];
+  let patScope = `($1::int IS NULL OR company_id = $1)`;
+  if (projectId != null) {
+    patParams.push(projectId);
+    patScope += ` AND COALESCE(project_id, 0) = $${patParams.length}`;
+  }
+  const patAgg = (await pool.query(
+    `SELECT COUNT(*)::int AS total,
+            COALESCE(SUM(usage_count), 0)::bigint AS reuse,
+            COALESCE(AVG(confidence), 0)::float AS avg_conf
+       FROM learned_patterns WHERE ${patScope}`,
+    patParams,
+  )).rows[0];
+  const topReused = (await pool.query(
+    `SELECT failed_locator, healed_locator, solution_strategy, usage_count, success_count
+       FROM learned_patterns WHERE ${patScope}
+      ORDER BY usage_count DESC, success_count DESC LIMIT 10`,
+    patParams,
+  )).rows;
+
+  const baselineTokens = totalHeals * 500; // if every heal had gone to AI
+  const tokensSaved = Math.max(0, baselineTokens - tokensUsed);
+
+  return {
+    window: { since: since.toISOString(), until: until.toISOString() },
+    totals: {
+      totalHeals,
+      successfulHeals,
+      successRate: totalHeals > 0 ? Math.round((successfulHeals / totalHeals) * 1000) / 10 : 0,
+      zeroTokenHeals,
+      aiHeals,
+      aiAvoidanceRate: totalHeals > 0 ? Math.round((zeroTokenHeals / totalHeals) * 1000) / 10 : 0,
+      tokensUsed,
+      tokensSaved,
+    },
+    byStrategy,
+    patterns: {
+      totalPatterns: Number(patAgg?.total ?? 0),
+      totalReuse: Number(patAgg?.reuse ?? 0),
+      avgConfidence: Math.round((Number(patAgg?.avg_conf ?? 0)) * 1000) / 1000,
+      topReused: topReused.map((p: any) => ({
+        failedLocator: p.failed_locator || '',
+        healedLocator: p.healed_locator || '',
+        strategy: p.solution_strategy || 'unknown',
+        usageCount: p.usage_count || 0,
+        successCount: p.success_count || 0,
+      })),
+    },
+  };
 }
 
 export async function getPageElementTrend(days = 30, companyId?: number): Promise<Array<{ date: string; pages: number; elements: number; snapshots: number }>> {
@@ -7243,6 +7496,32 @@ export async function getRepositoryContext(
   return res.rows[0].profile as RepositoryProfile;
 }
 
+/**
+ * Resolve the repository_contexts.id for a repo within a tenant. Returns null
+ * when no scanned context exists. Used by Healing Intelligence to map a healing
+ * job's repository to its method-index / RAG context id.
+ */
+export async function getRepositoryContextIdByRepo(
+  repoId: string,
+  companyId?: number | null,
+  projectId?: number | null,
+): Promise<number | null> {
+  const p = getPool();
+  // Prefer a project-specific context when a projectId is supplied, else fall
+  // back to the company-scoped context (project_id NULL or any).
+  const params: any[] = [repoId, companyId ?? null];
+  let sql = `SELECT id FROM repository_contexts
+             WHERE repo_id = $1 AND COALESCE(company_id, 0) = COALESCE($2, 0)`;
+  if (projectId != null) {
+    params.push(projectId);
+    sql += ` ORDER BY (CASE WHEN project_id = $3 THEN 0 ELSE 1 END), updated_at DESC LIMIT 1`;
+  } else {
+    sql += ` ORDER BY updated_at DESC LIMIT 1`;
+  }
+  const res = await p.query(sql, params);
+  return res.rows.length ? res.rows[0].id : null;
+}
+
 export async function getRepositoryContextById(
   contextId: number,
 ): Promise<{ repoId: string; companyId: number | null; profile: RepositoryProfile; version: number } | null> {
@@ -7256,6 +7535,26 @@ export async function getRepositoryContextById(
     version: r.profile_version ?? 1,
     profile: r.profile as RepositoryProfile,
   };
+}
+
+/**
+ * Resolve the owning tenant of a repository method by walking
+ * repository_methods → repository_contexts. Used by Phase 3C routes to enforce
+ * ownership (IDOR fix) before returning impact/graph data for a methodId.
+ * Returns null when the method does not exist.
+ */
+export async function getMethodOwnership(
+  methodId: number,
+): Promise<{ contextId: number; companyId: number | null } | null> {
+  const res = await getPool().query(
+    `SELECT rc.id AS context_id, rc.company_id
+       FROM repository_methods rm
+       JOIN repository_contexts rc ON rc.id = rm.repository_context_id
+      WHERE rm.id = $1`,
+    [methodId],
+  );
+  if (res.rows.length === 0) return null;
+  return { contextId: res.rows[0].context_id, companyId: res.rows[0].company_id };
 }
 
 export async function saveCodeChunks(

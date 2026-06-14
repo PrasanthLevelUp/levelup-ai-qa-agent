@@ -28,7 +28,7 @@ export class AIEngine {
     return !!this.openaiClient;
   }
 
-  async suggest(failure: FailureDetails): Promise<AIEngineResult | null> {
+  async suggest(failure: FailureDetails, repoContext?: string): Promise<AIEngineResult | null> {
     if (!this.openaiClient) {
       logger.warn(MOD, 'AI engine disabled (no OpenAI client configured) — skipping AI suggestion', {
         testName: failure.testName,
@@ -42,6 +42,9 @@ export class AIEngine {
       surroundingCode: failure.surroundingCode,
       failedLocator: failure.failedLocator,
       testName: failure.testName,
+      // Repository grounding (Sprint 2). Undefined unless the feature is enabled
+      // and the repo produced evidence — keeps the legacy prompt unchanged.
+      ...(repoContext ? { repoContext } : {}),
     });
 
     if (!response.newLocator) {

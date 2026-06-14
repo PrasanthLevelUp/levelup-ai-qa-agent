@@ -162,6 +162,23 @@ export const FEATURE_FLAGS = {
      * Enable with: ENABLE_KNOWLEDGE_GRAPH=true
      */
     KNOWLEDGE_GRAPH: envBool('ENABLE_KNOWLEDGE_GRAPH', false),
+
+    /**
+     * Repository-Grounded AI Healing — Sprint 2 (Healing Intelligence).
+     *
+     * When enabled, the healing flow builds a `HealingIntelligenceContext` for
+     * the failing test's repository (method-index hits for the failed locator,
+     * RAG-retrieved page-object / test snippets) and injects that evidence into
+     * the AI locator-suggestion prompt, and applies a repository-aware
+     * confidence boost when the proposed locator is corroborated by the repo
+     * (method index, page objects, DOM memory). Builds on METHOD_INTELLIGENCE
+     * and/or RAG — each sub-source is independently flag-gated, so this only
+     * grounds on what is already enabled. Default off: the AI prompt and
+     * confidence scoring are byte-for-byte unchanged.
+     *
+     * Enable with: ENABLE_HEALING_INTELLIGENCE=true
+     */
+    HEALING_INTELLIGENCE: envBool('ENABLE_HEALING_INTELLIGENCE', false),
   },
 } as const;
 

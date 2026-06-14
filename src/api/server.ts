@@ -96,8 +96,14 @@ import {
   logPR,
   getProjectIdForRepo,
   getHealingSettings,
+  getLatestDomHtmlForUrl,
   type HealingSettings,
 } from '../db/postgres';
+import {
+  HealingIntelligenceContext,
+  getHealingIntelligenceContext,
+  emptyHealingContext,
+} from '../services/healing-intelligence-context';
 import type { HealingJob } from './queue/job-queue';
 
 const MOD = 'api-server';
@@ -680,6 +686,52 @@ function createHealingWorker(
         const triedLocators = new Set<string>();   // All tried suggestions (global across retries)
         const RETRIES_PER_LOCATOR = 8;             // Max suggestions to try per broken locator
 
+        // ── Re-enable DOM-grounded candidate extraction ──
+        // The production worker reruns tests in a subprocess and has no live
+        // Playwright page, so previously `domHtml` was always undefined and the
+        // orchestrator's DOM candidate path never ran. Ground healing on the most
+        // recent DOM snapshot we captured for this page (tenant-scoped). Null is
+        // handled gracefully downstream (the DOM candidate step is skipped).
+        let domHtmlForFailure: string | undefined;
+        try {
+          if (failure.url) {
+            const snapshotHtml = await getLatestDomHtmlForUrl(
+              failure.url,
+              job.companyId,
+              resolvedProjectId,
+            );
+            domHtmlForFailure = snapshotHtml ?? undefined;
+            if (domHtmlForFailure) {
+              logger.info(MOD, 'DOM snapshot found for healing', {
+                testName: failure.testName,
+                url: failure.url,
+                domLength: domHtmlForFailure.length,
+              });
+            }
+          }
+        } catch (err: any) {
+          logger.warn(MOD, 'DOM snapshot lookup failed (non-critical)', { error: err?.message });
+        }
+
+        // ── Repository-grounded healing intelligence (Sprint 2) ──
+        // Build a repository-grounding context for this failure once (reused
+        // across retry iterations). Fully inert / no DB calls when the
+        // ENABLE_HEALING_INTELLIGENCE flag is OFF — returns an empty context so
+        // the orchestrator's prompt and confidence scoring are unchanged.
+        let repoHealingContext = emptyHealingContext();
+        try {
+          if (HealingIntelligenceContext.isEnabled()) {
+            repoHealingContext = await getHealingIntelligenceContext().load({
+              repoId: repoUrl || repo?.url || job.repositoryId,
+              companyId: job.companyId,
+              projectId: resolvedProjectId,
+              failure,
+            });
+          }
+        } catch (err: any) {
+          logger.warn(MOD, 'Healing intelligence context build failed (non-critical)', { error: err?.message });
+        }
+
         for (let iteration = 0; iteration < MAX_HEAL_ITERATIONS; iteration++) {
           jobQueue.updateJob(job.id, {
             progress: `Healing: ${failure.testName} (locator ${iteration + 1})...`,
@@ -699,7 +751,7 @@ function createHealingWorker(
 
           // Try multiple suggestions for the SAME broken locator
           for (let retry = 0; retry < RETRIES_PER_LOCATOR; retry++) {
-            const outcome = await orchestrator.heal(failure, undefined, triedLocators, resolvedProjectId, job.companyId);
+            const outcome = await orchestrator.heal(failure, domHtmlForFailure, triedLocators, resolvedProjectId, job.companyId, repoHealingContext);
             if (outcome.suggestion) {
               triedLocators.add(outcome.suggestion.newLocator);
             }
@@ -976,7 +1028,7 @@ function createHealingWorker(
                 solution_strategy: outcome.suggestion.strategy,
                 confidence: outcome.suggestion.confidence,
                 avg_tokens_saved: outcome.suggestion.tokensUsed,
-              }, job.companyId);
+              }, job.companyId, resolvedProjectId);
 
               // The fix for THIS locator was correct (a different locator now
               // fails), so record it into DOM Memory to strengthen the moat.

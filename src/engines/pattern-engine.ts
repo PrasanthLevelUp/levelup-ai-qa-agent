@@ -16,14 +16,26 @@ export interface PatternEngineResult {
   usageCount: number;
 }
 
+export interface PatternTenantScope {
+  companyId?: number | null;
+  projectId?: number | null;
+}
+
 export class PatternEngine {
-  async findMatch(failure: FailureDetails): Promise<PatternEngineResult | null> {
+  async findMatch(
+    failure: FailureDetails,
+    scope: PatternTenantScope = {},
+  ): Promise<PatternEngineResult | null> {
     if (!failure.failedLocator) return null;
 
+    // SECURITY: scope the learned-pattern lookup to the caller's tenant so a
+    // healed locator from one company/project is never served to another.
     const pattern = await lookupPattern({
       failed_locator: failure.failedLocator,
       test_name: failure.testName,
       error_pattern: failure.errorPattern,
+      company_id: scope.companyId ?? null,
+      project_id: scope.projectId ?? null,
     });
 
     if (!pattern) {

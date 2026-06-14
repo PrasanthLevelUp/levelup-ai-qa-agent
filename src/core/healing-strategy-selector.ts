@@ -8,7 +8,7 @@ import { logger } from '../utils/logger';
 import { getPool, logTokenUsage as dbLogTokenUsage, getTokensUsedToday as dbGetTokensUsedToday, getDailyCostUsd as dbGetDailyCostUsd } from '../db/postgres';
 import type { FailureDetails } from './failure-analyzer';
 import type { RuleEngine, RuleEngineResult } from '../engines/rule-engine';
-import type { PatternEngine, PatternEngineResult } from '../engines/pattern-engine';
+import type { PatternEngine, PatternEngineResult, PatternTenantScope } from '../engines/pattern-engine';
 import type { AIEngine } from '../engines/ai-engine';
 
 const MOD = 'strategy-selector';
@@ -93,6 +93,7 @@ export class HealingStrategySelector {
     ruleEngine: RuleEngine,
     patternEngine: PatternEngine,
     aiEngine: AIEngine,
+    scope: PatternTenantScope = {},
   ): Promise<SelectedStrategy> {
     // Priority 1: Rule Engine (free, fast, deterministic)
     const ruleResult = ruleEngine.generate(failure);
@@ -111,8 +112,8 @@ export class HealingStrategySelector {
       };
     }
 
-    // Priority 2: Pattern Engine (free, learned from history)
-    const patternResult = await patternEngine.findMatch(failure);
+    // Priority 2: Pattern Engine (free, learned from history) — tenant-scoped
+    const patternResult = await patternEngine.findMatch(failure, scope);
     if (patternResult && patternResult.confidence >= this.config.confidenceThresholds.pattern) {
       logger.info(MOD, 'Pattern engine selected', {
         confidence: patternResult.confidence,

@@ -11,6 +11,7 @@ import {
   getAiUsageByFeature,
   getAiCostTrend,
   getDailyBudgetStatus,
+  getHealingIntelligenceMetrics,
 } from '../../db/postgres';
 import { logger } from '../../utils/logger';
 
@@ -418,6 +419,26 @@ export function createDashboardRouter(): Router {
     } catch (err) {
       logger.error(MOD, 'stats/cost-savings failed', { error: err });
       res.status(500).json({ error: 'Failed to fetch cost savings' });
+    }
+  });
+
+  /**
+   * GET /api/dashboard/healing-intelligence?period=30d&projectId=
+   * Consolidated Healing Intelligence view (Sprint 1.4): strategy mix, AI
+   * avoidance rate, token savings and learned-pattern reuse — tenant-scoped.
+   */
+  router.get('/healing-intelligence', async (req: Request, res: Response) => {
+    try {
+      const { since, until } = resolveWindow(req);
+      const companyId = (req as any).companyId ?? null;
+      const pid = req.query.projectId ? parseInt(req.query.projectId as string, 10) : null;
+      const projectId = pid && !Number.isNaN(pid) ? pid : null;
+
+      const metrics = await getHealingIntelligenceMetrics({ companyId, projectId, since, until });
+      res.json({ success: true, ...metrics });
+    } catch (err) {
+      logger.error(MOD, 'healing-intelligence failed', { error: err });
+      res.status(500).json({ error: 'Failed to fetch healing intelligence metrics' });
     }
   });
 
