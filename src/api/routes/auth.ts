@@ -29,6 +29,20 @@ const COOKIE_MAX_AGE = 24 * 60 * 60 * 1000; // 24 hours
 /* -------------------------------------------------------------------------- */
 /*  In-Memory Rate Limiter (brute-force protection)                           */
 /* -------------------------------------------------------------------------- */
+/*
+ * IMPORTANT — why the bucket is keyed on (ip + username), not ip alone:
+ *
+ * Many teams sit behind a single shared egress IP (corporate NAT, office Wi-Fi,
+ * VPN, or a cloud reverse-proxy that collapses client IPs). If the limiter keys
+ * solely on IP, a handful of mistyped passwords by ANY teammate exhausts the
+ * shared bucket and locks out the ENTIRE team — including users supplying the
+ * correct password. That is a self-inflicted, team-wide outage.
+ *
+ * Fix: scope the per-account limiter to (ip + username). One user's failures can
+ * never block a different account. A separate, far more generous per-IP safety
+ * net still deters credential-stuffing (many distinct accounts from one IP), and
+ * known office/VPN IPs can be allow-listed via LOGIN_RATE_LIMIT_IP_ALLOWLIST.
+ */
 
 interface RateLimitEntry {
   attempts: number;
@@ -36,58 +50,116 @@ interface RateLimitEntry {
   blockedUntil: number;
 }
 
+function envInt(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  const n = parseInt(raw, 10);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
+// Per-account limiter (ip + username): the primary brute-force guard.
+const MAX_ATTEMPTS = envInt('LOGIN_RATE_LIMIT_MAX', 5);
+const WINDOW_MS = envInt('LOGIN_RATE_LIMIT_WINDOW_MS', 15 * 60 * 1000);   // 15 minutes
+const BLOCK_DURATION = envInt('LOGIN_RATE_LIMIT_BLOCK_MS', 15 * 60 * 1000); // 15 minutes block
+
+// Per-IP safety net: deliberately generous so shared-IP teams are not punished
+// for individual mistakes, while still catching distributed credential-stuffing
+// (one IP hammering many different accounts).
+const IP_MAX_ATTEMPTS = envInt('LOGIN_RATE_LIMIT_IP_MAX', 50);
+
+// IPs that should never be rate limited (e.g. trusted office / VPN egress).
+const IP_ALLOWLIST = new Set(
+  (process.env.LOGIN_RATE_LIMIT_IP_ALLOWLIST || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean),
+);
+
+// account bucket: key = `${ip}|${username}`   ·   ip bucket: key = ip
 const rateLimitMap = new Map<string, RateLimitEntry>();
-const MAX_ATTEMPTS = 5;
-const WINDOW_MS = 15 * 60 * 1000;   // 15 minutes
-const BLOCK_DURATION = 15 * 60 * 1000; // 15 minutes block
+const ipLimitMap = new Map<string, RateLimitEntry>();
 
-function checkRateLimit(ip: string): { allowed: boolean; retryAfterMs?: number } {
-  const now = Date.now();
-  const entry = rateLimitMap.get(ip);
-
+function evaluateEntry(
+  map: Map<string, RateLimitEntry>,
+  key: string,
+  max: number,
+  now: number,
+): { allowed: boolean; retryAfterMs?: number } {
+  const entry = map.get(key);
   if (!entry) return { allowed: true };
 
-  // Check if currently blocked
   if (entry.blockedUntil > now) {
     return { allowed: false, retryAfterMs: entry.blockedUntil - now };
   }
-
-  // Reset if window expired
   if (now - entry.firstAttempt > WINDOW_MS) {
-    rateLimitMap.delete(ip);
+    map.delete(key);
     return { allowed: true };
   }
-
-  return { allowed: entry.attempts < MAX_ATTEMPTS };
+  return { allowed: entry.attempts < max };
 }
 
-function recordAttempt(ip: string, success: boolean): void {
+function recordEntry(
+  map: Map<string, RateLimitEntry>,
+  key: string,
+  max: number,
+  now: number,
+): void {
+  const entry = map.get(key);
+  if (!entry || now - entry.firstAttempt > WINDOW_MS) {
+    map.set(key, { attempts: 1, firstAttempt: now, blockedUntil: 0 });
+    return;
+  }
+  entry.attempts++;
+  if (entry.attempts >= max) {
+    entry.blockedUntil = now + BLOCK_DURATION;
+  }
+}
+
+function acctKey(ip: string, username: string): string {
+  return `${ip}|${(username || '').toLowerCase()}`;
+}
+
+function checkRateLimit(ip: string, username: string): { allowed: boolean; retryAfterMs?: number } {
+  if (IP_ALLOWLIST.has(ip)) return { allowed: true };
   const now = Date.now();
 
+  // Account-scoped check first (this is what protects a normal user).
+  const acct = evaluateEntry(rateLimitMap, acctKey(ip, username), MAX_ATTEMPTS, now);
+  if (!acct.allowed) return acct;
+
+  // Generous per-IP safety net for credential-stuffing across many accounts.
+  return evaluateEntry(ipLimitMap, ip, IP_MAX_ATTEMPTS, now);
+}
+
+function recordAttempt(ip: string, username: string, success: boolean): void {
+  if (IP_ALLOWLIST.has(ip)) return;
+  const now = Date.now();
+  const key = acctKey(ip, username);
+
   if (success) {
-    rateLimitMap.delete(ip);
+    // Clear this account's bucket only; leave the IP safety-net counter intact
+    // so a successful login can't be used to reset a stuffing attack.
+    rateLimitMap.delete(key);
     return;
   }
 
-  const entry = rateLimitMap.get(ip);
-  if (!entry || now - entry.firstAttempt > WINDOW_MS) {
-    rateLimitMap.set(ip, { attempts: 1, firstAttempt: now, blockedUntil: 0 });
-    return;
-  }
+  recordEntry(rateLimitMap, key, MAX_ATTEMPTS, now);
+  recordEntry(ipLimitMap, ip, IP_MAX_ATTEMPTS, now);
 
-  entry.attempts++;
-  if (entry.attempts >= MAX_ATTEMPTS) {
-    entry.blockedUntil = now + BLOCK_DURATION;
-    console.warn(`[Auth] IP ${ip} blocked for ${BLOCK_DURATION / 1000}s after ${MAX_ATTEMPTS} failed attempts`);
+  const acct = rateLimitMap.get(key);
+  if (acct && acct.attempts >= MAX_ATTEMPTS) {
+    console.warn(`[Auth] Account bucket ${key} blocked for ${BLOCK_DURATION / 1000}s after ${MAX_ATTEMPTS} failed attempts`);
   }
 }
 
 // Cleanup stale entries every 30 minutes
 setInterval(() => {
   const now = Date.now();
-  for (const [ip, entry] of rateLimitMap) {
-    if (now - entry.firstAttempt > WINDOW_MS && entry.blockedUntil < now) {
-      rateLimitMap.delete(ip);
+  for (const map of [rateLimitMap, ipLimitMap]) {
+    for (const [key, entry] of map) {
+      if (now - entry.firstAttempt > WINDOW_MS && entry.blockedUntil < now) {
+        map.delete(key);
+      }
     }
   }
 }, 30 * 60 * 1000);
@@ -112,12 +184,14 @@ export function createAuthRouter(): Router {
   /* ── Login ──────────────────────────────────────────────────── */
   router.post('/login', async (req: Request, res: Response) => {
     const ip = getClientIp(req);
+    const { username, password } = req.body;
 
-    // Rate limit check
-    const rateCheck = checkRateLimit(ip);
+    // Rate limit check — scoped to (ip + username) so one teammate's failed
+    // attempts can never lock out a different account on a shared egress IP.
+    const rateCheck = checkRateLimit(ip, username);
     if (!rateCheck.allowed) {
       const retryAfter = Math.ceil((rateCheck.retryAfterMs || BLOCK_DURATION) / 1000);
-      console.warn(`[Auth] Rate limited: ${ip}`);
+      console.warn(`[Auth] Rate limited: ip=${ip} user=${username}`);
       return res.status(429).json({
         success: false,
         error: 'Too many login attempts. Please try again later.',
@@ -126,8 +200,6 @@ export function createAuthRouter(): Router {
     }
 
     try {
-      const { username, password } = req.body;
-
       if (!username || !password) {
         return res.status(400).json({ success: false, error: 'Username and password are required' });
       }
@@ -135,7 +207,7 @@ export function createAuthRouter(): Router {
       // Find user
       const user = await getUserByUsername(username);
       if (!user) {
-        recordAttempt(ip, false);
+        recordAttempt(ip, username, false);
         // Deliberate vague message — don't reveal if username exists
         return res.status(401).json({ success: false, error: 'Invalid credentials' });
       }
@@ -143,7 +215,7 @@ export function createAuthRouter(): Router {
       // Compare password
       const passwordMatch = await bcrypt.compare(password, user.password_hash);
       if (!passwordMatch) {
-        recordAttempt(ip, false);
+        recordAttempt(ip, username, false);
 
         await logAudit({
           user_id: user.id,
@@ -158,7 +230,7 @@ export function createAuthRouter(): Router {
       }
 
       // Success — clear rate limit
-      recordAttempt(ip, true);
+      recordAttempt(ip, username, true);
 
       // Generate JWT
       const tokenPayload = {
