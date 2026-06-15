@@ -16,8 +16,9 @@
 
 import { logger } from '../utils/logger';
 import { ProfileService } from './profile-service';
-import { findMatchingPatterns, incrementPatternUsage } from '../db/postgres';
+import { findMatchingPatterns, incrementPatternUsage, getProfileChanges } from '../db/postgres';
 import { findMaintenancePattern, PATTERN_APPLY_THRESHOLD } from '../services/maintenance-pattern-service';
+import { findLocatorReplacement } from '../services/profile-diff-engine';
 
 const MOD = 'HealingEngine';
 
@@ -56,7 +57,10 @@ export type SelectorStrategy =
   | 'css-fallback'
   | 'pattern-match'
   // Loop 3: instant, zero-AI-cost fix from the learned maintenance pattern library.
-  | 'maintenance-pattern';
+  | 'maintenance-pattern'
+  // App Profile change engine: a versioned crawl diff recorded this exact
+  // old→new locator change. Highest-trust, zero-AI fix ("System of Record").
+  | 'profile-diff';
 
 export interface HealingAnalysis {
   originalSelector: string;
@@ -101,6 +105,25 @@ export class SelectorHealingEngine {
     projectId?: number,
   ): Promise<HealingAnalysis> {
     const start = Date.now();
+
+    // ── App Profile Change Engine: consult versioned crawl diffs FIRST. ──
+    // If a recent crawl recorded that THIS exact locator changed (old→new), we
+    // can auto-heal instantly with ZERO AI cost and the highest possible trust,
+    // because the App Profile is the platform's System of Record for the DOM.
+    // User-requested flow: Broken Locator → Profile Diff → changed? → Auto-Heal.
+    const diffAlt = await this.tryProfileDiff(selector, baseUrl, companyId, projectId);
+    if (diffAlt) {
+      logger.info(MOD, 'Healed from App Profile change engine (no AI cost)', {
+        selector, replacement: diffAlt.selector, confidence: diffAlt.confidence,
+      });
+      return {
+        originalSelector: selector,
+        broken: true,
+        alternatives: [diffAlt],
+        bestAlternative: diffAlt,
+        analysisTimeMs: Date.now() - start,
+      };
+    }
 
     // ── Loop 3: consult the learned maintenance pattern library FIRST. ──
     // If a previous Script Sync / Migration confidently rewrote this exact
@@ -225,6 +248,72 @@ export class SelectorHealingEngine {
       };
     } catch (err: any) {
       logger.warn(MOD, `maintenance pattern lookup failed: ${err?.message || err}`);
+      return null;
+    }
+  }
+
+  /**
+   * App Profile Change Engine fast-path (Sprint A → Sprint B bridge).
+   *
+   * The App Profile is the platform's System of Record for the DOM. Whenever a
+   * crawl is captured, the orchestrator diffs the new snapshot against the
+   * previous one and persists every structured change — including, crucially,
+   * `LOCATOR_CHANGED` rows that record the exact `old → new` locator for an
+   * element whose identity (tag/type/role/label) stayed the same but whose
+   * recommended selector moved.
+   *
+   * Here we consult those persisted diffs BEFORE any DOM search or AI call: if a
+   * recent crawl already proved that this broken locator was replaced by a new
+   * one, we can heal instantly with zero AI cost and near-certain confidence.
+   * This is the cheap, read-only realisation of the user's requested healing
+   * flow — `Broken Locator → Profile Diff → Locator Changed? → YES → Auto-Heal`
+   * — and is what lets the platform "reduce AI calls significantly".
+   *
+   * Fail-safe by construction: any error, or no scope, or no matching change →
+   * returns null and healing falls through to the maintenance-pattern / DOM / AI
+   * strategies exactly as before. When no diffs are stored yet (e.g. a fresh
+   * deployment with only one crawl version) this path is simply inert.
+   */
+  private async tryProfileDiff(
+    selector: string,
+    baseUrl: string,
+    companyId?: number,
+    projectId?: number,
+  ): Promise<SelectorAlternative | null> {
+    try {
+      if (!selector || !baseUrl) return null;
+      // Only LOCATOR_CHANGED rows carry an old→new locator mapping that we can
+      // safely auto-apply. We scope strictly by company + project so we never
+      // leak a replacement learned in another tenant's application.
+      const rows = await getProfileChanges({
+        baseUrl,
+        companyId,
+        projectId,
+        changeType: 'LOCATOR_CHANGED',
+        limit: 500,
+      });
+      if (!rows || rows.length === 0) return null;
+
+      const changes = rows.map((r) => ({
+        type: r.change_type as any,
+        old: r.old_value ?? undefined,
+        new: r.new_value ?? undefined,
+      }));
+
+      const replacement = findLocatorReplacement(changes, selector);
+      if (!replacement || replacement === selector) return null;
+
+      return {
+        selector: replacement,
+        strategy: 'profile-diff',
+        confidence: 0.95,
+        reasoning:
+          'App Profile change engine recorded this exact locator changing in a ' +
+          'recent crawl (System of Record). Auto-healed from the persisted ' +
+          'old→new diff — instant fix, no AI cost.',
+      };
+    } catch (err: any) {
+      logger.warn(MOD, `profile-diff lookup failed: ${err?.message || err}`);
       return null;
     }
   }
