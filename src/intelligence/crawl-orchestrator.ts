@@ -10,9 +10,12 @@
 
 import { logger } from '../utils/logger';
 import { ProfileService, type SaveProfileInput } from './profile-service';
-import { updateProfileStatus, insertCrawlSnapshot } from '../db/postgres';
+import {
+  updateProfileStatus, insertCrawlSnapshot, getLatestSnapshots, insertProfileChanges,
+} from '../db/postgres';
 import type { ApplicationProfile } from '../db/postgres';
-import { computeCrawlSignature, signatureToSnapshotFields } from '../services/script-maintenance';
+import { signatureToSnapshotFields } from '../services/script-maintenance';
+import { computeProfileSignature, computeProfileDiff } from '../services/profile-diff-engine';
 
 const MOD = 'CrawlOrchestrator';
 
@@ -367,8 +370,24 @@ export class CrawlOrchestrator {
     projectId?: number,
   ): Promise<void> {
     try {
-      const signature = computeCrawlSignature(crawlData);
+      // Enriched signature = legacy CrawlSignature superset + identity-keyed
+      // elements + coverage. Backward compatible with existing consumers.
+      const signature = computeProfileSignature(crawlData);
       const fields = signatureToSnapshotFields(signature);
+      const coverage = signature.coverage;
+
+      // Fetch the PREVIOUS snapshot (newest existing) before inserting the new
+      // version, so we can diff old → new and persist a structured change set.
+      let prevSignature: any = null;
+      let prevVersion: number | null = null;
+      try {
+        const latest = await getLatestSnapshots(baseUrl, companyId, projectId, 1);
+        if (latest.length > 0) {
+          prevSignature = latest[0].signature;
+          prevVersion = latest[0].version;
+        }
+      } catch { /* no prior snapshot / table pending — first version */ }
+
       const snap = await insertCrawlSnapshot({
         profileId: profile?.id ?? null,
         baseUrl,
@@ -376,11 +395,51 @@ export class CrawlOrchestrator {
         projectId: projectId ?? null,
         signature,
         ...fields,
+        coveragePct: coverage.coveragePct,
+        discoveredPages: coverage.discoveredPages,
       });
+
       if (snap) {
         logger.info(MOD, '📸 Crawl snapshot captured for change detection', {
-          baseUrl, version: snap.version, selectors: fields.selectorCount, pages: fields.pageCount,
+          baseUrl, version: snap.version, selectors: fields.selectorCount,
+          pages: fields.pageCount, coveragePct: coverage.coveragePct,
         });
+
+        // Compute & persist the structured diff against the previous version.
+        if (prevSignature && prevVersion != null) {
+          try {
+            const diff = computeProfileDiff(prevSignature, signature);
+            if (!diff.unchanged && diff.changes.length > 0) {
+              const rows = diff.changes.slice(0, 1000).map((c) => ({
+                profileId: profile?.id ?? null,
+                baseUrl,
+                companyId: companyId ?? null,
+                projectId: projectId ?? null,
+                versionFrom: prevVersion,
+                versionTo: snap.version,
+                changeType: c.type,
+                page: c.page,
+                oldValue: c.old ?? null,
+                newValue: c.new ?? null,
+                detail: c.detail,
+                severity: c.severity,
+              }));
+              const inserted = await insertProfileChanges(rows);
+              logger.info(MOD, '🔄 Profile changes persisted', {
+                baseUrl, versionFrom: prevVersion, versionTo: snap.version,
+                changes: inserted, summary: diff.summary, severity: diff.severity,
+              });
+            } else {
+              logger.info(MOD, 'No profile changes between versions', {
+                baseUrl, versionFrom: prevVersion, versionTo: snap.version,
+              });
+            }
+          } catch (diffErr: any) {
+            logger.warn(MOD, 'Could not persist profile changes (non-blocking)', {
+              baseUrl, error: diffErr?.message,
+            });
+          }
+        }
       }
     } catch (err: any) {
       logger.warn(MOD, 'Could not capture crawl snapshot (non-blocking)', {

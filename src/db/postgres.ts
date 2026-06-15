@@ -137,6 +137,8 @@ const REQUIRED_TABLES = [
   'healing_settings',
   // Proactive script maintenance (change detection)
   'crawl_snapshots',
+  // App Profile change intelligence (versioned diffs between crawls)
+  'profile_changes',
   // Intelligence Learning System (cross-system learning flywheel)
   'selector_stability', 'intelligence_insights',
   // Observable metrics (investor-grade KPIs) + Loop 2 (failures → crawl intelligence) + privacy
@@ -1765,6 +1767,43 @@ async function migrateDefaultCompany(client: PoolClient): Promise<void> {
   await safeExec(client, 'idx_crawl_snapshots_scope',
     `CREATE INDEX IF NOT EXISTS idx_crawl_snapshots_scope
        ON crawl_snapshots(base_url, COALESCE(company_id, 0), COALESCE(project_id, 0), version DESC)`);
+  // Coverage columns (additive) — crawled vs. discovered surface per snapshot.
+  await safeExec(client, 'crawl_snapshots.coverage_pct',
+    `ALTER TABLE crawl_snapshots ADD COLUMN IF NOT EXISTS coverage_pct INTEGER DEFAULT 0`);
+  await safeExec(client, 'crawl_snapshots.discovered_pages',
+    `ALTER TABLE crawl_snapshots ADD COLUMN IF NOT EXISTS discovered_pages INTEGER DEFAULT 0`);
+
+  // ── App Profile change intelligence ───────────────────────────────────────
+  // Structured, versioned diffs between consecutive crawl snapshots. This is
+  // the "Change Engine" that powers Change Reports, script-sync, and the
+  // diff-based self-healing fast-path. Fully additive — absence simply means no
+  // change history is available yet.
+  console.log('🔧 [DB] Migration: profile_changes table...');
+  await safeExec(client, 'profile_changes', `CREATE TABLE IF NOT EXISTS profile_changes (
+    id SERIAL PRIMARY KEY,
+    profile_id UUID,
+    base_url TEXT NOT NULL,
+    company_id INTEGER,
+    project_id INTEGER,
+    version_from INTEGER,
+    version_to INTEGER NOT NULL,
+    change_type TEXT NOT NULL,
+    page TEXT,
+    old_value TEXT,
+    new_value TEXT,
+    detail TEXT,
+    severity TEXT DEFAULT 'low',
+    created_at TIMESTAMPTZ DEFAULT NOW()
+  )`);
+  await safeExec(client, 'idx_profile_changes_scope',
+    `CREATE INDEX IF NOT EXISTS idx_profile_changes_scope
+       ON profile_changes(base_url, COALESCE(company_id, 0), COALESCE(project_id, 0), version_to DESC)`);
+  await safeExec(client, 'idx_profile_changes_profile',
+    `CREATE INDEX IF NOT EXISTS idx_profile_changes_profile
+       ON profile_changes(profile_id, version_to DESC)`);
+  await safeExec(client, 'idx_profile_changes_locator',
+    `CREATE INDEX IF NOT EXISTS idx_profile_changes_locator
+       ON profile_changes(base_url, change_type) WHERE change_type = 'LOCATOR_CHANGED'`);
 
   // ── Migrations (Migration Assistant: bulk re-point scripts between crawls) ──
   // A migration captures an old → new crawl snapshot pair, the element mapping
@@ -4458,6 +4497,26 @@ export interface CrawlSnapshotRecord {
   form_count: number;
   selector_count: number;
   page_count: number;
+  coverage_pct?: number;
+  discovered_pages?: number;
+  created_at: string;
+}
+
+/** One structured change row between two profile versions. */
+export interface ProfileChangeRecord {
+  id: number;
+  profile_id: string | null;
+  base_url: string;
+  company_id: number | null;
+  project_id: number | null;
+  version_from: number | null;
+  version_to: number;
+  change_type: string;
+  page: string | null;
+  old_value: string | null;
+  new_value: string | null;
+  detail: string | null;
+  severity: string;
   created_at: string;
 }
 
@@ -4476,6 +4535,8 @@ export async function insertCrawlSnapshot(data: {
   formCount?: number;
   selectorCount?: number;
   pageCount?: number;
+  coveragePct?: number;
+  discoveredPages?: number;
 }): Promise<CrawlSnapshotRecord | null> {
   const pool = getPool();
   const verR = await pool.query(
@@ -4490,8 +4551,9 @@ export async function insertCrawlSnapshot(data: {
   const result = await pool.query(
     `INSERT INTO crawl_snapshots
        (profile_id, base_url, company_id, project_id, version, signature,
-        element_count, form_count, selector_count, page_count)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+        element_count, form_count, selector_count, page_count,
+        coverage_pct, discovered_pages)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
      RETURNING *`,
     [
       data.profileId ?? null,
@@ -4504,9 +4566,109 @@ export async function insertCrawlSnapshot(data: {
       data.formCount ?? 0,
       data.selectorCount ?? 0,
       data.pageCount ?? 0,
+      data.coveragePct ?? 0,
+      data.discoveredPages ?? 0,
     ],
   );
   return result.rows[0] || null;
+}
+
+/* -------------------------------------------------------------------------- */
+/*  Profile change intelligence (versioned diffs)                             */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Persist a batch of structured changes for one version transition. Best-effort
+ * — never throws (callers run this off the crawl-save critical path).
+ */
+export async function insertProfileChanges(rows: Array<{
+  profileId?: string | null;
+  baseUrl: string;
+  companyId?: number | null;
+  projectId?: number | null;
+  versionFrom?: number | null;
+  versionTo: number;
+  changeType: string;
+  page?: string | null;
+  oldValue?: string | null;
+  newValue?: string | null;
+  detail?: string | null;
+  severity?: string;
+}>): Promise<number> {
+  if (!Array.isArray(rows) || rows.length === 0) return 0;
+  const pool = getPool();
+  const values: string[] = [];
+  const params: any[] = [];
+  let i = 1;
+  for (const r of rows) {
+    values.push(`($${i++},$${i++},$${i++},$${i++},$${i++},$${i++},$${i++},$${i++},$${i++},$${i++},$${i++},$${i++})`);
+    params.push(
+      r.profileId ?? null, r.baseUrl, r.companyId ?? null, r.projectId ?? null,
+      r.versionFrom ?? null, r.versionTo, r.changeType, r.page ?? null,
+      r.oldValue ?? null, r.newValue ?? null, r.detail ?? null, r.severity ?? 'low',
+    );
+  }
+  const result = await pool.query(
+    `INSERT INTO profile_changes
+       (profile_id, base_url, company_id, project_id, version_from, version_to,
+        change_type, page, old_value, new_value, detail, severity)
+     VALUES ${values.join(',')}
+     RETURNING id`,
+    params,
+  );
+  return result.rowCount ?? 0;
+}
+
+/**
+ * Fetch persisted changes for a profile. When `versionTo` is omitted, returns
+ * the changes for the most recent version transition. Scoped by company/project.
+ */
+export async function getProfileChanges(opts: {
+  profileId?: string | null;
+  baseUrl?: string;
+  companyId?: number | null;
+  projectId?: number | null;
+  versionTo?: number;
+  changeType?: string;
+  limit?: number;
+}): Promise<ProfileChangeRecord[]> {
+  const conditions: string[] = [];
+  const params: any[] = [];
+  if (opts.profileId) { conditions.push(`profile_id = $${params.length + 1}`); params.push(opts.profileId); }
+  if (opts.baseUrl) { conditions.push(`base_url = $${params.length + 1}`); params.push(opts.baseUrl); }
+  if (opts.companyId != null) { conditions.push(`COALESCE(company_id, 0) = COALESCE($${params.length + 1}, 0)`); params.push(opts.companyId); }
+  if (opts.projectId != null) { conditions.push(`COALESCE(project_id, 0) = COALESCE($${params.length + 1}, 0)`); params.push(opts.projectId); }
+  if (opts.versionTo != null) { conditions.push(`version_to = $${params.length + 1}`); params.push(opts.versionTo); }
+  if (opts.changeType) { conditions.push(`change_type = $${params.length + 1}`); params.push(opts.changeType); }
+  if (conditions.length === 0) return [];
+  const limit = Math.min(opts.limit ?? 500, 2000);
+  const result = await getPool().query(
+    `SELECT * FROM profile_changes
+      WHERE ${conditions.join(' AND ')}
+      ORDER BY version_to DESC, id ASC
+      LIMIT ${limit}`,
+    params,
+  );
+  return result.rows;
+}
+
+/** List all crawl-snapshot versions for a profile (newest first), scoped. */
+export async function getProfileVersions(
+  profileId: string,
+  companyId?: number,
+  projectId?: number,
+): Promise<CrawlSnapshotRecord[]> {
+  const conditions = ['profile_id = $1'];
+  const params: any[] = [profileId];
+  if (companyId != null) { conditions.push(`COALESCE(company_id, 0) = COALESCE($${params.length + 1}, 0)`); params.push(companyId); }
+  if (projectId != null) { conditions.push(`COALESCE(project_id, 0) = COALESCE($${params.length + 1}, 0)`); params.push(projectId); }
+  const result = await getPool().query(
+    `SELECT * FROM crawl_snapshots
+      WHERE ${conditions.join(' AND ')}
+      ORDER BY version DESC`,
+    params,
+  );
+  return result.rows;
 }
 
 /** Fetch the most recent crawl snapshots for a scope (newest first). */

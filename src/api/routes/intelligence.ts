@@ -25,7 +25,7 @@ import { ProfileService } from '../../intelligence/profile-service';
 import { CrawlOrchestrator } from '../../intelligence/crawl-orchestrator';
 import { SelectorHealingEngine } from '../../intelligence/healing-engine';
 import { PatternMatcher } from '../../intelligence/pattern-matcher';
-import { findMatchingPatterns, migrateDataToDefaultProjects, getProjectStats, listProfiles, listRepositories, getKnowledgeStats, upsertProfile, getPool, getProfileById, updateProfileAuth, updateProfileStatus } from '../../db/postgres';
+import { findMatchingPatterns, migrateDataToDefaultProjects, getProjectStats, listProfiles, listRepositories, getKnowledgeStats, upsertProfile, getPool, getProfileById, updateProfileAuth, updateProfileStatus, getProfileVersions, getProfileChanges, getLatestSnapshots } from '../../db/postgres';
 import { PageCrawler } from '../../script-gen/page-crawler';
 import { IntelligenceHealthService } from '../../services/intelligence-health-service';
 import { startCrawlLog, appendCrawlLog, finishCrawlLog, getCrawlLog } from '../../intelligence/crawl-log-store';
@@ -479,6 +479,129 @@ export function createIntelligenceRouter(): Router {
         });
       }
       return res.json({ success: true, data: entry });
+    } catch (err) {
+      res.status(500).json({ success: false, error: (err as Error).message });
+    }
+  });
+
+  /* ══════════════════════════════════════════════════════════════════
+   *  APP PROFILE — VERSIONING & CHANGE ENGINE (Sprint A)
+   *
+   *  These read-only endpoints surface what the App Profile (the platform's
+   *  System of Record) actually knows: how complete its crawl is (coverage),
+   *  the version history of captured snapshots, and the structured changes
+   *  (page/element/locator/text/form/navigation) detected between versions.
+   *  All are strictly scoped by company + project so no tenant can read
+   *  another's profile data.
+   * ══════════════════════════════════════════════════════════════════ */
+
+  /**
+   * GET /profiles/:id/coverage
+   * Coverage % + page counts for the latest captured snapshot of this profile.
+   * Returns zeros (never 404) when no snapshot exists yet, so the dashboard can
+   * render an "uncrawled" state without special-casing errors.
+   */
+  router.get('/profiles/:id/coverage', async (req: Request, res: Response) => {
+    try {
+      const companyId = (req as any).companyId;
+      const projectId = (req as any).projectId as number | undefined;
+      const profile = await getProfileById(String(req.params.id));
+      if (!profile) return res.status(404).json({ success: false, error: 'Profile not found' });
+
+      const snaps = await getLatestSnapshots(profile.base_url, companyId, projectId ?? profile.project_id ?? undefined, 1);
+      const latest = snaps[0];
+      return res.json({
+        success: true,
+        data: {
+          profileId: profile.id,
+          baseUrl: profile.base_url,
+          version: latest?.version ?? 0,
+          coveragePct: latest?.coverage_pct ?? 0,
+          crawledPages: latest?.page_count ?? 0,
+          discoveredPages: latest?.discovered_pages ?? 0,
+          elementCount: latest?.element_count ?? 0,
+          formCount: latest?.form_count ?? 0,
+          selectorCount: latest?.selector_count ?? 0,
+          capturedAt: latest?.created_at ?? null,
+        },
+      });
+    } catch (err) {
+      res.status(500).json({ success: false, error: (err as Error).message });
+    }
+  });
+
+  /**
+   * GET /profiles/:id/versions
+   * Full version history (newest first) of captured crawl snapshots — each entry
+   * carries version, coverage, element/form/selector/page counts and timestamp.
+   */
+  router.get('/profiles/:id/versions', async (req: Request, res: Response) => {
+    try {
+      const companyId = (req as any).companyId;
+      const projectId = (req as any).projectId as number | undefined;
+      const profile = await getProfileById(String(req.params.id));
+      if (!profile) return res.status(404).json({ success: false, error: 'Profile not found' });
+
+      const versions = await getProfileVersions(profile.id, companyId, projectId ?? profile.project_id ?? undefined);
+      return res.json({
+        success: true,
+        data: versions.map((v) => ({
+          version: v.version,
+          coveragePct: v.coverage_pct ?? 0,
+          pageCount: v.page_count ?? 0,
+          discoveredPages: v.discovered_pages ?? 0,
+          elementCount: v.element_count ?? 0,
+          formCount: v.form_count ?? 0,
+          selectorCount: v.selector_count ?? 0,
+          createdAt: v.created_at,
+        })),
+      });
+    } catch (err) {
+      res.status(500).json({ success: false, error: (err as Error).message });
+    }
+  });
+
+  /**
+   * GET /profiles/:id/changes?versionTo=<n>&type=<CHANGE_TYPE>&limit=<n>
+   * Structured changes detected between consecutive snapshot versions. Optionally
+   * filter to a single target version (?versionTo) or a single change type
+   * (?type=LOCATOR_CHANGED). Drives the "Changes" tab and answers the user's
+   * "show me what changed between crawls" requirement.
+   */
+  router.get('/profiles/:id/changes', async (req: Request, res: Response) => {
+    try {
+      const companyId = (req as any).companyId;
+      const projectId = (req as any).projectId as number | undefined;
+      const profile = await getProfileById(String(req.params.id));
+      if (!profile) return res.status(404).json({ success: false, error: 'Profile not found' });
+
+      const versionTo = req.query.versionTo ? Number(req.query.versionTo) : undefined;
+      const changeType = req.query.type ? String(req.query.type) : undefined;
+      const limit = req.query.limit ? Math.min(Number(req.query.limit), 2000) : 500;
+
+      const changes = await getProfileChanges({
+        profileId: profile.id,
+        companyId,
+        projectId: projectId ?? profile.project_id ?? undefined,
+        versionTo,
+        changeType,
+        limit,
+      });
+      return res.json({
+        success: true,
+        data: changes.map((c) => ({
+          id: c.id,
+          versionFrom: c.version_from,
+          versionTo: c.version_to,
+          type: c.change_type,
+          page: c.page,
+          oldValue: c.old_value,
+          newValue: c.new_value,
+          detail: c.detail,
+          severity: c.severity,
+          createdAt: c.created_at,
+        })),
+      });
     } catch (err) {
       res.status(500).json({ success: false, error: (err as Error).message });
     }
