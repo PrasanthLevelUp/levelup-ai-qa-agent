@@ -30,6 +30,7 @@ import { PageCrawler } from '../../script-gen/page-crawler';
 import { IntelligenceHealthService } from '../../services/intelligence-health-service';
 import { healingOutcomeService, HealingResult } from '../../services/healing-outcome-service';
 import { healingVerificationService } from '../../services/healing-verification-service';
+import { healingAnalyticsService, AnalyticsTimeRange } from '../../services/healing-analytics-service';
 import { startCrawlLog, appendCrawlLog, finishCrawlLog, getCrawlLog } from '../../intelligence/crawl-log-store';
 
 /* ──────────────────────────────────────────────────────────────────────────
@@ -821,6 +822,46 @@ export function createIntelligenceRouter(): Router {
         return res.status(404).json({ success: false, error: 'Verification job not found' });
       }
       res.json({ success: true, data: job });
+    } catch (err) {
+      res.status(500).json({ success: false, error: (err as Error).message });
+    }
+  });
+
+  /* ══════════════════════════════════════════════════════════════════
+   *  HEALING ANALYTICS (Priority 1 — Healing Analytics Dashboard)
+   *
+   *  Read-only analytics over the learning loop, backed by
+   *  HealingAnalyticsService (healing_outcomes + healing_confidence_scores).
+   *  Every query is company + project scoped.
+   *
+   *    GET /healing/analytics                  — full dashboard aggregate
+   *    GET /healing/success-rate?timeRange=... — success rate for a window
+   * ══════════════════════════════════════════════════════════════════ */
+
+  /** Single-call dashboard aggregate (success rate, top elements, distribution, trend). */
+  router.get('/healing/analytics', async (req: Request, res: Response) => {
+    try {
+      const companyId = (req as any).companyId;
+      const projectId = (req as any).projectId as number | undefined;
+      const data = await healingAnalyticsService.getDashboardData(companyId, projectId);
+      res.json({ success: true, data });
+    } catch (err) {
+      res.status(500).json({ success: false, error: (err as Error).message });
+    }
+  });
+
+  /** Healing success rate for a time window: today | week | month | all (default all). */
+  router.get('/healing/success-rate', async (req: Request, res: Response) => {
+    try {
+      const companyId = (req as any).companyId;
+      const projectId = (req as any).projectId as number | undefined;
+      const allowed: AnalyticsTimeRange[] = ['today', 'week', 'month', 'all'];
+      const raw = String(req.query.timeRange ?? 'all');
+      const timeRange: AnalyticsTimeRange = (allowed as string[]).includes(raw)
+        ? (raw as AnalyticsTimeRange)
+        : 'all';
+      const data = await healingAnalyticsService.getSuccessRate(companyId, projectId, timeRange);
+      res.json({ success: true, data });
     } catch (err) {
       res.status(500).json({ success: false, error: (err as Error).message });
     }
