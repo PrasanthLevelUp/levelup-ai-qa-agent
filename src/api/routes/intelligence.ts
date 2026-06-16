@@ -29,6 +29,7 @@ import { findMatchingPatterns, migrateDataToDefaultProjects, getProjectStats, li
 import { PageCrawler } from '../../script-gen/page-crawler';
 import { IntelligenceHealthService } from '../../services/intelligence-health-service';
 import { healingOutcomeService, HealingResult } from '../../services/healing-outcome-service';
+import { healingVerificationService } from '../../services/healing-verification-service';
 import { startCrawlLog, appendCrawlLog, finishCrawlLog, getCrawlLog } from '../../intelligence/crawl-log-store';
 
 /* ──────────────────────────────────────────────────────────────────────────
@@ -747,6 +748,79 @@ export function createIntelligenceRouter(): Router {
       const projectId = (req as any).projectId as number | undefined;
       const stats = await healingOutcomeService.getLearningStats(companyId, projectId);
       res.json({ success: true, data: stats });
+    } catch (err) {
+      res.status(500).json({ success: false, error: (err as Error).message });
+    }
+  });
+
+  /* ══════════════════════════════════════════════════════════════════
+   *  HEALING VERIFICATION (Sprint B Phase 1 — Runner Integration)
+   *
+   *  These endpoints back the ASYNCHRONOUS verification path: a heal that is
+   *  applied out of process (e.g. committed to a GitHub PR) is rerun later by
+   *  CI, which reports the result back here so the learning loop can close.
+   *  (The in-process healing worker closes the loop directly and does NOT use
+   *  these endpoints.)
+   *
+   *    POST /healing/verify              — queue a verification job → { jobId }
+   *    POST /healing/verify/:jobId/result — report the rerun result
+   *    GET  /healing/verification/:jobId  — fetch a job's status
+   * ══════════════════════════════════════════════════════════════════ */
+
+  /** Queue an asynchronous verification run for an applied heal. */
+  router.post('/healing/verify', async (req: Request, res: Response) => {
+    try {
+      const companyId = (req as any).companyId;
+      const projectId = (req as any).projectId as number | undefined;
+      const b = req.body ?? {};
+      const { jobId, persisted } = await healingVerificationService.queueVerificationRun({
+        companyId,
+        projectId,
+        testId: b.testId ?? null,
+        testName: b.testName ?? null,
+        healingSessionId: b.healingSessionId ?? null,
+        baseUrl: b.baseUrl ?? null,
+        elementId: b.elementId ?? null,
+        locatorType: b.locatorType ?? null,
+        originalSelector: b.originalSelector ?? null,
+        healedSelector: b.healedSelector ?? null,
+        strategy: b.strategy ?? null,
+        suggestedConfidence: b.suggestedConfidence ?? null,
+        profileChangeId: b.profileChangeId ?? null,
+      });
+      res.json({ success: true, data: { jobId, persisted } });
+    } catch (err) {
+      res.status(500).json({ success: false, error: (err as Error).message });
+    }
+  });
+
+  /** Report the result of an externally-run verification, closing the loop. */
+  router.post('/healing/verify/:jobId/result', async (req: Request, res: Response) => {
+    try {
+      const b = req.body ?? {};
+      const outcome = await healingVerificationService.handleTestResult({
+        jobId: String(req.params.jobId),
+        result: b.result,
+        exitCode: typeof b.exitCode === 'number' ? b.exitCode : undefined,
+        executionTimeMs: b.executionTimeMs ?? b.durationMs ?? null,
+        errorMessage: b.errorMessage ?? null,
+      });
+      res.json({ success: outcome.ok, data: outcome });
+    } catch (err) {
+      res.status(500).json({ success: false, error: (err as Error).message });
+    }
+  });
+
+  /** Fetch the status of a verification job (tenant-scoped). */
+  router.get('/healing/verification/:jobId', async (req: Request, res: Response) => {
+    try {
+      const companyId = (req as any).companyId;
+      const projectId = (req as any).projectId as number | undefined;
+      const job = await healingVerificationService.getJob(String(req.params.jobId), companyId, projectId);
+      if (!job) {
+        return res.status(404).json({ success: false, error: 'Verification job not found' });
+      }
+      res.json({ success: true, data: job });
     } catch (err) {
       res.status(500).json({ success: false, error: (err as Error).message });
     }

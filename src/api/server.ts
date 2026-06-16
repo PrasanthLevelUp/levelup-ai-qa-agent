@@ -80,6 +80,7 @@ import { createIntelligenceRouter } from './routes/intelligence';
 import { createIntelligenceLearningRouter } from './routes/intelligence-learning';
 import { createMetricsRouter } from './routes/metrics';
 import { createCredentialsRouter } from './routes/credentials';
+import { healingVerificationService } from '../services/healing-verification-service';
 import { sessionMiddleware } from './middleware/session';
 import { notifyRca } from '../integrations/slack';
 import { createRcaTicket } from '../integrations/jira';
@@ -851,6 +852,22 @@ function createHealingWorker(
                 pageUrl: failure.url || undefined,
               });
 
+              // Close the learning loop AUTOMATICALLY: the heal was applied and
+              // the test rerun went green in-process, so record a 'pass' outcome
+              // and let the confidence score learn. Best-effort & non-blocking.
+              await healingVerificationService.recordOutcomeFromRerun({
+                companyId: job.companyId,
+                projectId: resolvedProjectId,
+                baseUrl: failure.url,
+                originalSelector: failure.failedLocator,
+                healedSelector: outcome.suggestion.newLocator,
+                strategy: outcome.suggestion.strategy,
+                suggestedConfidence: outcome.suggestion.confidence,
+                result: 'pass',
+                testName: failure.testName,
+                durationMs: rerun.durationMs,
+              });
+
               healings.push({
                 testName: failure.testName,
                 failedLocator: failure.failedLocator,
@@ -930,6 +947,20 @@ function createHealingWorker(
                   projectId: resolvedProjectId,
                   companyId: job.companyId,
                   pageUrl: failure.url || undefined,
+                });
+
+                // Learning loop: confirmation rerun went green → record 'pass'.
+                await healingVerificationService.recordOutcomeFromRerun({
+                  companyId: job.companyId,
+                  projectId: resolvedProjectId,
+                  baseUrl: failure.url,
+                  originalSelector: failure.failedLocator,
+                  healedSelector: outcome.suggestion.newLocator,
+                  strategy: outcome.suggestion.strategy,
+                  suggestedConfidence: outcome.suggestion.confidence,
+                  result: 'pass',
+                  testName: failure.testName,
+                  durationMs: confirmRerun.durationMs,
                 });
 
                 healings.push({
@@ -1048,6 +1079,22 @@ function createHealingWorker(
                 pageUrl: failure.url || undefined,
               });
 
+              // Learning loop: the healed selector for THIS element worked — the
+              // rerun progressed to a DIFFERENT locator — so record a 'pass' for
+              // this element even though the test as a whole isn't green yet.
+              await healingVerificationService.recordOutcomeFromRerun({
+                companyId: job.companyId,
+                projectId: resolvedProjectId,
+                baseUrl: failure.url,
+                originalSelector: failure.failedLocator,
+                healedSelector: outcome.suggestion.newLocator,
+                strategy: outcome.suggestion.strategy,
+                suggestedConfidence: outcome.suggestion.confidence,
+                result: 'pass',
+                testName: failure.testName,
+                durationMs: rerun.durationMs,
+              });
+
               // Advance to next locator
               healedLocators.add(failure.failedLocator); // Mark current locator as done
               failure = nextFailure;
@@ -1075,6 +1122,22 @@ function createHealingWorker(
               patch_path: validation.patchPath,
               project_id: resolvedProjectId ?? null,
             }, job.companyId);
+
+            // Learning loop: the healed selector did NOT fix this element (same
+            // locator still failing, fix reverted) → record a 'fail' so the
+            // confidence score learns this selector/strategy didn't work here.
+            await healingVerificationService.recordOutcomeFromRerun({
+              companyId: job.companyId,
+              projectId: resolvedProjectId,
+              baseUrl: failure.url,
+              originalSelector: failure.failedLocator,
+              healedSelector: outcome.suggestion.newLocator,
+              strategy: outcome.suggestion.strategy,
+              suggestedConfidence: outcome.suggestion.confidence,
+              result: 'fail',
+              testName: failure.testName,
+              durationMs: rerun.durationMs,
+            });
           } // end retry loop
 
           if (iterationSuccess) break;
