@@ -28,6 +28,7 @@ import { PatternMatcher } from '../../intelligence/pattern-matcher';
 import { findMatchingPatterns, migrateDataToDefaultProjects, getProjectStats, listProfiles, listRepositories, getKnowledgeStats, upsertProfile, getPool, getProfileById, updateProfileAuth, updateProfileStatus, getProfileVersions, getProfileChanges, getLatestSnapshots } from '../../db/postgres';
 import { PageCrawler } from '../../script-gen/page-crawler';
 import { IntelligenceHealthService } from '../../services/intelligence-health-service';
+import { healingOutcomeService, HealingResult } from '../../services/healing-outcome-service';
 import { startCrawlLog, appendCrawlLog, finishCrawlLog, getCrawlLog } from '../../intelligence/crawl-log-store';
 
 /* ──────────────────────────────────────────────────────────────────────────
@@ -647,6 +648,105 @@ export function createIntelligenceRouter(): Router {
 
       const analysis = await healingEngine.analyzeSelector(selector, baseUrl, companyId, projectId);
       res.json({ success: true, data: analysis });
+    } catch (err) {
+      res.status(500).json({ success: false, error: (err as Error).message });
+    }
+  });
+
+  /* ══════════════════════════════════════════════════════════════════
+   *  HEALING OUTCOMES LEARNING LOOP (Sprint B)
+   *
+   *  Closes the loop: record what happened after a heal was applied + the
+   *  test re-run, then surface the learned per-element confidence and
+   *  aggregate stats. Every route is strictly company + project scoped.
+   *
+   *    POST /healing/outcomes              — record a heal outcome (learn)
+   *    GET  /healing/outcomes              — list recent heal outcomes
+   *    GET  /healing/confidence/:elementId — learned confidence for an element
+   *    GET  /healing/learning-stats        — aggregate learning KPIs
+   * ══════════════════════════════════════════════════════════════════ */
+
+  /**
+   * Record the outcome of an applied heal. Called by the test runner /
+   * orchestrator once a suggested selector fix has been re-run and pass/fail is
+   * known. This is the write-path of the learning loop:
+   *   Heal Applied → Run Result → Pass/Fail → Store Outcome → Update Confidence
+   */
+  router.post('/healing/outcomes', async (req: Request, res: Response) => {
+    try {
+      const companyId = (req as any).companyId;
+      const projectId = (req as any).projectId as number | undefined;
+      const { result } = req.body || {};
+      if (!result) {
+        return res.status(400).json({ success: false, error: 'result is required (pass | fail | timeout | error)' });
+      }
+      const capture = await healingOutcomeService.captureHealingOutcome({
+        companyId,
+        projectId,
+        profileChangeId: req.body.profileChangeId ?? null,
+        baseUrl: req.body.baseUrl ?? null,
+        elementId: req.body.elementId ?? null,
+        locatorType: req.body.locatorType ?? null,
+        originalSelector: req.body.originalSelector ?? null,
+        healedSelector: req.body.healedSelector ?? null,
+        strategy: req.body.strategy ?? null,
+        suggestedConfidence: req.body.suggestedConfidence ?? null,
+        result: result as HealingResult,
+        testName: req.body.testName ?? null,
+        errorMessage: req.body.errorMessage ?? null,
+        durationMs: req.body.durationMs ?? null,
+      });
+      res.json({ success: true, data: capture });
+    } catch (err) {
+      res.status(500).json({ success: false, error: (err as Error).message });
+    }
+  });
+
+  /** List recent healing outcomes for the current scope (newest first). */
+  router.get('/healing/outcomes', async (req: Request, res: Response) => {
+    try {
+      const companyId = (req as any).companyId;
+      const projectId = (req as any).projectId as number | undefined;
+      const limit = req.query.limit ? Math.max(1, parseInt(String(req.query.limit), 10) || 200) : undefined;
+      const outcomes = await healingOutcomeService.listOutcomes({
+        companyId,
+        projectId,
+        elementId: req.query.elementId ? String(req.query.elementId) : undefined,
+        result: req.query.result ? String(req.query.result) : undefined,
+        strategy: req.query.strategy ? String(req.query.strategy) : undefined,
+        limit,
+      });
+      res.json({ success: true, data: { outcomes, total: outcomes.length } });
+    } catch (err) {
+      res.status(500).json({ success: false, error: (err as Error).message });
+    }
+  });
+
+  /** Learned confidence score(s) for a specific element (all locator buckets). */
+  router.get('/healing/confidence/:elementId', async (req: Request, res: Response) => {
+    try {
+      const companyId = (req as any).companyId;
+      const projectId = (req as any).projectId as number | undefined;
+      const elementId = String(req.params.elementId);
+      const scores = await healingOutcomeService.getElementConfidence(elementId, companyId, projectId);
+      // Convenience scalar: the highest learned confidence across buckets, or
+      // the neutral default when this element has never been healed before.
+      const confidence = scores.length
+        ? Math.max(...scores.map((s) => Number(s.confidence)))
+        : await healingOutcomeService.getConfidenceScore(elementId, companyId, projectId);
+      res.json({ success: true, data: { elementId, confidence, scores } });
+    } catch (err) {
+      res.status(500).json({ success: false, error: (err as Error).message });
+    }
+  });
+
+  /** Aggregate learning KPIs (success rate, mean confidence, per-strategy). */
+  router.get('/healing/learning-stats', async (req: Request, res: Response) => {
+    try {
+      const companyId = (req as any).companyId;
+      const projectId = (req as any).projectId as number | undefined;
+      const stats = await healingOutcomeService.getLearningStats(companyId, projectId);
+      res.json({ success: true, data: stats });
     } catch (err) {
       res.status(500).json({ success: false, error: (err as Error).message });
     }
