@@ -18,7 +18,12 @@ import { logger } from '../utils/logger';
 import { ProfileService } from './profile-service';
 import { findMatchingPatterns, incrementPatternUsage, getProfileChanges } from '../db/postgres';
 import { findMaintenancePattern, PATTERN_APPLY_THRESHOLD } from '../services/maintenance-pattern-service';
-import { findLocatorReplacement } from '../services/profile-diff-engine';
+import { findLocatorReplacement, canonicalizeLocator } from '../services/profile-diff-engine';
+import {
+  healingOutcomeService,
+  HealingOutcomeInput,
+  CaptureResult,
+} from '../services/healing-outcome-service';
 
 const MOD = 'HealingEngine';
 
@@ -523,5 +528,77 @@ export class SelectorHealingEngine {
     }
 
     return selectors;
+  }
+
+  /* ── Sprint B: Healing Outcomes Learning Loop ──────────────────────────── */
+
+  /**
+   * Record the outcome of an applied heal so the engine LEARNS from it.
+   *
+   * This is the write-back half of the user-requested loop:
+   *
+   *   Heal Applied → Run Result → Pass/Fail → Store Outcome → Update Confidence
+   *
+   * It is intended to be called by the test runner / orchestrator (or the
+   * `POST /healing/outcomes` API) once an applied selector fix has been re-run
+   * and we know whether the test passed. It delegates entirely to the
+   * {@link HealingOutcomeService}, which appends an immutable outcome row and
+   * folds the result into the element's smoothed confidence score.
+   *
+   * Best-effort and non-blocking by construction: the service never throws, so
+   * recording an outcome can never break a heal or a test run. The element
+   * identity defaults to the canonicalised original selector when not supplied.
+   */
+  async recordHealingOutcome(input: HealingOutcomeInput): Promise<CaptureResult> {
+    return healingOutcomeService.captureHealingOutcome(input);
+  }
+
+  /**
+   * Look up the learned confidence (0–100) for a selector's element, so callers
+   * can rank or gate fix suggestions by how well past heals of this element have
+   * actually held up. Returns the neutral default (50) when nothing is learned
+   * yet. Strictly tenant-scoped; never throws.
+   */
+  async getLearnedConfidence(
+    selector: string,
+    companyId?: number,
+    projectId?: number,
+    locatorType?: string,
+  ): Promise<number> {
+    const elementId = canonicalizeLocator(selector) || selector;
+    return healingOutcomeService.getConfidenceScore(elementId, companyId, projectId, locatorType ?? '');
+  }
+
+  /**
+   * Re-rank a list of candidate alternatives using the per-element confidence
+   * the platform has LEARNED from prior heal outcomes. Each alternative's static
+   * confidence is blended with the learned success score for its target element
+   * (70% static / 30% learned) so strategies that have repeatedly healed this
+   * element successfully float to the top, while ones that historically broke
+   * sink. When nothing has been learned yet (neutral 50), ordering is unchanged.
+   *
+   * Pure-ish and best-effort: a lookup failure leaves the original order intact.
+   */
+  async rankAlternativesByLearnedConfidence(
+    alternatives: SelectorAlternative[],
+    companyId?: number,
+    projectId?: number,
+  ): Promise<SelectorAlternative[]> {
+    if (!alternatives || alternatives.length <= 1) return alternatives;
+    try {
+      const scored = await Promise.all(
+        alternatives.map(async (alt) => {
+          const learned = await this.getLearnedConfidence(alt.selector, companyId, projectId);
+          // learned is 0–100; static confidence is 0–1. Blend on the 0–1 scale.
+          const blended = 0.7 * alt.confidence + 0.3 * (learned / 100);
+          return { alt, blended };
+        }),
+      );
+      scored.sort((a, b) => b.blended - a.blended);
+      return scored.map((s) => s.alt);
+    } catch (err: any) {
+      logger.warn(MOD, `rankAlternativesByLearnedConfidence failed: ${err?.message || err}`);
+      return alternatives;
+    }
   }
 }

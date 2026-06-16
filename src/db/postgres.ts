@@ -139,6 +139,9 @@ const REQUIRED_TABLES = [
   'crawl_snapshots',
   // App Profile change intelligence (versioned diffs between crawls)
   'profile_changes',
+  // Healing Outcomes Learning Loop (Sprint B): per-heal outcomes + per-element
+  // success-rate confidence aggregates that improve fix ranking over time.
+  'healing_outcomes', 'healing_confidence_scores',
   // Intelligence Learning System (cross-system learning flywheel)
   'selector_stability', 'intelligence_insights',
   // Observable metrics (investor-grade KPIs) + Loop 2 (failures → crawl intelligence) + privacy
@@ -1804,6 +1807,77 @@ async function migrateDefaultCompany(client: PoolClient): Promise<void> {
   await safeExec(client, 'idx_profile_changes_locator',
     `CREATE INDEX IF NOT EXISTS idx_profile_changes_locator
        ON profile_changes(base_url, change_type) WHERE change_type = 'LOCATOR_CHANGED'`);
+
+  // ── Healing Outcomes Learning Loop (Sprint B) ─────────────────────────────
+  // The platform already FINDS fixes (maintenance patterns, profile diffs, DOM
+  // search). Sprint B closes the loop: after a heal is applied and the test is
+  // re-run, we record whether the suggested selector actually WORKED, then fold
+  // that signal into a per-element success-rate confidence score. Future fix
+  // suggestions are ranked by this learned confidence, so the engine gets
+  // measurably better the more it is used.
+  //
+  //   Heal Applied → Run Result → Pass/Fail → Store Outcome → Update Confidence
+  //
+  // Both tables are fully additive and every write is best-effort, so a logging
+  // failure can never block a heal or a test run.
+  //
+  // `healing_outcomes` is the immutable event log — one row per applied heal,
+  // optionally linked back to the `profile_changes` diff that produced it.
+  console.log('🔧 [DB] Migration: healing_outcomes table...');
+  await safeExec(client, 'healing_outcomes', `CREATE TABLE IF NOT EXISTS healing_outcomes (
+    id SERIAL PRIMARY KEY,
+    company_id INTEGER,
+    project_id INTEGER,
+    profile_change_id INTEGER REFERENCES profile_changes(id) ON DELETE SET NULL,
+    base_url TEXT,
+    element_id TEXT NOT NULL,
+    locator_type TEXT,
+    original_selector TEXT,
+    healed_selector TEXT,
+    strategy TEXT,
+    suggested_confidence DECIMAL(5,2),
+    result TEXT NOT NULL,
+    test_name TEXT,
+    error_message TEXT,
+    duration_ms INTEGER,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+  )`);
+  await safeExec(client, 'idx_healing_outcomes_scope',
+    `CREATE INDEX IF NOT EXISTS idx_healing_outcomes_scope
+       ON healing_outcomes(COALESCE(company_id, 0), COALESCE(project_id, 0), created_at DESC)`);
+  await safeExec(client, 'idx_healing_outcomes_element',
+    `CREATE INDEX IF NOT EXISTS idx_healing_outcomes_element
+       ON healing_outcomes(element_id, COALESCE(company_id, 0), COALESCE(project_id, 0))`);
+  await safeExec(client, 'idx_healing_outcomes_change',
+    `CREATE INDEX IF NOT EXISTS idx_healing_outcomes_change
+       ON healing_outcomes(profile_change_id) WHERE profile_change_id IS NOT NULL`);
+
+  // `healing_confidence_scores` is the learned aggregate — one row per
+  // (company, project, element, locator_type). `confidence` is an
+  // exponentially-smoothed success score (0–100, learning rate 0.1) and the
+  // success/total counts let us also expose a raw historical success rate.
+  console.log('🔧 [DB] Migration: healing_confidence_scores table...');
+  await safeExec(client, 'healing_confidence_scores', `CREATE TABLE IF NOT EXISTS healing_confidence_scores (
+    id SERIAL PRIMARY KEY,
+    company_id INTEGER,
+    project_id INTEGER,
+    element_id TEXT NOT NULL,
+    locator_type TEXT NOT NULL DEFAULT '',
+    confidence DECIMAL(5,2) NOT NULL DEFAULT 50.0,
+    success_count INTEGER NOT NULL DEFAULT 0,
+    failure_count INTEGER NOT NULL DEFAULT 0,
+    total_count INTEGER NOT NULL DEFAULT 0,
+    last_result TEXT,
+    last_strategy TEXT,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+  )`);
+  await safeExec(client, 'uq_healing_confidence_scope',
+    `CREATE UNIQUE INDEX IF NOT EXISTS uq_healing_confidence_scope
+       ON healing_confidence_scores(COALESCE(company_id, 0), COALESCE(project_id, 0), element_id, locator_type)`);
+  await safeExec(client, 'idx_healing_confidence_lookup',
+    `CREATE INDEX IF NOT EXISTS idx_healing_confidence_lookup
+       ON healing_confidence_scores(element_id, COALESCE(company_id, 0), COALESCE(project_id, 0))`);
 
   // ── Migrations (Migration Assistant: bulk re-point scripts between crawls) ──
   // A migration captures an old → new crawl snapshot pair, the element mapping
@@ -4518,6 +4592,266 @@ export interface ProfileChangeRecord {
   detail: string | null;
   severity: string;
   created_at: string;
+}
+
+/* ──────────────────────────────────────────────────────────────────────────
+ *  Healing Outcomes Learning Loop (Sprint B)
+ *
+ *  Records what happened AFTER a heal was applied so the engine can learn which
+ *  selectors/strategies actually work for a given element, and rank future fix
+ *  suggestions by that learned confidence.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+/** One immutable row per applied heal + its re-run result. */
+export interface HealingOutcomeRecord {
+  id: number;
+  company_id: number | null;
+  project_id: number | null;
+  /** Optional link back to the profile_changes diff that produced the fix. */
+  profile_change_id: number | null;
+  base_url: string | null;
+  /** Canonical element identity (e.g. canonicalised locator) the heal targeted. */
+  element_id: string;
+  locator_type: string | null;
+  original_selector: string | null;
+  healed_selector: string | null;
+  /** Healing strategy used (profile-diff, maintenance-pattern, data-testid, …). */
+  strategy: string | null;
+  suggested_confidence: string | number | null;
+  /** 'pass' | 'fail' | 'timeout' | 'error'. */
+  result: string;
+  test_name: string | null;
+  error_message: string | null;
+  duration_ms: number | null;
+  created_at: string;
+}
+
+/** Learned per-element aggregate (exponentially-smoothed success score 0–100). */
+export interface HealingConfidenceScoreRecord {
+  id: number;
+  company_id: number | null;
+  project_id: number | null;
+  element_id: string;
+  locator_type: string;
+  confidence: string | number;
+  success_count: number;
+  failure_count: number;
+  total_count: number;
+  last_result: string | null;
+  last_strategy: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+/**
+ * Persist a single healing outcome (best-effort event log). Returns the new row
+ * id, or null if the write failed — callers MUST treat a null/throw as
+ * non-fatal so logging an outcome can never break a heal or a test run.
+ */
+export async function insertHealingOutcome(data: {
+  companyId?: number | null;
+  projectId?: number | null;
+  profileChangeId?: number | null;
+  baseUrl?: string | null;
+  elementId: string;
+  locatorType?: string | null;
+  originalSelector?: string | null;
+  healedSelector?: string | null;
+  strategy?: string | null;
+  suggestedConfidence?: number | null;
+  result: string;
+  testName?: string | null;
+  errorMessage?: string | null;
+  durationMs?: number | null;
+}): Promise<number | null> {
+  const result = await getPool().query(
+    `INSERT INTO healing_outcomes
+       (company_id, project_id, profile_change_id, base_url, element_id, locator_type,
+        original_selector, healed_selector, strategy, suggested_confidence, result,
+        test_name, error_message, duration_ms)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+     RETURNING id`,
+    [
+      data.companyId ?? null, data.projectId ?? null, data.profileChangeId ?? null,
+      data.baseUrl ?? null, data.elementId, data.locatorType ?? null,
+      data.originalSelector ?? null, data.healedSelector ?? null, data.strategy ?? null,
+      data.suggestedConfidence ?? null, data.result, data.testName ?? null,
+      data.errorMessage ?? null, data.durationMs ?? null,
+    ],
+  );
+  return result.rows[0]?.id ?? null;
+}
+
+/** Fetch healing outcomes for a scope (newest first). Strictly tenant-scoped. */
+export async function getHealingOutcomes(opts: {
+  companyId?: number | null;
+  projectId?: number | null;
+  elementId?: string;
+  result?: string;
+  strategy?: string;
+  limit?: number;
+}): Promise<HealingOutcomeRecord[]> {
+  const conditions: string[] = [];
+  const params: any[] = [];
+  if (opts.companyId != null) { conditions.push(`COALESCE(company_id, 0) = COALESCE($${params.length + 1}, 0)`); params.push(opts.companyId); }
+  if (opts.projectId != null) { conditions.push(`COALESCE(project_id, 0) = COALESCE($${params.length + 1}, 0)`); params.push(opts.projectId); }
+  if (opts.elementId) { conditions.push(`element_id = $${params.length + 1}`); params.push(opts.elementId); }
+  if (opts.result) { conditions.push(`result = $${params.length + 1}`); params.push(opts.result); }
+  if (opts.strategy) { conditions.push(`strategy = $${params.length + 1}`); params.push(opts.strategy); }
+  const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+  const limit = Math.min(opts.limit ?? 200, 2000);
+  const result = await getPool().query(
+    `SELECT * FROM healing_outcomes ${where} ORDER BY created_at DESC, id DESC LIMIT ${limit}`,
+    params,
+  );
+  return result.rows;
+}
+
+/**
+ * Read the learned confidence row for one element. When `locatorType` is
+ * omitted we match the default ('') bucket. Scoped by company + project so a
+ * score learned in one tenant never leaks into another.
+ */
+export async function getHealingConfidenceScore(
+  elementId: string,
+  companyId?: number | null,
+  projectId?: number | null,
+  locatorType?: string | null,
+): Promise<HealingConfidenceScoreRecord | null> {
+  const result = await getPool().query(
+    `SELECT * FROM healing_confidence_scores
+      WHERE element_id = $1
+        AND COALESCE(company_id, 0) = COALESCE($2, 0)
+        AND COALESCE(project_id, 0) = COALESCE($3, 0)
+        AND locator_type = $4
+      LIMIT 1`,
+    [elementId, companyId ?? null, projectId ?? null, locatorType ?? ''],
+  );
+  return result.rows[0] ?? null;
+}
+
+/** List all learned confidence rows for a scope (most-confident first). */
+export async function getHealingConfidenceScores(opts: {
+  companyId?: number | null;
+  projectId?: number | null;
+  limit?: number;
+}): Promise<HealingConfidenceScoreRecord[]> {
+  const conditions: string[] = [];
+  const params: any[] = [];
+  if (opts.companyId != null) { conditions.push(`COALESCE(company_id, 0) = COALESCE($${params.length + 1}, 0)`); params.push(opts.companyId); }
+  if (opts.projectId != null) { conditions.push(`COALESCE(project_id, 0) = COALESCE($${params.length + 1}, 0)`); params.push(opts.projectId); }
+  const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+  const limit = Math.min(opts.limit ?? 500, 2000);
+  const result = await getPool().query(
+    `SELECT * FROM healing_confidence_scores ${where}
+      ORDER BY confidence DESC, total_count DESC LIMIT ${limit}`,
+    params,
+  );
+  return result.rows;
+}
+
+/**
+ * UPSERT the learned confidence aggregate for one element. The caller computes
+ * the new smoothed `confidence` (see HealingOutcomeService.calculateConfidenceUpdate);
+ * here we persist it and atomically bump the success/failure/total counters.
+ * Keyed on the same (company, project, element, locator_type) expression as the
+ * unique index so concurrent heals upsert the same row instead of duplicating.
+ */
+export async function upsertHealingConfidenceScore(data: {
+  companyId?: number | null;
+  projectId?: number | null;
+  elementId: string;
+  locatorType?: string | null;
+  confidence: number;
+  success: boolean;
+  lastResult?: string | null;
+  lastStrategy?: string | null;
+}): Promise<HealingConfidenceScoreRecord | null> {
+  const succ = data.success ? 1 : 0;
+  const fail = data.success ? 0 : 1;
+  const result = await getPool().query(
+    `INSERT INTO healing_confidence_scores
+       (company_id, project_id, element_id, locator_type, confidence,
+        success_count, failure_count, total_count, last_result, last_strategy)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,1,$8,$9)
+     ON CONFLICT (COALESCE(company_id, 0), COALESCE(project_id, 0), element_id, locator_type)
+     DO UPDATE SET
+       confidence = EXCLUDED.confidence,
+       success_count = healing_confidence_scores.success_count + ${succ},
+       failure_count = healing_confidence_scores.failure_count + ${fail},
+       total_count = healing_confidence_scores.total_count + 1,
+       last_result = EXCLUDED.last_result,
+       last_strategy = EXCLUDED.last_strategy,
+       updated_at = NOW()
+     RETURNING *`,
+    [
+      data.companyId ?? null, data.projectId ?? null, data.elementId,
+      data.locatorType ?? '', data.confidence, succ, fail,
+      data.lastResult ?? null, data.lastStrategy ?? null,
+    ],
+  );
+  return result.rows[0] ?? null;
+}
+
+/**
+ * Aggregate learning stats for a scope: total outcomes, overall success rate,
+ * number of elements with learned scores, mean confidence and a per-strategy
+ * breakdown. Powers the GET /healing/learning-stats endpoint and dashboard.
+ */
+export async function getHealingLearningStats(
+  companyId?: number | null,
+  projectId?: number | null,
+): Promise<{
+  totalOutcomes: number;
+  successes: number;
+  failures: number;
+  successRate: number;
+  elementsTracked: number;
+  avgConfidence: number;
+  byStrategy: Array<{ strategy: string; total: number; successes: number; successRate: number }>;
+}> {
+  const scope = `COALESCE(company_id, 0) = COALESCE($1, 0) AND COALESCE(project_id, 0) = COALESCE($2, 0)`;
+  const params = [companyId ?? null, projectId ?? null];
+
+  const totals = await getPool().query(
+    `SELECT
+       COUNT(*)::int AS total,
+       COALESCE(SUM(CASE WHEN result = 'pass' THEN 1 ELSE 0 END), 0)::int AS successes
+     FROM healing_outcomes WHERE ${scope}`,
+    params,
+  );
+  const conf = await getPool().query(
+    `SELECT COUNT(*)::int AS elements, COALESCE(ROUND(AVG(confidence), 1), 0) AS avg_confidence
+     FROM healing_confidence_scores WHERE ${scope}`,
+    params,
+  );
+  const byStrategy = await getPool().query(
+    `SELECT
+       COALESCE(strategy, 'unknown') AS strategy,
+       COUNT(*)::int AS total,
+       COALESCE(SUM(CASE WHEN result = 'pass' THEN 1 ELSE 0 END), 0)::int AS successes
+     FROM healing_outcomes WHERE ${scope}
+     GROUP BY COALESCE(strategy, 'unknown')
+     ORDER BY total DESC`,
+    params,
+  );
+
+  const total = totals.rows[0]?.total ?? 0;
+  const successes = totals.rows[0]?.successes ?? 0;
+  return {
+    totalOutcomes: total,
+    successes,
+    failures: total - successes,
+    successRate: total > 0 ? Math.round((successes / total) * 1000) / 10 : 0,
+    elementsTracked: conf.rows[0]?.elements ?? 0,
+    avgConfidence: Number(conf.rows[0]?.avg_confidence ?? 0),
+    byStrategy: (byStrategy.rows || []).map((r: any) => ({
+      strategy: r.strategy,
+      total: r.total,
+      successes: r.successes,
+      successRate: r.total > 0 ? Math.round((r.successes / r.total) * 1000) / 10 : 0,
+    })),
+  };
 }
 
 /**
