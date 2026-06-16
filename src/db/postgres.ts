@@ -142,6 +142,9 @@ const REQUIRED_TABLES = [
   // Healing Outcomes Learning Loop (Sprint B): per-heal outcomes + per-element
   // success-rate confidence aggregates that improve fix ranking over time.
   'healing_outcomes', 'healing_confidence_scores',
+  // Healing verification jobs (Sprint B Phase 1): tracks asynchronous "rerun the
+  // test to verify the heal" jobs whose pass/fail result feeds the learning loop.
+  'healing_verification_jobs',
   // Intelligence Learning System (cross-system learning flywheel)
   'selector_stability', 'intelligence_insights',
   // Observable metrics (investor-grade KPIs) + Loop 2 (failures → crawl intelligence) + privacy
@@ -1878,6 +1881,51 @@ async function migrateDefaultCompany(client: PoolClient): Promise<void> {
   await safeExec(client, 'idx_healing_confidence_lookup',
     `CREATE INDEX IF NOT EXISTS idx_healing_confidence_lookup
        ON healing_confidence_scores(element_id, COALESCE(company_id, 0), COALESCE(project_id, 0))`);
+
+  // `healing_verification_jobs` (Sprint B Phase 1 — Runner Integration).
+  //
+  // Closing the learning loop requires the test to be RE-RUN after a heal is
+  // applied, and the pass/fail result captured. For the in-process healing
+  // worker the rerun is synchronous, so no job row is needed. But for the
+  // ASYNCHRONOUS path — e.g. a heal committed to a GitHub PR whose verification
+  // run happens later in CI — we persist a job row so the eventual result can be
+  // matched back to the applied fix and folded into the confidence score. Fully
+  // additive; the synchronous worker simply doesn't use it.
+  console.log('🔧 [DB] Migration: healing_verification_jobs table...');
+  await safeExec(client, 'healing_verification_jobs', `CREATE TABLE IF NOT EXISTS healing_verification_jobs (
+    id SERIAL PRIMARY KEY,
+    job_id TEXT UNIQUE NOT NULL,
+    company_id INTEGER,
+    project_id INTEGER,
+    test_id INTEGER,
+    test_name TEXT,
+    healing_session_id TEXT,
+    base_url TEXT,
+    element_id TEXT,
+    locator_type TEXT,
+    original_selector TEXT,
+    healed_selector TEXT,
+    strategy TEXT,
+    suggested_confidence DECIMAL(5,2),
+    profile_change_id INTEGER REFERENCES profile_changes(id) ON DELETE SET NULL,
+    status TEXT NOT NULL DEFAULT 'queued',
+    result TEXT,
+    error_message TEXT,
+    duration_ms INTEGER,
+    outcome_id INTEGER,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    started_at TIMESTAMPTZ,
+    completed_at TIMESTAMPTZ
+  )`);
+  await safeExec(client, 'idx_healing_verification_scope',
+    `CREATE INDEX IF NOT EXISTS idx_healing_verification_scope
+       ON healing_verification_jobs(COALESCE(company_id, 0), COALESCE(project_id, 0), created_at DESC)`);
+  await safeExec(client, 'idx_healing_verification_status',
+    `CREATE INDEX IF NOT EXISTS idx_healing_verification_status
+       ON healing_verification_jobs(status)`);
+  await safeExec(client, 'idx_healing_verification_session',
+    `CREATE INDEX IF NOT EXISTS idx_healing_verification_session
+       ON healing_verification_jobs(healing_session_id)`);
 
   // ── Migrations (Migration Assistant: bulk re-point scripts between crawls) ──
   // A migration captures an old → new crawl snapshot pair, the element mapping
@@ -4852,6 +4900,131 @@ export async function getHealingLearningStats(
       successRate: r.total > 0 ? Math.round((r.successes / r.total) * 1000) / 10 : 0,
     })),
   };
+}
+
+/* ──────────────────────────────────────────────────────────────────────────
+ *  Healing Verification Jobs (Sprint B Phase 1 — Runner Integration)
+ *
+ *  Tracks an asynchronous "rerun the test to verify a heal" job so its eventual
+ *  pass/fail result can be matched back to the applied fix and folded into the
+ *  learning loop. The synchronous in-process worker does NOT need these rows
+ *  (it reruns inline); they exist for the async/external path (e.g. a heal in a
+ *  GitHub PR verified later by CI reporting the result back).
+ * ────────────────────────────────────────────────────────────────────────── */
+
+export type HealingVerificationStatus = 'queued' | 'running' | 'completed' | 'failed';
+
+export interface HealingVerificationJobRecord {
+  id: number;
+  job_id: string;
+  company_id: number | null;
+  project_id: number | null;
+  test_id: number | null;
+  test_name: string | null;
+  healing_session_id: string | null;
+  base_url: string | null;
+  element_id: string | null;
+  locator_type: string | null;
+  original_selector: string | null;
+  healed_selector: string | null;
+  strategy: string | null;
+  suggested_confidence: string | number | null;
+  profile_change_id: number | null;
+  status: HealingVerificationStatus | string;
+  result: string | null;
+  error_message: string | null;
+  duration_ms: number | null;
+  outcome_id: number | null;
+  created_at: string;
+  started_at: string | null;
+  completed_at: string | null;
+}
+
+/** Create a queued verification job. Best-effort; throws only on a real DB error. */
+export async function createVerificationJob(data: {
+  jobId: string;
+  companyId?: number | null;
+  projectId?: number | null;
+  testId?: number | null;
+  testName?: string | null;
+  healingSessionId?: string | null;
+  baseUrl?: string | null;
+  elementId?: string | null;
+  locatorType?: string | null;
+  originalSelector?: string | null;
+  healedSelector?: string | null;
+  strategy?: string | null;
+  suggestedConfidence?: number | null;
+  profileChangeId?: number | null;
+}): Promise<HealingVerificationJobRecord | null> {
+  const result = await getPool().query(
+    `INSERT INTO healing_verification_jobs
+       (job_id, company_id, project_id, test_id, test_name, healing_session_id, base_url,
+        element_id, locator_type, original_selector, healed_selector, strategy,
+        suggested_confidence, profile_change_id, status)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'queued')
+     RETURNING *`,
+    [
+      data.jobId, data.companyId ?? null, data.projectId ?? null, data.testId ?? null,
+      data.testName ?? null, data.healingSessionId ?? null, data.baseUrl ?? null,
+      data.elementId ?? null, data.locatorType ?? null, data.originalSelector ?? null,
+      data.healedSelector ?? null, data.strategy ?? null, data.suggestedConfidence ?? null,
+      data.profileChangeId ?? null,
+    ],
+  );
+  return result.rows[0] ?? null;
+}
+
+/** Fetch a verification job by its public job_id, scoped when ids are provided. */
+export async function getVerificationJob(
+  jobId: string,
+  companyId?: number | null,
+  projectId?: number | null,
+): Promise<HealingVerificationJobRecord | null> {
+  const conditions = ['job_id = $1'];
+  const params: any[] = [jobId];
+  if (companyId != null) { conditions.push(`COALESCE(company_id, 0) = COALESCE($${params.length + 1}, 0)`); params.push(companyId); }
+  if (projectId != null) { conditions.push(`COALESCE(project_id, 0) = COALESCE($${params.length + 1}, 0)`); params.push(projectId); }
+  const result = await getPool().query(
+    `SELECT * FROM healing_verification_jobs WHERE ${conditions.join(' AND ')} LIMIT 1`,
+    params,
+  );
+  return result.rows[0] ?? null;
+}
+
+/**
+ * Transition a verification job's status and (when completing) record its
+ * result, the captured outcome id, error and duration. Sets started_at when
+ * moving to 'running' and completed_at when 'completed'/'failed'.
+ */
+export async function updateVerificationJob(
+  jobId: string,
+  patch: {
+    status?: HealingVerificationStatus | string;
+    result?: string | null;
+    errorMessage?: string | null;
+    durationMs?: number | null;
+    outcomeId?: number | null;
+  },
+): Promise<HealingVerificationJobRecord | null> {
+  const sets: string[] = [];
+  const params: any[] = [];
+  if (patch.status !== undefined) {
+    sets.push(`status = $${params.length + 1}`); params.push(patch.status);
+    if (patch.status === 'running') sets.push(`started_at = COALESCE(started_at, NOW())`);
+    if (patch.status === 'completed' || patch.status === 'failed') sets.push(`completed_at = NOW()`);
+  }
+  if (patch.result !== undefined) { sets.push(`result = $${params.length + 1}`); params.push(patch.result); }
+  if (patch.errorMessage !== undefined) { sets.push(`error_message = $${params.length + 1}`); params.push(patch.errorMessage); }
+  if (patch.durationMs !== undefined) { sets.push(`duration_ms = $${params.length + 1}`); params.push(patch.durationMs); }
+  if (patch.outcomeId !== undefined) { sets.push(`outcome_id = $${params.length + 1}`); params.push(patch.outcomeId); }
+  if (sets.length === 0) return getVerificationJob(jobId);
+  params.push(jobId);
+  const result = await getPool().query(
+    `UPDATE healing_verification_jobs SET ${sets.join(', ')} WHERE job_id = $${params.length} RETURNING *`,
+    params,
+  );
+  return result.rows[0] ?? null;
 }
 
 /**
