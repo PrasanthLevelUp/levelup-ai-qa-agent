@@ -392,7 +392,7 @@ export class HealingOrchestrator {
       const outcome = await this.healFallbackChain(failure, attemptedStrategies, scope, repoCtx);
       // Enrich with stability scores
       if (outcome.suggestion) {
-        await this.enrichWithStability(outcome.suggestion, domMemoryInsight);
+        await this.enrichWithStability(outcome.suggestion, domMemoryInsight, scope.projectId);
         this.applyRepositoryConfidenceBoost(outcome.suggestion, repoCtx, domMemoryInsight);
       }
       outcome.domMemoryInsight = domMemoryInsight;
@@ -438,7 +438,7 @@ export class HealingOrchestrator {
     suggestion.confidence = confidenceResult.finalScore;
 
     // ── Enrich with DOM Memory stability data ──
-    await this.enrichWithStability(suggestion, domMemoryInsight);
+    await this.enrichWithStability(suggestion, domMemoryInsight, scope.projectId);
 
     // ── Repository-aware confidence boost (Sprint 2.3) ──
     // No-op when the feature is OFF (repoCtx is empty / has no evidence).
@@ -604,6 +604,7 @@ export class HealingOrchestrator {
   private async enrichWithStability(
     suggestion: HealingSuggestion,
     domMemoryInsight?: DOMMemoryInsight,
+    projectId?: number | null,
   ): Promise<void> {
     try {
       // Check if the proposed locator matches any DOM Memory alternative
@@ -635,8 +636,11 @@ export class HealingOrchestrator {
         }
       }
 
-      // If no match in DOM Memory alternatives, do a direct lookup
-      const history = await this.domMemory.getSelectorHistory(suggestion.newLocator);
+      // If no match in DOM Memory alternatives, do a direct lookup.
+      // SECURITY (multi-tenant isolation): scope DOM Memory history to the
+      // caller's project so one project never inherits another's selector
+      // stability signal.
+      const history = await this.domMemory.getSelectorHistory(suggestion.newLocator, projectId ?? undefined);
       if (history.observations > 0) {
         suggestion.stabilityScore = history.stabilityScore;
         suggestion.stabilityAssessment = history.observations > 0

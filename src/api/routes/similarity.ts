@@ -39,7 +39,8 @@ export function createSimilarityRouter(): Router {
   router.get('/stats', async (req: Request, res: Response) => {
     try {
       const cid = (req as any).companyId;
-      const stats = await getSimilarityStats(cid);
+      const pid = (req as any).projectId;
+      const stats = await getSimilarityStats(cid, pid);
       res.json(stats);
     } catch (err) {
       logger.error(MOD, 'Failed to get similarity stats', { error: err });
@@ -54,7 +55,8 @@ export function createSimilarityRouter(): Router {
   router.get('/distribution', async (req: Request, res: Response) => {
     try {
       const cid = (req as any).companyId;
-      const distribution = await getConfidenceDistribution(cid);
+      const pid = (req as any).projectId;
+      const distribution = await getConfidenceDistribution(cid, pid);
       res.json(distribution);
     } catch (err) {
       logger.error(MOD, 'Failed to get confidence distribution', { error: err });
@@ -69,8 +71,9 @@ export function createSimilarityRouter(): Router {
   router.get('/trend', async (req: Request, res: Response) => {
     try {
       const cid = (req as any).companyId;
+      const pid = (req as any).projectId;
       const days = parseInt(req.query.days as string, 10) || 30;
-      const trend = await getSimilarityTrend(days, cid);
+      const trend = await getSimilarityTrend(days, cid, pid);
       res.json(trend);
     } catch (err) {
       logger.error(MOD, 'Failed to get similarity trend', { error: err });
@@ -85,8 +88,9 @@ export function createSimilarityRouter(): Router {
   router.get('/top-matches', async (req: Request, res: Response) => {
     try {
       const cid = (req as any).companyId;
+      const pid = (req as any).projectId;
       const limit = parseInt(req.query.limit as string, 10) || 20;
-      const matches = await getTopSimilarityMatches(limit, cid);
+      const matches = await getTopSimilarityMatches(limit, cid, pid);
       res.json(matches);
     } catch (err) {
       logger.error(MOD, 'Failed to get top matches', { error: err });
@@ -101,8 +105,9 @@ export function createSimilarityRouter(): Router {
   router.get('/pairs', async (req: Request, res: Response) => {
     try {
       const cid = (req as any).companyId;
+      const pid = (req as any).projectId;
       const limit = parseInt(req.query.limit as string, 10) || 20;
-      const pairs = await getLocatorPairAnalysis(limit, cid);
+      const pairs = await getLocatorPairAnalysis(limit, cid, pid);
       res.json(pairs);
     } catch (err) {
       logger.error(MOD, 'Failed to get locator pairs', { error: err });
@@ -117,7 +122,8 @@ export function createSimilarityRouter(): Router {
   router.get('/locator-types', async (req: Request, res: Response) => {
     try {
       const cid = (req as any).companyId;
-      const stats = await getSemanticGroupStats(cid);
+      const pid = (req as any).projectId;
+      const stats = await getSemanticGroupStats(cid, pid);
       res.json(stats);
     } catch (err) {
       logger.error(MOD, 'Failed to get locator type stats', { error: err });

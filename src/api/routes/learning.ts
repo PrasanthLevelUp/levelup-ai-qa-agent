@@ -22,8 +22,12 @@ export function createLearningRouter(): Router {
 
   router.get('/stats', async (req: Request, res: Response) => {
     try {
+      // SECURITY (multi-tenant isolation): scope every learning query by BOTH
+      // company_id AND project_id. projectId is populated by
+      // projectContextMiddleware (see api/server.ts mount).
       const cid = (req as any).companyId;
-      const stats = await getLearningStats(cid);
+      const pid = (req as any).projectId;
+      const stats = await getLearningStats(cid, pid);
       res.json({ success: true, data: stats });
     } catch (err: any) {
       console.error('[Learning] stats error:', err);
@@ -34,8 +38,9 @@ export function createLearningRouter(): Router {
   router.get('/patterns', async (req: Request, res: Response) => {
     try {
       const cid = (req as any).companyId;
+      const pid = (req as any).projectId;
       const limit = parseInt(String(req.query.limit || '100')) || 100;
-      const patterns = await getPatternsList(limit, cid);
+      const patterns = await getPatternsList(limit, cid, pid);
       res.json({ success: true, data: patterns, count: patterns.length });
     } catch (err: any) {
       console.error('[Learning] patterns error:', err);
@@ -46,8 +51,9 @@ export function createLearningRouter(): Router {
   router.get('/top', async (req: Request, res: Response) => {
     try {
       const cid = (req as any).companyId;
+      const pid = (req as any).projectId;
       const limit = parseInt(String(req.query.limit || '10')) || 10;
-      const top = await getTopPatterns(limit, cid);
+      const top = await getTopPatterns(limit, cid, pid);
       res.json({ success: true, data: top });
     } catch (err: any) {
       console.error('[Learning] top patterns error:', err);
@@ -58,7 +64,8 @@ export function createLearningRouter(): Router {
   router.get('/strategies', async (req: Request, res: Response) => {
     try {
       const cid = (req as any).companyId;
-      const strategies = await getStrategyEffectiveness(cid);
+      const pid = (req as any).projectId;
+      const strategies = await getStrategyEffectiveness(cid, pid);
       res.json({ success: true, data: strategies });
     } catch (err: any) {
       console.error('[Learning] strategies error:', err);
@@ -69,8 +76,9 @@ export function createLearningRouter(): Router {
   router.get('/velocity', async (req: Request, res: Response) => {
     try {
       const cid = (req as any).companyId;
+      const pid = (req as any).projectId;
       const days = parseInt(String(req.query.days || '30')) || 30;
-      const velocity = await getLearningVelocity(days, cid);
+      const velocity = await getLearningVelocity(days, cid, pid);
       res.json({ success: true, data: velocity });
     } catch (err: any) {
       console.error('[Learning] velocity error:', err);

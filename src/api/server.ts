@@ -217,10 +217,18 @@ export function createServer(): express.Application {
   app.use('/api/script-health', authMiddleware, companyMiddleware, sessionMiddleware, projectContextMiddleware, contextMiddleware, createScriptHealthRouter());
   app.use('/api/migrations', authMiddleware, companyMiddleware, sessionMiddleware, projectContextMiddleware, contextMiddleware, createMigrationsRouter());
   app.use('/api/notifications', authMiddleware, companyMiddleware, sessionMiddleware, createNotificationsRouter());
-  app.use('/api/dom', authMiddleware, companyMiddleware, sessionMiddleware, createDomMemoryRouter());
-  app.use('/api/learning', authMiddleware, companyMiddleware, sessionMiddleware, createLearningRouter());
+  // SECURITY (multi-tenant isolation): projectContextMiddleware populates
+  // (req as any).projectId from the X-Project-Id header so the DOM-memory and
+  // learning analytics queries can scope by BOTH company_id AND project_id.
+  // Without it these dashboards would aggregate across every project in the
+  // company (cross-project intelligence leak).
+  app.use('/api/dom', authMiddleware, companyMiddleware, sessionMiddleware, projectContextMiddleware, contextMiddleware, createDomMemoryRouter());
+  app.use('/api/learning', authMiddleware, companyMiddleware, sessionMiddleware, projectContextMiddleware, contextMiddleware, createLearningRouter());
   app.use('/api/companies', authMiddleware, sessionMiddleware, createCompaniesRouter());
-  app.use('/api/similarity', authMiddleware, companyMiddleware, sessionMiddleware, createSimilarityRouter());
+  // SECURITY (multi-tenant isolation): projectContextMiddleware populates
+  // (req as any).projectId so the similarity engine analytics scope by BOTH
+  // company_id AND project_id instead of leaking across projects.
+  app.use('/api/similarity', authMiddleware, companyMiddleware, sessionMiddleware, projectContextMiddleware, contextMiddleware, createSimilarityRouter());
   app.use('/api/release-risk', authMiddleware, companyMiddleware, sessionMiddleware, projectContextMiddleware, contextMiddleware, createReleaseRiskRouter());
   app.use('/api/release-signoff', authMiddleware, companyMiddleware, sessionMiddleware, projectContextMiddleware, contextMiddleware, createReleaseSignoffRouter());
   app.use('/api/rca-intelligence', authMiddleware, companyMiddleware, sessionMiddleware, createRCAIntelligenceRouter());

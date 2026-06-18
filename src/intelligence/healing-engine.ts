@@ -148,7 +148,7 @@ export class SelectorHealingEngine {
       };
     }
 
-    const status = await this.profileService.getProfileStatus(baseUrl, companyId);
+    const status = await this.profileService.getProfileStatus(baseUrl, companyId, projectId);
     if (!status.profile || status.status === 'not_exists') {
       return {
         originalSelector: selector,
@@ -181,7 +181,7 @@ export class SelectorHealingEngine {
       url: baseUrl,
     });
 
-    const alternatives = await this.findAlternatives(selector, crawlData, companyId);
+    const alternatives = await this.findAlternatives(selector, crawlData, companyId, projectId);
 
     return {
       originalSelector: selector,
@@ -368,6 +368,7 @@ export class SelectorHealingEngine {
     selector: string,
     crawlData: any,
     companyId?: number,
+    projectId?: number,
   ): Promise<SelectorAlternative[]> {
     const alternatives: SelectorAlternative[] = [];
 
@@ -434,7 +435,11 @@ export class SelectorHealingEngine {
 
     // Strategy 5: Check pattern database
     if (context.elementType) {
-      const patterns = await findMatchingPatterns(context.elementType, companyId);
+      // SECURITY (multi-tenant isolation): pattern reuse MUST be scoped to the
+      // caller's project, not just the company. Passing companyId alone let one
+      // project read another project's learned selector patterns (the exact
+      // cross-project contamination reported in the product audit).
+      const patterns = await findMatchingPatterns(context.elementType, companyId, projectId);
       for (const pattern of patterns.slice(0, 3)) {
         const patternSelectors = typeof pattern.selectors === 'string'
           ? JSON.parse(pattern.selectors) : pattern.selectors;

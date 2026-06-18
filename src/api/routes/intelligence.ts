@@ -353,7 +353,7 @@ export function createIntelligenceRouter(): Router {
       const id = String(req.params.id);
       const b = req.body || {};
 
-      const profile = await getProfileById(id);
+      const profile = await getProfileById(id, companyId); // SECURITY: tenant-scope (IDOR guard)
       if (!profile) return res.status(404).json({ success: false, error: 'Profile not found' });
 
       const username = String(b.username || b.email || '').trim();
@@ -408,7 +408,7 @@ export function createIntelligenceRouter(): Router {
       const id = String(req.params.id);
       const b = req.body || {};
 
-      const profile = await getProfileById(id);
+      const profile = await getProfileById(id, companyId, projectId); // SECURITY: tenant-scope (IDOR guard)
       if (!profile) return res.status(404).json({ success: false, error: 'Profile not found' });
 
       const baseUrl = profile.base_url;
@@ -508,7 +508,7 @@ export function createIntelligenceRouter(): Router {
     try {
       const companyId = (req as any).companyId;
       const projectId = (req as any).projectId as number | undefined;
-      const profile = await getProfileById(String(req.params.id));
+      const profile = await getProfileById(String(req.params.id), companyId, projectId); // SECURITY: tenant-scope (IDOR guard)
       if (!profile) return res.status(404).json({ success: false, error: 'Profile not found' });
 
       const snaps = await getLatestSnapshots(profile.base_url, companyId, projectId ?? profile.project_id ?? undefined, 1);
@@ -542,7 +542,7 @@ export function createIntelligenceRouter(): Router {
     try {
       const companyId = (req as any).companyId;
       const projectId = (req as any).projectId as number | undefined;
-      const profile = await getProfileById(String(req.params.id));
+      const profile = await getProfileById(String(req.params.id), companyId, projectId); // SECURITY: tenant-scope (IDOR guard)
       if (!profile) return res.status(404).json({ success: false, error: 'Profile not found' });
 
       const versions = await getProfileVersions(profile.id, companyId, projectId ?? profile.project_id ?? undefined);
@@ -575,7 +575,7 @@ export function createIntelligenceRouter(): Router {
     try {
       const companyId = (req as any).companyId;
       const projectId = (req as any).projectId as number | undefined;
-      const profile = await getProfileById(String(req.params.id));
+      const profile = await getProfileById(String(req.params.id), companyId, projectId); // SECURITY: tenant-scope (IDOR guard)
       if (!profile) return res.status(404).json({ success: false, error: 'Profile not found' });
 
       const versionTo = req.query.versionTo ? Number(req.query.versionTo) : undefined;

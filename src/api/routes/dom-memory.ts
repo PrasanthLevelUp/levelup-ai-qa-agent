@@ -25,8 +25,12 @@ export function createDomMemoryRouter(): Router {
   /* ── Stats ──────────────────────────────────────────────────── */
   router.get('/stats', async (req: Request, res: Response) => {
     try {
+      // SECURITY (multi-tenant isolation): scope every DOM-memory query by BOTH
+      // company_id AND project_id. projectId is populated by
+      // projectContextMiddleware (see api/server.ts mount).
       const cid = (req as any).companyId;
-      const stats = await getDomMemoryStats(cid);
+      const pid = (req as any).projectId;
+      const stats = await getDomMemoryStats(cid, pid);
       res.json({ success: true, data: stats });
     } catch (err: any) {
       console.error('[DOM] stats error:', err);
@@ -38,8 +42,9 @@ export function createDomMemoryRouter(): Router {
   router.get('/snapshots', async (req: Request, res: Response) => {
     try {
       const cid = (req as any).companyId;
+      const pid = (req as any).projectId;
       const limit = parseInt(String(req.query.limit || '50')) || 50;
-      const snapshots = await getDomSnapshots(limit, cid);
+      const snapshots = await getDomSnapshots(limit, cid, pid);
       res.json({ success: true, data: snapshots, count: snapshots.length });
     } catch (err: any) {
       console.error('[DOM] snapshots error:', err);
@@ -51,8 +56,9 @@ export function createDomMemoryRouter(): Router {
   router.get('/selectors', async (req: Request, res: Response) => {
     try {
       const cid = (req as any).companyId;
+      const pid = (req as any).projectId;
       const limit = parseInt(String(req.query.limit || '100')) || 100;
-      const selectors = await getSelectorHealth(limit, cid);
+      const selectors = await getSelectorHealth(limit, cid, pid);
       res.json({ success: true, data: selectors, count: selectors.length });
     } catch (err: any) {
       console.error('[DOM] selectors error:', err);
@@ -64,7 +70,8 @@ export function createDomMemoryRouter(): Router {
   router.get('/selectors/distribution', async (req: Request, res: Response) => {
     try {
       const cid = (req as any).companyId;
-      const distribution = await getSelectorScoreDistribution(cid);
+      const pid = (req as any).projectId;
+      const distribution = await getSelectorScoreDistribution(cid, pid);
       res.json({ success: true, data: distribution });
     } catch (err: any) {
       console.error('[DOM] selector distribution error:', err);
@@ -76,8 +83,9 @@ export function createDomMemoryRouter(): Router {
   router.get('/locators', async (req: Request, res: Response) => {
     try {
       const cid = (req as any).companyId;
+      const pid = (req as any).projectId;
       const limit = parseInt(String(req.query.limit || '50')) || 50;
-      const locators = await getLocatorEvolution(limit, cid);
+      const locators = await getLocatorEvolution(limit, cid, pid);
       res.json({ success: true, data: locators, count: locators.length });
     } catch (err: any) {
       console.error('[DOM] locators error:', err);
@@ -89,8 +97,9 @@ export function createDomMemoryRouter(): Router {
   router.get('/trend', async (req: Request, res: Response) => {
     try {
       const cid = (req as any).companyId;
+      const pid = (req as any).projectId;
       const days = parseInt(String(req.query.days || '30')) || 30;
-      const trend = await getPageElementTrend(days, cid);
+      const trend = await getPageElementTrend(days, cid, pid);
       res.json({ success: true, data: trend });
     } catch (err: any) {
       console.error('[DOM] trend error:', err);
