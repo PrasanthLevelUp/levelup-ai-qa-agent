@@ -444,6 +444,14 @@ export function createIntelligenceRouter(): Router {
             { authConfig },
             projectId ?? profile.project_id ?? undefined,
           );
+          // Self-heal: explicitly clear the ORIGINAL row's 'crawling' status.
+          // saveDeepCrawlResult upserts on the normalized base_url; for profiles
+          // created after the normalization fix this is the SAME row (already set
+          // to 'fresh'), so this is a harmless idempotent confirm. For LEGACY rows
+          // whose stored base_url was never normalized, the upsert may land on a
+          // different row — without this line the original row would stay stuck in
+          // 'crawling' forever (the exact bug we are fixing).
+          await updateProfileStatus(id, 'fresh').catch(() => {});
           const totalElements = result.pages.reduce((s, p) => s + p.elements.length, 0);
           appendCrawlLog(id, `Saved crawl: ${result.pages.length} page(s), ${totalElements} elements`);
           finishCrawlLog(id, 'success');

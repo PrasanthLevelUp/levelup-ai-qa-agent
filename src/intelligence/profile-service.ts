@@ -9,6 +9,7 @@
 
 import * as crypto from 'crypto';
 import { logger } from '../utils/logger';
+import { normalizeBaseUrl } from '../utils/url-normalize';
 import {
   getProfileByUrl,
   getProfileById,
@@ -331,18 +332,9 @@ export class ProfileService {
   /* ── Helpers ──────────────────────────────────────────────────── */
 
   private normalizeUrl(url: string): string {
-    try {
-      const parsed = new URL(url);
-      // Remove trailing slash, default ports, sort query params
-      let normalized = `${parsed.protocol}//${parsed.hostname}`;
-      if (parsed.port && parsed.port !== '80' && parsed.port !== '443') {
-        normalized += `:${parsed.port}`;
-      }
-      normalized += parsed.pathname.replace(/\/+$/, '') || '/';
-      return normalized.toLowerCase();
-    } catch {
-      return url.toLowerCase().replace(/\/+$/, '');
-    }
+    // Delegate to the shared canonical normalizer so reads (getProfileByUrl,
+    // getProfileStatus) and writes (upsertProfile) always agree on the key.
+    return normalizeBaseUrl(url);
   }
 
   private isExpired(profile: ApplicationProfile): boolean {
