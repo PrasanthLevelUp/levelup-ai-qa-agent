@@ -957,14 +957,39 @@ ${perFileRows}${missingNote}${extraNote}`;
     const updateRows = impact.filesToUpdate.map(f => `| \`${f.path}\` | ${f.reason} |`).join('\n') || '| _(none)_ | |';
     const reuseRows = impact.filesToReuse.map(f => `| \`${f.path}\` | ${f.reason} |`).join('\n') || '| _(none)_ | |';
     
-    const savingsPercent = impact.reuseSavings.codeReductionPercent;
-    const savingsBadge = savingsPercent >= 70 ? '✅ Excellent' : savingsPercent >= 40 ? '✔️ Good' : savingsPercent >= 10 ? 'ℹ️ Fair' : '—';
-    
+    const reuse = impact.reuseOpportunity;
+    const reuseBadge = reuse.level === 'HIGH' ? '✅ HIGH' : reuse.level === 'MEDIUM' ? '✔️ MEDIUM' : reuse.level === 'LOW' ? 'ℹ️ LOW' : '— NONE';
+    const reuseAssetRows = reuse.assetsReused.length
+      ? reuse.assetsReused.map(a => `| ✓ \`${a}\` |`).join('\n')
+      : '| _(none)_ |';
+
     const qualMark = (s: string) => s === 'EXCELLENT' ? '✅' : s === 'GOOD' ? '✔️' : s === 'FAIR' ? 'ℹ️' : '—';
-    
+
+    // Framework Assets Catalog (the future Repository Intelligence overview)
+    const cat = fw.catalog;
+    const lastScanRow = cat.lastRepositoryScan ? `\n**Last Repository Scan:** ${cat.lastRepositoryScan}` : '';
+
+    // Suite recommendation — derived from repository intelligence, not assumptions
+    const existingSuitesStr = impact.existingSuites.length
+      ? impact.existingSuites.map(s => `\`${s}\``).join(', ')
+      : '_(none detected)_';
+    const suiteNote = impact.suggestedSuiteExists ? '' : ' _(suggested — does not exist yet)_';
+
     frameworkSection = `
 
 ### 🏗️ Framework Analysis
+
+**Framework Assets Catalog**
+
+| Asset Type | Count |
+|------------|-------|
+| Page Objects | ${cat.pageObjects} |
+| Fixtures | ${cat.fixtures} |
+| Utilities | ${cat.utilities} |
+| Data Files | ${cat.dataFiles} |
+| Suites | ${cat.suites} |
+| Tags | ${cat.tags} |
+${lastScanRow}
 
 **Generation Quality Report: ${quality.overallAssessment}**
 
@@ -1000,20 +1025,21 @@ ${updateRows}
 |------|--------|
 ${reuseRows}
 
-**Reuse Savings:** ${savingsBadge}
+**Reuse Opportunity:** ${reuseBadge}
 
-| Metric | Value |
-|--------|-------|
-| Without Reuse | ${impact.reuseSavings.withoutReuseLOC} LOC |
-| With Reuse | ${impact.reuseSavings.withReuseLOC} LOC |
-| Code Reduction | ${savingsPercent}% |
+${reuse.summary}
+
+| Asset Reused |
+|--------------|
+${reuseAssetRows}
 
 **Risk Assessment:** ${riskBadge}
 
 ${riskReasons}
 
 **Tags:** ${impact.suggestedTags.join(', ') || '_(none)_'}  
-**Suite:** ${impact.suggestedSuite || '_(none)_'}
+**Existing Suites:** ${existingSuitesStr}  
+**Recommended Suite:** \`${impact.suggestedSuite}\`${suiteNote}
 `;
   }
 

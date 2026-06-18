@@ -80,6 +80,9 @@ export type RiskLevel = 'LOW' | 'MEDIUM' | 'HIGH';
 /** Qualitative assessment of framework reuse */
 export type ReuseLevel = 'HIGH REUSE' | 'MEDIUM REUSE' | 'LOW REUSE' | 'NO REUSE';
 
+/** Qualitative reuse opportunity level (defensible, no fabricated metrics) */
+export type ReuseOpportunityLevel = 'HIGH' | 'MEDIUM' | 'LOW' | 'NONE';
+
 /** Framework Impact Analysis — what will be created/updated/reused */
 export interface FrameworkImpactAnalysis {
   /** Existing assets in the framework */
@@ -92,12 +95,16 @@ export interface FrameworkImpactAnalysis {
   filesToReuse: FileImpact[];
   /** Suggested tags for the generated tests */
   suggestedTags: string[];
-  /** Suggested suite (smoke, sanity, regression, nightly, etc.) */
+  /** Existing suites discovered in the repository (derived, not assumed) */
+  existingSuites: string[];
+  /** Recommended suite — chosen from existingSuites when possible */
   suggestedSuite: string;
+  /** Whether the recommended suite already exists in the repository */
+  suggestedSuiteExists: boolean;
   /** Risk assessment */
   risk: RiskAssessment;
-  /** Reuse savings */
-  reuseSavings: ReuseSavings;
+  /** Reuse opportunity (qualitative — replaces fabricated LOC savings) */
+  reuseOpportunity: ReuseOpportunity;
 }
 
 export interface FileImpact {
@@ -113,11 +120,20 @@ export interface RiskAssessment {
   mitigations: string[];
 }
 
-export interface ReuseSavings {
-  withoutReuseLOC: number;
-  withReuseLOC: number;
-  codeReductionPercent: number;
-  reusedAssets: string[];
+/**
+ * Reuse Opportunity Analysis — qualitative, defensible assessment of how much of
+ * the existing framework can be reused. Intentionally avoids fabricated
+ * "Without Reuse vs With Reuse LOC" numbers that become a trust issue when a
+ * customer asks "how did you calculate that?". Instead we report the concrete
+ * assets that can be reused and a level derived purely from that count.
+ */
+export interface ReuseOpportunity {
+  /** Qualitative level derived from the number of concrete reusable assets */
+  level: ReuseOpportunityLevel;
+  /** Concrete, verifiable assets that can be reused (e.g. LoginPage, BaseFixture) */
+  assetsReused: string[];
+  /** Human-readable summary of the reuse opportunity */
+  summary: string;
 }
 
 /** Generation Quality Report — qualitative assessment of framework compliance */
@@ -136,9 +152,28 @@ export interface ReuseCategoryScore {
   detail: string;
 }
 
+/**
+ * Framework Assets Catalog — a high-level inventory snapshot of the repository's
+ * framework knowledge. This is the foundation of the future Repository
+ * Intelligence screen: Script Generation *consumes* this catalog rather than
+ * rescanning the repo on every generation.
+ */
+export interface FrameworkAssetsCatalog {
+  pageObjects: number;
+  fixtures: number;
+  utilities: number;
+  dataFiles: number;
+  suites: number;
+  tags: number;
+  /** When the underlying repository profile was last scanned, if known */
+  lastRepositoryScan?: string;
+}
+
 /** Complete framework audit result */
 export interface FrameworkAuditResult {
   inventory: FrameworkInventory;
+  /** High-level catalog snapshot (counts + last scan) */
+  catalog: FrameworkAssetsCatalog;
   impactAnalysis: FrameworkImpactAnalysis;
   qualityReport: GenerationQualityReport;
   /** Project isolation context */
@@ -167,29 +202,74 @@ export interface FrameworkAuditResult {
 export async function auditFramework(
   profile: RepositoryProfile,
   generationContext: GenerationContext,
-  scope: { companyId: number; projectId?: number; repositoryId?: number },
+  scope: {
+    companyId: number;
+    projectId?: number;
+    repositoryId?: number;
+    /** When the repository profile was last scanned by Repo Intelligence */
+    lastScannedAt?: Date | string;
+  },
 ): Promise<FrameworkAuditResult> {
-  // 1. Start with the existing repo structure analysis
+  // 1. Start with the existing repo structure analysis. NOTE: this is a pure,
+  //    in-memory read of the *already-scanned* RepositoryProfile produced by
+  //    Repository Intelligence — it does NOT re-scan the repo on every
+  //    generation. Repository Intelligence owns framework knowledge; Script
+  //    Generation only consumes it here.
   const repoAnalysis = analyzeRepoStructure(profile);
 
   // 2. Build deep framework inventory
   const inventory = await buildFrameworkInventory(profile, repoAnalysis, scope);
 
-  // 3. Compute framework impact analysis
+  // 3. Build the high-level Framework Assets Catalog snapshot
+  const catalog = buildAssetsCatalog(inventory, scope.lastScannedAt);
+
+  // 4. Compute framework impact analysis
   const impactAnalysis = computeImpactAnalysis(
     inventory,
     generationContext,
     repoAnalysis,
   );
 
-  // 4. Compute generation quality report
+  // 5. Compute generation quality report
   const qualityReport = computeQualityReport(inventory, impactAnalysis);
 
   return {
     inventory,
+    catalog,
     impactAnalysis,
     qualityReport,
-    scope,
+    scope: {
+      companyId: scope.companyId,
+      projectId: scope.projectId,
+      repositoryId: scope.repositoryId,
+    },
+  };
+}
+
+/**
+ * Build the Framework Assets Catalog — counts of each asset type plus the last
+ * repository scan time. Becomes the Repository Intelligence overview screen.
+ */
+function buildAssetsCatalog(
+  inventory: FrameworkInventory,
+  lastScannedAt?: Date | string,
+): FrameworkAssetsCatalog {
+  let lastRepositoryScan: string | undefined;
+  if (lastScannedAt) {
+    const d = lastScannedAt instanceof Date ? lastScannedAt : new Date(lastScannedAt);
+    if (!Number.isNaN(d.getTime())) {
+      lastRepositoryScan = formatDate(d);
+    }
+  }
+
+  return {
+    pageObjects: inventory.pageObjects.length,
+    fixtures: inventory.fixtures.length,
+    utilities: inventory.utilities.length,
+    dataFiles: inventory.dataFiles.length,
+    suites: inventory.suites.length,
+    tags: inventory.tags.length,
+    lastRepositoryScan,
   };
 }
 
@@ -425,14 +505,18 @@ function computeImpactAnalysis(
   // Suggested tags (based on test case complexity)
   const suggestedTags = suggestTags(context, inventory);
 
-  // Suggested suite
-  const suggestedSuite = suggestSuite(context, suggestedTags);
+  // Suite recommendation — derived from the repository's actual suites/tags,
+  // never a hardcoded assumption.
+  const { existingSuites, suggestedSuite, suggestedSuiteExists } = recommendSuite(
+    inventory,
+    suggestedTags,
+  );
 
   // Risk assessment
   const risk = assessRisk(filesToCreate, filesToUpdate, inventory);
 
-  // Reuse savings
-  const reuseSavings = computeReuseSavings(filesToCreate, filesToReuse);
+  // Reuse opportunity (qualitative — no fabricated LOC)
+  const reuseOpportunity = computeReuseOpportunity(filesToReuse);
 
   return {
     existingAssets,
@@ -440,9 +524,11 @@ function computeImpactAnalysis(
     filesToUpdate,
     filesToReuse,
     suggestedTags,
+    existingSuites,
     suggestedSuite,
+    suggestedSuiteExists,
     risk,
-    reuseSavings,
+    reuseOpportunity,
   };
 }
 
@@ -481,10 +567,86 @@ function suggestTags(context: GenerationContext, inventory: FrameworkInventory):
   }
 }
 
-function suggestSuite(context: GenerationContext, tags: string[]): string {
-  if (tags.includes('@smoke')) return 'smoke';
-  if (tags.includes('@sanity')) return 'sanity';
-  return 'nightly-regression';
+/**
+ * Recommend a suite for the generated tests. The recommendation is *derived*
+ * from the repository's actual suites and tags discovered by Repository
+ * Intelligence — never a hardcoded assumption like "nightly-regression".
+ *
+ * Resolution order:
+ *  1. Collect the real suite names known to the repo (from suite files and
+ *     tags such as @smoke / @regression).
+ *  2. If the suggested tag (e.g. @smoke) maps to an existing suite, recommend it.
+ *  3. Otherwise prefer a conventional existing suite (regression > sanity > smoke).
+ *  4. Only if the repo has no suites at all do we fall back to a clearly-labelled
+ *     suggestion, flagged with suggestedSuiteExists = false.
+ */
+function recommendSuite(
+  inventory: FrameworkInventory,
+  tags: string[],
+): { existingSuites: string[]; suggestedSuite: string; suggestedSuiteExists: boolean } {
+  const existingSuites = collectExistingSuites(inventory);
+
+  const matchExisting = (candidate: string): string | undefined =>
+    existingSuites.find((s) => s.toLowerCase() === candidate.toLowerCase());
+
+  // 1. Tag-driven match against an existing suite (strip leading @).
+  for (const tag of tags) {
+    const bare = tag.replace(/^@/, '').toLowerCase();
+    const matched = matchExisting(bare);
+    if (matched) {
+      return { existingSuites, suggestedSuite: matched, suggestedSuiteExists: true };
+    }
+  }
+
+  // 2. Prefer a conventional existing suite, in priority order.
+  for (const preferred of ['regression', 'sanity', 'smoke']) {
+    const matched = matchExisting(preferred);
+    if (matched) {
+      return { existingSuites, suggestedSuite: matched, suggestedSuiteExists: true };
+    }
+  }
+
+  // 3. Any existing suite is better than an assumption.
+  if (existingSuites.length > 0) {
+    return {
+      existingSuites,
+      suggestedSuite: existingSuites[0],
+      suggestedSuiteExists: true,
+    };
+  }
+
+  // 4. No suites in the repo — derive a sensible suggestion from the tag and
+  //    flag clearly that it does not yet exist.
+  const fallback = tags.includes('@smoke') ? 'smoke' : 'regression';
+  return { existingSuites, suggestedSuite: fallback, suggestedSuiteExists: false };
+}
+
+/**
+ * Collect the distinct, human-meaningful suite names known to the repository:
+ * suite categories/file names plus tag-derived suite names (@smoke → smoke).
+ */
+function collectExistingSuites(inventory: FrameworkInventory): string[] {
+  const suites = new Set<string>();
+
+  for (const suite of inventory.suites) {
+    // Skip pure config files — they're not runnable suites.
+    if (suite.type === 'playwright-project' && /\.config\.[tj]s$/.test(suite.name)) {
+      continue;
+    }
+    if (suite.name) suites.add(suite.name);
+    for (const t of suite.tags ?? []) {
+      const bare = t.replace(/^@/, '').trim();
+      if (bare) suites.add(bare);
+    }
+  }
+
+  // Tags discovered across the framework also represent runnable suites.
+  for (const tag of inventory.tags) {
+    const bare = tag.replace(/^@/, '').trim();
+    if (bare) suites.add(bare);
+  }
+
+  return Array.from(suites);
 }
 
 function assessRisk(
@@ -515,28 +677,30 @@ function assessRisk(
   return { level, reasons, mitigations };
 }
 
-function computeReuseSavings(
-  filesToCreate: FileImpact[],
-  filesToReuse: FileImpact[],
-): ReuseSavings {
-  const withoutReuseLOC = filesToCreate.reduce(
-    (sum, f) => sum + (f.estimatedLOC ?? 0),
-    0,
-  ) + filesToReuse.length * 50; // Assume 50 LOC per reusable asset if we had to recreate it
+/**
+ * Compute a qualitative Reuse Opportunity. Deliberately does NOT estimate
+ * "Without Reuse LOC vs With Reuse LOC" — those numbers are not mathematically
+ * defensible and become a trust issue when a customer asks how they were
+ * calculated. Instead we report the concrete assets that can be reused and a
+ * level derived purely from how many real assets were found.
+ */
+function computeReuseOpportunity(filesToReuse: FileImpact[]): ReuseOpportunity {
+  const assetsReused = filesToReuse.map((f) => f.path.split('/').pop() ?? f.path);
+  const count = assetsReused.length;
 
-  const withReuseLOC = filesToCreate.reduce((sum, f) => sum + (f.estimatedLOC ?? 0), 0);
+  let level: ReuseOpportunityLevel = 'NONE';
+  if (count >= 3) level = 'HIGH';
+  else if (count === 2) level = 'MEDIUM';
+  else if (count === 1) level = 'LOW';
 
-  const codeReductionPercent =
-    withoutReuseLOC > 0 ? Math.round(((withoutReuseLOC - withReuseLOC) / withoutReuseLOC) * 100) : 0;
+  let summary: string;
+  if (count === 0) {
+    summary = 'No existing assets available to reuse (greenfield generation).';
+  } else {
+    summary = `${count} existing framework asset(s) can be reused instead of regenerated: ${assetsReused.join(', ')}.`;
+  }
 
-  const reusedAssets = filesToReuse.map((f) => f.path.split('/').pop() ?? f.path);
-
-  return {
-    withoutReuseLOC,
-    withReuseLOC,
-    codeReductionPercent,
-    reusedAssets,
-  };
+  return { level, assetsReused, summary };
 }
 
 /* ------------------------------------------------------------------ */
@@ -554,14 +718,21 @@ function computeQualityReport(
   const conventionMatch = scoreConventionMatch(inventory);
   const tagRecommendation = scoreTagRecommendation(impact);
 
-  // Overall assessment based on reuse %
+  // Overall assessment derived from the qualitative reuse opportunity level
+  // (number of real reusable assets) — not a fabricated percentage.
   let overallAssessment: ReuseLevel = 'NO REUSE';
-  if (impact.reuseSavings.codeReductionPercent >= 70) {
-    overallAssessment = 'HIGH REUSE';
-  } else if (impact.reuseSavings.codeReductionPercent >= 40) {
-    overallAssessment = 'MEDIUM REUSE';
-  } else if (impact.reuseSavings.codeReductionPercent >= 10) {
-    overallAssessment = 'LOW REUSE';
+  switch (impact.reuseOpportunity.level) {
+    case 'HIGH':
+      overallAssessment = 'HIGH REUSE';
+      break;
+    case 'MEDIUM':
+      overallAssessment = 'MEDIUM REUSE';
+      break;
+    case 'LOW':
+      overallAssessment = 'LOW REUSE';
+      break;
+    default:
+      overallAssessment = 'NO REUSE';
   }
 
   return {

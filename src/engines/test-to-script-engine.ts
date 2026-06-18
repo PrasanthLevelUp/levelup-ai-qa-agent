@@ -362,7 +362,8 @@ export class TestToScriptEngine {
           logger.info(MOD, '🏗️ Framework audit complete', {
             overallAssessment: frameworkAnalysis.qualityReport.overallAssessment,
             riskLevel: frameworkAnalysis.impactAnalysis.risk.level,
-            reuseSavings: frameworkAnalysis.impactAnalysis.reuseSavings.codeReductionPercent,
+            reuseLevel: frameworkAnalysis.impactAnalysis.reuseOpportunity.level,
+            assetsReused: frameworkAnalysis.impactAnalysis.reuseOpportunity.assetsReused.length,
           });
         }
       } catch (auditErr: any) {

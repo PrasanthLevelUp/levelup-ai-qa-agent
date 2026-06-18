@@ -127,19 +127,31 @@ const scope = { companyId: 1, projectId: 1, repositoryId: 1 };
   check('established: files to create includes spec', establishedAudit.impactAnalysis.filesToCreate.some(f => f.path.includes('.spec.ts')));
   check('established: files to reuse includes LoginPage', establishedAudit.impactAnalysis.filesToReuse.some(f => f.path.includes('LoginPage')));
   check('established: suggested tags is @smoke (short 3-step flow)', establishedAudit.impactAnalysis.suggestedTags.includes('@smoke'));
+  // This established repo has no suite files/tags, so the recommendation must be
+  // a clearly-flagged suggestion (not pretend it exists).
   check('established: suggested suite is smoke', establishedAudit.impactAnalysis.suggestedSuite === 'smoke');
+  check('established: suggested suite flagged as not existing', establishedAudit.impactAnalysis.suggestedSuiteExists === false);
+  check('established: no existing suites detected', establishedAudit.impactAnalysis.existingSuites.length === 0);
+
+  console.log('framework-auditor: assets catalog');
+
+  check('catalog: 2 page objects counted', establishedAudit.catalog.pageObjects === 2);
+  check('catalog: 1 fixture counted', establishedAudit.catalog.fixtures === 1);
+  check('catalog: suites count is a number', typeof establishedAudit.catalog.suites === 'number');
+  check('catalog: tags count is a number', typeof establishedAudit.catalog.tags === 'number');
 
   console.log('framework-auditor: risk assessment');
 
   check('established: risk is LOW (no updates)', establishedAudit.impactAnalysis.risk.level === 'LOW');
   check('established: risk reason mentions no modifications', establishedAudit.impactAnalysis.risk.reasons.some(r => r.toLowerCase().includes('no existing files modified')));
 
-  console.log('framework-auditor: reuse savings');
+  console.log('framework-auditor: reuse opportunity (qualitative — no fabricated LOC)');
 
-  const savings = establishedAudit.impactAnalysis.reuseSavings;
-  check('reuse savings: withoutReuse > withReuse', savings.withoutReuseLOC > savings.withReuseLOC);
-  check('reuse savings: code reduction % > 0', savings.codeReductionPercent > 0);
-  check('reuse savings: reused assets includes LoginPage', savings.reusedAssets.some(a => a.includes('LoginPage')));
+  const reuse = establishedAudit.impactAnalysis.reuseOpportunity;
+  check('reuse opportunity: level is HIGH/MEDIUM/LOW (assets reused)', ['HIGH', 'MEDIUM', 'LOW'].includes(reuse.level));
+  check('reuse opportunity: assetsReused includes LoginPage', reuse.assetsReused.some(a => a.includes('LoginPage')));
+  check('reuse opportunity: summary is a non-empty string', typeof reuse.summary === 'string' && reuse.summary.length > 0);
+  check('reuse opportunity: no fabricated LOC fields', !('withoutReuseLOC' in (reuse as any)) && !('codeReductionPercent' in (reuse as any)));
 
   console.log('framework-auditor: quality report');
 
@@ -174,7 +186,41 @@ const scope = { companyId: 1, projectId: 1, repositoryId: 1 };
 
   const regressionAudit = await auditFramework(establishedRepo, regressionContext, scope);
   check('regression: suggested tags is @regression (6-step flow)', regressionAudit.impactAnalysis.suggestedTags.includes('@regression'));
-  check('regression: suggested suite is nightly-regression', regressionAudit.impactAnalysis.suggestedSuite === 'nightly-regression');
+  // No suites exist in this repo → fall back to a flagged 'regression' suggestion.
+  check('regression: suggested suite is regression (derived fallback)', regressionAudit.impactAnalysis.suggestedSuite === 'regression');
+  check('regression: suggested suite flagged as not existing', regressionAudit.impactAnalysis.suggestedSuiteExists === false);
+
+  console.log('framework-auditor: suite recommendation derived from repo intelligence');
+
+  // Repo that actually has suites/tags — recommendation must come from these,
+  // never a hardcoded assumption.
+  const repoWithSuites: RepositoryProfile = {
+    ...establishedRepo,
+    testSuites: [
+      { name: 'auth.spec.ts', filePath: 'tests/auth.spec.ts', testCount: 3, testNames: [], describeName: 'Auth', tags: ['@smoke', '@regression'], category: 'auth' },
+      { name: 'checkout.spec.ts', filePath: 'tests/checkout.spec.ts', testCount: 5, testNames: [], describeName: 'Checkout', tags: ['@regression'], category: 'crud' },
+    ] as any,
+  };
+
+  // Short flow → @smoke tag → must map to the repo's real 'smoke' suite.
+  const suitesAudit = await auditFramework(repoWithSuites, greenfieldContext, scope);
+  check('derived suite: existingSuites contains smoke', suitesAudit.impactAnalysis.existingSuites.map(s => s.toLowerCase()).includes('smoke'));
+  check('derived suite: existingSuites contains regression', suitesAudit.impactAnalysis.existingSuites.map(s => s.toLowerCase()).includes('regression'));
+  check('derived suite: recommended is smoke (tag maps to existing suite)', suitesAudit.impactAnalysis.suggestedSuite.toLowerCase() === 'smoke');
+  check('derived suite: recommended suite exists in repo', suitesAudit.impactAnalysis.suggestedSuiteExists === true);
+  check('derived suite: catalog tags count > 0', suitesAudit.catalog.tags > 0);
+
+  // Multi-step flow → @regression tag → must map to the repo's real 'regression' suite.
+  const suitesRegressionAudit = await auditFramework(repoWithSuites, regressionContext, scope);
+  check('derived suite (regression): recommended is regression', suitesRegressionAudit.impactAnalysis.suggestedSuite.toLowerCase() === 'regression');
+  check('derived suite (regression): recommended suite exists', suitesRegressionAudit.impactAnalysis.suggestedSuiteExists === true);
+
+  console.log('framework-auditor: last repository scan in catalog');
+
+  const scopedWithScan = { ...scope, lastScannedAt: new Date() };
+  const scanAudit = await auditFramework(repoWithSuites, greenfieldContext, scopedWithScan);
+  check('catalog: lastRepositoryScan populated when provided', scanAudit.catalog.lastRepositoryScan === 'today');
+  check('catalog: lastRepositoryScan omitted when not provided', suitesAudit.catalog.lastRepositoryScan === undefined);
 
   console.log('framework-auditor: project scoping');
 
