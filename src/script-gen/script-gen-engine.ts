@@ -36,6 +36,7 @@ import { analyzeRepoPatterns } from './repo-pattern-analyzer';
 import { adaptiveGenerateFiles } from './adaptive-codegen';
 import { getRAGService } from '../services/rag-service';
 import { TrueReuseEngine } from '../services/true-reuse-engine';
+import { auditFramework, type FrameworkAuditResult, type GenerationContext } from './framework-auditor';
 
 const MOD = 'script-gen-engine';
 
@@ -123,6 +124,8 @@ export interface GenerationResult {
   authResult?: AuthResult;
   /** Raw crawl data for Application Intelligence caching */
   rawCrawlData?: any;
+  /** Framework audit analysis (Phase 1: Impact Analysis + Quality Report) */
+  frameworkAnalysis?: FrameworkAuditResult;
 }
 
 export interface GeneratedFile {
@@ -465,6 +468,41 @@ export class ScriptGenEngine {
     // ─── Step 7: Generate Playwright code deterministically ───────
     const generatedFiles = this.generatePlaywrightCode(testPlan, config);
 
+    // ─── Step 8: Framework Audit (Phase 1: Impact Analysis + Quality Report) ───
+    let frameworkAnalysis: FrameworkAuditResult | undefined;
+    if (config.repoProfile && (config.companyId || config.projectId)) {
+      try {
+        const generationContext: GenerationContext = {
+          testCases: testPlan.flows.map((flow) => ({
+            id: flow.name,
+            title: flow.description || flow.name,
+            steps: flow.steps.map((s) => s.description),
+          })),
+          baseUrl: config.url,
+          isGreenfield: !config.repoProfile || (config.repoProfile.pageObjects?.length ?? 0) === 0,
+          framework: 'playwright',
+        };
+        frameworkAnalysis = await auditFramework(
+          config.repoProfile,
+          generationContext,
+          {
+            companyId: config.companyId ?? 0,
+            projectId: config.projectId ?? undefined,
+            repositoryId: config.repoContextId ?? undefined,
+          },
+        );
+        logger.info(MOD, 'Framework audit complete', {
+          overallAssessment: frameworkAnalysis.qualityReport.overallAssessment,
+          riskLevel: frameworkAnalysis.impactAnalysis.risk.level,
+          reuseLevel: frameworkAnalysis.impactAnalysis.reuseOpportunity.level,
+          assetsReused: frameworkAnalysis.impactAnalysis.reuseOpportunity.assetsReused.length,
+        });
+      } catch (auditErr: any) {
+        logger.warn(MOD, 'Framework audit failed (non-blocking)', { error: auditErr.message });
+        // Audit failure is non-blocking — generation proceeds without it
+      }
+    }
+
     // ─── Stats ────────────────────────────────────────────────────
     let totalTests = 0;
     let totalAssertions = 0;
@@ -492,6 +530,8 @@ export class ScriptGenEngine {
       ...(authResult ? { authResult } : {}),
       // Expose raw crawl data for Application Intelligence caching (only for fresh crawls)
       ...(!config.cachedCrawlData ? { rawCrawlData: crawlResult } : {}),
+      // Framework audit (Phase 1: Impact Analysis + Quality Report)
+      ...(frameworkAnalysis ? { frameworkAnalysis } : {}),
     };
 
     logger.info(MOD, 'Script generation complete', result.stats);

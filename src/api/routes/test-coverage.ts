@@ -634,6 +634,8 @@ export function createTestCoverageRouter(): Router {
           coverage: scriptResult.coverage,
           // Audit of which intelligence layers grounded the generated scripts.
           intelligence: scriptResult.intelligence,
+          // Framework audit (Phase 1: Impact Analysis + Quality Report)
+          ...(scriptResult.frameworkAnalysis ? { frameworkAnalysis: scriptResult.frameworkAnalysis } : {}),
           github: {
             prUrl: prResult.prUrl,
             prNumber: prResult.prNumber,
@@ -869,6 +871,7 @@ function buildTestScriptPRBody(
       repoPatternsUsed: boolean;
       locatorReport?: { totalLocators: number; validatedCount: number; avgConfidence: number; todoCount: number };
     };
+    frameworkAnalysis?: import('../../script-gen/framework-auditor').FrameworkAuditResult;
   },
   requirementId: number,
   coverage?: {
@@ -937,10 +940,113 @@ ${perFileRows}${missingNote}${extraNote}`;
 | **Repository Patterns** | ${mark(intel.repoPatternsUsed)} |${lrRow}`;
   }
 
+  // Framework Analysis section (Phase 1): Impact Analysis + Quality Report
+  let frameworkSection = '';
+  const fw = result.frameworkAnalysis;
+  if (fw) {
+    const impact = fw.impactAnalysis;
+    const quality = fw.qualityReport;
+    
+    const riskBadge = impact.risk.level === 'LOW' ? '🟢 LOW' : impact.risk.level === 'MEDIUM' ? '🟡 MEDIUM' : '🔴 HIGH';
+    const riskReasons = impact.risk.reasons.map(r => `- ${r}`).join('\n');
+    
+    const existingRows = impact.existingAssets.slice(0, 5).map(a => `| ${a} |`).join('\n');
+    const moreExisting = impact.existingAssets.length > 5 ? `\n> _... and ${impact.existingAssets.length - 5} more asset(s)_` : '';
+    
+    const createRows = impact.filesToCreate.map(f => `| \`${f.path}\` | ${f.reason} |`).join('\n') || '| _(none)_ | |';
+    const updateRows = impact.filesToUpdate.map(f => `| \`${f.path}\` | ${f.reason} |`).join('\n') || '| _(none)_ | |';
+    const reuseRows = impact.filesToReuse.map(f => `| \`${f.path}\` | ${f.reason} |`).join('\n') || '| _(none)_ | |';
+    
+    const reuse = impact.reuseOpportunity;
+    const reuseBadge = reuse.level === 'HIGH' ? '✅ HIGH' : reuse.level === 'MEDIUM' ? '✔️ MEDIUM' : reuse.level === 'LOW' ? 'ℹ️ LOW' : '— NONE';
+    const reuseAssetRows = reuse.assetsReused.length
+      ? reuse.assetsReused.map(a => `| ✓ \`${a}\` |`).join('\n')
+      : '| _(none)_ |';
+
+    const qualMark = (s: string) => s === 'EXCELLENT' ? '✅' : s === 'GOOD' ? '✔️' : s === 'FAIR' ? 'ℹ️' : '—';
+
+    // Framework Assets Catalog (the future Repository Intelligence overview)
+    const cat = fw.catalog;
+    const lastScanRow = cat.lastRepositoryScan ? `\n**Last Repository Scan:** ${cat.lastRepositoryScan}` : '';
+
+    // Suite recommendation — derived from repository intelligence, not assumptions
+    const existingSuitesStr = impact.existingSuites.length
+      ? impact.existingSuites.map(s => `\`${s}\``).join(', ')
+      : '_(none detected)_';
+    const suiteNote = impact.suggestedSuiteExists ? '' : ' _(suggested — does not exist yet)_';
+
+    frameworkSection = `
+
+### 🏗️ Framework Analysis
+
+**Framework Assets Catalog**
+
+| Asset Type | Count |
+|------------|-------|
+| Page Objects | ${cat.pageObjects} |
+| Fixtures | ${cat.fixtures} |
+| Utilities | ${cat.utilities} |
+| Data Files | ${cat.dataFiles} |
+| Suites | ${cat.suites} |
+| Tags | ${cat.tags} |
+${lastScanRow}
+
+**Generation Quality Report: ${quality.overallAssessment}**
+
+| Category | Score | Detail |
+|----------|-------|--------|
+| Page Object Reuse | ${qualMark(quality.pageObjectReuse.score)} | ${quality.pageObjectReuse.detail} |
+| Fixture Reuse | ${qualMark(quality.fixtureReuse.score)} | ${quality.fixtureReuse.detail} |
+| Utility Reuse | ${qualMark(quality.utilityReuse.score)} | ${quality.utilityReuse.detail} |
+| Data Reuse | ${qualMark(quality.dataReuse.score)} | ${quality.dataReuse.detail} |
+| Convention Match | ${qualMark(quality.conventionMatch.score)} | ${quality.conventionMatch.detail} |
+
+**Existing Assets Found:**
+
+| Asset |
+|-------|
+${existingRows}${moreExisting}
+
+**Files To Create:**
+
+| File | Reason |
+|------|--------|
+${createRows}
+
+**Files To Update:**
+
+| File | Reason |
+|------|--------|
+${updateRows}
+
+**Files Reused:**
+
+| File | Reason |
+|------|--------|
+${reuseRows}
+
+**Reuse Opportunity:** ${reuseBadge}
+
+${reuse.summary}
+
+| Asset Reused |
+|--------------|
+${reuseAssetRows}
+
+**Risk Assessment:** ${riskBadge}
+
+${riskReasons}
+
+**Tags:** ${impact.suggestedTags.join(', ') || '_(none)_'}  
+**Existing Suites:** ${existingSuitesStr}  
+**Recommended Suite:** \`${impact.suggestedSuite}\`${suiteNote}
+`;
+  }
+
   return `## 🧪 AI-Generated Test Scripts
 
 > Automated PR created by [LevelUp AI QA](https://app.leveluptesting.in) Test-to-Script Engine.
-${intelligenceSection}
+${intelligenceSection}${frameworkSection}
 
 ### 📋 Source
 

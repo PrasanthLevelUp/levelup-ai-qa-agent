@@ -37,6 +37,7 @@ import {
 } from '../services/locator-resolver';
 import { buildApplicationProfileContext } from '../utils/application-profile-context';
 import { analyzeRepoPatterns, type RepoPatternGuide } from '../script-gen/repo-pattern-analyzer';
+import { auditFramework, type GenerationContext } from '../script-gen/framework-auditor';
 import { extractElementDescriptions } from '../utils/element-descriptions';
 import type { KnowledgeItem } from '../ai/knowledge-optimizer';
 import type { RepositoryProfile } from '../context/types';
@@ -120,6 +121,8 @@ export interface TestToScriptResult {
   coverage: CoverageReport;
   /** Which intelligence layers were available + applied during generation. */
   intelligence?: IntelligenceUsage;
+  /** Framework audit analysis (Phase 1: Impact Analysis + Quality Report) */
+  frameworkAnalysis?: import('../script-gen/framework-auditor').FrameworkAuditResult;
 }
 
 /**
@@ -331,6 +334,44 @@ export class TestToScriptEngine {
       avgLocatorConfidence: mergedLocatorReport?.avgConfidence ?? 0,
     });
 
+    // 🏗️ Framework Audit (Phase 1: Impact Analysis + Quality Report)
+    let frameworkAnalysis: import('../script-gen/framework-auditor').FrameworkAuditResult | undefined;
+    if (input.repositoryId && (input.companyId || input.projectId)) {
+      try {
+        const repoProfile = await getRepositoryContext(String(input.repositoryId), input.companyId);
+        if (repoProfile) {
+          const generationContext: GenerationContext = {
+            testCases: testCases.map((tc) => ({
+              id: String(tc.id),
+              title: tc.title || `Test Case ${tc.id}`,
+              steps: tc.steps ? JSON.parse(tc.steps).map((s: any) => s.description || s.action || '') : [],
+            })),
+            baseUrl: input.baseUrl || intel.appBaseUrl,
+            isGreenfield: !repoProfile || (repoProfile.pageObjects?.length ?? 0) === 0,
+            framework: 'playwright',
+          };
+          frameworkAnalysis = await auditFramework(
+            repoProfile,
+            generationContext,
+            {
+              companyId: input.companyId,
+              projectId: input.projectId,
+              repositoryId: input.repositoryId,
+            },
+          );
+          logger.info(MOD, '🏗️ Framework audit complete', {
+            overallAssessment: frameworkAnalysis.qualityReport.overallAssessment,
+            riskLevel: frameworkAnalysis.impactAnalysis.risk.level,
+            reuseLevel: frameworkAnalysis.impactAnalysis.reuseOpportunity.level,
+            assetsReused: frameworkAnalysis.impactAnalysis.reuseOpportunity.assetsReused.length,
+          });
+        }
+      } catch (auditErr: any) {
+        logger.warn(MOD, 'Framework audit failed (non-blocking)', { error: auditErr.message });
+        // Audit failure is non-blocking — generation proceeds without it
+      }
+    }
+
     return {
       requirementId,
       requirementTitle: requirement.title,
@@ -339,6 +380,7 @@ export class TestToScriptEngine {
       totalFiles: files.length,
       coverage,
       intelligence,
+      ...(frameworkAnalysis ? { frameworkAnalysis } : {}),
     };
   }
 
