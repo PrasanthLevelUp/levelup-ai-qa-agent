@@ -634,6 +634,8 @@ export function createTestCoverageRouter(): Router {
           coverage: scriptResult.coverage,
           // Audit of which intelligence layers grounded the generated scripts.
           intelligence: scriptResult.intelligence,
+          // Framework audit (Phase 1: Impact Analysis + Quality Report)
+          ...(scriptResult.frameworkAnalysis ? { frameworkAnalysis: scriptResult.frameworkAnalysis } : {}),
           github: {
             prUrl: prResult.prUrl,
             prNumber: prResult.prNumber,
@@ -869,6 +871,7 @@ function buildTestScriptPRBody(
       repoPatternsUsed: boolean;
       locatorReport?: { totalLocators: number; validatedCount: number; avgConfidence: number; todoCount: number };
     };
+    frameworkAnalysis?: import('../../script-gen/framework-auditor').FrameworkAuditResult;
   },
   requirementId: number,
   coverage?: {
@@ -937,10 +940,87 @@ ${perFileRows}${missingNote}${extraNote}`;
 | **Repository Patterns** | ${mark(intel.repoPatternsUsed)} |${lrRow}`;
   }
 
+  // Framework Analysis section (Phase 1): Impact Analysis + Quality Report
+  let frameworkSection = '';
+  const fw = result.frameworkAnalysis;
+  if (fw) {
+    const impact = fw.impactAnalysis;
+    const quality = fw.qualityReport;
+    
+    const riskBadge = impact.risk.level === 'LOW' ? '🟢 LOW' : impact.risk.level === 'MEDIUM' ? '🟡 MEDIUM' : '🔴 HIGH';
+    const riskReasons = impact.risk.reasons.map(r => `- ${r}`).join('\n');
+    
+    const existingRows = impact.existingAssets.slice(0, 5).map(a => `| ${a} |`).join('\n');
+    const moreExisting = impact.existingAssets.length > 5 ? `\n> _... and ${impact.existingAssets.length - 5} more asset(s)_` : '';
+    
+    const createRows = impact.filesToCreate.map(f => `| \`${f.path}\` | ${f.reason} |`).join('\n') || '| _(none)_ | |';
+    const updateRows = impact.filesToUpdate.map(f => `| \`${f.path}\` | ${f.reason} |`).join('\n') || '| _(none)_ | |';
+    const reuseRows = impact.filesToReuse.map(f => `| \`${f.path}\` | ${f.reason} |`).join('\n') || '| _(none)_ | |';
+    
+    const savingsPercent = impact.reuseSavings.codeReductionPercent;
+    const savingsBadge = savingsPercent >= 70 ? '✅ Excellent' : savingsPercent >= 40 ? '✔️ Good' : savingsPercent >= 10 ? 'ℹ️ Fair' : '—';
+    
+    const qualMark = (s: string) => s === 'EXCELLENT' ? '✅' : s === 'GOOD' ? '✔️' : s === 'FAIR' ? 'ℹ️' : '—';
+    
+    frameworkSection = `
+
+### 🏗️ Framework Analysis
+
+**Generation Quality Report: ${quality.overallAssessment}**
+
+| Category | Score | Detail |
+|----------|-------|--------|
+| Page Object Reuse | ${qualMark(quality.pageObjectReuse.score)} | ${quality.pageObjectReuse.detail} |
+| Fixture Reuse | ${qualMark(quality.fixtureReuse.score)} | ${quality.fixtureReuse.detail} |
+| Utility Reuse | ${qualMark(quality.utilityReuse.score)} | ${quality.utilityReuse.detail} |
+| Data Reuse | ${qualMark(quality.dataReuse.score)} | ${quality.dataReuse.detail} |
+| Convention Match | ${qualMark(quality.conventionMatch.score)} | ${quality.conventionMatch.detail} |
+
+**Existing Assets Found:**
+
+| Asset |
+|-------|
+${existingRows}${moreExisting}
+
+**Files To Create:**
+
+| File | Reason |
+|------|--------|
+${createRows}
+
+**Files To Update:**
+
+| File | Reason |
+|------|--------|
+${updateRows}
+
+**Files Reused:**
+
+| File | Reason |
+|------|--------|
+${reuseRows}
+
+**Reuse Savings:** ${savingsBadge}
+
+| Metric | Value |
+|--------|-------|
+| Without Reuse | ${impact.reuseSavings.withoutReuseLOC} LOC |
+| With Reuse | ${impact.reuseSavings.withReuseLOC} LOC |
+| Code Reduction | ${savingsPercent}% |
+
+**Risk Assessment:** ${riskBadge}
+
+${riskReasons}
+
+**Tags:** ${impact.suggestedTags.join(', ') || '_(none)_'}  
+**Suite:** ${impact.suggestedSuite || '_(none)_'}
+`;
+  }
+
   return `## 🧪 AI-Generated Test Scripts
 
 > Automated PR created by [LevelUp AI QA](https://app.leveluptesting.in) Test-to-Script Engine.
-${intelligenceSection}
+${intelligenceSection}${frameworkSection}
 
 ### 📋 Source
 

@@ -1,0 +1,187 @@
+/**
+ * Unit tests for Framework Auditor (src/script-gen/framework-auditor.ts).
+ *
+ * Regression tests for Phase 1: Framework Impact Analysis + Quality Report.
+ *
+ * Run with:  npx tsx tests/unit/framework-auditor.test.ts
+ */
+import { auditFramework, type GenerationContext } from '../../src/script-gen/framework-auditor';
+import type { RepositoryProfile } from '../../src/context/types';
+
+let passed = 0;
+let failed = 0;
+
+function check(name: string, cond: boolean, detail = '') {
+  if (cond) {
+    passed++;
+    console.log(`  ✓ ${name}`);
+  } else {
+    failed++;
+    console.error(`  ✗ ${name} ${detail}`);
+  }
+}
+
+console.log('framework-auditor: inventory extraction');
+
+// Mock greenfield repo (no existing assets)
+const greenfieldRepo: RepositoryProfile = {
+  framework: 'playwright',
+  language: 'typescript',
+  testPattern: 'spec',
+  locatorStrategy: 'role-based',
+  folderStructure: { tests: [], pageObjectFolder: null, fixtureFolder: null, helperFolder: null },
+  totalFiles: 0,
+  totalTestFiles: 0,
+  totalHelperFiles: 0,
+  totalLineCount: 0,
+  codingStyle: { indentation: 'spaces-2', quoteStyle: 'single', semicolons: true },
+  helperFunctions: [],
+  pageObjects: [],
+  fixtures: [],
+  customCommands: [],
+  sharedConstants: [],
+  businessFlows: [],
+  testSuites: [],
+  preferredLocators: [],
+  avoidPatterns: [],
+  dependencies: [],
+  assertionLibrary: 'expect',
+  hasApiLayer: false,
+  hasCustomFixtures: false,
+  hasMocking: false,
+  hasVisualTesting: false,
+  ciIntegration: null,
+  files: [],
+  classes: [],
+  testPatterns: [],
+};
+
+const greenfieldContext: GenerationContext = {
+  testCases: [
+    { id: 'TC1', title: 'Login test', steps: ['Navigate to login', 'Enter credentials', 'Click submit'] },
+  ],
+  baseUrl: 'https://example.com',
+  isGreenfield: true,
+  framework: 'playwright',
+};
+
+const scope = { companyId: 1, projectId: 1, repositoryId: 1 };
+
+(async () => {
+  const greenfieldAudit = await auditFramework(greenfieldRepo, greenfieldContext, scope);
+  check('greenfield: no page objects', greenfieldAudit.inventory.pageObjects.length === 0);
+  check('greenfield: no fixtures', greenfieldAudit.inventory.fixtures.length === 0);
+  check('greenfield: no utils', greenfieldAudit.inventory.utilities.length === 0);
+  check('greenfield: no data files', greenfieldAudit.inventory.dataFiles.length === 0);
+  check('greenfield: risk is LOW (no files modified)', greenfieldAudit.impactAnalysis.risk.level === 'LOW');
+  check('greenfield: quality is NO REUSE (nothing to reuse)', greenfieldAudit.qualityReport.overallAssessment === 'NO REUSE');
+
+  console.log('framework-auditor: inventory with existing assets');
+
+  // Mock established repo with page objects, fixtures, utils, data
+  const establishedRepo: RepositoryProfile = {
+    ...greenfieldRepo,
+    totalFiles: 6,
+    totalTestFiles: 0,
+    totalHelperFiles: 2,
+    pageObjects: [
+      {
+        name: 'LoginPage',
+        filePath: 'pages/LoginPage.ts',
+        isExported: true,
+        baseClass: null,
+        methods: [
+          { name: 'login', signature: 'login(username, password)', filePath: 'pages/LoginPage.ts', lineNumber: 10 },
+          { name: 'clickSubmit', signature: 'clickSubmit()', filePath: 'pages/LoginPage.ts', lineNumber: 20 },
+        ],
+        properties: [],
+      },
+      {
+        name: 'DashboardPage',
+        filePath: 'pages/DashboardPage.ts',
+        isExported: true,
+        baseClass: null,
+        methods: [{ name: 'navigate', signature: 'navigate()', filePath: 'pages/DashboardPage.ts', lineNumber: 5 }],
+        properties: [],
+      },
+    ],
+    fixtures: [
+      { name: 'baseFixture', signature: 'baseFixture()', filePath: 'fixtures/baseFixture.ts', lineNumber: 1 },
+    ],
+    helperFunctions: [
+      { name: 'waitForElement', signature: 'waitForElement(selector)', filePath: 'utils/waitUtils.ts', lineNumber: 1 },
+    ],
+  };
+
+  const establishedAudit = await auditFramework(establishedRepo, greenfieldContext, scope);
+  check('established: 2 page objects found', establishedAudit.inventory.pageObjects.length === 2);
+  check('established: LoginPage has 2 methods', establishedAudit.inventory.pageObjects.find(p => p.name === 'LoginPage')?.methodCount === 2);
+  check('established: 1 fixture found', establishedAudit.inventory.fixtures.length >= 1);
+  check('established: baseFixture purpose is base', establishedAudit.inventory.fixtures.some(f => f.name.includes('baseFixture') && f.purpose === 'base'));
+  // Note: utilities, data files, env files, config files are TODO (repo intelligence doesn't capture these yet)
+  // For now, we only verify the core page object + fixture extraction works
+
+  console.log('framework-auditor: impact analysis');
+
+  check('established: existing assets list includes LoginPage', establishedAudit.impactAnalysis.existingAssets.some(a => a.includes('LoginPage')));
+  check('established: files to create includes spec', establishedAudit.impactAnalysis.filesToCreate.some(f => f.path.includes('.spec.ts')));
+  check('established: files to reuse includes LoginPage', establishedAudit.impactAnalysis.filesToReuse.some(f => f.path.includes('LoginPage')));
+  check('established: suggested tags is @smoke (short 3-step flow)', establishedAudit.impactAnalysis.suggestedTags.includes('@smoke'));
+  check('established: suggested suite is smoke', establishedAudit.impactAnalysis.suggestedSuite === 'smoke');
+
+  console.log('framework-auditor: risk assessment');
+
+  check('established: risk is LOW (no updates)', establishedAudit.impactAnalysis.risk.level === 'LOW');
+  check('established: risk reason mentions no modifications', establishedAudit.impactAnalysis.risk.reasons.some(r => r.toLowerCase().includes('no existing files modified')));
+
+  console.log('framework-auditor: reuse savings');
+
+  const savings = establishedAudit.impactAnalysis.reuseSavings;
+  check('reuse savings: withoutReuse > withReuse', savings.withoutReuseLOC > savings.withReuseLOC);
+  check('reuse savings: code reduction % > 0', savings.codeReductionPercent > 0);
+  check('reuse savings: reused assets includes LoginPage', savings.reusedAssets.some(a => a.includes('LoginPage')));
+
+  console.log('framework-auditor: quality report');
+
+  const quality = establishedAudit.qualityReport;
+  check('quality: overall assessment is HIGH/MEDIUM/LOW REUSE', ['HIGH REUSE', 'MEDIUM REUSE', 'LOW REUSE'].includes(quality.overallAssessment));
+  check('quality: page object reuse is GOOD or EXCELLENT', ['GOOD', 'EXCELLENT'].includes(quality.pageObjectReuse.score));
+  check('quality: fixture reuse is EXCELLENT', quality.fixtureReuse.score === 'EXCELLENT');
+  // Data reuse is FAIR (no data files extracted yet)
+  check('quality: tag recommendation is EXCELLENT', quality.tagRecommendation.score === 'EXCELLENT');
+
+  console.log('framework-auditor: multi-step regression flow');
+
+  const regressionContext: GenerationContext = {
+    testCases: [
+      {
+        id: 'TC2',
+        title: 'Create user',
+        steps: [
+          'Login as admin',
+          'Navigate to users',
+          'Click create',
+          'Fill form',
+          'Submit',
+          'Verify success',
+        ],
+      },
+    ],
+    baseUrl: 'https://example.com',
+    isGreenfield: false,
+    framework: 'playwright',
+  };
+
+  const regressionAudit = await auditFramework(establishedRepo, regressionContext, scope);
+  check('regression: suggested tags is @regression (6-step flow)', regressionAudit.impactAnalysis.suggestedTags.includes('@regression'));
+  check('regression: suggested suite is nightly-regression', regressionAudit.impactAnalysis.suggestedSuite === 'nightly-regression');
+
+  console.log('framework-auditor: project scoping');
+
+  check('scope: companyId matches input', greenfieldAudit.scope.companyId === scope.companyId);
+  check('scope: projectId matches input', greenfieldAudit.scope.projectId === scope.projectId);
+  check('scope: repositoryId matches input', greenfieldAudit.scope.repositoryId === scope.repositoryId);
+
+  console.log(`\n${passed} passed, ${failed} failed`);
+  process.exit(failed === 0 ? 0 : 1);
+})();
