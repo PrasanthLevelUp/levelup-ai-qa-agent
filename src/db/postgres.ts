@@ -3527,7 +3527,7 @@ export async function getFlakyHistory(testName: string, companyId?: number): Pro
 /*  DOM Memory Analytics                                                      */
 /* -------------------------------------------------------------------------- */
 
-export async function getDomMemoryStats(companyId?: number): Promise<{
+export async function getDomMemoryStats(companyId?: number, projectId?: number): Promise<{
   totalSnapshots: number;
   totalSelectors: number;
   uniquePages: number;
@@ -3536,10 +3536,12 @@ export async function getDomMemoryStats(companyId?: number): Promise<{
   uniqueHealedLocators: number;
 }> {
   const pool = getPool();
-  // DOM snapshots/selectors join through generated_scripts for company scope
-  const snapCf = companyId ? `WHERE ds.script_id IN (SELECT id FROM generated_scripts WHERE company_id = ${companyId})` : '';
-  const selCf = companyId ? `WHERE ss.script_id IN (SELECT id FROM generated_scripts WHERE company_id = ${companyId})` : '';
-  const haCf = companyId ? `AND company_id = ${companyId}` : '';
+  // DOM snapshots/selectors join through generated_scripts for tenant scope.
+  // Isolation: scope by company AND project (generated_scripts carries both).
+  const gsWhere = buildTenantWhere(companyId, projectId); // applies to generated_scripts
+  const snapCf = gsWhere ? `WHERE ds.script_id IN (SELECT id FROM generated_scripts ${gsWhere})` : '';
+  const selCf = gsWhere ? `WHERE ss.script_id IN (SELECT id FROM generated_scripts ${gsWhere})` : '';
+  const haCf = buildTenantAnd(companyId, projectId); // healing_actions carries both
   const [snapRes, selRes, pagesRes, avgRes, changesRes, uniqueHealedRes] = await Promise.all([
     pool.query(`SELECT COUNT(*) AS c FROM dom_snapshots ds ${snapCf}`),
     pool.query(`SELECT COUNT(*) AS c FROM selector_scores ss ${selCf}`),
@@ -3558,8 +3560,8 @@ export async function getDomMemoryStats(companyId?: number): Promise<{
   };
 }
 
-export async function getDomSnapshots(limit = 50, companyId?: number): Promise<any[]> {
-  const cf = companyId ? `WHERE gs.company_id = ${companyId}` : '';
+export async function getDomSnapshots(limit = 50, companyId?: number, projectId?: number): Promise<any[]> {
+  const cf = buildTenantWhere(companyId, projectId, 'gs.');
   const result = await getPool().query(
     `SELECT ds.*, gs.url AS script_url, gs.test_count
      FROM dom_snapshots ds
@@ -3641,8 +3643,9 @@ export async function getLatestDomHtmlForUrl(
   return null;
 }
 
-export async function getSelectorHealth(limit = 100, companyId?: number): Promise<any[]> {
-  const cfJoin = companyId ? `JOIN generated_scripts gs ON gs.id = ss.script_id AND gs.company_id = ${companyId}` : '';
+export async function getSelectorHealth(limit = 100, companyId?: number, projectId?: number): Promise<any[]> {
+  const gsAnd = buildTenantAnd(companyId, projectId, 'gs.');
+  const cfJoin = gsAnd ? `JOIN generated_scripts gs ON gs.id = ss.script_id ${gsAnd}` : '';
   const result = await getPool().query(
     `SELECT
        ss.selector,
@@ -3663,8 +3666,10 @@ export async function getSelectorHealth(limit = 100, companyId?: number): Promis
   return result.rows;
 }
 
-export async function getLocatorEvolution(limit = 50, companyId?: number): Promise<any[]> {
-  const cfAnd = companyId ? `AND company_id = ${companyId}` : '';
+export async function getLocatorEvolution(limit = 50, companyId?: number, projectId?: number): Promise<any[]> {
+  // SECURITY (multi-tenant isolation): scope by BOTH company_id and project_id
+  // so a project never sees another project's locator-evolution history.
+  const cfAnd = buildTenantAnd(companyId, projectId);
   const result = await getPool().query(
     `SELECT
        failed_locator,
@@ -3821,8 +3826,9 @@ export async function getHealingIntelligenceMetrics(opts: {
   };
 }
 
-export async function getPageElementTrend(days = 30, companyId?: number): Promise<Array<{ date: string; pages: number; elements: number; snapshots: number }>> {
-  const cfJoin = companyId ? `JOIN generated_scripts gs ON gs.id = ds.script_id AND gs.company_id = ${companyId}` : '';
+export async function getPageElementTrend(days = 30, companyId?: number, projectId?: number): Promise<Array<{ date: string; pages: number; elements: number; snapshots: number }>> {
+  const gsAnd = buildTenantAnd(companyId, projectId, 'gs.');
+  const cfJoin = gsAnd ? `JOIN generated_scripts gs ON gs.id = ds.script_id ${gsAnd}` : '';
   const result = await getPool().query(`
     SELECT
       DATE(ds.created_at) AS date,
@@ -3843,8 +3849,9 @@ export async function getPageElementTrend(days = 30, companyId?: number): Promis
   }));
 }
 
-export async function getSelectorScoreDistribution(companyId?: number): Promise<Array<{ range: string; count: number }>> {
-  const cfJoin = companyId ? `JOIN generated_scripts gs ON gs.id = ss.script_id AND gs.company_id = ${companyId}` : '';
+export async function getSelectorScoreDistribution(companyId?: number, projectId?: number): Promise<Array<{ range: string; count: number }>> {
+  const gsAnd = buildTenantAnd(companyId, projectId, 'gs.');
+  const cfJoin = gsAnd ? `JOIN generated_scripts gs ON gs.id = ss.script_id ${gsAnd}` : '';
   const result = await getPool().query(`
     SELECT
       CASE
@@ -3864,10 +3871,42 @@ export async function getSelectorScoreDistribution(companyId?: number): Promise<
 }
 
 /* -------------------------------------------------------------------------- */
+/*  Multi-tenant scope helpers (analytics/dashboard read paths)               */
+/*                                                                            */
+/*  These build SQL scope fragments for tables that carry direct company_id / */
+/*  project_id columns. Values are coerced with Number() so only integers are */
+/*  ever interpolated (defence-in-depth against injection; the callers pass   */
+/*  ids resolved from the authenticated session/project context). Project is  */
+/*  ALWAYS applied alongside company when supplied, enforcing the product     */
+/*  "Golden Rule": every intelligence query is filtered by company_id AND     */
+/*  project_id so one project can never read another project's data.          */
+/* -------------------------------------------------------------------------- */
+
+/** Build the conjuncts (e.g. ["company_id = 3", "project_id = 7"]) for a tenant. */
+function tenantConjuncts(companyId?: number | null, projectId?: number | null, prefix = ''): string[] {
+  const out: string[] = [];
+  if (companyId != null) out.push(`${prefix}company_id = ${Number(companyId)}`);
+  if (projectId != null) out.push(`${prefix}project_id = ${Number(projectId)}`);
+  return out;
+}
+
+/** `WHERE company_id = .. AND project_id = ..` (or '' when neither supplied). */
+function buildTenantWhere(companyId?: number | null, projectId?: number | null, prefix = ''): string {
+  const c = tenantConjuncts(companyId, projectId, prefix);
+  return c.length ? `WHERE ${c.join(' AND ')}` : '';
+}
+
+/** `AND company_id = .. AND project_id = ..` (or '' when neither supplied). */
+function buildTenantAnd(companyId?: number | null, projectId?: number | null, prefix = ''): string {
+  const c = tenantConjuncts(companyId, projectId, prefix);
+  return c.length ? `AND ${c.join(' AND ')}` : '';
+}
+
+/* -------------------------------------------------------------------------- */
 /*  Learning Engine Analytics                                                 */
 /* -------------------------------------------------------------------------- */
 
-export async function getLearningStats(companyId?: number): Promise<{
+export async function getLearningStats(companyId?: number, projectId?: number): Promise<{
   totalPatterns: number;
   totalUsages: number;
   avgConfidence: number;
@@ -3878,8 +3917,10 @@ export async function getLearningStats(companyId?: number): Promise<{
   stalePatterns: number;
 }> {
   const pool = getPool();
-  const cf = companyId ? `WHERE company_id = ${companyId}` : '';
-  const cfAnd = companyId ? `AND company_id = ${companyId}` : '';
+  // Multi-tenant isolation: scope by BOTH company AND project so one project's
+  // Learning Dashboard never aggregates another project's learned patterns.
+  const cf = buildTenantWhere(companyId, projectId);
+  const cfAnd = buildTenantAnd(companyId, projectId);
   const [totalRes, usageRes, avgRes, tokenRes, stratRes, activeRes, staleRes] = await Promise.all([
     pool.query(`SELECT COUNT(*) AS c FROM learned_patterns ${cf}`),
     pool.query(`SELECT COALESCE(SUM(usage_count), 0) AS c FROM learned_patterns ${cf}`),
@@ -3901,8 +3942,8 @@ export async function getLearningStats(companyId?: number): Promise<{
   };
 }
 
-export async function getPatternsList(limit = 100, companyId?: number): Promise<any[]> {
-  const cf = companyId ? `WHERE company_id = ${companyId}` : '';
+export async function getPatternsList(limit = 100, companyId?: number, projectId?: number): Promise<any[]> {
+  const cf = buildTenantWhere(companyId, projectId);
   const result = await getPool().query(
     `SELECT * FROM learned_patterns ${cf} ORDER BY usage_count DESC, success_count DESC, last_used DESC LIMIT $1`,
     [limit],
@@ -3910,7 +3951,7 @@ export async function getPatternsList(limit = 100, companyId?: number): Promise<
   return result.rows;
 }
 
-export async function getStrategyEffectiveness(companyId?: number): Promise<Array<{
+export async function getStrategyEffectiveness(companyId?: number, projectId?: number): Promise<Array<{
   strategy: string;
   pattern_count: number;
   total_usages: number;
@@ -3920,7 +3961,7 @@ export async function getStrategyEffectiveness(companyId?: number): Promise<Arra
   success_rate: number;
   avg_tokens_saved: number;
 }>> {
-  const cf = companyId ? `WHERE company_id = ${companyId}` : '';
+  const cf = buildTenantWhere(companyId, projectId);
   const result = await getPool().query(`
     SELECT
       solution_strategy AS strategy,
@@ -3951,9 +3992,10 @@ export async function getStrategyEffectiveness(companyId?: number): Promise<Arra
   }));
 }
 
-export async function getLearningVelocity(days = 30, companyId?: number): Promise<Array<{ date: string; new_patterns: number; usages: number }>> {
+export async function getLearningVelocity(days = 30, companyId?: number, projectId?: number): Promise<Array<{ date: string; new_patterns: number; usages: number }>> {
   const pool = getPool();
-  const cfAnd = companyId ? `AND company_id = ${companyId}` : '';
+  // learned_patterns and healing_actions both carry company_id + project_id.
+  const cfAnd = buildTenantAnd(companyId, projectId);
   const result = await pool.query(`
     SELECT
       DATE(created_at) AS date,
@@ -3990,8 +4032,8 @@ export async function getLearningVelocity(days = 30, companyId?: number): Promis
   });
 }
 
-export async function getTopPatterns(limit = 10, companyId?: number): Promise<any[]> {
-  const cf = companyId ? `WHERE company_id = ${companyId}` : '';
+export async function getTopPatterns(limit = 10, companyId?: number, projectId?: number): Promise<any[]> {
+  const cf = buildTenantWhere(companyId, projectId);
   const result = await getPool().query(
     `SELECT
        test_name, failed_locator, healed_locator, solution_strategy,
@@ -5872,10 +5914,12 @@ export interface SimilarityStats {
   }>;
 }
 
-export async function getSimilarityStats(companyId?: number): Promise<SimilarityStats> {
+export async function getSimilarityStats(companyId?: number, projectId?: number): Promise<SimilarityStats> {
   const p = getPool();
-  const cf = companyId ? `WHERE company_id = ${companyId}` : '';
-  const cfAnd = companyId ? `AND company_id = ${companyId}` : '';
+  // SECURITY (multi-tenant isolation): scope by BOTH company_id and project_id
+  // so the similarity engine never aggregates another project's heals.
+  const cf = buildTenantWhere(companyId, projectId);
+  const cfAnd = buildTenantAnd(companyId, projectId);
 
   const [totalRes, confRes, highRes, medRes, lowRes, domRes, stratRes] = await Promise.all([
     p.query(`SELECT COUNT(*) as c FROM healing_actions WHERE healed_locator IS NOT NULL ${cfAnd}`),
@@ -5922,10 +5966,10 @@ export interface SimilarityDistribution {
   percentage: number;
 }
 
-export async function getConfidenceDistribution(companyId?: number): Promise<SimilarityDistribution[]> {
+export async function getConfidenceDistribution(companyId?: number, projectId?: number): Promise<SimilarityDistribution[]> {
   const p = getPool();
-  const cf = companyId ? `WHERE company_id = ${companyId}` : '';
-  const cfAnd = companyId ? `AND company_id = ${companyId}` : '';
+  // SECURITY (multi-tenant isolation): scope by BOTH company_id and project_id.
+  const cfAnd = buildTenantAnd(companyId, projectId);
 
   const result = await p.query(`
     SELECT
@@ -5975,9 +6019,10 @@ export interface SimilarityTrend {
   domCandidateCount: number;
 }
 
-export async function getSimilarityTrend(days: number = 30, companyId?: number): Promise<SimilarityTrend[]> {
+export async function getSimilarityTrend(days: number = 30, companyId?: number, projectId?: number): Promise<SimilarityTrend[]> {
   const p = getPool();
-  const cfAnd = companyId ? `AND company_id = ${companyId}` : '';
+  // SECURITY (multi-tenant isolation): scope by BOTH company_id and project_id.
+  const cfAnd = buildTenantAnd(companyId, projectId);
 
   const result = await p.query(`
     SELECT
@@ -6011,9 +6056,10 @@ export interface TopSimilarityMatch {
   createdAt: string;
 }
 
-export async function getTopSimilarityMatches(limit: number = 20, companyId?: number): Promise<TopSimilarityMatch[]> {
+export async function getTopSimilarityMatches(limit: number = 20, companyId?: number, projectId?: number): Promise<TopSimilarityMatch[]> {
   const p = getPool();
-  const cf = companyId ? `WHERE company_id = ${companyId}` : '';
+  // SECURITY (multi-tenant isolation): scope by BOTH company_id and project_id.
+  const cf = buildTenantWhere(companyId, projectId);
 
   const result = await p.query(`
     SELECT failed_locator, healed_locator, confidence, healing_strategy,
@@ -6045,9 +6091,10 @@ export interface LocatorPairAnalysis {
   lastSeen: string;
 }
 
-export async function getLocatorPairAnalysis(limit: number = 20, companyId?: number): Promise<LocatorPairAnalysis[]> {
+export async function getLocatorPairAnalysis(limit: number = 20, companyId?: number, projectId?: number): Promise<LocatorPairAnalysis[]> {
   const p = getPool();
-  const cf = companyId ? `WHERE healed_locator IS NOT NULL ${companyId ? `AND company_id = ${companyId}` : ''}` : 'WHERE healed_locator IS NOT NULL';
+  // SECURITY (multi-tenant isolation): scope by BOTH company_id and project_id.
+  const cf = `WHERE healed_locator IS NOT NULL ${buildTenantAnd(companyId, projectId)}`;
 
   const result = await p.query(`
     SELECT failed_locator, healed_locator,
@@ -6074,15 +6121,15 @@ export async function getLocatorPairAnalysis(limit: number = 20, companyId?: num
   }));
 }
 
-export async function getSemanticGroupStats(companyId?: number): Promise<Array<{
+export async function getSemanticGroupStats(companyId?: number, projectId?: number): Promise<Array<{
   locatorType: string;
   count: number;
   avgConfidence: number;
   successRate: number;
 }>> {
   const p = getPool();
-  const cf = companyId ? `WHERE company_id = ${companyId}` : '';
-  const cfAnd = companyId ? `AND company_id = ${companyId}` : '';
+  // SECURITY (multi-tenant isolation): scope by BOTH company_id and project_id.
+  const cf = buildTenantWhere(companyId, projectId);
 
   const result = await p.query(`
     SELECT
@@ -10183,9 +10230,32 @@ export async function getProfileByUrl(baseUrl: string, companyId?: number, proje
   return rows[0] || null;
 }
 
-export async function getProfileById(id: string): Promise<ApplicationProfile | null> {
+/**
+ * Fetch a single application profile by its primary key.
+ *
+ * SECURITY (multi-tenant isolation / IDOR): when `companyId` (and optionally
+ * `projectId`) are supplied the lookup is constrained to that tenant so a
+ * caller cannot read another company's / project's profile by guessing its id.
+ * Both parameters are optional to preserve backward compatibility for trusted
+ * internal callers (e.g. ProfileService) that already operate on a resolved,
+ * tenant-owned id — API route handlers MUST pass at least `companyId`.
+ */
+export async function getProfileById(id: string, companyId?: number, projectId?: number): Promise<ApplicationProfile | null> {
   const pool = getPool();
-  const { rows } = await pool.query(`SELECT * FROM application_profiles WHERE id = $1`, [id]);
+  const conds = ['id = $1'];
+  const params: any[] = [id];
+  if (companyId != null) {
+    params.push(companyId);
+    conds.push(`COALESCE(company_id, 0) = COALESCE($${params.length}, 0)`);
+  }
+  if (projectId != null) {
+    params.push(projectId);
+    conds.push(`project_id = $${params.length}`);
+  }
+  const { rows } = await pool.query(
+    `SELECT * FROM application_profiles WHERE ${conds.join(' AND ')}`,
+    params,
+  );
   return rows[0] || null;
 }
 
