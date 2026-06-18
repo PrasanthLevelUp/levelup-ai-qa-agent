@@ -5,6 +5,7 @@
 
 import { Pool, type PoolClient } from 'pg';
 import { logger } from '../utils/logger';
+import { normalizeBaseUrl } from '../utils/url-normalize';
 import { RTM_STATEMENTS, RTM_TABLES, applyRtmSchema } from './rtm-schema';
 import {
   ENV_SPRINT_STATEMENTS,
@@ -10334,6 +10335,16 @@ export async function upsertProfile(data: {
   const pool = getPool();
   const ttl = data.ttlDays || 30;
 
+  // CRITICAL: normalize base_url at the single DB write point so every caller
+  // (manual create via POST /profiles, background crawl-save via saveProfile,
+  // edits, etc.) computes the SAME ON CONFLICT key. Without this, a user who
+  // typed a non-canonical URL ("https://Example.com/") created one row while
+  // the crawl-completion path stored the normalized form ("https://example.com")
+  // — the conflict missed, a duplicate row was INSERTed, and the original row
+  // stayed stuck in 'crawling' forever. normalizeBaseUrl is idempotent, so
+  // callers that already normalized are unaffected.
+  const baseUrl = normalizeBaseUrl(data.baseUrl);
+
   // Use the project-scoped unique index (uq_app_profile_url_project) for upsert.
   // This correctly handles per-project profiles instead of conflicting on the
   // older (base_url, company_id) constraint which ignores project_id.
@@ -10377,7 +10388,7 @@ export async function upsertProfile(data: {
        updated_at = NOW()
      RETURNING *`,
     [
-      data.baseUrl,
+      baseUrl,
       data.appFingerprint || null,
       JSON.stringify(data.crawlData),
       data.authRequired ?? false,
@@ -10403,7 +10414,7 @@ export async function upsertProfile(data: {
       data.source || 'manual',
     ],
   );
-  console.log(`[DB] upsertProfile: ${data.baseUrl} → id=${rows[0]?.id}, project=${data.projectId ?? 'none'}, company=${companyId ?? 'none'}, source=${data.source || 'manual'}`);
+  console.log(`[DB] upsertProfile: ${baseUrl} → id=${rows[0]?.id}, project=${data.projectId ?? 'none'}, company=${companyId ?? 'none'}, source=${data.source || 'manual'}`);
   return rows[0];
 }
 
