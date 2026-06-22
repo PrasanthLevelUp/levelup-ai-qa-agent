@@ -1,9 +1,14 @@
 /**
  * Test Data Store API
  *
- * Project-scoped, environment-aware test data for Script Generation, Framework
- * Auditor, and Healing. Closes the QA intelligence loop: Test Data Store →
- * Auditor discovers → Test Cases reference → Generation uses.
+ * Project-scoped, environment-aware test data consumed by Script Generation and
+ * discoverable by the Framework Auditor (once datasets are materialized to
+ * data/*.json). Loop: Test Data Store → Auditor discovers → Test Cases reference
+ * → Generation uses.
+ *
+ * Scope note: this is Script Generation Intelligence. Healing does NOT yet
+ * consume test data during recovery — that integration is future work and must
+ * not be marketed as Healing Intelligence until healing truly reads datasets.
  */
 
 import { Router, Request, Response } from 'express';
