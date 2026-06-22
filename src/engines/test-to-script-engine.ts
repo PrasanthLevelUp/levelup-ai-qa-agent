@@ -178,7 +178,7 @@ interface IntelligenceBundle {
    * discover, and passed here so Script Generation can reference real data
    * instead of hallucinating test values.
    */
-  testData?: Array<{ name: string; sampleKeys: string[] }>;
+  testData?: Array<{ name: string; environment: string; recordCount: number; sampleKeys: string[] }>;
   testDataUsed: boolean;
 }
 
@@ -493,15 +493,15 @@ export class TestToScriptEngine {
     bundle.testDataUsed = false;
     if (input.projectId) {
       try {
-        const { listTestDataSets } = await import('../db/postgres');
-        const datasets = await listTestDataSets(companyId, input.projectId);
-        if (datasets.length > 0) {
-          bundle.testData = datasets.slice(0, 10).map(ds => ({
-            name: ds.name,
-            sampleKeys: [], // Keys are not loaded here; the AI just knows the dataset exists.
-          }));
+        const { getTestDataSetSummaries } = await import('../db/postgres');
+        // Token-safe: only names + record counts + a few sample KEYS (never values,
+        // never secrets, never full rows). The generated script imports the data
+        // FILE; we never embed the dataset contents in the prompt.
+        const summaries = await getTestDataSetSummaries(companyId, input.projectId, undefined, 5);
+        if (summaries.length > 0) {
+          bundle.testData = summaries.slice(0, 10);
           bundle.testDataUsed = true;
-          logger.info(MOD, '✅ Test data sets loaded', { count: datasets.length });
+          logger.info(MOD, '✅ Test data sets loaded (metadata only)', { count: summaries.length });
         }
       } catch (err: any) {
         logger.warn(MOD, 'Test data load failed (non-blocking)', { error: err?.message });
@@ -806,8 +806,14 @@ export class TestToScriptEngine {
     // points at real selectors instead of guesses.
     const repoBlock = intel.repoGuide ? `\n${intel.repoGuide.promptBlock}` : '';
     const appProfileBlock = intel.appProfileBlock ? `\n${intel.appProfileBlock}` : '';
+    // Token-safe test data block: list datasets with their record count + a few
+    // sample keys ONLY. We deliberately never embed full rows or values here — the
+    // generated test imports the data/*.json FILE and reads values at runtime.
     const testDataBlock = intel.testData && intel.testData.length > 0
-      ? `\n## Available Test Data (Materialized as data/*.json)\n\nThe following test data sets are available in the repository's \`data/\` folder:\n${intel.testData.map(td => `- ${td.name}`).join('\n')}\n\nYou can import and use them:\n\`\`\`typescript\nimport users from '../data/valid_users.json';\nconst testUser = users[0].value;\n\`\`\`\n\nPrefer using these real data sets over hardcoded test values.`
+      ? `\n## Available Test Data (Materialized as data/*.json)\n\nThese datasets live in the repository's \`data/\` folder. Import the FILE and read values at runtime — do NOT hardcode or inline the dataset contents.\n${intel.testData.map(td => {
+          const keys = td.sampleKeys.length ? ` — sample keys: ${td.sampleKeys.slice(0, 5).join(', ')}` : '';
+          return `- \`data/${td.name}.json\` (${td.environment}, ${td.recordCount} record${td.recordCount === 1 ? '' : 's'})${keys}`;
+        }).join('\n')}\n\nUsage pattern:\n\`\`\`typescript\nimport dataset from '../data/<name>.json';\nconst record = dataset.find((r) => r.key === '<key>');\nconst value = record?.value;\n\`\`\`\n\nPrefer these real datasets over hardcoded test values.`
       : '';
 
     const prompt = `You are an expert Playwright test automation engineer.

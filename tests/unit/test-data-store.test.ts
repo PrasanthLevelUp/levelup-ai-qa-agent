@@ -1,9 +1,10 @@
 /**
  * Test Data Store — Unit Tests
  *
- * Project-scoped, environment-aware test data for Script Generation, Framework
- * Auditor, and Healing. Tests the full QA intelligence loop: Test Data Store →
- * Auditor discovers → Test Cases reference → Generation uses.
+ * Project-scoped, environment-aware test data for Script Generation (consumer
+ * today) and the Framework Auditor (via materialized data/*.json). Tests the
+ * loop: Test Data Store → Auditor discovers → Test Cases reference → Generation
+ * uses. Healing does NOT consume test data yet (future work).
  *
  * Requires a reachable database (DATABASE_URL). If none is configured the suite
  * SKIPS (a missing DB must not fail CI).
@@ -197,6 +198,23 @@ async function main() {
 
   // Cleanup temp repo.
   await fs.rm(tmpRepoPath, { recursive: true, force: true });
+
+  console.log('\n=== Token-Safe Prompt Summaries (Check #1) ===');
+  // getTestDataSetSummaries must return counts + sample KEYS only — never values,
+  // never secrets, never full rows — so the generation prompt can't explode.
+  const summaries = await pg.getTestDataSetSummaries(companyId, projA.id, undefined, 5);
+  assert(summaries.length > 0, 'getTestDataSetSummaries returns datasets for the project');
+  const credsSummary = summaries.find(s => s.name === 'credentials');
+  assert(
+    !!credsSummary && credsSummary.recordCount === 1 && credsSummary.sampleKeys.includes('admin'),
+    'summary exposes record count + sample keys',
+  );
+  // Critical: the summary object must NOT carry any record values or secret material.
+  const serialized = JSON.stringify(summaries);
+  assert(
+    !serialized.includes('super-secret-123') && !serialized.includes('password') && !serialized.includes('value'),
+    'summaries never leak values or secrets into the prompt payload',
+  );
 
   // ── Cleanup ───────────────────────────────────────────────────────────────
   await pool.query(`DELETE FROM test_data_records WHERE dataset_id IN (SELECT id FROM test_data_sets WHERE company_id = $1)`, [companyId]);

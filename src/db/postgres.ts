@@ -2411,9 +2411,12 @@ async function migrateDefaultCompany(client: PoolClient): Promise<void> {
   await safeExec(client, 'idx_kr_company', `CREATE INDEX IF NOT EXISTS idx_kr_company ON knowledge_relationships(company_id)`);
 
   // ── Test Data Store ──
-  // Project-scoped, environment-aware, reusable test data for Script Generation,
-  // Framework Auditor, and Healing. Designed to close the QA intelligence loop:
-  // Test Data Store → Auditor discovers → Test Cases reference → Generation uses.
+  // Project-scoped, environment-aware, reusable test data. Consumed today by
+  // Script Generation (and discoverable by the Framework Auditor once materialized).
+  // Current loop: Test Data Store → Auditor discovers → Test Cases reference →
+  // Generation uses. NOTE: Healing does NOT consume test data yet — that link is
+  // future work, so this is marketed as Script Generation Intelligence, not
+  // Healing Intelligence.
   console.log('🔧 [DB] Migration: Test Data Store...');
 
   await safeExec(client, 'test_data_sets', `CREATE TABLE IF NOT EXISTS test_data_sets (
@@ -2427,10 +2430,14 @@ async function migrateDefaultCompany(client: PoolClient): Promise<void> {
     is_active BOOLEAN NOT NULL DEFAULT TRUE,
     created_by VARCHAR(200),
     created_at TIMESTAMPTZ DEFAULT NOW(),
-    updated_at TIMESTAMPTZ DEFAULT NOW(),
-    -- Project-scoped uniqueness: same name can exist per project per environment.
-    CONSTRAINT uq_test_dataset_name_project_env UNIQUE (company_id, COALESCE(project_id, 0), name, environment)
+    updated_at TIMESTAMPTZ DEFAULT NOW()
   )`);
+  // Project-scoped uniqueness: same name can exist per project per environment.
+  // NOTE: this must be an expression UNIQUE INDEX, not a table UNIQUE constraint —
+  // PostgreSQL forbids expressions like COALESCE() inside UNIQUE table constraints.
+  // COALESCE(project_id, 0) treats company-wide rows (project_id IS NULL) as a single
+  // "0" bucket so they stay unique per (company, name, environment).
+  await safeExec(client, 'uq_test_dataset_name_project_env', `CREATE UNIQUE INDEX IF NOT EXISTS uq_test_dataset_name_project_env ON test_data_sets (company_id, COALESCE(project_id, 0), name, environment)`);
   await safeExec(client, 'idx_tds_company', `CREATE INDEX IF NOT EXISTS idx_tds_company ON test_data_sets(company_id)`);
   await safeExec(client, 'idx_tds_project', `CREATE INDEX IF NOT EXISTS idx_tds_project ON test_data_sets(project_id)`);
   await safeExec(client, 'idx_tds_name', `CREATE INDEX IF NOT EXISTS idx_tds_name ON test_data_sets(name)`);
@@ -8196,6 +8203,44 @@ export async function getTestDataRecords(datasetId: number): Promise<TestDataRec
   return rows;
 }
 
+/**
+ * Token-safe dataset summary for prompt injection. Returns each dataset's name,
+ * environment, total record count, and a small sample of KEYS only — never values
+ * and never secrets. This keeps the generation prompt cheap (no full-dataset
+ * explosion) while giving the model enough to reference the right data file.
+ *
+ * @param sampleKeysPerSet - max sample keys to fetch per dataset (default 5)
+ */
+export async function getTestDataSetSummaries(
+  companyId: number,
+  projectId?: number,
+  environment?: string,
+  sampleKeysPerSet: number = 5,
+): Promise<Array<{ name: string; environment: string; recordCount: number; sampleKeys: string[] }>> {
+  const sets = await listTestDataSets(companyId, projectId, environment);
+  if (sets.length === 0) return [];
+  const pool = getPool();
+  const out: Array<{ name: string; environment: string; recordCount: number; sampleKeys: string[] }> = [];
+  for (const ds of sets) {
+    // COUNT + a capped sample of keys in one round-trip; no value_jsonb / secrets fetched.
+    const { rows } = await pool.query(
+      `SELECT
+         (SELECT COUNT(*)::int FROM test_data_records WHERE dataset_id = $1) AS total,
+         (SELECT COALESCE(array_agg(k ORDER BY k), '{}')
+            FROM (SELECT key AS k FROM test_data_records WHERE dataset_id = $1 ORDER BY key LIMIT $2) s
+         ) AS sample_keys`,
+      [ds.id, sampleKeysPerSet],
+    );
+    out.push({
+      name: ds.name,
+      environment: ds.environment,
+      recordCount: rows[0]?.total ?? 0,
+      sampleKeys: rows[0]?.sample_keys ?? [],
+    });
+  }
+  return out;
+}
+
 export async function updateTestDataRecord(
   id: number,
   updates: Partial<Pick<TestDataRecord, 'value_jsonb' | 'data_type' | 'is_secret' | 'secret_ref' | 'tags'>>,
@@ -8254,10 +8299,16 @@ export async function resolveTestData(
   }
   const envOrder = environment === 'shared' ? ['shared'] : [environment, 'shared'];
   params.push(envOrder);
+  const envArrayIdx = params.length;
+  // Dedicated param for the target environment so the ORDER BY compares
+  // environment (varchar) against the requested env string — NOT against
+  // projectId. Prefer the exact environment, then fall back to 'shared'.
+  params.push(environment);
+  const targetEnvIdx = params.length;
   const { rows: datasets } = await pool.query(
     `SELECT * FROM test_data_sets
-     WHERE ${conds.join(' AND ')} AND environment = ANY($${params.length})
-     ORDER BY (CASE WHEN environment = $${params.length - (projectId != null ? 1 : 0)} THEN 0 ELSE 1 END), updated_at DESC
+     WHERE ${conds.join(' AND ')} AND environment = ANY($${envArrayIdx})
+     ORDER BY (CASE WHEN environment = $${targetEnvIdx} THEN 0 ELSE 1 END), updated_at DESC
      LIMIT 1`,
     params,
   );

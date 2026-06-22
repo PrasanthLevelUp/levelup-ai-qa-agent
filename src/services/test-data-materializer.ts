@@ -5,6 +5,12 @@
  * 1. Framework Auditor to discover and catalog data files (populates `dataFiles`).
  * 2. Generated scripts to import/reference real data instead of hallucinating values.
  * 3. Human visibility — `data/` fixtures are part of the repo for review/version control.
+ *
+ * IMPORTANT — call this at dataset CREATE/UPDATE time only (materialize once per
+ * change). Do NOT call it on every script-generation request: re-writing data/*.json
+ * on each generation causes needless repo churn and diff noise. Script Generation
+ * reads dataset METADATA from the DB (see getTestDataSetSummaries) and references the
+ * already-materialized files; it must never trigger materialization itself.
  */
 
 import * as fs from 'fs/promises';
