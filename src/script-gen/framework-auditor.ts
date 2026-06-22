@@ -380,19 +380,45 @@ function extractUtilities(profile: RepositoryProfile): UtilityInfo[] {
 }
 
 function extractDataFiles(profile: RepositoryProfile): DataFileInfo[] {
-  // TODO: Repo intelligence doesn't yet capture data/ files as a structured field.
-  // The Test Data Store materializes datasets to data/*.json when scripts are generated,
-  // but those files are written AFTER repo intelligence scans. Future integration paths:
-  // 1. Extend repo-intelligence to scan data/ folder as a first-class asset category.
-  // 2. OR: re-scan repo after materializeTestData() writes the files (adds latency).
-  // 3. OR: synthesize DataFileInfo from listTestDataSets() at audit time (current state:
-  //    Test Data Store loads datasets into the generation context but Auditor doesn't
-  //    yet report them as discovered assets — Script Generation knows about them).
+  // PR #122: Repo intelligence now discovers data/ files automatically during scan.
+  // The Repository Context Engine scans the data/ folder and populates profile.dataFiles
+  // with discovered JSON, TS, JS, and CSV files. This closes the discovery loop:
+  //   1. Test Data Store materializes datasets to data/*.json (PR #119)
+  //   2. Repo intelligence scans and discovers those files (PR #122 — this function)
+  //   3. Framework Auditor reports them as available assets (here)
+  //   4. Script Generation references them in generated tests (test-to-script-engine.ts)
   //
-  // For now: return empty array. Script Generation already injects test data context into
-  // the prompt (see test-to-script-engine.ts loadIntelligence → testData field), so the
-  // QA intelligence loop is closed even though the Auditor doesn't catalog them yet.
-  return [];
+  // Note: Test Data Store still injects runtime metadata (getTestDataSetSummaries) for
+  // generation prompts, so scripts get both discovered file paths AND dataset metadata.
+  if (!profile.dataFiles || profile.dataFiles.length === 0) {
+    return [];
+  }
+
+  return profile.dataFiles.map(df => {
+    // Infer purpose from filename and record count
+    let purpose = 'test data';
+    const nameLower = df.name.toLowerCase();
+    if (nameLower.includes('user') || nameLower.includes('account') || nameLower.includes('auth')) {
+      purpose = 'user credentials';
+    } else if (nameLower.includes('product') || nameLower.includes('item') || nameLower.includes('catalog')) {
+      purpose = 'product data';
+    } else if (nameLower.includes('form') || nameLower.includes('input')) {
+      purpose = 'form data';
+    } else if (nameLower.includes('config') || nameLower.includes('setting')) {
+      purpose = 'configuration';
+    }
+
+    if (df.recordCount !== undefined) {
+      purpose += ` (${df.recordCount} records)`;
+    }
+
+    return {
+      name: df.name,
+      path: df.path,
+      type: df.type,
+      purpose,
+    };
+  });
 }
 
 function extractSuites(profile: RepositoryProfile): SuiteInfo[] {

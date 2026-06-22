@@ -758,6 +758,71 @@ export function extractCodeChunks(repoRoot: string, analyses: FileAnalysis[]): C
 /*  MAIN: Repository Context Engine                                    */
 /* ================================================================== */
 
+/**
+ * Discover test data files in the repository's data/ folder.
+ * Scans for JSON, TS, JS, and CSV files that contain test fixtures.
+ * Part of PR #122: Framework Auditor auto-discovers existing repo fixtures.
+ */
+function discoverDataFiles(repoRoot: string): Array<{ name: string; path: string; type: 'json' | 'ts' | 'js' | 'csv'; recordCount?: number }> {
+  const dataFiles: Array<{ name: string; path: string; type: 'json' | 'ts' | 'js' | 'csv'; recordCount?: number }> = [];
+  const dataDir = path.join(repoRoot, 'data');
+
+  if (!fs.existsSync(dataDir)) {
+    return dataFiles;
+  }
+
+  try {
+    const entries = fs.readdirSync(dataDir, { withFileTypes: true });
+    for (const entry of entries) {
+      if (!entry.isFile()) continue;
+
+      const ext = path.extname(entry.name).toLowerCase();
+      let fileType: 'json' | 'ts' | 'js' | 'csv' | null = null;
+      
+      if (ext === '.json') fileType = 'json';
+      else if (ext === '.ts') fileType = 'ts';
+      else if (ext === '.js') fileType = 'js';
+      else if (ext === '.csv') fileType = 'csv';
+      else continue; // Skip non-data file types
+
+      const filePath = path.join(dataDir, entry.name);
+      const relativePath = path.relative(repoRoot, filePath);
+      let recordCount: number | undefined;
+
+      // Try to count records for JSON files
+      if (fileType === 'json') {
+        try {
+          const content = fs.readFileSync(filePath, 'utf-8');
+          const parsed = JSON.parse(content);
+          if (Array.isArray(parsed)) {
+            recordCount = parsed.length;
+          } else if (typeof parsed === 'object' && parsed !== null) {
+            recordCount = Object.keys(parsed).length;
+          }
+        } catch {
+          // Invalid JSON or parse error — still include the file but without count
+        }
+      }
+
+      dataFiles.push({
+        name: path.basename(entry.name, ext),
+        path: relativePath,
+        type: fileType,
+        recordCount,
+      });
+    }
+
+    logger.info(MOD, 'Data file discovery complete', {
+      dataDir,
+      filesFound: dataFiles.length,
+    });
+  } catch (err: any) {
+    logger.warn(MOD, 'Failed to scan data/ directory', { dataDir, error: err.message });
+  }
+
+  return dataFiles;
+}
+
 export class RepositoryContextEngine {
   private astAnalyzer: ASTAnalyzer;
 
@@ -809,6 +874,9 @@ export class RepositoryContextEngine {
     const helperFunctions = allFunctions.filter(f =>
       f.category === 'helper' || f.category === 'utility'
     ).filter(f => f.isExported);
+    
+    // Phase 3.5: Discover test data files (PR #122)
+    const dataFiles = discoverDataFiles(repoRoot);
 
     const pageObjects = allClasses.filter(c => c.category === 'page-object');
 
@@ -880,6 +948,7 @@ export class RepositoryContextEngine {
       fixtures,
       customCommands,
       sharedConstants: sharedConstants.slice(0, 100), // cap
+      dataFiles, // PR #122: auto-discovered test data files
       businessFlows,
       testSuites,
       preferredLocators,
@@ -903,6 +972,7 @@ export class RepositoryContextEngine {
       helpers: profile.helperFunctions.length,
       pageObjects: profile.pageObjects.length,
       fixtures: profile.fixtures.length,
+      dataFiles: profile.dataFiles.length, // PR #122
       flows: profile.businessFlows.length,
       suites: profile.testSuites.length,
       chunks: chunks.length,

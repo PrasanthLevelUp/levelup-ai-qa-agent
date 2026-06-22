@@ -153,6 +153,7 @@ export interface RepositoryProfile {
   fixtures: FunctionSignature[];
   customCommands: FunctionSignature[];
   sharedConstants: Array<{ name: string; value: string; filePath: string }>;
+  dataFiles: Array<{ name: string; path: string; type: 'json' | 'ts' | 'js' | 'csv'; recordCount?: number }>;
 
   // Business intelligence
   businessFlows: BusinessFlow[];
