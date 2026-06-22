@@ -380,8 +380,18 @@ function extractUtilities(profile: RepositoryProfile): UtilityInfo[] {
 }
 
 function extractDataFiles(profile: RepositoryProfile): DataFileInfo[] {
-  // TODO: Repo intelligence doesn't yet capture data files as a structured field.
-  // When repo-intelligence is enhanced to scan data/ folders, populate this.
+  // TODO: Repo intelligence doesn't yet capture data/ files as a structured field.
+  // The Test Data Store materializes datasets to data/*.json when scripts are generated,
+  // but those files are written AFTER repo intelligence scans. Future integration paths:
+  // 1. Extend repo-intelligence to scan data/ folder as a first-class asset category.
+  // 2. OR: re-scan repo after materializeTestData() writes the files (adds latency).
+  // 3. OR: synthesize DataFileInfo from listTestDataSets() at audit time (current state:
+  //    Test Data Store loads datasets into the generation context but Auditor doesn't
+  //    yet report them as discovered assets — Script Generation knows about them).
+  //
+  // For now: return empty array. Script Generation already injects test data context into
+  // the prompt (see test-to-script-engine.ts loadIntelligence → testData field), so the
+  // QA intelligence loop is closed even though the Auditor doesn't catalog them yet.
   return [];
 }
 

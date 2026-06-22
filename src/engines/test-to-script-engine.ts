@@ -134,6 +134,7 @@ export interface IntelligenceUsage {
   appProfileUsed: boolean;
   appKnowledgeUsed: boolean;
   repoPatternsUsed: boolean;
+  testDataUsed: boolean;
   /** Aggregated locator-resolution quality across all generated files. */
   locatorReport?: LocatorReport;
 }
@@ -171,6 +172,14 @@ interface IntelligenceBundle {
    * the user's own test environment and are committed only to the user's repo.
    */
   credentials?: { username?: string; password?: string };
+  /**
+   * Test data sets available for this project (from Test Data Store).
+   * Materialized as data/*.json files in the repo for the Framework Auditor to
+   * discover, and passed here so Script Generation can reference real data
+   * instead of hallucinating test values.
+   */
+  testData?: Array<{ name: string; sampleKeys: string[] }>;
+  testDataUsed: boolean;
 }
 
 /** Internal: a set of related test cases that will become one spec file. */
@@ -324,12 +333,14 @@ export class TestToScriptEngine {
       appProfileUsed: intel.appProfileUsed,
       appKnowledgeUsed: intel.appKnowledgeUsed,
       repoPatternsUsed: !!intel.repoGuide,
+      testDataUsed: intel.testDataUsed,
       locatorReport: mergedLocatorReport,
     };
     logger.info(MOD, '🧠 Intelligence usage', {
       appProfile: intelligence.appProfileUsed,
       appKnowledge: intelligence.appKnowledgeUsed,
       repoPatterns: intelligence.repoPatternsUsed,
+      testData: intelligence.testDataUsed,
       locatorsResolved: mergedLocatorReport?.totalLocators ?? 0,
       avgLocatorConfidence: mergedLocatorReport?.avgConfidence ?? 0,
     });
@@ -400,6 +411,7 @@ export class TestToScriptEngine {
     const bundle: IntelligenceBundle = {
       appProfileUsed: false,
       appKnowledgeUsed: knowledgeItems.length > 0,
+      testDataUsed: false,
     };
 
     // 1. Application Profile → cached DOM (crawl_data) + compact prompt context.
@@ -472,6 +484,27 @@ export class TestToScriptEngine {
         }
       } catch (err: any) {
         logger.warn(MOD, 'Repo context load failed (non-blocking)', { error: err?.message });
+      }
+    }
+
+    // 2.5. Test Data Store → available datasets for this project. Script Generation
+    //      can now reference real data (e.g., `import users from '../data/valid_users.json'`)
+    //      instead of hallucinating test values.
+    bundle.testDataUsed = false;
+    if (input.projectId) {
+      try {
+        const { listTestDataSets } = await import('../db/postgres');
+        const datasets = await listTestDataSets(companyId, input.projectId);
+        if (datasets.length > 0) {
+          bundle.testData = datasets.slice(0, 10).map(ds => ({
+            name: ds.name,
+            sampleKeys: [], // Keys are not loaded here; the AI just knows the dataset exists.
+          }));
+          bundle.testDataUsed = true;
+          logger.info(MOD, '✅ Test data sets loaded', { count: datasets.length });
+        }
+      } catch (err: any) {
+        logger.warn(MOD, 'Test data load failed (non-blocking)', { error: err?.message });
       }
     }
 
@@ -773,6 +806,9 @@ export class TestToScriptEngine {
     // points at real selectors instead of guesses.
     const repoBlock = intel.repoGuide ? `\n${intel.repoGuide.promptBlock}` : '';
     const appProfileBlock = intel.appProfileBlock ? `\n${intel.appProfileBlock}` : '';
+    const testDataBlock = intel.testData && intel.testData.length > 0
+      ? `\n## Available Test Data (Materialized as data/*.json)\n\nThe following test data sets are available in the repository's \`data/\` folder:\n${intel.testData.map(td => `- ${td.name}`).join('\n')}\n\nYou can import and use them:\n\`\`\`typescript\nimport users from '../data/valid_users.json';\nconst testUser = users[0].value;\n\`\`\`\n\nPrefer using these real data sets over hardcoded test values.`
+      : '';
 
     const prompt = `You are an expert Playwright test automation engineer.
 
@@ -785,7 +821,7 @@ Generate ONE complete, runnable Playwright TypeScript test file for the feature 
 - Coverage Type: ${group.coverageType}
 - Base URL: ${baseUrl}
 - Framework: Playwright with TypeScript
-${knowledgeContext ? `\n## Application Knowledge\n${knowledgeContext}` : ''}${appProfileBlock}${repoBlock}
+${knowledgeContext ? `\n## Application Knowledge\n${knowledgeContext}` : ''}${appProfileBlock}${repoBlock}${testDataBlock}
 
 ## Test Cases to Automate (${group.cases.length})
 

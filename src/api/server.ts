@@ -52,6 +52,7 @@ import { createReleaseRiskRouter } from './routes/release-risk';
 import { createReleaseSignoffRouter } from './routes/release-signoff';
 import { createRCAIntelligenceRouter } from './routes/rca-intelligence';
 import { createTestCoverageRouter } from './routes/test-coverage';
+import { createTestDataRouter } from './routes/test-data';
 import { createHealingSettingsRouter } from './routes/healing-settings';
 import { createRequirementsRouter } from './routes/requirements';
 import { createTestCasesRouter } from './routes/test-cases';
@@ -234,6 +235,7 @@ export function createServer(): express.Application {
   app.use('/api/rca-intelligence', authMiddleware, companyMiddleware, sessionMiddleware, createRCAIntelligenceRouter());
   app.use('/api/roi', authMiddleware, companyMiddleware, sessionMiddleware, createROIRouter());
   app.use('/api/test-coverage', authMiddleware, companyMiddleware, sessionMiddleware, projectContextMiddleware, contextMiddleware, createTestCoverageRouter());
+  app.use('/api/test-data', authMiddleware, companyMiddleware, sessionMiddleware, projectContextMiddleware, contextMiddleware, createTestDataRouter());
   app.use('/api/healing-settings', authMiddleware, companyMiddleware, sessionMiddleware, projectContextMiddleware, contextMiddleware, createHealingSettingsRouter());
   app.use('/api/requirements', authMiddleware, companyMiddleware, sessionMiddleware, projectContextMiddleware, contextMiddleware, createRequirementsRouter());
   app.use('/api/test-cases', authMiddleware, companyMiddleware, sessionMiddleware, projectContextMiddleware, contextMiddleware, createTestCasesRouter());
