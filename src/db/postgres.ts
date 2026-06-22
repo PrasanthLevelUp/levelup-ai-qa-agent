@@ -8415,6 +8415,68 @@ export async function getTestCasesForDataset(datasetId: number): Promise<number[
   return rows.map(r => r.test_case_id);
 }
 
+/**
+ * Get test cases linked to a dataset with display metadata (id, title, scenario,
+ * priority). Powers the dataset "usage" view in the dashboard so users can see
+ * exactly which test cases consume a dataset before they edit or delete it.
+ */
+export async function getTestCasesForDatasetDetailed(
+  datasetId: number,
+): Promise<Array<{ id: number; title: string; scenario: string | null; priority: string | null }>> {
+  const pool = getPool();
+  const { rows } = await pool.query(
+    `SELECT tc.id, tc.title, ts.scenario AS scenario, tc.priority
+     FROM test_case_data_sets tcds
+     INNER JOIN generated_test_cases tc ON tc.id = tcds.test_case_id
+     LEFT JOIN generated_test_scenarios ts ON ts.id = tc.scenario_id
+     WHERE tcds.dataset_id = $1
+     ORDER BY tc.priority, tc.id`,
+    [datasetId],
+  );
+  return rows.map(r => ({
+    id: r.id,
+    title: r.title,
+    scenario: r.scenario ?? null,
+    priority: r.priority ?? null,
+  }));
+}
+
+/**
+ * List test cases belonging to a project (via requirement → scenario → case
+ * chain) so the dashboard can offer a picker when linking a test case to a
+ * dataset. Company-scoped; project filter is applied through the parent
+ * requirement's project_id. Legacy rows with a NULL company_id remain visible to
+ * their company but never leak across companies.
+ */
+export async function listTestCasesForProject(
+  companyId: number,
+  projectId?: number,
+): Promise<Array<{ id: number; title: string; scenario: string | null; requirement: string | null; priority: string | null }>> {
+  const pool = getPool();
+  const conds: string[] = ['(tc.company_id = $1 OR tc.company_id IS NULL)'];
+  const params: any[] = [companyId];
+  if (projectId != null) {
+    params.push(projectId);
+    conds.push(`req.project_id = $${params.length}`);
+  }
+  const { rows } = await pool.query(
+    `SELECT tc.id, tc.title, ts.scenario AS scenario, req.title AS requirement, tc.priority
+     FROM generated_test_cases tc
+     JOIN generated_test_scenarios ts ON ts.id = tc.scenario_id
+     JOIN test_requirements req ON req.id = ts.requirement_id
+     WHERE ${conds.join(' AND ')}
+     ORDER BY tc.priority, tc.id`,
+    params,
+  );
+  return rows.map(r => ({
+    id: r.id,
+    title: r.title,
+    scenario: r.scenario ?? null,
+    requirement: r.requirement ?? null,
+    priority: r.priority ?? null,
+  }));
+}
+
 // ---- Coverage Stats ----
 export async function getTestCoverageStats(companyId?: number, projectId?: number): Promise<{
   totalRequirements: number; totalScenarios: number; totalTestCases: number;
