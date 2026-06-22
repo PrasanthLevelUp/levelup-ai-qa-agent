@@ -16,10 +16,128 @@ import {
   createTestDataSet, getTestDataSet, listTestDataSets, updateTestDataSet, deleteTestDataSet,
   createTestDataRecord, getTestDataRecords, updateTestDataRecord, deleteTestDataRecord,
   resolveTestData,
+  linkTestCaseToDataset, unlinkTestCaseFromDataset, getLinkedDatasets,
+  getTestCasesForDatasetDetailed, listTestCasesForProject,
 } from '../../db/postgres';
 
 export function createTestDataRouter(): Router {
   const router = Router();
+
+  // ── Runtime Resolution ──────────────────────────────────────────────────────
+  // Registered before `/:id` so the literal `/resolve` path is never captured by
+  // the parameterized dataset-by-id route.
+
+  /**
+   * GET /api/test-data/resolve?name=valid_users&environment=prod
+   * Resolve test data with environment fallback and secret hydration.
+   *
+   * Returns records from the target environment, falls back to 'shared' if not
+   * found, and hydrates secret_ref values from Railway env vars.
+   */
+  router.get('/resolve', async (req: Request, res: Response) => {
+    try {
+      const companyId = (req as any).companyId as number;
+      const projectId = (req as any).projectId as number | undefined;
+      const name = req.query.name as string;
+      const environment = (req.query.environment as string) || 'shared';
+
+      if (!name) {
+        return res.status(400).json({ error: 'name query parameter is required' });
+      }
+
+      const data = await resolveTestData(name, companyId, projectId, environment);
+      if (!data) {
+        return res.status(404).json({ error: 'Test data set not found' });
+      }
+
+      return res.json({ name, environment, data });
+    } catch (err: any) {
+      return res.status(500).json({ error: 'Failed to resolve test data', details: err.message });
+    }
+  });
+
+  // ── Test Case ↔ Dataset Linkage ─────────────────────────────────────────────
+  // Registered before the parameterized `/:id` routes so the multi-segment
+  // linkage paths are never shadowed by `/:id`.
+
+  /**
+   * GET /api/test-data/link/test-cases
+   * List candidate test cases for the active project so the dashboard can offer a
+   * picker when linking a test case to a dataset. Project-scoped via middleware.
+   */
+  router.get('/link/test-cases', async (req: Request, res: Response) => {
+    try {
+      const companyId = (req as any).companyId as number;
+      const projectId = (req as any).projectId as number | undefined;
+      const testCases = await listTestCasesForProject(companyId, projectId);
+      return res.json({ testCases });
+    } catch (err: any) {
+      return res.status(500).json({ error: 'Failed to list test cases', details: err.message });
+    }
+  });
+
+  /**
+   * GET /api/test-data/test-case/:testCaseId/datasets
+   * List datasets linked to a test case.
+   */
+  router.get('/test-case/:testCaseId/datasets', async (req: Request, res: Response) => {
+    try {
+      const testCaseId = parseInt(String(req.params.testCaseId), 10);
+      if (Number.isNaN(testCaseId)) {
+        return res.status(400).json({ error: 'Invalid test case id' });
+      }
+      const datasets = await getLinkedDatasets(testCaseId);
+      return res.json({ datasets });
+    } catch (err: any) {
+      return res.status(500).json({ error: 'Failed to fetch linked datasets', details: err.message });
+    }
+  });
+
+  /**
+   * POST /api/test-data/test-case/:testCaseId/datasets/:datasetId
+   * Link a test case to a dataset. Validates dataset ownership (company + project)
+   * so a test case can never be linked to another tenant's dataset.
+   */
+  router.post('/test-case/:testCaseId/datasets/:datasetId', async (req: Request, res: Response) => {
+    try {
+      const testCaseId = parseInt(String(req.params.testCaseId), 10);
+      const datasetId = parseInt(String(req.params.datasetId), 10);
+      if (Number.isNaN(testCaseId) || Number.isNaN(datasetId)) {
+        return res.status(400).json({ error: 'Invalid test case id or dataset id' });
+      }
+      const companyId = (req as any).companyId as number;
+      const projectId = (req as any).projectId as number | undefined;
+
+      // Ownership check: the dataset must be visible to this company/project.
+      const dataset = await getTestDataSet(datasetId, companyId, projectId);
+      if (!dataset) {
+        return res.status(404).json({ error: 'Dataset not found or not accessible' });
+      }
+
+      await linkTestCaseToDataset(testCaseId, datasetId);
+      return res.status(201).json({ success: true, testCaseId, datasetId });
+    } catch (err: any) {
+      return res.status(500).json({ error: 'Failed to link test case to dataset', details: err.message });
+    }
+  });
+
+  /**
+   * DELETE /api/test-data/test-case/:testCaseId/datasets/:datasetId
+   * Unlink a test case from a dataset.
+   */
+  router.delete('/test-case/:testCaseId/datasets/:datasetId', async (req: Request, res: Response) => {
+    try {
+      const testCaseId = parseInt(String(req.params.testCaseId), 10);
+      const datasetId = parseInt(String(req.params.datasetId), 10);
+      if (Number.isNaN(testCaseId) || Number.isNaN(datasetId)) {
+        return res.status(400).json({ error: 'Invalid test case id or dataset id' });
+      }
+      await unlinkTestCaseFromDataset(testCaseId, datasetId);
+      return res.json({ success: true });
+    } catch (err: any) {
+      return res.status(500).json({ error: 'Failed to unlink test case from dataset', details: err.message });
+    }
+  });
 
   // ── Datasets CRUD ──────────────────────────────────────────────────────────
 
@@ -107,6 +225,32 @@ export function createTestDataRouter(): Router {
       return res.json({ dataset, records });
     } catch (err: any) {
       return res.status(500).json({ error: 'Failed to fetch test data set', details: err.message });
+    }
+  });
+
+  /**
+   * GET /api/test-data/:id/usage
+   * Show which test cases consume this dataset (impact view). Verifies dataset
+   * ownership first so usage can't be probed across tenants.
+   */
+  router.get('/:id/usage', async (req: Request, res: Response) => {
+    try {
+      const id = parseInt(String(req.params.id), 10);
+      if (Number.isNaN(id)) {
+        return res.status(400).json({ error: 'Invalid dataset id' });
+      }
+      const companyId = (req as any).companyId as number;
+      const projectId = (req as any).projectId as number | undefined;
+
+      const dataset = await getTestDataSet(id, companyId, projectId);
+      if (!dataset) {
+        return res.status(404).json({ error: 'Test data set not found or not accessible' });
+      }
+
+      const testCases = await getTestCasesForDatasetDetailed(id);
+      return res.json({ datasetId: id, testCaseCount: testCases.length, testCases });
+    } catch (err: any) {
+      return res.status(500).json({ error: 'Failed to fetch dataset usage', details: err.message });
     }
   });
 
@@ -239,39 +383,6 @@ export function createTestDataRouter(): Router {
       return res.json({ success: true });
     } catch (err: any) {
       return res.status(500).json({ error: 'Failed to delete test data record', details: err.message });
-    }
-  });
-
-  // ── Runtime Resolution ─────────────────────────────────────────────────────
-
-  /**
-   * GET /api/test-data/resolve?name=valid_users&environment=prod
-   * Resolve test data with environment fallback and secret hydration.
-   * 
-   * Example:
-   *   GET /api/test-data/resolve?name=valid_users&environment=prod
-   *   Returns records from 'prod' environment, falls back to 'shared' if not found,
-   *   and hydrates secret_ref values from Railway env vars.
-   */
-  router.get('/resolve', async (req: Request, res: Response) => {
-    try {
-      const companyId = (req as any).companyId as number;
-      const projectId = (req as any).projectId as number | undefined;
-      const name = req.query.name as string;
-      const environment = (req.query.environment as string) || 'shared';
-
-      if (!name) {
-        return res.status(400).json({ error: 'name query parameter is required' });
-      }
-
-      const data = await resolveTestData(name, companyId, projectId, environment);
-      if (!data) {
-        return res.status(404).json({ error: 'Test data set not found' });
-      }
-
-      return res.json({ name, environment, data });
-    } catch (err: any) {
-      return res.status(500).json({ error: 'Failed to resolve test data', details: err.message });
     }
   });
 
