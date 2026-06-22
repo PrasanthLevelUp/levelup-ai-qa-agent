@@ -2410,6 +2410,49 @@ async function migrateDefaultCompany(client: PoolClient): Promise<void> {
   await safeExec(client, 'idx_kr_target', `CREATE INDEX IF NOT EXISTS idx_kr_target ON knowledge_relationships(target_knowledge_id)`);
   await safeExec(client, 'idx_kr_company', `CREATE INDEX IF NOT EXISTS idx_kr_company ON knowledge_relationships(company_id)`);
 
+  // ── Test Data Store ──
+  // Project-scoped, environment-aware, reusable test data for Script Generation,
+  // Framework Auditor, and Healing. Designed to close the QA intelligence loop:
+  // Test Data Store → Auditor discovers → Test Cases reference → Generation uses.
+  console.log('🔧 [DB] Migration: Test Data Store...');
+
+  await safeExec(client, 'test_data_sets', `CREATE TABLE IF NOT EXISTS test_data_sets (
+    id SERIAL PRIMARY KEY,
+    company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+    project_id INTEGER REFERENCES projects(id) ON DELETE CASCADE,
+    name VARCHAR(200) NOT NULL,
+    description TEXT,
+    environment VARCHAR(50) NOT NULL DEFAULT 'shared' CHECK (environment IN ('shared', 'dev', 'staging', 'prod')),
+    version INTEGER NOT NULL DEFAULT 1,
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    created_by VARCHAR(200),
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    -- Project-scoped uniqueness: same name can exist per project per environment.
+    CONSTRAINT uq_test_dataset_name_project_env UNIQUE (company_id, COALESCE(project_id, 0), name, environment)
+  )`);
+  await safeExec(client, 'idx_tds_company', `CREATE INDEX IF NOT EXISTS idx_tds_company ON test_data_sets(company_id)`);
+  await safeExec(client, 'idx_tds_project', `CREATE INDEX IF NOT EXISTS idx_tds_project ON test_data_sets(project_id)`);
+  await safeExec(client, 'idx_tds_name', `CREATE INDEX IF NOT EXISTS idx_tds_name ON test_data_sets(name)`);
+  await safeExec(client, 'idx_tds_env', `CREATE INDEX IF NOT EXISTS idx_tds_env ON test_data_sets(environment)`);
+
+  await safeExec(client, 'test_data_records', `CREATE TABLE IF NOT EXISTS test_data_records (
+    id SERIAL PRIMARY KEY,
+    dataset_id INTEGER NOT NULL REFERENCES test_data_sets(id) ON DELETE CASCADE,
+    key VARCHAR(200) NOT NULL,
+    value_jsonb JSONB NOT NULL DEFAULT '{}',
+    data_type VARCHAR(50) NOT NULL DEFAULT 'object' CHECK (data_type IN ('string', 'number', 'boolean', 'object', 'array')),
+    is_secret BOOLEAN NOT NULL DEFAULT FALSE,
+    secret_ref VARCHAR(500),
+    tags TEXT[],
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    CONSTRAINT uq_test_record_key UNIQUE (dataset_id, key)
+  )`);
+  await safeExec(client, 'idx_tdr_dataset', `CREATE INDEX IF NOT EXISTS idx_tdr_dataset ON test_data_records(dataset_id)`);
+  await safeExec(client, 'idx_tdr_key', `CREATE INDEX IF NOT EXISTS idx_tdr_key ON test_data_records(key)`);
+  await safeExec(client, 'idx_tdr_tags', `CREATE INDEX IF NOT EXISTS idx_tdr_tags ON test_data_records USING GIN(tags)`);
+
   // ── AI Usage Logging ──
   console.log('🔧 [DB] Migration: AI Usage tables...');
 
@@ -7992,6 +8035,258 @@ export async function deleteApplicationKnowledge(id: number): Promise<boolean> {
   const pool = getPool();
   const r = await pool.query('DELETE FROM application_knowledge WHERE id = $1', [id]);
   return (r.rowCount ?? 0) > 0;
+}
+
+// ---- Test Data Store ----
+export interface TestDataSet {
+  id: number;
+  company_id: number;
+  project_id: number | null;
+  name: string;
+  description: string | null;
+  environment: 'shared' | 'dev' | 'staging' | 'prod';
+  version: number;
+  is_active: boolean;
+  created_by: string | null;
+  created_at: Date;
+  updated_at: Date;
+}
+
+export interface TestDataRecord {
+  id: number;
+  dataset_id: number;
+  key: string;
+  value_jsonb: any;
+  data_type: 'string' | 'number' | 'boolean' | 'object' | 'array';
+  is_secret: boolean;
+  secret_ref: string | null;
+  tags: string[];
+  created_at: Date;
+  updated_at: Date;
+}
+
+export async function createTestDataSet(data: {
+  companyId: number;
+  projectId?: number | null;
+  name: string;
+  description?: string;
+  environment?: 'shared' | 'dev' | 'staging' | 'prod';
+  createdBy?: string;
+}): Promise<TestDataSet> {
+  const pool = getPool();
+  const { rows } = await pool.query(
+    `INSERT INTO test_data_sets (company_id, project_id, name, description, environment, created_by)
+     VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+    [data.companyId, data.projectId ?? null, data.name, data.description ?? null,
+     data.environment ?? 'shared', data.createdBy ?? null],
+  );
+  return rows[0];
+}
+
+export async function getTestDataSet(id: number, companyId: number, projectId?: number): Promise<TestDataSet | null> {
+  const pool = getPool();
+  // Enforce project isolation: only return if this project owns it OR it's company-wide (project_id NULL).
+  const conds = ['id = $1', 'company_id = $2'];
+  const params: any[] = [id, companyId];
+  if (projectId != null) {
+    params.push(projectId);
+    conds.push('(project_id = $3 OR project_id IS NULL)');
+  }
+  const { rows } = await pool.query(
+    `SELECT * FROM test_data_sets WHERE ${conds.join(' AND ')}`,
+    params,
+  );
+  return rows.length > 0 ? rows[0] : null;
+}
+
+export async function listTestDataSets(
+  companyId: number,
+  projectId?: number,
+  environment?: string,
+): Promise<TestDataSet[]> {
+  const pool = getPool();
+  const conds = ['company_id = $1', 'is_active = TRUE'];
+  const params: any[] = [companyId];
+  if (projectId != null) {
+    params.push(projectId);
+    conds.push('(project_id = $2 OR project_id IS NULL)');
+  }
+  if (environment) {
+    params.push(environment);
+    conds.push(`environment = $${params.length}`);
+  }
+  const { rows } = await pool.query(
+    `SELECT * FROM test_data_sets WHERE ${conds.join(' AND ')} ORDER BY name, environment`,
+    params,
+  );
+  return rows;
+}
+
+export async function updateTestDataSet(
+  id: number,
+  companyId: number,
+  projectId: number | undefined,
+  updates: Partial<Pick<TestDataSet, 'name' | 'description' | 'environment' | 'version' | 'is_active'>>,
+): Promise<TestDataSet | null> {
+  const pool = getPool();
+  const setClauses: string[] = [];
+  const params: any[] = [];
+  if (updates.name !== undefined) { params.push(updates.name); setClauses.push(`name = $${params.length}`); }
+  if (updates.description !== undefined) { params.push(updates.description); setClauses.push(`description = $${params.length}`); }
+  if (updates.environment !== undefined) { params.push(updates.environment); setClauses.push(`environment = $${params.length}`); }
+  if (updates.version !== undefined) { params.push(updates.version); setClauses.push(`version = $${params.length}`); }
+  if (updates.is_active !== undefined) { params.push(updates.is_active); setClauses.push(`is_active = $${params.length}`); }
+  if (setClauses.length === 0) {
+    return getTestDataSet(id, companyId, projectId);
+  }
+  setClauses.push('updated_at = NOW()');
+  params.push(id, companyId);
+  const whereConds = [`id = $${params.length - 1}`, `company_id = $${params.length}`];
+  if (projectId != null) {
+    params.push(projectId);
+    whereConds.push(`(project_id = $${params.length} OR project_id IS NULL)`);
+  }
+  const { rows } = await pool.query(
+    `UPDATE test_data_sets SET ${setClauses.join(', ')} WHERE ${whereConds.join(' AND ')} RETURNING *`,
+    params,
+  );
+  return rows.length > 0 ? rows[0] : null;
+}
+
+export async function deleteTestDataSet(id: number, companyId: number, projectId?: number): Promise<boolean> {
+  const pool = getPool();
+  const conds = ['id = $1', 'company_id = $2'];
+  const params: any[] = [id, companyId];
+  if (projectId != null) {
+    params.push(projectId);
+    conds.push('(project_id = $3 OR project_id IS NULL)');
+  }
+  const { rowCount } = await pool.query(
+    `DELETE FROM test_data_sets WHERE ${conds.join(' AND ')}`,
+    params,
+  );
+  return (rowCount ?? 0) > 0;
+}
+
+export async function createTestDataRecord(data: {
+  datasetId: number;
+  key: string;
+  value: any;
+  dataType?: 'string' | 'number' | 'boolean' | 'object' | 'array';
+  isSecret?: boolean;
+  secretRef?: string;
+  tags?: string[];
+}): Promise<TestDataRecord> {
+  const pool = getPool();
+  const { rows } = await pool.query(
+    `INSERT INTO test_data_records (dataset_id, key, value_jsonb, data_type, is_secret, secret_ref, tags)
+     VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`,
+    [data.datasetId, data.key, JSON.stringify(data.value), data.dataType ?? 'object',
+     data.isSecret ?? false, data.secretRef ?? null, data.tags ?? []],
+  );
+  return rows[0];
+}
+
+export async function getTestDataRecords(datasetId: number): Promise<TestDataRecord[]> {
+  const pool = getPool();
+  const { rows } = await pool.query(
+    `SELECT * FROM test_data_records WHERE dataset_id = $1 ORDER BY key`,
+    [datasetId],
+  );
+  return rows;
+}
+
+export async function updateTestDataRecord(
+  id: number,
+  updates: Partial<Pick<TestDataRecord, 'value_jsonb' | 'data_type' | 'is_secret' | 'secret_ref' | 'tags'>>,
+): Promise<TestDataRecord | null> {
+  const pool = getPool();
+  const setClauses: string[] = [];
+  const params: any[] = [];
+  if (updates.value_jsonb !== undefined) { params.push(JSON.stringify(updates.value_jsonb)); setClauses.push(`value_jsonb = $${params.length}`); }
+  if (updates.data_type !== undefined) { params.push(updates.data_type); setClauses.push(`data_type = $${params.length}`); }
+  if (updates.is_secret !== undefined) { params.push(updates.is_secret); setClauses.push(`is_secret = $${params.length}`); }
+  if (updates.secret_ref !== undefined) { params.push(updates.secret_ref); setClauses.push(`secret_ref = $${params.length}`); }
+  if (updates.tags !== undefined) { params.push(updates.tags); setClauses.push(`tags = $${params.length}`); }
+  if (setClauses.length === 0) return null;
+  setClauses.push('updated_at = NOW()');
+  params.push(id);
+  const { rows } = await pool.query(
+    `UPDATE test_data_records SET ${setClauses.join(', ')} WHERE id = $${params.length} RETURNING *`,
+    params,
+  );
+  return rows.length > 0 ? rows[0] : null;
+}
+
+export async function deleteTestDataRecord(id: number): Promise<boolean> {
+  const pool = getPool();
+  const { rowCount } = await pool.query(`DELETE FROM test_data_records WHERE id = $1`, [id]);
+  return (rowCount ?? 0) > 0;
+}
+
+/**
+ * Resolve test data with environment fallback and secret resolution.
+ * 
+ * Resolution order for a given (name, environment):
+ * 1. Look for dataset in target environment (e.g., 'prod')
+ * 2. Fall back to 'shared' environment if not found
+ * 3. Resolve secret references via Railway env vars (extensible to AWS Secrets Manager / Vault)
+ * 
+ * @param name - dataset name (e.g., 'valid_users')
+ * @param companyId - company scope
+ * @param projectId - project scope (NULL = company-wide)
+ * @param environment - target environment ('dev', 'staging', 'prod'); defaults to 'shared'
+ * @returns Resolved records as array of objects with secrets hydrated
+ */
+export async function resolveTestData(
+  name: string,
+  companyId: number,
+  projectId?: number,
+  environment: string = 'shared',
+): Promise<any[] | null> {
+  const pool = getPool();
+  // Find dataset: prefer target environment, fall back to 'shared'.
+  const conds = ['company_id = $1', 'name = $2', 'is_active = TRUE'];
+  const params: any[] = [companyId, name];
+  if (projectId != null) {
+    params.push(projectId);
+    conds.push('(project_id = $3 OR project_id IS NULL)');
+  }
+  const envOrder = environment === 'shared' ? ['shared'] : [environment, 'shared'];
+  params.push(envOrder);
+  const { rows: datasets } = await pool.query(
+    `SELECT * FROM test_data_sets
+     WHERE ${conds.join(' AND ')} AND environment = ANY($${params.length})
+     ORDER BY (CASE WHEN environment = $${params.length - (projectId != null ? 1 : 0)} THEN 0 ELSE 1 END), updated_at DESC
+     LIMIT 1`,
+    params,
+  );
+  if (datasets.length === 0) return null;
+  const dataset = datasets[0];
+
+  // Fetch records.
+  const { rows: records } = await pool.query(
+    `SELECT * FROM test_data_records WHERE dataset_id = $1 ORDER BY key`,
+    [dataset.id],
+  );
+
+  // Resolve secrets.
+  return records.map((rec: TestDataRecord) => {
+    let value = rec.value_jsonb;
+    if (rec.is_secret && rec.secret_ref) {
+      // Railway env var resolution (process.env).
+      // Future: extend to AWS Secrets Manager / Vault via provider pattern.
+      const secretValue = process.env[rec.secret_ref];
+      if (secretValue) {
+        value = typeof value === 'object' && !Array.isArray(value)
+          ? { ...value, _resolved: secretValue }
+          : secretValue;
+      } else {
+        console.warn(`[TestData] Secret ref ${rec.secret_ref} not found in environment`);
+      }
+    }
+    return { key: rec.key, value, dataType: rec.data_type, tags: rec.tags };
+  });
 }
 
 // ---- Coverage Stats ----
