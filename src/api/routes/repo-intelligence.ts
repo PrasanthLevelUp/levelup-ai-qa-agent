@@ -179,7 +179,7 @@ export function createRepoIntelligenceRouter(): Router {
     try {
       const repoId = req.params['repoId'] as string;
       const companyId = (req as any).companyId as number | undefined;
-      const profile = await getRepositoryContext(repoId, companyId);
+      const profile = await getRepositoryContext(repoId, companyId, (req as any).projectId);
       if (!profile) {
         // Return 200 with exists:false instead of 404 — unscanned repos are expected, not errors
         return res.json({ success: true, exists: false, profile: null });
@@ -195,7 +195,7 @@ export function createRepoIntelligenceRouter(): Router {
     try {
       const repoId = req.params['repoId'] as string;
       const companyId = (req as any).companyId as number | undefined;
-      const profile = await getRepositoryContext(repoId, companyId);
+      const profile = await getRepositoryContext(repoId, companyId, (req as any).projectId);
       if (!profile) {
         return res.status(404).json({ success: false, error: 'Repository context not found' });
       }
@@ -217,7 +217,7 @@ export function createRepoIntelligenceRouter(): Router {
     try {
       const repoId = req.params['repoId'] as string;
       const companyId = (req as any).companyId as number | undefined;
-      const profile = await getRepositoryContext(repoId, companyId);
+      const profile = await getRepositoryContext(repoId, companyId, (req as any).projectId);
       if (!profile) {
         return res.status(404).json({ success: false, error: 'Repository context not found' });
       }
@@ -243,7 +243,7 @@ export function createRepoIntelligenceRouter(): Router {
       };
 
       // First get the context ID
-      const profile = await getRepositoryContext(repoId, companyId);
+      const profile = await getRepositoryContext(repoId, companyId, (req as any).projectId);
       if (!profile) {
         return res.status(404).json({ success: false, error: 'Repository context not found' });
       }
@@ -272,7 +272,7 @@ export function createRepoIntelligenceRouter(): Router {
     try {
       const repoId = req.params['repoId'] as string;
       const companyId = (req as any).companyId as number | undefined;
-      const profile = await getRepositoryContext(repoId, companyId);
+      const profile = await getRepositoryContext(repoId, companyId, (req as any).projectId);
       if (!profile) {
         return res.status(404).json({ success: false, error: 'Repository context not found' });
       }

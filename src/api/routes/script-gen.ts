@@ -234,7 +234,9 @@ export function createScriptGenRouter(): Router {
       let repoProfile: import('../../context/types').RepositoryProfile | undefined;
       if (repoId) {
         console.log(`[ScriptGen] 🔍 Loading repository intelligence for repoId=${repoId}...`);
-        const profile = await getRepositoryContext(repoId, companyId);
+        // Strict project scoping: never surface another project's repo profile.
+        const reqProjectId = (req as any).projectId as number | undefined;
+        const profile = await getRepositoryContext(repoId, companyId, reqProjectId);
         if (profile) {
           const { buildAIPromptContext } = await import('../../context/prompt-builder');
           repoIntelligence = buildAIPromptContext(profile);

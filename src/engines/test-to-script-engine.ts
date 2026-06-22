@@ -222,7 +222,7 @@ export class TestToScriptEngine {
     let knowledgeContext = '';
     let knowledgeItems: KnowledgeItem[] = [];
     try {
-      const knowledge = await getApplicationKnowledge(companyId);
+      const knowledge = await getApplicationKnowledge(companyId, input.projectId);
       if (knowledge.length) {
         knowledgeItems = knowledge as KnowledgeItem[];
         knowledgeContext = knowledge
@@ -338,7 +338,7 @@ export class TestToScriptEngine {
     let frameworkAnalysis: import('../script-gen/framework-auditor').FrameworkAuditResult | undefined;
     if (input.repositoryId && (input.companyId || input.projectId)) {
       try {
-        const repoProfile = await getRepositoryContext(String(input.repositoryId), input.companyId);
+        const repoProfile = await getRepositoryContext(String(input.repositoryId), input.companyId, input.projectId);
         if (repoProfile) {
           const generationContext: GenerationContext = {
             testCases: testCases.map((tc) => ({
@@ -457,7 +457,7 @@ export class TestToScriptEngine {
     let repoProfile: RepositoryProfile | null = null;
     if (input.repositoryId) {
       try {
-        repoProfile = await getRepositoryContext(String(input.repositoryId), companyId);
+        repoProfile = await getRepositoryContext(String(input.repositoryId), companyId, input.projectId);
         if (repoProfile) {
           bundle.repoGuide = analyzeRepoPatterns(repoProfile);
           if (bundle.repoGuide) {
