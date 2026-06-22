@@ -109,7 +109,7 @@ export function createTestCoverageRouter(): Router {
       // Fetch app knowledge for context (legacy application_knowledge table)
       let knowledge: KnowledgeContext = { modules: [], historicalBugs: [] };
       try {
-        const knowledgeRows = await getApplicationKnowledge(companyId);
+        const knowledgeRows = await getApplicationKnowledge(companyId, projectId);
         knowledge = {
           modules: knowledgeRows.map((k: any) => ({
             name: k.module,
@@ -157,7 +157,7 @@ export function createTestCoverageRouter(): Router {
       let repoContextUsed: any = null;
       if (useRepoIntelligence && repoId) {
         try {
-          const profile = await getRepositoryContext(repoId, companyId);
+          const profile = await getRepositoryContext(repoId, companyId, projectId);
           if (profile) {
             repoContextUsed = { repoId, profile };
             // Merge repo context into knowledge for the AI engine
@@ -473,7 +473,8 @@ export function createTestCoverageRouter(): Router {
   router.get('/knowledge', async (req: Request, res: Response) => {
     try {
       const companyId = (req as any).companyId;
-      const knowledge = await getApplicationKnowledge(companyId);
+      const projectId = (req as any).projectId;
+      const knowledge = await getApplicationKnowledge(companyId, projectId);
       return res.json(knowledge);
     } catch (err: any) {
       return res.status(500).json({ error: 'Failed to fetch knowledge', details: err.message });
@@ -485,8 +486,9 @@ export function createTestCoverageRouter(): Router {
       const { module: mod, workflow, businessRules, dependencies, apis, historicalBugs } = req.body;
       if (!mod) return res.status(400).json({ error: 'module is required' });
       const companyId = (req as any).companyId;
+      const projectId = (req as any).projectId;
       const id = await upsertApplicationKnowledge({
-        module: mod, workflow, businessRules, dependencies, apis, historicalBugs, companyId,
+        module: mod, workflow, businessRules, dependencies, apis, historicalBugs, companyId, projectId,
       });
       return res.json({ id, module: mod });
     } catch (err: any) {

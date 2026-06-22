@@ -1695,6 +1695,9 @@ async function migrateDefaultCompany(client: PoolClient): Promise<void> {
     IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='learned_patterns' AND column_name='project_id') THEN
       ALTER TABLE learned_patterns ADD COLUMN project_id INTEGER REFERENCES projects(id) ON DELETE SET NULL;
     END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='application_knowledge' AND column_name='project_id') THEN
+      ALTER TABLE application_knowledge ADD COLUMN project_id INTEGER REFERENCES projects(id) ON DELETE SET NULL;
+    END IF;
   END $$`);
 
   // ── Healing Intelligence: tenant-isolate learned_patterns uniqueness ──
@@ -2198,6 +2201,7 @@ async function migrateDefaultCompany(client: PoolClient): Promise<void> {
     `CREATE INDEX IF NOT EXISTS idx_rca_project ON rca_analyses(project_id)`,
     `CREATE INDEX IF NOT EXISTS idx_test_req_project ON test_requirements(project_id)`,
     `CREATE INDEX IF NOT EXISTS idx_repo_ctx_project ON repository_contexts(project_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_app_knowledge_project ON application_knowledge(project_id)`,
   ];
   for (const idx of projectIdIndexes) {
     await safeExec(client, idx.match(/idx_\w+/)?.[0] || 'project_index', idx);
@@ -2207,6 +2211,28 @@ async function migrateDefaultCompany(client: PoolClient): Promise<void> {
   await safeExec(client, 'comment_repo_ctx_project',
     `COMMENT ON COLUMN repository_contexts.project_id IS
      'Links repository intelligence to a specific project for scoped access (Phase 1). NULL = company-wide.'`);
+
+  // ── Project-partitioned repository contexts ──
+  // Previously the unique key was (repo_id, company_id) which allowed only ONE
+  // scanned profile per repo+company. When two projects shared the same repo
+  // they clobbered each other's scan, and Script Generation could surface the
+  // wrong project's page-objects/locators. We re-key uniqueness to also include
+  // the project so each project keeps its own profile (NULL = company-wide).
+  //
+  // Done atomically and GUARDED on project_id existing: we only swap indexes
+  // once the column is present, so a brand-new database (where the project_id
+  // ALTER lands on a later pass) is never left without a unique constraint.
+  // Idempotent — safe to re-run.
+  await safeExec(client, 'repo_ctx_repo_company_project_unique', `DO $$ BEGIN
+    IF EXISTS (
+      SELECT 1 FROM information_schema.columns
+      WHERE table_name='repository_contexts' AND column_name='project_id'
+    ) THEN
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_repo_ctx_repo_company_project
+        ON repository_contexts(repo_id, COALESCE(company_id, 0), COALESCE(project_id, 0));
+      DROP INDEX IF EXISTS idx_repo_ctx_repo_company;
+    END IF;
+  END $$`);
 
   // ── Script history: add deleted_at for soft deletes ──
   console.log('🔧 [DB] Migration: Adding script history columns...');
@@ -7908,12 +7934,17 @@ export async function getRequirementAutomationCoverage(
 export async function upsertApplicationKnowledge(data: {
   module: string; workflow?: string; businessRules?: string;
   dependencies?: string; apis?: string; historicalBugs?: string;
-  companyId?: number;
+  companyId?: number; projectId?: number | null;
 }): Promise<number> {
   const pool = getPool();
+  const pid = data.projectId ?? null;
+  // Scope the upsert key by project so the same module name can hold distinct
+  // knowledge per project (NULL = company-wide). Prevents one project's module
+  // workflow from overwriting another's, and keeps reads project-isolated.
   const existing = await pool.query(
-    `SELECT id FROM application_knowledge WHERE module = $1 AND COALESCE(company_id, 0) = $2`,
-    [data.module, data.companyId || 0]
+    `SELECT id FROM application_knowledge
+       WHERE module = $1 AND COALESCE(company_id, 0) = $2 AND COALESCE(project_id, 0) = COALESCE($3, 0)`,
+    [data.module, data.companyId || 0, pid]
   );
   if (existing.rows.length > 0) {
     await pool.query(
@@ -7925,19 +7956,32 @@ export async function upsertApplicationKnowledge(data: {
     return existing.rows[0].id;
   }
   const r = await pool.query(
-    `INSERT INTO application_knowledge (module, workflow, business_rules, dependencies, apis, historical_bugs, company_id)
-     VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id`,
+    `INSERT INTO application_knowledge (module, workflow, business_rules, dependencies, apis, historical_bugs, company_id, project_id)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id`,
     [data.module, data.workflow || null, data.businessRules || null,
      data.dependencies || null, data.apis || null, data.historicalBugs || null,
-     data.companyId || null]
+     data.companyId || null, pid]
   );
   return r.rows[0].id;
 }
 
-export async function getApplicationKnowledge(companyId?: number): Promise<any[]> {
+export async function getApplicationKnowledge(
+  companyId?: number,
+  projectId?: number | null,
+): Promise<any[]> {
   const pool = getPool();
-  const where = companyId ? 'WHERE company_id = $1' : '';
-  const params = companyId ? [companyId] : [];
+  // Project-scoped read for Script Generation: when a projectId is supplied we
+  // return this project's knowledge plus company-wide rows (project_id IS NULL),
+  // never another project's knowledge — its module workflows / selectors could
+  // otherwise bleed into a different project's generated scripts.
+  const conds: string[] = [];
+  const params: any[] = [];
+  if (companyId) { params.push(companyId); conds.push(`company_id = $${params.length}`); }
+  if (projectId != null) {
+    params.push(projectId);
+    conds.push(`(project_id = $${params.length} OR project_id IS NULL)`);
+  }
+  const where = conds.length ? `WHERE ${conds.join(' AND ')}` : '';
   const r = await pool.query(
     `SELECT * FROM application_knowledge ${where} ORDER BY module`, params
   );
@@ -8169,23 +8213,26 @@ export async function saveRepositoryContext(
   const pid = projectId ?? null;
   const profileJson = JSON.stringify(profile);
 
-  // Upsert – update if same repo+company exists
+  // Upsert – scope existence by repo + company + project so that two projects
+  // sharing the same repo each keep their OWN scanned profile instead of
+  // clobbering one another (which previously caused cross-project locator
+  // bleed). A company-wide row (project_id IS NULL) and a project-specific row
+  // can coexist; we only match/replace the row for the exact same scope.
   const existing = await p.query(
     `SELECT id, profile_version FROM repository_contexts
-     WHERE repo_id = $1 AND COALESCE(company_id, 0) = COALESCE($2, 0)`,
-    [repoId, cid],
+     WHERE repo_id = $1 AND COALESCE(company_id, 0) = COALESCE($2, 0)
+       AND COALESCE(project_id, 0) = COALESCE($3, 0)`,
+    [repoId, cid, pid],
   );
 
   if (existing.rows.length > 0) {
     const row = existing.rows[0];
     const newVersion = (row.profile_version ?? 1) + 1;
-    // Only overwrite project_id when a concrete value is supplied, so a
-    // company-wide re-scan never clobbers an existing project link.
     await p.query(
       `UPDATE repository_contexts SET profile=$1, scan_duration_ms=$2,
-       profile_version=$3, project_id=COALESCE($4, project_id), updated_at=NOW()
-       WHERE id=$5`,
-      [profileJson, scanDurationMs, newVersion, pid, row.id],
+       profile_version=$3, updated_at=NOW()
+       WHERE id=$4`,
+      [profileJson, scanDurationMs, newVersion, row.id],
     );
     return row.id;
   }
@@ -8201,14 +8248,26 @@ export async function saveRepositoryContext(
 export async function getRepositoryContext(
   repoId: string,
   companyId?: number,
+  projectId?: number | null,
 ): Promise<RepositoryProfile | null> {
   const p = getPool();
-  const res = await p.query(
-    `SELECT profile FROM repository_contexts
-     WHERE repo_id = $1 AND COALESCE(company_id, 0) = COALESCE($2, 0)
-     ORDER BY updated_at DESC LIMIT 1`,
-    [repoId, companyId ?? null],
-  );
+  // Strict project scoping for Script Generation: when a projectId is supplied
+  // we must NEVER return another project's scanned repository profile (its page
+  // objects / locators would leak across projects). We therefore FILTER to rows
+  // belonging to this project OR to company-wide rows (project_id IS NULL), and
+  // prefer the exact project match. If neither exists we return null so the
+  // caller falls back to greenfield generation instead of leaking.
+  const params: any[] = [repoId, companyId ?? null];
+  let sql = `SELECT profile FROM repository_contexts
+             WHERE repo_id = $1 AND COALESCE(company_id, 0) = COALESCE($2, 0)`;
+  if (projectId != null) {
+    params.push(projectId);
+    sql += ` AND (project_id = $3 OR project_id IS NULL)
+             ORDER BY (CASE WHEN project_id = $3 THEN 0 ELSE 1 END), updated_at DESC LIMIT 1`;
+  } else {
+    sql += ` ORDER BY updated_at DESC LIMIT 1`;
+  }
+  const res = await p.query(sql, params);
   if (res.rows.length === 0) return null;
   return res.rows[0].profile as RepositoryProfile;
 }

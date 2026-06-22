@@ -374,7 +374,7 @@ export class IntelligenceFusionService {
     // Direct repository context lookup (by repo_id) when available.
     if (repositoryId !== undefined && repositoryId !== null) {
       try {
-        const profile = await getRepositoryContext(String(repositoryId), companyId);
+        const profile = await getRepositoryContext(String(repositoryId), companyId, projectId);
         if (profile) return this.summarizeRepoProfile(profile);
       } catch {
         /* fall through to context-table lookup */
