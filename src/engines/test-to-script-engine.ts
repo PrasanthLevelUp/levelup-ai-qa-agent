@@ -771,6 +771,44 @@ export class TestToScriptEngine {
       }
     }
 
+    // ── DETERMINISTIC DATASET SELECTION ─────────────────────────────────────
+    // Load datasets linked to the test cases in this group. If any case has
+    // linkage, we use ONLY those datasets (deterministic); otherwise fall back
+    // to project-level datasets (all available). This closes the "which dataset
+    // should I use?" guessing problem: TC-001 Login → valid_users → generation
+    // knows exactly what to import.
+    let groupTestData: Array<{ name: string; environment: string; recordCount: number; sampleKeys: string[] }> = [];
+    try {
+      const { getLinkedDatasets, getTestDataSetSummaries } = await import('../db/postgres');
+      const linkedDatasetIds = new Set<number>();
+      for (const tc of group.cases) {
+        const linked = await getLinkedDatasets(tc.id);
+        linked.forEach(ds => linkedDatasetIds.add(ds.id));
+      }
+      if (linkedDatasetIds.size > 0) {
+        // Deterministic path: use only the linked datasets for this group's cases.
+        // getTestDataSetSummaries filters by dataset ID when the 5th param is provided.
+        groupTestData = await getTestDataSetSummaries(
+          requirement.company_id,
+          requirement.project_id,
+          undefined,
+          5,
+          [...linkedDatasetIds],
+        );
+        logger.info(MOD, '✅ Deterministic dataset selection via linkage', {
+          feature: group.feature,
+          caseIds: group.cases.map((c: any) => c.id),
+          linkedDatasets: groupTestData.map(d => d.name),
+        });
+      } else {
+        // Fallback: no linkage, use project-level datasets (original behavior).
+        groupTestData = intel.testData || [];
+      }
+    } catch (err: any) {
+      logger.warn(MOD, 'Dataset linkage load failed (non-blocking)', { error: err?.message });
+      groupTestData = intel.testData || [];
+    }
+
     // Build the prompt with explicit per-case anchors and a strict contract.
     const testCaseDescriptions = group.cases.map((tc: any, i: number) => {
       const steps = this.parseJson(tc.steps, []);
@@ -809,8 +847,10 @@ export class TestToScriptEngine {
     // Token-safe test data block: list datasets with their record count + a few
     // sample keys ONLY. We deliberately never embed full rows or values here — the
     // generated test imports the data/*.json FILE and reads values at runtime.
-    const testDataBlock = intel.testData && intel.testData.length > 0
-      ? `\n## Available Test Data (Materialized as data/*.json)\n\nThese datasets live in the repository's \`data/\` folder. Import the FILE and read values at runtime — do NOT hardcode or inline the dataset contents.\n${intel.testData.map(td => {
+    // NOTE: groupTestData is either (a) linked datasets for this group's test cases
+    // (deterministic), or (b) project-level datasets (fallback when no linkage).
+    const testDataBlock = groupTestData.length > 0
+      ? `\n## Available Test Data (Materialized as data/*.json)\n\nThese datasets live in the repository's \`data/\` folder. Import the FILE and read values at runtime — do NOT hardcode or inline the dataset contents.\n${groupTestData.map(td => {
           const keys = td.sampleKeys.length ? ` — sample keys: ${td.sampleKeys.slice(0, 5).join(', ')}` : '';
           return `- \`data/${td.name}.json\` (${td.environment}, ${td.recordCount} record${td.recordCount === 1 ? '' : 's'})${keys}`;
         }).join('\n')}\n\nUsage pattern:\n\`\`\`typescript\nimport dataset from '../data/<name>.json';\nconst record = dataset.find((r) => r.key === '<key>');\nconst value = record?.value;\n\`\`\`\n\nPrefer these real datasets over hardcoded test values.`
