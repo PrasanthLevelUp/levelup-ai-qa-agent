@@ -2460,6 +2460,20 @@ async function migrateDefaultCompany(client: PoolClient): Promise<void> {
   await safeExec(client, 'idx_tdr_key', `CREATE INDEX IF NOT EXISTS idx_tdr_key ON test_data_records(key)`);
   await safeExec(client, 'idx_tdr_tags', `CREATE INDEX IF NOT EXISTS idx_tdr_tags ON test_data_records USING GIN(tags)`);
 
+  // ── Test Case → Dataset Linkage ──
+  // Many-to-many relationship enabling deterministic dataset selection during
+  // script generation. When TC-001 (Login) links to valid_users, generation
+  // knows exactly which dataset to use instead of guessing from all available.
+  await safeExec(client, 'test_case_data_sets', `CREATE TABLE IF NOT EXISTS test_case_data_sets (
+    id SERIAL PRIMARY KEY,
+    test_case_id INTEGER NOT NULL REFERENCES generated_test_cases(id) ON DELETE CASCADE,
+    dataset_id INTEGER NOT NULL REFERENCES test_data_sets(id) ON DELETE CASCADE,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    CONSTRAINT uq_test_case_dataset UNIQUE (test_case_id, dataset_id)
+  )`);
+  await safeExec(client, 'idx_tcds_test_case', `CREATE INDEX IF NOT EXISTS idx_tcds_test_case ON test_case_data_sets(test_case_id)`);
+  await safeExec(client, 'idx_tcds_dataset', `CREATE INDEX IF NOT EXISTS idx_tcds_dataset ON test_case_data_sets(dataset_id)`);
+
   // ── AI Usage Logging ──
   console.log('🔧 [DB] Migration: AI Usage tables...');
 
@@ -8210,14 +8224,19 @@ export async function getTestDataRecords(datasetId: number): Promise<TestDataRec
  * explosion) while giving the model enough to reference the right data file.
  *
  * @param sampleKeysPerSet - max sample keys to fetch per dataset (default 5)
+ * @param datasetIds - optional array of dataset IDs to filter (for deterministic linkage)
  */
 export async function getTestDataSetSummaries(
   companyId: number,
   projectId?: number,
   environment?: string,
   sampleKeysPerSet: number = 5,
+  datasetIds?: number[],
 ): Promise<Array<{ name: string; environment: string; recordCount: number; sampleKeys: string[] }>> {
-  const sets = await listTestDataSets(companyId, projectId, environment);
+  let sets = await listTestDataSets(companyId, projectId, environment);
+  if (datasetIds && datasetIds.length > 0) {
+    sets = sets.filter(ds => datasetIds.includes(ds.id));
+  }
   if (sets.length === 0) return [];
   const pool = getPool();
   const out: Array<{ name: string; environment: string; recordCount: number; sampleKeys: string[] }> = [];
@@ -8338,6 +8357,62 @@ export async function resolveTestData(
     }
     return { key: rec.key, value, dataType: rec.data_type, tags: rec.tags };
   });
+}
+
+// ── Test Case → Dataset Linkage ──────────────────────────────────────────────
+
+/**
+ * Link a test case to one or more datasets. During generation, the engine loads
+ * only the linked datasets for that test case — making dataset selection
+ * deterministic instead of guessing from all available datasets in the project.
+ */
+export async function linkTestCaseToDataset(testCaseId: number, datasetId: number): Promise<void> {
+  const pool = getPool();
+  await pool.query(
+    `INSERT INTO test_case_data_sets (test_case_id, dataset_id)
+     VALUES ($1, $2) ON CONFLICT (test_case_id, dataset_id) DO NOTHING`,
+    [testCaseId, datasetId],
+  );
+}
+
+/**
+ * Unlink a dataset from a test case.
+ */
+export async function unlinkTestCaseFromDataset(testCaseId: number, datasetId: number): Promise<void> {
+  const pool = getPool();
+  await pool.query(
+    `DELETE FROM test_case_data_sets WHERE test_case_id = $1 AND dataset_id = $2`,
+    [testCaseId, datasetId],
+  );
+}
+
+/**
+ * Get all datasets linked to a test case (for deterministic generation).
+ * Returns full TestDataSet objects so the caller can access name/environment/etc.
+ */
+export async function getLinkedDatasets(testCaseId: number): Promise<TestDataSet[]> {
+  const pool = getPool();
+  const { rows } = await pool.query(
+    `SELECT tds.*
+     FROM test_data_sets tds
+     INNER JOIN test_case_data_sets tcds ON tcds.dataset_id = tds.id
+     WHERE tcds.test_case_id = $1 AND tds.is_active = TRUE
+     ORDER BY tds.name`,
+    [testCaseId],
+  );
+  return rows;
+}
+
+/**
+ * Get all test cases linked to a dataset (for impact analysis when updating datasets).
+ */
+export async function getTestCasesForDataset(datasetId: number): Promise<number[]> {
+  const pool = getPool();
+  const { rows } = await pool.query(
+    `SELECT test_case_id FROM test_case_data_sets WHERE dataset_id = $1`,
+    [datasetId],
+  );
+  return rows.map(r => r.test_case_id);
 }
 
 // ---- Coverage Stats ----
