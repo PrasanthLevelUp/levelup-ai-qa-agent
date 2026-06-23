@@ -104,11 +104,45 @@ export interface CoverageGap {
   suggestion: string;
 }
 
+/**
+ * An open question the requirement leaves unanswered. Instead of fabricating an
+ * "Assumption-Based" test case (e.g. a 255-char username limit nobody specified),
+ * we surface the gap as a question for the author to resolve. This is more
+ * honest and more valuable than a guessed test case.
+ */
+export interface MissingRequirement {
+  /** The concrete question to ask the requirement author. */
+  question: string;
+  /** Functional area the question relates to (e.g. "Input validation"). */
+  area: string;
+  /** Why this matters / what's missing. */
+  rationale: string;
+}
+
+/**
+ * Generation mode.
+ *  - 'strict'   : ONLY test cases that trace directly to the requirement.
+ *                 Knowledge / Test Data / Profile are CONTEXT (they enrich a
+ *                 requirement-derived case) — they never spawn new cases.
+ *                 Assumptions become MissingRequirements, not test cases.
+ *  - 'expanded' : strict coverage PLUS a separate set of suggested additional
+ *                 cases (negative paths, security, etc. the requirement implies
+ *                 but doesn't state). Only used when Coverage Gap Analysis is on.
+ */
+export type GenerationMode = 'strict' | 'expanded';
+
 export interface GenerationResult {
   requirementAnalysis: RequirementAnalysis;
   scenarios: TestScenario[];
   testCases: TestCase[];
+  /** Expansion cases (only populated in 'expanded' mode) — kept SEPARATE from
+   *  the requirement-derived testCases so reviewers never confuse the two. */
+  suggestedTestCases: TestCase[];
+  /** Open questions raised instead of generating assumption-based test cases. */
+  missingRequirements: MissingRequirement[];
   coverageGaps: CoverageGap[];
+  /** Which mode produced this result. */
+  mode: GenerationMode;
   stats: {
     totalScenarios: number;
     totalTestCases: number;
@@ -118,6 +152,10 @@ export interface GenerationResult {
     tokensUsed: number;
     /** How many near-duplicate cases the semantic dedup pass removed. */
     duplicatesRemoved?: number;
+    /** Count of separate suggested (expansion) cases. */
+    suggestedCount?: number;
+    /** Count of open questions raised instead of assumption test cases. */
+    missingRequirementsCount?: number;
   };
 }
 
@@ -414,14 +452,28 @@ Return ONLY valid JSON, no markdown fences.`;
     input: RequirementInput,
     analysis: RequirementAnalysis,
     coverageTypes: CoverageType[],
-    knowledge?: KnowledgeContext
-  ): Promise<{ scenarios: TestScenario[]; testCases: TestCase[]; tokensUsed: number }> {
-    // Auto-expand to a comprehensive baseline so core coverage is always thorough.
-    // Even if the caller only requested a couple of types, we always include the
-    // foundational automatable coverage types. This pushes the bulk of testing into
-    // CORE coverage (so gap analysis has little left to report).
-    const baselineTypes: CoverageType[] = ['positive', 'negative', 'edge_cases', 'boundary', 'integration'];
-    coverageTypes = Array.from(new Set([...coverageTypes, ...baselineTypes]));
+    knowledge?: KnowledgeContext,
+    mode: GenerationMode = 'strict'
+  ): Promise<{
+    scenarios: TestScenario[];
+    testCases: TestCase[];
+    suggestedTestCases: TestCase[];
+    missingRequirements: MissingRequirement[];
+    tokensUsed: number;
+  }> {
+    // EXPANDED mode only: auto-expand to a comprehensive baseline so the
+    // *suggested additional coverage* bucket is thorough. In STRICT mode we do
+    // NOT inflate the requested types — strict coverage must stay tightly scoped
+    // to what the requirement actually asks for (no forced negative/boundary/etc).
+    const expand = mode === 'expanded';
+    if (expand) {
+      const baselineTypes: CoverageType[] = ['positive', 'negative', 'edge_cases', 'boundary', 'integration'];
+      coverageTypes = Array.from(new Set([...coverageTypes, ...baselineTypes]));
+    } else if (coverageTypes.length === 0) {
+      // Strict mode with no explicit types — default to positive (happy path)
+      // which is what a single requirement most directly implies.
+      coverageTypes = ['positive'];
+    }
 
     const knowledgeBugs = knowledge?.historicalBugs?.length
       ? `\nHistorical bugs to consider: ${knowledge.historicalBugs.join('; ')}`
@@ -457,11 +509,31 @@ Return ONLY valid JSON, no markdown fences.`;
       return expectations[ct] || `${ct} — 2 scenarios, 2-3 test cases each.`;
     }).join('\n  - ');
 
-    const numTypes = coverageTypes.length;
-    const minScenarios = Math.max(8, numTypes * 2);
-    const minTestCases = Math.max(15, numTypes * 4);
+    // ── Mode-specific scope & volume guidance ──
+    // STRICT: tightly scoped to the requirement, small case count, no expansion.
+    // EXPANDED: strict coverage + a separate suggested-additional-coverage bucket.
+    const scopeBlock = expand
+      ? `GENERATION MODE: EXPANDED COVERAGE (Coverage Gap Analysis is ON)
+  - Produce TWO separate buckets:
+    1) "testCases" — STRICT requirement coverage (see the STRICT SCOPE rules below). This is still tightly scoped to the requirement.
+    2) "suggestedTestCases" — ADDITIONAL coverage the requirement does not state but a senior QA would consider (negative paths, security, edge/boundary, role/permission, concurrency). These are SUGGESTIONS for review — keep them OUT of "testCases".
+  - For suggestedTestCases you MAY use the requested coverage types as inspiration:
+  - ${coverageExpectations}
+  - Aim for quality over quantity: a handful of high-value suggestions, not dozens.`
+      : `GENERATION MODE: STRICT REQUIREMENT COVERAGE (Coverage Gap Analysis is OFF)
+  - Produce ONLY "testCases" that trace DIRECTLY to the stated requirement.
+  - "suggestedTestCases" MUST be an empty array [].
+  - DO NOT add negative, boundary, security, concurrency, or permission cases unless the REQUIREMENT itself states them.`;
 
-    const prompt = `You are a principal QA engineer writing release-ready test coverage. Generate comprehensive, thorough test scenarios and detailed test cases that a QA lead would approve for production release.
+    const volumeBlock = expand
+      ? `OUTPUT VOLUME:
+  - "testCases" (strict): typically 3-6 — only what the requirement directly demands.
+  - "suggestedTestCases" (expansion): up to ~8 high-value additional cases. Fewer is fine.`
+      : `OUTPUT VOLUME:
+  - Generate ONLY as many cases as the requirement genuinely needs — typically 3-6 for a single, focused requirement.
+  - Do NOT pad to hit a number. A small, precise set is the CORRECT result. Quality over quantity.`;
+
+    const prompt = `You are a principal QA engineer. ${expand ? 'Generate strict requirement coverage PLUS clearly-separated suggested additional coverage.' : 'Generate ONLY the test cases that a single, focused requirement genuinely demands — no padding, no scope creep.'}
 
 REQUIREMENT:
 Title: ${input.title}
@@ -476,89 +548,97 @@ Impacted Modules: ${analysis.impactedModules.join(', ')}
 Workflow: ${analysis.workflowSteps.join(' → ')}
 User Roles: ${analysis.userRolesAffected.join(', ')}${knowledgeBugs}${knowledgeTests}${enterpriseBlock}${repoBlock}${appProfileBlock}${testDataBlock}
 
-COVERAGE TYPES REQUESTED (${numTypes} types): ${coverageTypes.join(', ')}
+${scopeBlock}
 
-MANDATORY COVERAGE REQUIREMENTS:
-  - ${coverageExpectations}
+${volumeBlock}
 
-MINIMUM OUTPUT TARGETS:
-  - At least ${minScenarios} scenarios total across all coverage types
-  - At least ${minTestCases} test cases total
-  - Every requested coverage type MUST have at least 2 scenarios and 4 test cases
-  - Critical/high risk areas need MORE test cases
+STRICT SCOPE — the single most important rule (applies to "testCases"):
+  - A test case belongs in "testCases" ONLY if it verifies behaviour the REQUIREMENT (title / description / acceptance criteria / business flow) explicitly states or directly implies.
+  - APP KNOWLEDGE, TEST DATA, and APP PROFILE are CONTEXT — they ENRICH a requirement-derived case (e.g. use a real "standard_user" record as the test data for the login case). They DO NOT justify a brand-new case on their own.
+  - Concrete example: a requirement "standard user logs in and reaches Inventory" justifies: (a) successful login, (b) navigation to Inventory. It does NOT justify "locked-out user login", "invalid username", "empty credentials", "max character limit", "concurrent login", or "session persistence" — the requirement never asked for those.
+  - The existence of a "locked_users" or "problem_users" dataset is NOT a reason to generate a locked-user test for a valid-login requirement. Use such data only if the requirement is about that behaviour.
 
-QUALITY STANDARDS — Each test case must have:
+ASSUMPTIONS → MISSING REQUIREMENTS (do NOT fabricate test cases):
+  - If you would need to ASSUME a value/limit/behaviour not stated anywhere (e.g. a username max length, a lockout threshold, a session timeout), DO NOT create a test case for it.
+  - Instead, add an entry to "missingRequirements" phrased as a question for the requirement author (e.g. { "question": "What is the maximum username length?", "area": "Input validation", "rationale": "No length limit is stated, so a boundary test cannot be written reliably." }).
+  - This is MORE valuable than a guessed test case. NEVER emit a test case with source "assumption".
+
+QUALITY STANDARDS — each test case must have:
   - Specific, actionable title (NOT vague like "Verify login works")
-  - Clear preconditions (what must be true before testing)
-  - Numbered steps (3-6 steps, specific user actions)
-  - Precise expected result (what exactly should happen)
-  - Realistic test data examples
+  - Clear preconditions, numbered steps (3-6), precise expected result, realistic test data.
 
-BAD examples (NEVER generate):
-  - "Verify login works" (too vague)
-  - "Test error handling" (no specificity)
-  - "Check boundary values" (which values?)
+NO DUPLICATES:
+  - Do NOT emit multiple cases that verify the same behaviour with different wording. "Verify successful login", "Verify navigation after login", and "Verify login+inventory integration" overlap heavily — keep the distinct ones, merge the rest.
 
-GOOD examples:
-  - "Verify session token invalidation after password reset from another device"
-  - "Verify failed login throttling locks account after 5 consecutive attempts within 15 minutes"
-  - "Verify SQL injection prevention in search field with payload: ' OR 1=1 --"
-  - "Verify form submission with maximum character limit (255 chars) in name field"
-
-NO DUPLICATES — critical quality rule:
-  - Do NOT emit multiple test cases that verify the same behaviour with different wording.
-  - Example of what to AVOID: "Verify successful login", "Verify navigation to Inventory after login", and "Verify login + inventory integration" are the SAME happy path — keep ONE, drop the rest.
-  - Each test case must assert something genuinely distinct. Merge overlapping cases.
-
-EVIDENCE-BASED ONLY — do not hallucinate:
-  - Only generate boundary/limit cases (max/min length, character limits, numeric ranges) when a concrete limit is stated in the REQUIREMENT, APP KNOWLEDGE, APP PROFILE, or TEST DATA above.
-  - If NO such limit exists in the provided context, DO NOT invent one. Either omit the boundary case, or, if it is genuinely valuable, generate it but set "source":"assumption" and explain in "sourceEvidence" (e.g. "assumed 255-char limit — not specified").
-  - The same applies to any behaviour not traceable to the inputs: tag it "assumption", never "requirement".
-
-SOURCE TAGGING — for traceability (RTM) and trust, every test case MUST include:
-  - "source": one of "requirement" | "knowledge" | "test_data" | "app_profile" | "gap_analysis" | "assumption"
-      • "requirement" — directly verifies the stated requirement / acceptance criteria.
-      • "knowledge"  — grounded in the APP KNOWLEDGE / business rules above.
-      • "test_data"  — driven by a real dataset listed under AVAILABLE TEST DATA.
+SOURCE TAGGING — every test case (in BOTH buckets) MUST include:
+  - "source": one of "requirement" | "knowledge" | "test_data" | "app_profile" | "gap_analysis"
+      • "requirement" — directly verifies the stated requirement / acceptance criteria. (Most "testCases" should be this.)
+      • "knowledge"  — the requirement case is grounded in / enriched by APP KNOWLEDGE business rules.
+      • "test_data"  — the requirement case uses a real dataset listed under AVAILABLE TEST DATA.
       • "app_profile"— grounded in the crawled APP PROFILE structure/selectors.
-      • "gap_analysis" — fills a coverage gap not explicitly stated in the requirement but clearly implied (e.g. an obvious negative/error path the requirement omitted).
-      • "assumption" — extrapolated beyond the provided evidence (see rule above).
-  - "sourceEvidence": a short phrase naming the exact evidence (e.g. "AC: standard user logs in", "valid_users dataset", "Authentication Rules knowledge", "assumed limit — not specified").
+      • "gap_analysis" — ONLY for "suggestedTestCases": coverage the requirement implies but does not state.
+  - "source" MUST NOT be "assumption" — assumptions go to "missingRequirements" instead.
+  - "sourceEvidence": a short phrase naming the exact evidence (e.g. "AC: standard user logs in", "standard_user dataset", "Authentication Rules knowledge").
 
-IMPORTANT: Each test case must include a "scenarioIndex" field (0-based) linking it to the scenario it belongs to. This ensures proper grouping.
+IMPORTANT: Each test case must include a "scenarioIndex" field (0-based) linking it to the scenario it belongs to.
 
-Return JSON:
+Return JSON (use [] for empty buckets):
 {
   "scenarios": [{ "scenario": string, "coverageType": string, "priority": "P0"|"P1"|"P2"|"P3", "riskArea": string }],
   "testCases": [{
-    "title": string,
-    "scenarioIndex": number,
-    "preconditions": string,
-    "steps": string[],
-    "expectedResult": string,
-    "testData": string,
-    "priority": "P0"|"P1"|"P2"|"P3",
-    "severity": "critical"|"major"|"minor"|"trivial",
-    "tags": string[],
-    "automationReady": boolean,
-    "automationComplexity": "low"|"medium"|"high",
-    "selectorAvailability": "high"|"medium"|"low"|"unknown",
-    "source": "requirement"|"knowledge"|"test_data"|"app_profile"|"gap_analysis"|"assumption",
-    "sourceEvidence": string
-  }]
+    "title": string, "scenarioIndex": number, "preconditions": string, "steps": string[],
+    "expectedResult": string, "testData": string,
+    "priority": "P0"|"P1"|"P2"|"P3", "severity": "critical"|"major"|"minor"|"trivial",
+    "tags": string[], "automationReady": boolean,
+    "automationComplexity": "low"|"medium"|"high", "selectorAvailability": "high"|"medium"|"low"|"unknown",
+    "source": "requirement"|"knowledge"|"test_data"|"app_profile", "sourceEvidence": string
+  }],
+  "suggestedTestCases": [ /* same shape as a testCase; source usually "gap_analysis". EMPTY [] in strict mode. */ ],
+  "missingRequirements": [{ "question": string, "area": string, "rationale": string }]
 }
 
-Return ONLY valid JSON. Generate comprehensive, NON-DUPLICATE coverage — this is for a production release.`;
+Return ONLY valid JSON. ${expand ? 'Keep strict requirement coverage and suggestions in SEPARATE buckets.' : 'Stay strictly within the requirement scope.'}`;
 
     const resp = await this.callLLM(prompt, 6000);
-    let parsed: { scenarios: TestScenario[]; testCases: TestCase[] };
+    let parsed: {
+      scenarios?: TestScenario[];
+      testCases?: TestCase[];
+      suggestedTestCases?: TestCase[];
+      missingRequirements?: MissingRequirement[];
+    };
     try {
       parsed = JSON.parse(resp.content);
     } catch {
       logger.error(MOD, 'Failed to parse test generation response', { raw: resp.content.slice(0, 300) });
       parsed = { scenarios: [], testCases: [] };
     }
-    return { ...parsed, tokensUsed: resp.tokensUsed };
+
+    let scenarios = parsed.scenarios || [];
+    let testCases = parsed.testCases || [];
+    let suggestedTestCases = expand ? (parsed.suggestedTestCases || []) : [];
+    const missingRequirements = parsed.missingRequirements || [];
+
+    // ── Safety net — enforce the strict/expanded contract even if the model
+    //    misclassifies. Any case the model tagged "assumption" or "gap_analysis"
+    //    is NOT requirement coverage: move it out of testCases.
+    const isExpansionCase = (tc: TestCase) =>
+      (tc as any).source === 'assumption' || (tc as any).source === 'gap_analysis';
+    const misplaced = testCases.filter(isExpansionCase);
+    if (misplaced.length > 0) {
+      testCases = testCases.filter(tc => !isExpansionCase(tc));
+      if (expand) {
+        // Relocate genuine expansion cases into the suggestions bucket (drop pure assumptions).
+        suggestedTestCases = [
+          ...suggestedTestCases,
+          ...misplaced.filter(tc => (tc as any).source !== 'assumption'),
+        ];
+      }
+      logger.info(MOD, 'Strict-scope safety net relocated misclassified cases', {
+        mode, relocated: misplaced.length, keptStrict: testCases.length,
+      });
+    }
+
+    return { scenarios, testCases, suggestedTestCases, missingRequirements, tokensUsed: resp.tokensUsed };
   }
 
   /* ---- Phase 6: Coverage Gap Analysis ---- */
@@ -621,36 +701,52 @@ Return ONLY valid JSON array.`;
     input: RequirementInput,
     coverageTypes: CoverageType[],
     knowledge?: KnowledgeContext,
-    options?: { includeCoverageGaps?: boolean; deduplicate?: boolean }
+    options?: { includeCoverageGaps?: boolean; deduplicate?: boolean; mode?: GenerationMode }
   ): Promise<GenerationResult> {
-    // Gap analysis is a separate LLM round-trip. Skip it entirely when the caller
-    // opts out (UI "Coverage Gaps" toggle off) — this removes one of three
-    // sequential model calls and is a direct latency win for test-case generation.
+    // The "Coverage Gap Analysis" toggle drives BOTH the generation mode and the
+    // separate gap-analysis LLM call:
+    //   • OFF → STRICT mode: only requirement-derived cases, no expansion, no gap call.
+    //   • ON  → EXPANDED mode: requirement coverage + a separate "suggested additional
+    //           coverage" bucket + the non-automatable gap analysis pass.
+    // This matches the product rule: "make it strict — only if gap analysis is enabled
+    // do we add extra cases." Callers can still force a mode via options.mode.
     const includeCoverageGaps = options?.includeCoverageGaps !== false;
-    logger.info(MOD, 'Starting full coverage generation', { title: input.title, coverageTypes, includeCoverageGaps });
+    const mode: GenerationMode = options?.mode ?? (includeCoverageGaps ? 'expanded' : 'strict');
+    logger.info(MOD, 'Starting full coverage generation', { title: input.title, coverageTypes, includeCoverageGaps, mode });
 
     // Phase 2: Analyze requirement
     const { analysis, tokensUsed: t1 } = await this.analyzeRequirement(input, knowledge);
     logger.info(MOD, 'Requirement analysis complete', { featureType: analysis.featureType, riskLevel: analysis.riskLevel });
 
-    // Phase 5: Generate tests
-    const { scenarios, testCases: rawTestCases, tokensUsed: t2 } = await this.generateTestCoverage(
-      input, analysis, coverageTypes, knowledge
-    );
-    logger.info(MOD, 'Test generation complete', { scenarios: scenarios.length, testCases: rawTestCases.length });
+    // Phase 5: Generate tests (mode-aware — strict vs expanded)
+    const gen = await this.generateTestCoverage(input, analysis, coverageTypes, knowledge, mode);
+    const { scenarios, testCases: rawTestCases, missingRequirements, tokensUsed: t2 } = gen;
+    let rawSuggested = gen.suggestedTestCases || [];
+    logger.info(MOD, 'Test generation complete', {
+      scenarios: scenarios.length, testCases: rawTestCases.length,
+      suggested: rawSuggested.length, missingRequirements: missingRequirements.length, mode,
+    });
 
     // Phase 5b: Semantic de-duplication — drop near-identical cases (e.g. three
     // variants of the same happy-path login). Cheap batched embeddings call; fails
-    // open. Can be disabled via options.deduplicate=false.
+    // open. Can be disabled via options.deduplicate=false. Applied to both buckets.
     let testCases = rawTestCases;
+    let suggestedTestCases = rawSuggested;
     let duplicatesRemoved = 0;
-    if (options?.deduplicate !== false && rawTestCases.length > 1) {
-      const dedup = await this.deduplicateTestCases(rawTestCases);
-      testCases = dedup.kept;
-      duplicatesRemoved = dedup.removed;
+    if (options?.deduplicate !== false) {
+      if (rawTestCases.length > 1) {
+        const dedup = await this.deduplicateTestCases(rawTestCases);
+        testCases = dedup.kept;
+        duplicatesRemoved += dedup.removed;
+      }
+      if (rawSuggested.length > 1) {
+        const dedupS = await this.deduplicateTestCases(rawSuggested);
+        suggestedTestCases = dedupS.kept;
+        duplicatesRemoved += dedupS.removed;
+      }
     }
 
-    // Phase 6: Gap analysis (optional — skipped when not requested to save a full LLM call)
+    // Phase 6: Gap analysis (only in expanded mode — saves a full LLM call in strict).
     let gaps: CoverageGap[] = [];
     let t3 = 0;
     if (includeCoverageGaps) {
@@ -659,7 +755,7 @@ Return ONLY valid JSON array.`;
       t3 = gapResult.tokensUsed;
       logger.info(MOD, 'Gap analysis complete', { gaps: gaps.length });
     } else {
-      logger.info(MOD, 'Gap analysis skipped (includeCoverageGaps=false) — saved one LLM call');
+      logger.info(MOD, 'Gap analysis skipped (strict mode) — saved one LLM call');
     }
 
     const totalTokens = t1 + t2 + t3;
@@ -667,7 +763,10 @@ Return ONLY valid JSON array.`;
       requirementAnalysis: analysis,
       scenarios,
       testCases,
+      suggestedTestCases,
+      missingRequirements,
       coverageGaps: gaps,
+      mode,
       stats: {
         totalScenarios: scenarios.length,
         totalTestCases: testCases.length,
@@ -676,6 +775,8 @@ Return ONLY valid JSON array.`;
         gapsFound: gaps.length,
         tokensUsed: totalTokens,
         duplicatesRemoved,
+        suggestedCount: suggestedTestCases.length,
+        missingRequirementsCount: missingRequirements.length,
       },
     };
   }
