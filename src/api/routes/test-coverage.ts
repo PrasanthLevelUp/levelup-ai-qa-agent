@@ -71,6 +71,7 @@ export function createTestCoverageRouter(): Router {
         appProfileId,    // optional: pin a specific crawled profile instead of auto-picking the freshest
         useTestData,     // optional: explicitly disable (false) the test-data grounding
         testDataIds,     // optional: pin specific dataset IDs instead of all project datasets
+        deduplicate,     // optional: set false to skip the semantic duplicate-removal pass (default on)
       } = req.body;
 
       if (!title || !description) {
@@ -288,6 +289,7 @@ export function createTestCoverageRouter(): Router {
       });
       const result = await getEngine().generateFullCoverage(input, selectedTypes, knowledge, {
         includeCoverageGaps: includeCoverageGaps !== false,
+        deduplicate: deduplicate !== false, // default on — semantic near-duplicate removal
       });
       logger.info(MOD, 'AI engine returned', {
         scenarios: result.scenarios.length,
@@ -344,6 +346,8 @@ export function createTestCoverageRouter(): Router {
         // the History detail view (gaps are not stored in a separate table).
         coverageGaps: result.coverageGaps || [],
         gapsFound: result.stats?.gapsFound ?? (result.coverageGaps?.length || 0),
+        // How many near-duplicate test cases the semantic dedup pass removed.
+        duplicatesRemoved: result.stats?.duplicatesRemoved ?? 0,
         // Issue #2: record whether real app knowledge was used for this generation
         appProfileUsed: appProfileUsed || undefined,
         // Record which Test Data sets grounded this generation (names + counts only).
@@ -429,6 +433,10 @@ export function createTestCoverageRouter(): Router {
               automationReady: tc.automationReady ?? false,
               automationComplexity: tc.automationComplexity || 'medium',
               selectorAvailability: tc.selectorAvailability || 'unknown',
+              // Source provenance — which intelligence grounded this case
+              // (requirement | knowledge | test_data | app_profile | assumption).
+              source: (tc as any).source || undefined,
+              sourceEvidence: (tc as any).sourceEvidence || undefined,
             }], companyId);
             insertedTestCaseIds.push(...newIds);
             insertedCases++;

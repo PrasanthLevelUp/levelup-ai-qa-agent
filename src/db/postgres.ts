@@ -2325,6 +2325,8 @@ async function migrateDefaultCompany(client: PoolClient): Promise<void> {
     automation_ready BOOLEAN DEFAULT false,
     automation_complexity VARCHAR(20) DEFAULT 'medium',
     selector_availability VARCHAR(20) DEFAULT 'unknown',
+    source VARCHAR(20),
+    source_evidence TEXT,
     company_id INTEGER REFERENCES companies(id),
     created_at TIMESTAMPTZ DEFAULT NOW()
   )`);
@@ -2498,6 +2500,11 @@ async function migrateDefaultCompany(client: PoolClient): Promise<void> {
   const migrations = [
     `ALTER TABLE generated_scripts ADD COLUMN IF NOT EXISTS company_id INTEGER`,
     `ALTER TABLE generated_scripts ADD COLUMN IF NOT EXISTS project_context_id INTEGER REFERENCES project_contexts(id) ON DELETE SET NULL`,
+    // Source provenance per test case — which intelligence grounded it
+    // (requirement | knowledge | test_data | app_profile | assumption).
+    // Lets the UI/RTM show coverage by source and flag assumption-based tests.
+    `ALTER TABLE generated_test_cases ADD COLUMN IF NOT EXISTS source VARCHAR(20)`,
+    `ALTER TABLE generated_test_cases ADD COLUMN IF NOT EXISTS source_evidence TEXT`,
   ];
   for (const sql of migrations) {
     await safeExec(client, 'migration_alter', sql);
@@ -7732,6 +7739,7 @@ export async function insertTestCases(scenarioId: number, cases: Array<{
   title: string; preconditions: string; steps: string[]; expectedResult: string;
   testData: string; priority: string; severity: string; tags: string[];
   automationReady: boolean; automationComplexity: string; selectorAvailability: string;
+  source?: string; sourceEvidence?: string;
 }>, companyId?: number): Promise<number[]> {
   const pool = getPool();
   const ids: number[] = [];
@@ -7740,12 +7748,13 @@ export async function insertTestCases(scenarioId: number, cases: Array<{
       `INSERT INTO generated_test_cases
          (scenario_id, title, preconditions, steps, expected_result, test_data,
           priority, severity, tags, automation_ready, automation_complexity,
-          selector_availability, company_id)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING id`,
+          selector_availability, source, source_evidence, company_id)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING id`,
       [scenarioId, c.title, c.preconditions, JSON.stringify(c.steps),
        c.expectedResult, c.testData, c.priority, c.severity,
        JSON.stringify(c.tags), c.automationReady, c.automationComplexity,
-       c.selectorAvailability, companyId || null]
+       c.selectorAvailability, c.source || null, c.sourceEvidence || null,
+       companyId || null]
     );
     ids.push(r.rows[0].id);
   }

@@ -58,6 +58,9 @@ export interface TestCaseRow {
   selector_availability?: string;
   company_id?: number;
   created_at: string;
+  // source provenance — which intelligence grounded this case
+  source?: string;
+  source_evidence?: string;
   // joined fields
   scenario?: string;
   coverage_type?: string;
@@ -168,6 +171,8 @@ export class ExportService {
           'Expected Result': tc.expected_result,
           'Test Data': tc.test_data || '',
           'Tags': this.formatTags(tc.tags),
+          'Source': this.formatSource(tc.source),
+          'Source Evidence': tc.source_evidence || '',
           'Automation Ready': tc.automation_ready ? 'Yes' : 'No',
           'Automation Complexity': tc.automation_complexity || '',
         });
@@ -190,6 +195,8 @@ export class ExportService {
       { header: 'Expected Result', key: 'expected_result', width: 40 },
       { header: 'Test Data', key: 'test_data', width: 25 },
       { header: 'Tags', key: 'tags', width: 20 },
+      { header: 'Source', key: 'source', width: 18 },
+      { header: 'Source Evidence', key: 'source_evidence', width: 40 },
       { header: 'Automation Ready', key: 'automation_ready', width: 16 },
       { header: 'Complexity', key: 'automation_complexity', width: 14 },
     ];
@@ -212,6 +219,8 @@ export class ExportService {
         expected_result: tc.expected_result,
         test_data: tc.test_data || '',
         tags: this.formatTags(tc.tags),
+        source: this.formatSource(tc.source),
+        source_evidence: tc.source_evidence || '',
         automation_ready: tc.automation_ready ? '✅ Yes' : '❌ No',
         automation_complexity: tc.automation_complexity || '',
       });
@@ -226,10 +235,11 @@ export class ExportService {
       row.getCell('steps').alignment = { wrapText: true, vertical: 'top' };
       row.getCell('expected_result').alignment = { wrapText: true, vertical: 'top' };
       row.getCell('preconditions').alignment = { wrapText: true, vertical: 'top' };
+      row.getCell('source_evidence').alignment = { wrapText: true, vertical: 'top' };
     });
 
-    // Auto-filter
-    ws.autoFilter = { from: 'A1', to: `M${testCases.length + 1}` };
+    // Auto-filter (two extra columns — Source, Source Evidence — extend the range to O)
+    ws.autoFilter = { from: 'A1', to: `O${testCases.length + 1}` };
   }
 
   /* ── Private: Jira format sheet ────────────────────────────────────────── */
@@ -348,6 +358,22 @@ export class ExportService {
     if (!tags) return '';
     const arr = typeof tags === 'string' ? JSON.parse(tags) : tags;
     return Array.isArray(arr) ? arr.join(', ') : '';
+  }
+
+  // Human-readable source provenance for the export. Mirrors the UI labels so
+  // an exported sheet reads the same as the on-screen badges. Empty when the
+  // case predates source tagging (legacy rows).
+  private formatSource(source?: string): string {
+    if (!source) return '';
+    const map: Record<string, string> = {
+      requirement: 'Requirement',
+      knowledge: 'App Knowledge',
+      test_data: 'Test Data',
+      app_profile: 'App Profile',
+      gap_analysis: 'Gap Analysis',
+      assumption: '⚠ Assumption-Based',
+    };
+    return map[source] || source;
   }
 
   private mapJiraPriority(p: string): string {
