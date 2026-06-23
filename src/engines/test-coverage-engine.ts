@@ -326,7 +326,11 @@ Do NOT invent placeholder data (john@test.com, password123, ABC Product) when a 
         ).join('\n')}\n\nHistorical Bugs: ${(knowledge.historicalBugs || []).join('; ') || 'None'}\nExisting Tests: ${(knowledge.existingTestCases || []).join('; ') || 'None'}`
       : '';
     const enterpriseBlock = this.buildEnterpriseKnowledgeBlock(knowledge, input);
-    const repoBlock = this.buildRepoIntelligenceBlock(knowledge);
+    // NOTE: Repository Intelligence is intentionally NOT injected here. Requirement
+    // analysis (featureType/riskLevel/impactedModules) does not benefit from
+    // code-level tech-stack/pattern details — sending it here only burns tokens
+    // and latency. Repo intelligence is injected ONLY into the test-case
+    // generation prompt below, where it can actually influence output.
     const appProfileBlock = this.buildApplicationProfileBlock(knowledge);
     const testDataBlock = this.buildTestDataBlock(knowledge);
 
@@ -339,7 +343,7 @@ ${input.acceptanceCriteria ? `Acceptance Criteria: ${input.acceptanceCriteria}` 
 ${input.businessFlow ? `Business Flow: ${input.businessFlow}` : ''}
 ${input.module ? `Module: ${input.module}` : ''}
 ${input.apiDocs ? `API Documentation: ${input.apiDocs}` : ''}
-${input.releaseNotes ? `Release Notes: ${input.releaseNotes}` : ''}${knowledgeBlock}${enterpriseBlock}${repoBlock}${appProfileBlock}${testDataBlock}
+${input.releaseNotes ? `Release Notes: ${input.releaseNotes}` : ''}${knowledgeBlock}${enterpriseBlock}${appProfileBlock}${testDataBlock}
 
 Analyze this requirement and return a JSON object with:
 - featureType: string (e.g. "authentication", "payment", "search", "data_entry", "reporting")
@@ -515,7 +519,9 @@ Return ONLY valid JSON. Generate comprehensive coverage — this is for a produc
       ? `\nExisting Test Cases: ${knowledge.existingTestCases.join('; ')}`
       : '';
     const enterpriseBlock = this.buildEnterpriseKnowledgeBlock(knowledge, input);
-    const repoBlock = this.buildRepoIntelligenceBlock(knowledge);
+    // Repository Intelligence is NOT injected into gap analysis — gaps are about
+    // what CANNOT be automated, which is unrelated to the codebase's tech stack.
+    // Skipping it here saves tokens with zero loss of quality.
 
     const prompt = `You are a QA coverage analyst reviewing an ALREADY-COMPREHENSIVE automated test suite. The scenarios below represent extensive, release-ready automated coverage (positive, negative, edge cases, boundary, integration, security, etc.). Your ONLY job is to flag the small number of items that genuinely CANNOT or SHOULD NOT be covered by this automated test suite.
 
@@ -525,7 +531,7 @@ Description: ${input.description}
 Feature Type: ${analysis.featureType}
 Risk Level: ${analysis.riskLevel}
 Workflow: ${analysis.workflowSteps.join(' → ')}
-Impacted Modules: ${analysis.impactedModules.join(', ')}${existingCoverage}${enterpriseBlock}${repoBlock}
+Impacted Modules: ${analysis.impactedModules.join(', ')}${existingCoverage}${enterpriseBlock}
 
 CURRENT AUTOMATED SCENARIOS (already comprehensive):
 ${scenarios.map((s, i) => `${i + 1}. [${s.coverageType}] ${s.scenario}`).join('\n')}
@@ -561,9 +567,14 @@ Return ONLY valid JSON array.`;
   async generateFullCoverage(
     input: RequirementInput,
     coverageTypes: CoverageType[],
-    knowledge?: KnowledgeContext
+    knowledge?: KnowledgeContext,
+    options?: { includeCoverageGaps?: boolean }
   ): Promise<GenerationResult> {
-    logger.info(MOD, 'Starting full coverage generation', { title: input.title, coverageTypes });
+    // Gap analysis is a separate LLM round-trip. Skip it entirely when the caller
+    // opts out (UI "Coverage Gaps" toggle off) — this removes one of three
+    // sequential model calls and is a direct latency win for test-case generation.
+    const includeCoverageGaps = options?.includeCoverageGaps !== false;
+    logger.info(MOD, 'Starting full coverage generation', { title: input.title, coverageTypes, includeCoverageGaps });
 
     // Phase 2: Analyze requirement
     const { analysis, tokensUsed: t1 } = await this.analyzeRequirement(input, knowledge);
@@ -575,11 +586,17 @@ Return ONLY valid JSON array.`;
     );
     logger.info(MOD, 'Test generation complete', { scenarios: scenarios.length, testCases: testCases.length });
 
-    // Phase 6: Gap analysis
-    const { gaps, tokensUsed: t3 } = await this.analyzeCoverageGaps(
-      input, analysis, scenarios, knowledge
-    );
-    logger.info(MOD, 'Gap analysis complete', { gaps: gaps.length });
+    // Phase 6: Gap analysis (optional — skipped when not requested to save a full LLM call)
+    let gaps: CoverageGap[] = [];
+    let t3 = 0;
+    if (includeCoverageGaps) {
+      const gapResult = await this.analyzeCoverageGaps(input, analysis, scenarios, knowledge);
+      gaps = gapResult.gaps;
+      t3 = gapResult.tokensUsed;
+      logger.info(MOD, 'Gap analysis complete', { gaps: gaps.length });
+    } else {
+      logger.info(MOD, 'Gap analysis skipped (includeCoverageGaps=false) — saved one LLM call');
+    }
 
     const totalTokens = t1 + t2 + t3;
     return {

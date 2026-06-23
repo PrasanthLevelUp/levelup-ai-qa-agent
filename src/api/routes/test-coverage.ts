@@ -156,15 +156,20 @@ export function createTestCoverageRouter(): Router {
         }
       }
 
-      // Fetch repository intelligence context if requested
+      // Fetch repository intelligence context if requested.
+      // NOTE: repo intelligence is now injected ONLY into the test-case generation
+      // prompt (not requirement-analysis or gap-analysis), so we only spend those
+      // tokens where the codebase context can actually influence the output.
+      // `repoIntelligenceContributed` records whether the loaded context had any
+      // substantive content — so the response can HONESTLY report whether repo
+      // intelligence really fed the model (proof), rather than just claiming it.
       let repoContextUsed: any = null;
+      let repoIntelligenceContributed = false;
       if (useRepoIntelligence && repoId) {
         try {
           const profile = await getRepositoryContext(repoId, companyId, projectId);
           if (profile) {
-            repoContextUsed = { repoId, profile };
-            // Merge repo context into knowledge for the AI engine
-            knowledge.repositoryContext = {
+            const repoCtx = {
               repoId,
               techStack: (profile as any).techStack || [],
               architecture: (profile as any).architecture || {},
@@ -172,7 +177,22 @@ export function createTestCoverageRouter(): Router {
               testingFrameworks: (profile as any).testingFrameworks || [],
               summary: (profile as any).summary || '',
             };
-            logger.info(MOD, 'Repository intelligence loaded', { repoId });
+            // Substantive only if at least one field carries real signal.
+            repoIntelligenceContributed = Boolean(
+              repoCtx.summary ||
+              repoCtx.techStack.length ||
+              repoCtx.patterns.length ||
+              repoCtx.testingFrameworks.length ||
+              (repoCtx.architecture && Object.keys(repoCtx.architecture).length > 0)
+            );
+            if (repoIntelligenceContributed) {
+              repoContextUsed = { repoId, profile };
+              knowledge.repositoryContext = repoCtx;
+              logger.info(MOD, 'Repository intelligence loaded', { repoId });
+            } else {
+              // Empty context — do NOT inject it (zero token waste) and report it honestly.
+              logger.info(MOD, 'Repository context empty — skipping injection to avoid wasted tokens', { repoId });
+            }
           } else {
             logger.warn(MOD, 'No repository context found for repoId', { repoId });
           }
@@ -266,12 +286,50 @@ export function createTestCoverageRouter(): Router {
         applicationProfile: appProfileUsed ? true : false,
         testData: testDataUsed.length,
       });
-      const result = await getEngine().generateFullCoverage(input, selectedTypes, knowledge);
+      const result = await getEngine().generateFullCoverage(input, selectedTypes, knowledge, {
+        includeCoverageGaps: includeCoverageGaps !== false,
+      });
       logger.info(MOD, 'AI engine returned', {
         scenarios: result.scenarios.length,
         testCases: result.testCases.length,
         gaps: result.coverageGaps.length,
       });
+
+      // ── Intelligence provenance (proof) ──
+      // Build an HONEST record of which intelligence sources actually fed the model
+      // for this run. This is surfaced in the API response and persisted so the UI
+      // can show an "Intelligence Used" panel — customers see exactly what grounded
+      // their test cases (requirement, app profile, app knowledge, test data, repo)
+      // instead of trusting an opaque "AI generated" label. A source is only marked
+      // used when it genuinely contributed content.
+      const intelligenceUsed = {
+        requirement: { used: true, detail: title },
+        appProfile: appProfileUsed
+          ? {
+              used: true,
+              name: appProfileUsed.name || undefined,
+              pageCount: appProfileUsed.pageCount,
+              totalElements: appProfileUsed.totalElements,
+              totalForms: appProfileUsed.totalForms,
+            }
+          : { used: false },
+        appKnowledge: knowledgeItemsUsed.length > 0
+          ? { used: true, items: knowledgeItemsUsed.map((ki: any) => ki.title) }
+          : { used: false },
+        testData: testDataUsed.length > 0
+          ? { used: true, datasets: testDataUsed.map(td => `${td.name} [${td.environment}]`) }
+          : { used: false },
+        repoIntelligence: repoIntelligenceContributed
+          ? { used: true, repoId, summary: (repoContextUsed?.profile as any)?.summary || undefined }
+          : {
+              used: false,
+              // Explain WHY when the user asked for repo intelligence but it added nothing,
+              // so the "wasted token" concern is transparent rather than silent.
+              reason: useRepoIntelligence && repoId
+                ? 'Repository selected but its scanned context had no usable signal — not injected (no tokens spent).'
+                : undefined,
+            },
+      };
 
       // Persist to DB — store knowledge item references and coverage types in analysis
       const analysisWithKnowledge = {
@@ -292,6 +350,8 @@ export function createTestCoverageRouter(): Router {
         testDataUsed: testDataUsed.length > 0
           ? testDataUsed.map(td => ({ name: td.name, environment: td.environment, recordCount: td.recordCount }))
           : undefined,
+        // Provenance proof — which intelligence sources actually fed the model.
+        intelligenceUsed,
       };
 
       let reqId: number;
@@ -418,6 +478,8 @@ export function createTestCoverageRouter(): Router {
         testDataUsed: testDataUsed.length > 0
           ? testDataUsed.map(td => ({ name: td.name, environment: td.environment, recordCount: td.recordCount }))
           : undefined,
+        // Provenance proof — surfaced in the UI "Intelligence Used" panel.
+        intelligenceUsed,
       });
     } catch (err: any) {
       logger.error(MOD, 'Generation failed', { error: err.message, stack: err.stack });
