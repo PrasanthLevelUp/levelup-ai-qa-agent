@@ -491,6 +491,19 @@ function detectCodingStyle(repoRoot: string, analyses: FileAnalysis[]): CodingSt
 /*  Business Flow Extraction                                           */
 /* ------------------------------------------------------------------ */
 
+/**
+ * Turn a camelCase / snake_case method name into a human-readable step label.
+ * e.g. `addProductToCart` → "Add product to cart", `verify_order` → "Verify order".
+ */
+function humanizeMethod(method: string): string {
+  const words = method
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .replace(/[_-]+/g, ' ')
+    .trim()
+    .toLowerCase();
+  return words.charAt(0).toUpperCase() + words.slice(1);
+}
+
 function extractBusinessFlows(repoRoot: string, analyses: FileAnalysis[]): BusinessFlow[] {
   const flows: BusinessFlow[] = [];
   const testFiles = analyses.filter(a => a.testCount > 0);
@@ -541,9 +554,38 @@ function extractBusinessFlows(repoRoot: string, analyses: FileAnalysis[]): Busin
       }
     }
 
-    // Find URL if available
+    // Page-Object-Model step extraction. POM-style tests delegate actions to
+    // page object methods (e.g. `loginPage.login(...)`) rather than calling
+    // `page.click/fill` directly, so the literal-action patterns above miss
+    // them entirely. Map page-object instances → their method calls in source
+    // order so the flow reads like "Login → Add product to cart → Checkout".
+    const pomInstances = new Map<string, string>(); // varName -> PageClass
+    const newRe = /(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*new\s+([A-Za-z_$][\w$]*)\s*\(/g;
+    while ((m = newRe.exec(content)) !== null) {
+      pomInstances.set(m[1], m[2]);
+    }
+    if (pomInstances.size > 0) {
+      const callRe = /\b([A-Za-z_$][\w$]*)\.([A-Za-z_$][\w$]*)\s*\(/g;
+      while ((m = callRe.exec(content)) !== null) {
+        const [, recv, method] = m;
+        if (!pomInstances.has(recv)) continue;
+        if (method === 'constructor') continue;
+        const step = `${humanizeMethod(method)} (${pomInstances.get(recv)}.${method})`;
+        if (!steps.includes(step)) steps.push(step);
+      }
+    }
+
+    // Navigation with a non-literal target (e.g. `page.goto(env.baseUrl)`).
+    const gotoVarRe = /page\.goto\s*\(\s*([A-Za-z_$][\w$.]*)\s*[),]/g;
+    while ((m = gotoVarRe.exec(content)) !== null) {
+      const step = `Navigate to ${m[1]}`;
+      if (!steps.includes(step)) steps.push(step);
+    }
+
+    // Find URL if available (string literal first, then a variable reference).
     const urlMatch = /page\.goto\s*\(\s*['"`]([^'"`]+)['"`]/.exec(content);
-    const entryUrl = urlMatch?.[1] || null;
+    const urlVarMatch = /page\.goto\s*\(\s*([A-Za-z_$][\w$.]*)\s*[),]/.exec(content);
+    const entryUrl = urlMatch?.[1] || urlVarMatch?.[1] || null;
 
     // Find related helpers (imported functions from relative paths)
     const relatedHelpers = tf.imports
@@ -823,6 +865,210 @@ function discoverDataFiles(repoRoot: string): Array<{ name: string; path: string
   return dataFiles;
 }
 
+/**
+ * Detect environment/configuration awareness for the repository.
+ *
+ * Surfaces how the framework wires runtime config: .env files, dotenv usage,
+ * a dedicated env loader module (e.g. utils/env.ts) and the `process.env.X`
+ * variables referenced across the codebase. Previously the auditor's
+ * `extractEnvFiles` was a stub returning [] — this gives the UI real signal.
+ */
+function detectEnvironment(
+  repoRoot: string,
+  analyses: FileAnalysis[],
+  dependencies: Array<{ name: string; version: string; isDev: boolean }>,
+): RepositoryProfile['environment'] {
+  const envFiles: string[] = [];
+  try {
+    const entries = fs.readdirSync(repoRoot, { withFileTypes: true });
+    for (const e of entries) {
+      if (e.isFile() && /^\.env(\..+)?$/.test(e.name)) envFiles.push(e.name);
+    }
+  } catch {
+    /* ignore */
+  }
+
+  let usesDotenv = dependencies.some(d => d.name === 'dotenv');
+  let configModule: string | null = null;
+  const envVarSet = new Set<string>();
+
+  for (const a of analyses) {
+    // dotenv import (e.g. `import 'dotenv/config'` or `require('dotenv')`).
+    if (a.imports.some(i => i.module === 'dotenv' || i.module.startsWith('dotenv/'))) {
+      usesDotenv = true;
+    }
+
+    // Dedicated env module: utils/env.ts, config/env.ts, src/env.ts, etc.
+    const lp = a.relativePath.toLowerCase();
+    if (!configModule && /(^|\/)(env|environment|config)\.(t|j)s$/.test(lp)) {
+      configModule = a.relativePath;
+    }
+
+    // process.env.X references.
+    const full = path.join(repoRoot, a.relativePath);
+    if (fs.existsSync(full)) {
+      try {
+        const content = fs.readFileSync(full, 'utf-8');
+        const re = /process\.env\.([A-Z0-9_]+)/g;
+        let m: RegExpExecArray | null;
+        while ((m = re.exec(content)) !== null) envVarSet.add(m[1]);
+        // bracket access: process.env['X']
+        const re2 = /process\.env\[\s*['"`]([A-Z0-9_]+)['"`]\s*\]/g;
+        while ((m = re2.exec(content)) !== null) envVarSet.add(m[1]);
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+
+  return {
+    envFiles: envFiles.sort(),
+    usesDotenv,
+    configModule,
+    envVars: Array.from(envVarSet).sort().slice(0, 100),
+  };
+}
+
+/**
+ * Discover fixture files in the repository.
+ *
+ * The function-level AST categorizer only tags a *function* as a fixture, so a
+ * fixture module that merely re-exports `test`/`expect` or calls
+ * `base.extend({...})` at the top level (the common Playwright pattern) was
+ * previously invisible — producing the "Fixtures: 0" bug even when a
+ * `fixtures/baseFixture.ts` clearly exists.
+ *
+ * This scans the AST analyses for files that are *structurally* fixtures:
+ *   - located in a `fixtures/` or `support/` folder, OR
+ *   - call `.extend(` / `mergeTests(` (Playwright fixture composition), OR
+ *   - re-export `test` and/or `expect` from a base test module.
+ *
+ * For each such file (that isn't already represented by a function-level
+ * fixture) we synthesize a fixture entry. When the file composes fixtures via
+ * `base.extend({ a, b, c })` we surface each named sub-fixture, otherwise we
+ * surface the module itself (named after the file).
+ */
+function discoverFixtureFiles(
+  repoRoot: string,
+  analyses: FileAnalysis[],
+  existingFixtures: FunctionSignature[],
+): FunctionSignature[] {
+  const result: FunctionSignature[] = [];
+  const filesWithFnFixture = new Set(existingFixtures.map(f => f.filePath));
+
+  for (const a of analyses) {
+    const lowerPath = a.relativePath.toLowerCase();
+    const inFixtureFolder =
+      /(^|\/)(fixtures|support)\//.test(lowerPath) ||
+      /\bfixture\b/.test(path.basename(lowerPath));
+
+    const fullPath = path.join(repoRoot, a.relativePath);
+    if (!fs.existsSync(fullPath)) continue;
+    let content = '';
+    try {
+      content = fs.readFileSync(fullPath, 'utf-8');
+    } catch {
+      continue;
+    }
+
+    const usesExtend = /\.extend\s*\(/.test(content) || /\bmergeTests\s*\(/.test(content);
+    const reExportsTest =
+      /export\s+(?:const|let|var)\s+test\b/.test(content) ||
+      /export\s*\{[^}]*\btest\b[^}]*\}/.test(content);
+
+    if (!inFixtureFolder && !usesExtend && !reExportsTest) continue;
+
+    // Already captured a function-level fixture in this file — don't double count.
+    if (filesWithFnFixture.has(a.relativePath)) continue;
+
+    const baseName = path.basename(a.relativePath, path.extname(a.relativePath));
+
+    // Try to surface individual sub-fixtures from `extend({ a, b, c })`.
+    const subFixtures = extractExtendFixtureKeys(content);
+
+    if (subFixtures.length > 0) {
+      for (const key of subFixtures) {
+        result.push(makeFixtureEntry(key, a.relativePath));
+      }
+    } else {
+      result.push(makeFixtureEntry(baseName, a.relativePath));
+    }
+  }
+
+  if (result.length > 0) {
+    logger.info(MOD, 'Fixture-file discovery complete', {
+      filesFound: new Set(result.map(r => r.filePath)).size,
+      fixturesAdded: result.length,
+    });
+  }
+
+  return result;
+}
+
+/** Build a synthetic FunctionSignature representing a file-level fixture. */
+function makeFixtureEntry(name: string, filePath: string): FunctionSignature {
+  return {
+    name,
+    filePath,
+    isExported: true,
+    isAsync: false,
+    parameters: [],
+    returnType: 'Fixture',
+    jsdoc: '',
+    lineNumber: 1,
+    category: 'fixture',
+    complexity: 1,
+  };
+}
+
+/**
+ * Extract the first-level fixture names from a `base.extend({ ... })` /
+ * `test.extend({ ... })` call. Returns the object keys (e.g. ['authedPage',
+ * 'standardUser']). Best-effort: matches the object literal passed to the first
+ * `.extend(` and pulls top-level `key:` / `key,` identifiers, skipping nested
+ * objects so we don't surface inner option keys.
+ */
+function extractExtendFixtureKeys(content: string): string[] {
+  const extendIdx = content.search(/\.extend\s*\(\s*\{/);
+  if (extendIdx === -1) return [];
+
+  // Walk from the opening brace, tracking depth to isolate the top-level object.
+  const braceStart = content.indexOf('{', extendIdx);
+  if (braceStart === -1) return [];
+
+  let depth = 0;
+  let end = -1;
+  for (let i = braceStart; i < content.length; i++) {
+    const ch = content[i];
+    if (ch === '{') depth++;
+    else if (ch === '}') {
+      depth--;
+      if (depth === 0) { end = i; break; }
+    }
+  }
+  if (end === -1) return [];
+
+  const body = content.slice(braceStart + 1, end);
+  const keys: string[] = [];
+  let depth2 = 0;
+  // Split on top-level commas only.
+  let token = '';
+  const flush = () => {
+    const m = /^\s*([A-Za-z_$][\w$]*)\s*:/.exec(token) || /^\s*([A-Za-z_$][\w$]*)\s*$/.exec(token);
+    if (m && !keys.includes(m[1])) keys.push(m[1]);
+    token = '';
+  };
+  for (let i = 0; i < body.length; i++) {
+    const ch = body[i];
+    if (ch === '{' || ch === '[' || ch === '(') depth2++;
+    else if (ch === '}' || ch === ']' || ch === ')') depth2--;
+    if (ch === ',' && depth2 === 0) { flush(); continue; }
+    token += ch;
+  }
+  flush();
+  return keys.slice(0, 30);
+}
+
 export class RepositoryContextEngine {
   private astAnalyzer: ASTAnalyzer;
 
@@ -880,7 +1126,12 @@ export class RepositoryContextEngine {
 
     const pageObjects = allClasses.filter(c => c.category === 'page-object');
 
-    const fixtures = allFunctions.filter(f => f.category === 'fixture');
+    // Fixtures: function-level fixtures from the AST, plus structurally-detected
+    // fixture *files* (e.g. fixtures/baseFixture.ts that re-exports `test` or
+    // composes via base.extend) which the function categorizer can't see.
+    const fnFixtures = allFunctions.filter(f => f.category === 'fixture');
+    const fileFixtures = discoverFixtureFiles(repoRoot, analyses, fnFixtures);
+    const fixtures = [...fnFixtures, ...fileFixtures];
 
     const customCommands = allFunctions.filter(f =>
       f.name.startsWith('use') || // Playwright fixtures
@@ -949,6 +1200,7 @@ export class RepositoryContextEngine {
       customCommands,
       sharedConstants: sharedConstants.slice(0, 100), // cap
       dataFiles, // PR #122: auto-discovered test data files
+      environment: detectEnvironment(repoRoot, analyses, dependencies),
       businessFlows,
       testSuites,
       preferredLocators,
