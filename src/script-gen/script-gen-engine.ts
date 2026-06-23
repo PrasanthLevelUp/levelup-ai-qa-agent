@@ -2396,15 +2396,30 @@ ${config.testCase
     let best: { element: PageElement; score: number; via: string } | undefined;
 
     for (const el of elements) {
+      // `data-test` is the primary test hook for many apps (SauceDemo et al.),
+      // but the crawler only promotes `data-testid`/`data-test-id` to the
+      // `dataTestId` field — `data-test` stays in the raw `attributes` map. Read
+      // it (and the test-id variants) straight from `attributes` so elements that
+      // expose ONLY `data-test` (titles, error banners, cart/inventory nodes
+      // without an id) still ground instead of silently falling back.
+      const rawAttrs = (el as any).attributes as Record<string, string> | undefined;
+      const dataTestAttr =
+        rawAttrs?.['data-test'] ?? rawAttrs?.['data-testid'] ?? rawAttrs?.['data-test-id'];
+
       // Attributes ordered by selector quality / signal strength.
       const attrs: { label: string; value: string | undefined; weight: number }[] = [
         { label: 'data-testid', value: el.dataTestId, weight: 100 },
+        { label: 'data-test', value: dataTestAttr, weight: 100 },
         { label: 'id', value: el.id, weight: 95 },
         { label: 'name', value: el.name, weight: 90 },
         { label: 'aria-label', value: el.ariaLabel, weight: 85 },
         { label: 'placeholder', value: el.placeholder, weight: 70 },
         { label: 'label', value: el.nearbyLabel, weight: 65 },
         { label: 'text', value: el.textContent, weight: 50 },
+        // Class names are weak signals (often styling), but for component-style
+        // hooks like `shopping_cart_link` / `inventory_item` they are the only
+        // stable identifier, so match them last at a low weight.
+        { label: 'class', value: el.className, weight: 40 },
       ];
 
       for (const attr of attrs) {

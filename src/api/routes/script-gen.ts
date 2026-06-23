@@ -354,6 +354,37 @@ export function createScriptGenRouter(): Router {
 
       console.log(`[ScriptGen] Crawl decision: usedCache=${crawlDecision.usedCache}, reason="${crawlDecision.reason}" (${crawlDecision.decisionTimeMs}ms)`);
 
+      // ── Empty-DOM cache guard ──
+      // A cached App Profile is only useful for locator grounding if it actually
+      // carries DOM elements. We have seen profiles persisted with an empty
+      // `elements` array (e.g. saved from a path that never captured the DOM, or
+      // a crawl that yielded nothing). Serving that as the "Fast Path" produces a
+      // dishonest result: the UI claims "cached real DOM" while every selector
+      // silently falls back → "REAL LOCATORS 0/N". Detect this and fall through
+      // to a fresh crawl, which also self-heals the stale profile (the fresh
+      // crawl is saved back, refreshing the existing profile row below).
+      const cachedElementCount = (() => {
+        const cd: any = crawlDecision.crawlData;
+        if (!cd) return 0;
+        if (Array.isArray(cd.elements)) return cd.elements.length;
+        // Some profiles store per-page crawls — sum their element arrays.
+        if (Array.isArray(cd.pages)) {
+          return cd.pages.reduce(
+            (n: number, p: any) => n + (Array.isArray(p?.elements) ? p.elements.length : 0),
+            0,
+          );
+        }
+        return 0;
+      })();
+      if (crawlDecision.usedCache && cachedElementCount === 0) {
+        console.warn(
+          `[ScriptGen] ⚠️ Cached profile has no DOM elements (id=${crawlDecision.profile?.id ?? 'n/a'}) — ignoring cache and performing a fresh crawl so locators can ground against the real DOM.`,
+        );
+        crawlDecision.usedCache = false;
+        crawlDecision.crawlData = null;
+        crawlDecision.reason = `${crawlDecision.reason}; overridden — cached DOM was empty, re-crawling for real grounding`;
+      }
+
       // ── Multi-Intelligence Fusion: gather ALL intelligence sources + compute confidence ──
       let fusion: import('../../services/intelligence-fusion-service').FusedIntelligence | undefined;
       let fusionContext: string | undefined;
