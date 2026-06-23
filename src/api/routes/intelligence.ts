@@ -75,6 +75,45 @@ const screenshotUpload = multer({
  * The presence of auth is exposed via `auth_required` and a boolean flag,
  * but raw username/password are never echoed back.
  */
+/**
+ * Resolve user-specified "additional pages to crawl" into absolute, same-origin
+ * URLs. Users add pages that the link/anchor crawler cannot reach on its own
+ * because they sit behind buttons or multi-step forms (e.g. a Cart page reached
+ * by clicking a cart icon, or Checkout / Order-Complete pages reached by
+ * submitting a form). Accepts either full URLs ("https://app/cart.html") or
+ * paths relative to the profile's base URL ("/cart.html", "cart.html").
+ *
+ * Safety: only same-origin URLs are kept (no crawling third-party sites), the
+ * list is de-duplicated, and capped to a sane maximum.
+ */
+function resolveCrawlUrls(raw: unknown, baseUrl: string): string[] {
+  if (!Array.isArray(raw)) return [];
+  let origin = '';
+  try { origin = new URL(baseUrl).origin; } catch { return []; }
+
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const entry of raw) {
+    const s = String(entry || '').trim();
+    if (!s) continue;
+    let resolved: string;
+    try {
+      // `new URL(s, origin)` handles both absolute URLs and relative paths.
+      resolved = new URL(s, origin + '/').href;
+    } catch {
+      continue;
+    }
+    // Same-origin guard — never let a profile crawl an unrelated site.
+    if (!resolved.startsWith(origin)) continue;
+    const key = resolved.replace(/#.*$/, '').replace(/\/$/, '');
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(resolved);
+    if (out.length >= 20) break; // hard cap
+  }
+  return out;
+}
+
 function sanitizeProfileAuth(profile: any): any {
   if (!profile) return profile;
   const ac = profile.auth_config
@@ -418,6 +457,23 @@ export function createIntelligenceRouter(): Router {
         ? (typeof profile.auth_config === 'string' ? JSON.parse(profile.auth_config) : profile.auth_config)
         : undefined;
 
+      // ── Additional pages to crawl ────────────────────────────────────
+      // The link/anchor crawler can only discover pages reachable by following
+      // <a href> links. Pages behind buttons or multi-step forms (e.g. Cart,
+      // Checkout, Order Complete) are unreachable that way. Users explicitly
+      // list those pages on the profile (custom_metadata.additionalCrawlUrls);
+      // we seed them into the same authenticated crawl session so their real
+      // selectors/forms get captured. A request-body `additionalUrls` overrides.
+      const customMetadata = profile.custom_metadata
+        ? (typeof profile.custom_metadata === 'string' ? JSON.parse(profile.custom_metadata) : profile.custom_metadata)
+        : null;
+      const rawExtraUrls = Array.isArray(b.additionalUrls)
+        ? b.additionalUrls
+        : (customMetadata && Array.isArray(customMetadata.additionalCrawlUrls)
+            ? customMetadata.additionalCrawlUrls
+            : []);
+      const additionalUrls = resolveCrawlUrls(rawExtraUrls, baseUrl);
+
       // Mark crawling immediately so the UI reflects progress.
       await updateProfileStatus(id, 'crawling');
       startCrawlLog(id, baseUrl);
@@ -426,13 +482,19 @@ export function createIntelligenceRouter(): Router {
       (async () => {
         const t0 = Date.now();
         try {
-          console.log(`[intelligence] 🕷️  Manual deep crawl started for ${baseUrl} (profile=${id}, auth=${!!authConfig}, maxPages=${maxPages}, maxDepth=${maxDepth})`);
+          console.log(`[intelligence] 🕷️  Manual deep crawl started for ${baseUrl} (profile=${id}, auth=${!!authConfig}, maxPages=${maxPages}, maxDepth=${maxDepth}, extraPages=${additionalUrls.length})`);
+          if (additionalUrls.length > 0) {
+            appendCrawlLog(id, `Seeding ${additionalUrls.length} user-specified page(s): ${additionalUrls.join(', ')}`);
+          }
           const crawler = new PageCrawler({
             url: baseUrl,
             authConfig,
-            maxPages,
+            maxPages: Math.max(maxPages, additionalUrls.length + 2),
             maxDepth,
             captureScreenshot: true,
+            // User-specified pages behind buttons/forms (Cart, Checkout, etc.) —
+            // crawled in the SAME authenticated session so the login carries over.
+            additionalUrls,
             // Stream progress lines into the crawl-log store for the diagnostics endpoint.
             onLog: (msg: string) => appendCrawlLog(id, msg),
           });
@@ -466,7 +528,7 @@ export function createIntelligenceRouter(): Router {
       res.status(202).json({
         success: true,
         message: 'Crawl started — poll GET /profiles/:id for status',
-        data: { id, status: 'crawling', baseUrl, authenticated: !!authConfig, maxPages, maxDepth },
+        data: { id, status: 'crawling', baseUrl, authenticated: !!authConfig, maxPages, maxDepth, additionalPages: additionalUrls.length },
       });
     } catch (err) {
       res.status(500).json({ success: false, error: (err as Error).message });
