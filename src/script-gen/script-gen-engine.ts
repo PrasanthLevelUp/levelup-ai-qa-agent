@@ -637,6 +637,23 @@ export class ScriptGenEngine {
       creds.password = String(v.password ?? v.pass ?? creds.password ?? '');
     }
 
+    // Backfill credentials from concrete values written in the steps when no
+    // dataset record resolved them (e.g. "...from valid_users: standard_user").
+    // This is what powers the precondition-login and concurrent-skeleton paths
+    // (which fill from `creds`) so they no longer emit silent fill('').
+    if (!creds.username || !creds.password) {
+      for (const s of steps) {
+        if (!creds.username) {
+          const u = this.extractStepCredential('username', s);
+          if (u) creds.username = u;
+        }
+        if (!creds.password) {
+          const p = this.extractStepCredential('password', s);
+          if (p) creds.password = p;
+        }
+      }
+    }
+
     // Resolve grounded selectors from the crawled DOM, with stable semantic
     // fallbacks for elements not present on the crawled (login) page.
     // Resolve every semantic selector against the REAL crawl DOM (App Profile)
@@ -679,6 +696,22 @@ export class ScriptGenEngine {
     const { lines } = this.tcStepsToCode(steps, ctx);
     const assertions = this.buildTcAssertions(`${tc.expected_result || ''}`, ctx, tc);
 
+    // ── Guarantee an initial navigation ──
+    // Some cases (e.g. "Leave username field empty → click login") interact with
+    // the page but never include a navigate step, which would run against
+    // about:blank and fail. If nothing navigates yet the body touches the page,
+    // prepend a goto so the test starts on the real base URL.
+    const navLines: string[] = [];
+    const bodyTouchesPage = [...preLines, ...lines].some(l => /\bpage\.(locator|getBy|fill|click|goto)\b/.test(l));
+    const bodyNavigates = [...preLines, ...lines].some(l => /\bpage\.goto\s*\(/.test(l));
+    if (bodyTouchesPage && !bodyNavigates) {
+      navLines.push(
+        `await page.goto('${escapeStr(baseUrl)}');`,
+        `await page.waitForLoadState('domcontentloaded');`,
+        '',
+      );
+    }
+
     // Declare the resolved record once at the top of the test body so step code
     // can read `user.username` / `user.password`.
     const declLines: string[] = [];
@@ -689,7 +722,7 @@ export class ScriptGenEngine {
       declLines.push(sourceNote);
       declLines.push(`const ${dataRef.varName} = ${dataRef.ref};`, '');
     }
-    const body = [...declLines, ...preLines, ...lines];
+    const body = [...declLines, ...navLines, ...preLines, ...lines];
 
     // Reference the generated test-data module whenever the body binds a dataset.
     const usesModule = body.some(l => /\bgetRecord\s*\(/.test(l));
@@ -929,11 +962,81 @@ ${assertions.map(l => `    ${l}`).join('\n')}
       return out;
     }
     const s = String(testData);
+    // 1) Structured "username: x" / "password = y".
     const u = s.match(/user(?:name)?\s*[:=]\s*([^,;\n]*)/i);
     const p = s.match(/pass(?:word)?\s*[:=]\s*([^,;\n]*)/i);
-    if (u) out.username = u[1]!.trim();
-    if (p) out.password = p[1]!.trim();
+    if (u) out.username = this.cleanCredentialToken(u[1]!);
+    if (p) out.password = this.cleanCredentialToken(p[1]!);
+    // 2) Natural-language "standard_user from valid_users" → username token is
+    //    the credential-looking word *before* "from <dataset>". The dataset name
+    //    after "from" is NOT the value.
+    if (!out.username) {
+      const fromForm = s.match(/\b([a-z0-9][a-z0-9._@-]*)\s+from\s+[a-z0-9_]+/i);
+      if (fromForm && this.looksLikeCredential(fromForm[1]!)) out.username = fromForm[1]!.trim();
+    }
     return out;
+  }
+
+  /** Strip placeholder/markup tokens like `<password>` and quotes/whitespace. */
+  private cleanCredentialToken(raw: string): string {
+    const v = String(raw).trim().replace(/^['"]|['"]$/g, '').trim();
+    if (!v || /^<.*>$/.test(v)) return '';
+    return v;
+  }
+
+  /** A value that looks like a real credential (not a noise/placeholder word). */
+  private looksLikeCredential(v: string): boolean {
+    const t = v.trim();
+    if (!t || /^<.*>$/.test(t)) return false;
+    if (/^(the|a|an|to|valid|invalid|empty|blank|field|fields|account|user|users|username|password|placeholder|credentials?|with|and|into|from|enter|leave)$/i.test(t)) return false;
+    return /^[a-z0-9][a-z0-9._@+-]*$/i.test(t);
+  }
+
+  /**
+   * Extract a concrete credential value written directly in a step/test-data
+   * string, e.g. "...from valid_users: standard_user" → "standard_user",
+   * "Enter username standard_user" → "standard_user". Returns '' when the text
+   * carries only a placeholder (<password>) or no usable value.
+   */
+  private extractStepCredential(kind: 'username' | 'password', raw: string): string {
+    const text = String(raw);
+    // Only extract a value for a field the step is actually about — otherwise a
+    // username step's trailing value (e.g. "...: standard_user") would wrongly
+    // be picked up as the password too.
+    const refersToKind = kind === 'username'
+      ? /\buser(?:\s*name)?\b/i.test(text)
+      : /\bpass(?:\s*word)?\b/i.test(text);
+    if (!refersToKind) return '';
+    // For password steps that also mention a username (rare), don't let the
+    // username token leak in via the colon rule.
+    if (kind === 'password' && /\buser(?:\s*name)?\b/i.test(text) && !/\bpass(?:\s*word)?\b.*:/i.test(text)) {
+      // fall through to the password-specific regex (rule 2) only.
+    } else {
+      // 1) Explicit value after a colon near the end: "...: standard_user".
+      const afterColon = text.match(/:\s*([a-z0-9][a-z0-9._@+-]*)\s*$/i);
+      if (afterColon && this.looksLikeCredential(afterColon[1]!)) return afterColon[1]!.trim();
+    }
+    // 2) "username/user <value>" or "password is <value>" (skips noise words).
+    const re = kind === 'username'
+      ? /\buser(?:name)?\b(?:\s+(?:is|=|:|as))?\s+(?:to\s+)?["']?([a-z0-9][a-z0-9._@+-]*)["']?/i
+      : /\bpass(?:word)?\b(?:\s+(?:is|=|:|as))?\s+(?:to\s+)?["']?([a-z0-9][a-z0-9._@+!$-]*)["']?/i;
+    const m = text.match(re);
+    if (m && this.looksLikeCredential(m[1]!)) return m[1]!.trim();
+    return '';
+  }
+
+  /**
+   * JS expression to fill a credential field given a resolved literal value.
+   * When the value is genuinely unknown we emit an env-var expression rather
+   * than a silent `fill('')` — the test stays runnable once credentials are
+   * supplied, and never masquerades as a passing login with empty inputs.
+   */
+  private credFillExpr(kind: 'username' | 'password', literal: string): string {
+    const v = (literal || '').trim();
+    if (v) return `'${escapeStr(v)}'`;
+    return kind === 'username'
+      ? `process.env.TEST_USERNAME ?? ''`
+      : `process.env.TEST_PASSWORD ?? ''`;
   }
 
   /* ──────────────────────────────────────────────────────────────────────── */
@@ -1383,8 +1486,8 @@ export default datasets;
       ? `import { test, expect, chromium } from '@playwright/test';\nimport { getRecord } from './data/test-data';`
       : `import { test, expect, chromium } from '@playwright/test';`;
     const userDecl = dataRef ? `    const ${dataRef.varName} = ${dataRef.ref};\n` : '';
-    const uname = dataRef ? `${dataRef.varName}.username ?? ''` : `'${escapeStr(meta.creds.username)}'`;
-    const pwd = dataRef ? `${dataRef.varName}.password ?? ''` : `'${escapeStr(meta.creds.password)}'`;
+    const uname = dataRef ? `${dataRef.varName}.username ?? ''` : this.credFillExpr('username', meta.creds.username);
+    const pwd = dataRef ? `${dataRef.varName}.password ?? ''` : this.credFillExpr('password', meta.creds.password);
 
     return `${importLine}
 
@@ -1479,8 +1582,8 @@ ${userDecl}    // Two isolated sessions, each with its own cookies/storage.
         unameExpr = `loginUser.username ?? ''`;
         pwdExpr = `loginUser.password ?? ''`;
       } else {
-        unameExpr = `'${escapeStr(ctx.creds.username)}'`;
-        pwdExpr = `'${escapeStr(ctx.creds.password)}'`;
+        unameExpr = this.credFillExpr('username', ctx.creds.username);
+        pwdExpr = this.credFillExpr('password', ctx.creds.password);
       }
     }
 
@@ -1526,19 +1629,33 @@ ${userDecl}    // Two isolated sessions, each with its own cookies/storage.
     //   4. parsed creds fallback (literal) → '<value>'
     // This is what replaces the old empty fill('') for "<password>" placeholders.
     const fieldExpr = (kind: 'username' | 'password', raw: string, t: string): string => {
+      // 1) Intentionally-empty field (negative "empty/blank" test) → ''.
       if (/empty|blank|without|no\s+(user|pass)|leave.*(blank|empty)/.test(t)) return `''`;
+      // 2) Explicit quoted literal in the step ('standard_user') → that literal.
       const quoted = raw.match(/'([^']*)'|"([^"]*)"/);
       if (quoted) {
         const lit = quoted[1] ?? quoted[2] ?? '';
-        // A `<placeholder>` token is NOT a real literal — fall through to data.
+        // A `<placeholder>` token is NOT a real literal — fall through.
         if (!/^<.*>$/.test(lit.trim())) return `'${escapeStr(lit)}'`;
       }
+      // 3) A concrete value written in the step text itself, e.g.
+      //    "...from valid_users: standard_user" → 'standard_user'. This is the
+      //    fix for silent fill('') when the value is right there in the step.
+      const stepVal = this.extractStepCredential(kind, raw);
+      if (stepVal) return `'${escapeStr(stepVal)}'`;
+      // 4) Resolved Test Data Store record → user.username / user.password.
       if (ctx.data) {
-        // `?? ''` keeps the fill type-safe (record fields are optional strings).
         if (kind === 'username' && ctx.data.hasUsername) return `${ctx.data.varName}.username ?? ''`;
         if (kind === 'password' && ctx.data.hasPassword) return `${ctx.data.varName}.password ?? ''`;
       }
-      return `'${escapeStr(kind === 'username' ? ctx.creds.username : ctx.creds.password)}'`;
+      // 5) Negative test that needs a *non-empty but wrong* value so the step is
+      //    meaningful (e.g. "Enter invalid username" with no value provided).
+      if (/\b(invalid|wrong|incorrect|bad|unregistered|nonexistent|non-existent)\b/.test(t)) {
+        return kind === 'username' ? `'invalid_user'` : `'wrong_password'`;
+      }
+      // 6) Parsed credential literal, else an env-backed expression (never a
+      //    silent empty string for a field that's meant to carry a value).
+      return this.credFillExpr(kind, kind === 'username' ? ctx.creds.username : ctx.creds.password);
     };
 
     for (const raw of steps) {
