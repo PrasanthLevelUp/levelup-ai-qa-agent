@@ -324,21 +324,35 @@ export class ScriptGenEngine {
     if (config.cachedCrawlData) {
       // FAST PATH: Use cached crawl data from Application Intelligence
       logger.info(MOD, 'Using cached crawl data (Application Intelligence)', { url: config.url });
+      // Multi-page profiles (saveDeepCrawlResult) store the DOM under
+      // `pages[].elements` with NO flat top-level `elements`, whereas
+      // single-page profiles store a flat `elements` array. Reading only the
+      // top-level array left the engine with 0 elements for multi-page
+      // profiles → every locator fell back → "REAL LOCATORS 0/N" even though
+      // the profile clearly had elements. Flatten the per-page arrays when the
+      // top-level one is absent so grounding works for both shapes.
+      const cc = config.cachedCrawlData;
+      const pages: any[] = Array.isArray(cc.pages) ? cc.pages : [];
+      const flat = (key: string): any[] =>
+        Array.isArray(cc[key]) && cc[key].length
+          ? cc[key]
+          : pages.flatMap((p: any) => (Array.isArray(p?.[key]) ? p[key] : []));
+      const elements = flat('elements');
       crawlResult = {
-        url: config.cachedCrawlData.url || config.url,
-        finalUrl: config.cachedCrawlData.finalUrl || config.url,
-        title: config.cachedCrawlData.title || '',
-        pageType: config.cachedCrawlData.pageType || 'unknown',
-        pageTypeConfidence: config.cachedCrawlData.pageTypeConfidence || 0.5,
-        elements: config.cachedCrawlData.elements || [],
-        forms: config.cachedCrawlData.forms || [],
-        navigationLinks: config.cachedCrawlData.navigationLinks || [],
-        buttons: config.cachedCrawlData.buttons || [],
-        inputs: config.cachedCrawlData.inputs || [],
-        headings: config.cachedCrawlData.headings || [],
-        htmlSnapshot: config.cachedCrawlData.htmlSnapshot || '',
-        totalElements: config.cachedCrawlData.totalElements || 0,
-        interactiveElements: config.cachedCrawlData.interactiveElements || 0,
+        url: cc.url || config.url,
+        finalUrl: cc.finalUrl || config.url,
+        title: cc.title || pages[0]?.title || '',
+        pageType: cc.pageType || pages[0]?.pageType || 'unknown',
+        pageTypeConfidence: cc.pageTypeConfidence || 0.5,
+        elements,
+        forms: flat('forms'),
+        navigationLinks: flat('navigationLinks'),
+        buttons: flat('buttons'),
+        inputs: flat('inputs'),
+        headings: flat('headings'),
+        htmlSnapshot: cc.htmlSnapshot || '',
+        totalElements: cc.totalElements || elements.length,
+        interactiveElements: cc.interactiveElements || 0,
         crawlTimeMs: 0, // No crawl performed
         errors: [],
       };
