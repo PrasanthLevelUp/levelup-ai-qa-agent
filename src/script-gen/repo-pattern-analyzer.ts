@@ -71,6 +71,10 @@ export interface RepoPatternSummary {
   pageObjects: Array<{ name: string; filePath: string; methods: string[] }>;
   /** Fixtures available. */
   fixtures: Array<{ name: string; filePath: string }>;
+  /** Data files discovered in the repo (json/csv). */
+  dataFiles: Array<{ name: string; path: string; type: string; recordCount?: number }>;
+  /** Environment configuration (dotenv, env files, config module). */
+  environment: { envFiles: string[]; usesDotenv: boolean; configModule: string | null; envVars: string[] } | null;
   /** Folder layout hints. */
   folders: { tests?: string; pages?: string; fixtures?: string; utils?: string };
   /** File-naming convention slug, e.g. 'kebab.spec' / 'camelCase.test'. */
@@ -128,6 +132,10 @@ function fingerprint(profile: RepositoryProfile): string {
     helpers: (profile.helperFunctions || []).map((h) => `${h.name}@${h.filePath}`),
     pageObjects: (profile.pageObjects || []).map((p) => `${p.name}@${p.filePath}`),
     fixtures: (profile.fixtures || []).map((f) => `${f.name}@${f.filePath}`),
+    dataFiles: (profile.dataFiles || []).map((df) => `${df.name}@${df.path}`),
+    environment: profile.environment
+      ? `${profile.environment.envFiles.join(',')}|${profile.environment.usesDotenv}|${profile.environment.configModule || ''}|${profile.environment.envVars.join(',')}`
+      : null,
     preferredLocators: (profile.preferredLocators || []).map((l) => `${l.pattern}|${l.example ?? ''}`),
     avoidPatterns: profile.avoidPatterns || [],
     style: s
@@ -221,6 +229,17 @@ function buildSummary(profile: RepositoryProfile): RepoPatternSummary {
     .slice(0, 6)
     .map((f: FunctionSignature) => ({ name: f.name, filePath: f.filePath }));
 
+  const dataFiles = (profile.dataFiles || [])
+    .slice(0, 10)
+    .map((df) => ({
+      name: df.name,
+      path: df.path,
+      type: df.type,
+      recordCount: df.recordCount,
+    }));
+
+  const environment = profile.environment || null;
+
   const folders = {
     tests: profile.folderStructure?.testFolder || undefined,
     pages: profile.folderStructure?.pageObjectFolder || undefined,
@@ -241,6 +260,8 @@ function buildSummary(profile: RepositoryProfile): RepoPatternSummary {
   if (pageObjects.length) confidence += 20;
   if (style) confidence += 10;
   if (fixtures.length) confidence += 5;
+  if (dataFiles.length) confidence += 5;
+  if (environment?.envFiles?.length || environment?.usesDotenv) confidence += 5;
   confidence = Math.min(100, confidence);
 
   return {
@@ -260,6 +281,8 @@ function buildSummary(profile: RepositoryProfile): RepoPatternSummary {
     helpers,
     pageObjects,
     fixtures,
+    dataFiles,
+    environment,
     folders,
     fileNaming,
     confidence,
@@ -379,6 +402,32 @@ function buildPromptBlock(s: RepoPatternSummary): string {
     lines.push('');
     lines.push('FIXTURES:');
     for (const f of s.fixtures) lines.push(`  - ${f.name} from ${f.filePath}`);
+  }
+
+  if (s.dataFiles.length) {
+    lines.push('');
+    lines.push('TEST DATA FILES (import and use these instead of hardcoded values):');
+    for (const df of s.dataFiles) {
+      const count = df.recordCount != null ? ` (${df.recordCount} record${df.recordCount === 1 ? '' : 's'})` : '';
+      lines.push(`  - ${df.name}${count} at ${df.path}`);
+    }
+  }
+
+  if (s.environment) {
+    lines.push('');
+    lines.push('ENVIRONMENT CONFIG:');
+    if (s.environment.envFiles.length) {
+      lines.push(`  - Env files: ${s.environment.envFiles.join(', ')}`);
+    }
+    if (s.environment.usesDotenv) {
+      lines.push(`  - Uses dotenv: true`);
+    }
+    if (s.environment.configModule) {
+      lines.push(`  - Config module: ${s.environment.configModule} (import env vars from here)`);
+    }
+    if (s.environment.envVars.length) {
+      lines.push(`  - Env vars: ${s.environment.envVars.slice(0, 8).join(', ')}`);
+    }
   }
 
   const folders = Object.entries(s.folders).filter(([, v]) => !!v).map(([k, v]) => `${k}=${v}`);
