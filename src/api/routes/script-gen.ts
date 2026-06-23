@@ -28,6 +28,9 @@ import {
   autoLinkScriptTraceability,
   getTestCaseById,
   getTestCasesForRequirement,
+  getLinkedDatasets,
+  getTestDataRecords,
+  resolveTestData,
   getRequirement,
   getProfileByUrl,
   markTestCaseAutomated,
@@ -223,6 +226,53 @@ export function createScriptGenRouter(): Router {
         }
       }
 
+      // ── Test Data → Script traceability: load REAL dataset records ──
+      // For each test case in scope, load the datasets explicitly linked to it
+      // and resolve their records (values, secrets hydrated). These are passed
+      // to the engine so generated specs reference real data via getUser('<key>')
+      // instead of empty/hardcoded credentials. Best-effort and non-blocking.
+      let resolvedTestData: Array<{ name: string; environment?: string; records: Array<{ key: string; value: any }> }> = [];
+      if (companyId != null) {
+        try {
+          const scopedCaseIds = [
+            ...(testCase?.id != null ? [Number(testCase.id)] : []),
+            ...requirementTestCases.map((t: any) => Number(t.id)).filter((n: number) => !Number.isNaN(n)),
+          ];
+          const projectIdForData = (req as any).projectId as number | undefined;
+          const seenDatasets = new Set<string>(); // dedupe by name+environment
+          for (const cid of scopedCaseIds) {
+            const linked = await getLinkedDatasets(cid).catch(() => []);
+            for (const ds of linked) {
+              const dedupeKey = `${ds.name}::${ds.environment}`;
+              if (seenDatasets.has(dedupeKey)) continue;
+              seenDatasets.add(dedupeKey);
+              // Prefer resolveTestData (hydrates secret refs); fall back to raw
+              // records if resolution returns nothing.
+              let records: Array<{ key: string; value: any }> = [];
+              try {
+                const resolved = await resolveTestData(ds.name, companyId as number, projectIdForData, ds.environment);
+                if (Array.isArray(resolved) && resolved.length > 0) {
+                  records = resolved.map((r: any) => ({ key: String(r.key), value: r.value }));
+                }
+              } catch { /* fall through to raw records */ }
+              if (records.length === 0) {
+                const raw = await getTestDataRecords(ds.id).catch(() => []);
+                records = raw.map((r: any) => ({ key: String(r.key), value: r.value_jsonb }));
+              }
+              if (records.length > 0) {
+                resolvedTestData.push({ name: ds.name, environment: ds.environment, records });
+              }
+            }
+          }
+          if (resolvedTestData.length > 0) {
+            const totalRecords = resolvedTestData.reduce((n, d) => n + d.records.length, 0);
+            console.log(`[ScriptGen] 🔗 Test data resolved — ${resolvedTestData.length} dataset(s), ${totalRecords} record(s) for ${scopedCaseIds.length} case(s)`);
+          }
+        } catch (tdErr: any) {
+          console.warn(`[ScriptGen] Could not resolve linked test data (non-blocking): ${tdErr?.message}`);
+        }
+      }
+
       // Resolve the generation provenance. Explicit value wins; otherwise infer
       // from what the caller supplied (test case / requirement / url).
       const generationSource: string =
@@ -353,6 +403,8 @@ export function createScriptGenRouter(): Router {
         ...(testCase ? { testCase } : {}),
         // Requirement-based batch: one deterministic spec per linked test case.
         ...(requirementTestCases.length > 0 ? { testCases: requirementTestCases } : {}),
+        // Resolved dataset records → enables getUser('<key>') traceability.
+        ...(resolvedTestData.length > 0 ? { resolvedTestData } : {}),
         ...(companyId != null ? { companyId } : {}),
         ...(projectId != null ? { projectId } : {}),
       };
