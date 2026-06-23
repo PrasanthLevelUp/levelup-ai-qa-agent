@@ -38,6 +38,7 @@ import {
   setRequirementGenerationState,
   getApplicationProfileForGeneration,
   getProfileById,
+  getTestDataSetSummaries,
 } from '../../db/postgres';
 import { buildApplicationProfileContext } from '../../utils/application-profile-context';
 import { ExportService } from '../../services/export-service';
@@ -68,6 +69,8 @@ export function createTestCoverageRouter(): Router {
         force,
         useAppProfile,   // optional: explicitly disable (false) the application-profile grounding
         appProfileId,    // optional: pin a specific crawled profile instead of auto-picking the freshest
+        useTestData,     // optional: explicitly disable (false) the test-data grounding
+        testDataIds,     // optional: pin specific dataset IDs instead of all project datasets
       } = req.body;
 
       if (!title || !description) {
@@ -226,6 +229,31 @@ export function createTestCoverageRouter(): Router {
         logger.warn(MOD, 'Could not load application profile (continuing)', { error: profErr.message });
       }
 
+      // ── Test Data grounding ──
+      // Project the project's Test Data sets (token-safe summaries: names,
+      // environments, record counts, and a small sample of KEYS only — never
+      // values/secrets) so generated cases reference REAL datasets instead of
+      // inventing placeholder credentials/products. On by default; opt out with
+      // useTestData:false. Optionally pin specific datasets via testDataIds.
+      let testDataUsed: Array<{ name: string; environment: string; recordCount: number; sampleKeys: string[] }> = [];
+      if (useTestData !== false) {
+        try {
+          const ids = Array.isArray(testDataIds)
+            ? testDataIds.map((n: any) => parseInt(String(n), 10)).filter((n: number) => Number.isFinite(n))
+            : undefined;
+          const summaries = await getTestDataSetSummaries(companyId, projectId, undefined, 5, ids);
+          if (summaries.length > 0) {
+            testDataUsed = summaries.slice(0, 12);
+            knowledge.testData = testDataUsed;
+            logger.info(MOD, '🗃️ Test data loaded for generation', { datasets: testDataUsed.length });
+          } else {
+            logger.info(MOD, 'No test data sets available — generation without test-data grounding', { companyId, projectId });
+          }
+        } catch (tdErr: any) {
+          logger.warn(MOD, 'Could not load test data (continuing)', { error: tdErr.message });
+        }
+      }
+
       const input: RequirementInput = {
         title, description, jiraId, businessFlow,
         acceptanceCriteria, apiDocs, releaseNotes, module: mod,
@@ -236,6 +264,7 @@ export function createTestCoverageRouter(): Router {
         enterpriseKnowledge: knowledge.enterpriseKnowledge?.length || 0,
         repositoryContext: repoContextUsed ? true : false,
         applicationProfile: appProfileUsed ? true : false,
+        testData: testDataUsed.length,
       });
       const result = await getEngine().generateFullCoverage(input, selectedTypes, knowledge);
       logger.info(MOD, 'AI engine returned', {
@@ -259,6 +288,10 @@ export function createTestCoverageRouter(): Router {
         gapsFound: result.stats?.gapsFound ?? (result.coverageGaps?.length || 0),
         // Issue #2: record whether real app knowledge was used for this generation
         appProfileUsed: appProfileUsed || undefined,
+        // Record which Test Data sets grounded this generation (names + counts only).
+        testDataUsed: testDataUsed.length > 0
+          ? testDataUsed.map(td => ({ name: td.name, environment: td.environment, recordCount: td.recordCount }))
+          : undefined,
       };
 
       let reqId: number;
@@ -381,6 +414,10 @@ export function createTestCoverageRouter(): Router {
         })) : undefined,
         // Issue #2: surface whether the real application profile grounded this run
         appProfileUsed: appProfileUsed || undefined,
+        // Surface which Test Data sets grounded this run (names + counts only).
+        testDataUsed: testDataUsed.length > 0
+          ? testDataUsed.map(td => ({ name: td.name, environment: td.environment, recordCount: td.recordCount }))
+          : undefined,
       });
     } catch (err: any) {
       logger.error(MOD, 'Generation failed', { error: err.message, stack: err.stack });

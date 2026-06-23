@@ -123,6 +123,13 @@ export interface KnowledgeContext {
    * credentials instead of generic guesses. Issue #2 fix.
    */
   applicationProfile?: ApplicationProfileContext;
+  /**
+   * Token-safe summaries of the project's Test Data sets (names, environments,
+   * record counts, and a small sample of KEYS only — never values/secrets).
+   * When present, generation references REAL project datasets (e.g. valid_users,
+   * checkout_data) instead of inventing placeholder credentials/products.
+   */
+  testData?: Array<{ name: string; environment: string; recordCount: number; sampleKeys: string[] }>;
 }
 
 /** Compact, token-budgeted projection of an application profile for prompts. */
@@ -289,6 +296,25 @@ CRITICAL — Because this application has been crawled, you MUST:
 Do NOT invent selectors or pages that are not present above.`;
   }
 
+  /* ---- Build Test Data Block (REAL project datasets — token-safe summaries) ---- */
+  private buildTestDataBlock(knowledge?: KnowledgeContext): string {
+    const sets = knowledge?.testData;
+    if (!sets?.length) return '';
+
+    const lines = sets.slice(0, 12).map(ds => {
+      const keys = ds.sampleKeys?.length ? ` — sample keys: ${ds.sampleKeys.slice(0, 5).join(', ')}` : '';
+      return `  - ${ds.name} [${ds.environment}] (${ds.recordCount} record${ds.recordCount === 1 ? '' : 's'})${keys}`;
+    });
+
+    return `\n\nAVAILABLE TEST DATA (real datasets defined for this project):\n${lines.join('\n')}
+
+Because these datasets exist, you MUST:
+1. Reference the REAL dataset names and keys above (e.g. "log in using the standard_user record from valid_users") instead of inventing emails/passwords/products.
+2. Use the actual keys as the data behind positive AND negative cases (e.g. a locked/invalid user from the data above for negative login).
+3. Keep credentials and other secret values abstract — refer to the dataset/key, never embed a real password.
+Do NOT invent placeholder data (john@test.com, password123, ABC Product) when a matching dataset above can supply it.`;
+  }
+
   /* ---- Phase 2: Requirement Understanding ---- */
   async analyzeRequirement(
     input: RequirementInput,
@@ -302,6 +328,7 @@ Do NOT invent selectors or pages that are not present above.`;
     const enterpriseBlock = this.buildEnterpriseKnowledgeBlock(knowledge, input);
     const repoBlock = this.buildRepoIntelligenceBlock(knowledge);
     const appProfileBlock = this.buildApplicationProfileBlock(knowledge);
+    const testDataBlock = this.buildTestDataBlock(knowledge);
 
     const prompt = `You are a senior QA architect analyzing a software requirement.
 
@@ -312,7 +339,7 @@ ${input.acceptanceCriteria ? `Acceptance Criteria: ${input.acceptanceCriteria}` 
 ${input.businessFlow ? `Business Flow: ${input.businessFlow}` : ''}
 ${input.module ? `Module: ${input.module}` : ''}
 ${input.apiDocs ? `API Documentation: ${input.apiDocs}` : ''}
-${input.releaseNotes ? `Release Notes: ${input.releaseNotes}` : ''}${knowledgeBlock}${enterpriseBlock}${repoBlock}${appProfileBlock}
+${input.releaseNotes ? `Release Notes: ${input.releaseNotes}` : ''}${knowledgeBlock}${enterpriseBlock}${repoBlock}${appProfileBlock}${testDataBlock}
 
 Analyze this requirement and return a JSON object with:
 - featureType: string (e.g. "authentication", "payment", "search", "data_entry", "reporting")
@@ -370,6 +397,7 @@ Return ONLY valid JSON, no markdown fences.`;
     const enterpriseBlock = this.buildEnterpriseKnowledgeBlock(knowledge, input);
     const repoBlock = this.buildRepoIntelligenceBlock(knowledge);
     const appProfileBlock = this.buildApplicationProfileBlock(knowledge);
+    const testDataBlock = this.buildTestDataBlock(knowledge);
 
     // Build per-type coverage expectations
     const coverageExpectations = coverageTypes.map(ct => {
@@ -411,7 +439,7 @@ Feature Type: ${analysis.featureType}
 Risk Level: ${analysis.riskLevel}
 Impacted Modules: ${analysis.impactedModules.join(', ')}
 Workflow: ${analysis.workflowSteps.join(' → ')}
-User Roles: ${analysis.userRolesAffected.join(', ')}${knowledgeBugs}${knowledgeTests}${enterpriseBlock}${repoBlock}${appProfileBlock}
+User Roles: ${analysis.userRolesAffected.join(', ')}${knowledgeBugs}${knowledgeTests}${enterpriseBlock}${repoBlock}${appProfileBlock}${testDataBlock}
 
 COVERAGE TYPES REQUESTED (${numTypes} types): ${coverageTypes.join(', ')}
 
