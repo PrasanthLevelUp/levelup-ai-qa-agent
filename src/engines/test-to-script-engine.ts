@@ -289,6 +289,62 @@ export class TestToScriptEngine {
       effectiveBaseUrl,
     });
 
+    // 5b. Test Data → Script traceability: load FULL dataset records for all
+    // linked datasets across ALL test cases. These are materialized into a
+    // tests/data/test-data.ts module so generated specs bind to the dataset
+    // schema (getRecord('valid_users')) rather than hardcoded values. Best-effort.
+    let resolvedTestData: Array<{ name: string; environment?: string; records: Array<{ key: string; value: any }> }> = [];
+    try {
+      const { getLinkedDatasets, getTestDataRecords, resolveTestData } = await import('../db/postgres');
+      const linkedDatasetIds = new Set<number>();
+      const datasetById = new Map<number, { name: string; environment?: string }>();
+      for (const tc of testCases) {
+        const linked = await getLinkedDatasets(tc.id).catch(() => []);
+        for (const ds of linked) {
+          linkedDatasetIds.add(ds.id);
+          datasetById.set(ds.id, { name: ds.name, environment: ds.environment });
+        }
+      }
+      if (linkedDatasetIds.size > 0) {
+        const seenDatasets = new Set<string>();
+        for (const dsId of linkedDatasetIds) {
+          const ds = datasetById.get(dsId);
+          if (!ds) continue;
+          const dedupeKey = `${ds.name}::${ds.environment}`;
+          if (seenDatasets.has(dedupeKey)) continue;
+          seenDatasets.add(dedupeKey);
+          // Prefer resolveTestData (hydrates secrets); fall back to raw records.
+          let records: Array<{ key: string; value: any }> = [];
+          try {
+            const resolved = await resolveTestData(ds.name, companyId, input.projectId, ds.environment);
+            if (Array.isArray(resolved) && resolved.length > 0) {
+              records = resolved.map((r: any) => ({ key: String(r.key), value: r.value }));
+            }
+          } catch { /* fall through */ }
+          if (records.length === 0) {
+            const raw = await getTestDataRecords(dsId).catch(() => []);
+            records = raw.map((r: any) => ({ key: String(r.key), value: r.value_jsonb }));
+          }
+          if (records.length > 0) {
+            resolvedTestData.push({ name: ds.name, environment: ds.environment, records });
+          }
+        }
+        if (resolvedTestData.length > 0) {
+          const totalRecords = resolvedTestData.reduce((n, d) => n + d.records.length, 0);
+          logger.info(MOD, '🔗 Test data resolved (full records for module generation)', {
+            datasets: resolvedTestData.length,
+            records: totalRecords,
+            testCases: testCases.length,
+          });
+        }
+      }
+    } catch (tdErr: any) {
+      logger.warn(MOD, 'Could not resolve test data (non-blocking):', tdErr?.message);
+    }
+
+    // Build the test-data index for downstream use in script generation.
+    const dataIndex = this.buildTestDataIndex(resolvedTestData);
+
     for (const group of groups) {
       const { file, coverage, locatorReport } = await this.generateScriptForGroup(
         group,
@@ -298,6 +354,7 @@ export class TestToScriptEngine {
         outputDir,
         knowledgeContext,
         intel,
+        dataIndex,
       );
       files.push(file);
       perFile.push(coverage);
@@ -306,6 +363,17 @@ export class TestToScriptEngine {
 
     // 6. Generate shared helpers file (not counted as coverage)
     files.push(this.generateHelpers(outputDir));
+
+    // 6b. Generate test-data module when resolved records are available (fixes
+    // Critical Issue #1 & #2 from review: no test-data.ts in ZIP, fill('') generated).
+    const dataModule = this.buildTestDataModule(dataIndex);
+    if (dataModule) {
+      files.push(dataModule);
+      logger.info(MOD, '📦 Test-data module generated', {
+        filePath: dataModule.filePath,
+        datasets: resolvedTestData.length,
+      });
+    }
 
     // 7. Build the overall coverage report by reconciling in vs out
     const coverage = this.buildCoverageReport(testCases, perFile);
@@ -726,6 +794,7 @@ export class TestToScriptEngine {
     outputDir: string,
     knowledgeContext: string,
     intel: IntelligenceBundle,
+    dataIndex?: Map<string, Map<string, any>>,
   ): Promise<{ file: GeneratedScriptFile; coverage: FileCoverage; locatorReport?: LocatorReport }> {
     // Use the repo's own file-naming convention when we have a repo guide so the
     // committed file looks native to the target codebase; otherwise default.
@@ -958,7 +1027,7 @@ Return ONLY the TypeScript code. No markdown fences, no explanations.`;
     }
 
     // ── Reconcile: which test cases did the AI actually cover? ──
-    const reconciled = this.reconcileCoverage(aiCode, group, requirement, baseUrl, resolvedByCase);
+    const reconciled = this.reconcileCoverage(aiCode, group, requirement, baseUrl, resolvedByCase, dataIndex);
 
     const coverage: FileCoverage = {
       filePath,
@@ -1149,13 +1218,14 @@ Return ONLY the TypeScript code. No markdown fences, no explanations.`;
     requirement: any,
     baseUrl: string,
     resolvedByCase: Map<number, ResolvedLocator[]>,
+    dataIndex?: Map<string, Map<string, any>>,
   ): { content: string; actualTests: number; coveredIds: number[]; missingFilled: number[]; extra: number } {
     const inputIds = group.cases.map((c: any) => c.id);
 
     // No usable AI output → deterministic template file (guaranteed 1:1).
     const looksValid = aiCode && /\btest\s*\(/.test(aiCode) && aiCode.includes('@playwright/test');
     if (!looksValid) {
-      const content = this.buildTemplateFile(group, requirement, baseUrl, group.cases, resolvedByCase);
+      const content = this.buildTemplateFile(group, requirement, baseUrl, group.cases, resolvedByCase, dataIndex);
       return {
         content,
         actualTests: group.cases.length,
@@ -1176,7 +1246,7 @@ Return ONLY the TypeScript code. No markdown fences, no explanations.`;
     let content = aiCode;
     if (missing.length) {
       const missingCases = group.cases.filter((c: any) => missing.includes(c.id));
-      content = this.injectTemplateTests(aiCode, group, missingCases, resolvedByCase);
+      content = this.injectTemplateTests(aiCode, group, missingCases, resolvedByCase, dataIndex);
     }
 
     const actualTests = this.countTests(content);
@@ -1217,10 +1287,11 @@ Return ONLY the TypeScript code. No markdown fences, no explanations.`;
     group: FileGroup,
     missingCases: any[],
     resolvedByCase: Map<number, ResolvedLocator[]>,
+    dataIndex?: Map<string, Map<string, any>>,
   ): string {
     const block = [
       `  test.describe('Coverage (auto-filled)', () => {`,
-      missingCases.map(tc => this.buildTemplateTest(tc, 2, resolvedByCase.get(tc.id))).join('\n\n'),
+      missingCases.map(tc => this.buildTemplateTest(tc, 2, resolvedByCase.get(tc.id), dataIndex)).join('\n\n'),
       `  });`,
     ].join('\n');
 
@@ -1229,7 +1300,7 @@ Return ONLY the TypeScript code. No markdown fences, no explanations.`;
       return `${aiCode.slice(0, lastClose)}\n${block}\n${aiCode.slice(lastClose)}`;
     }
     // Fallback: wrap as a standalone describe appended to the file.
-    return `${aiCode}\n\ntest.describe('${this.escapeStr(group.feature)} — Coverage (auto-filled)', () => {\n${missingCases.map(tc => this.buildTemplateTest(tc, 1, resolvedByCase.get(tc.id))).join('\n\n')}\n});\n`;
+    return `${aiCode}\n\ntest.describe('${this.escapeStr(group.feature)} — Coverage (auto-filled)', () => {\n${missingCases.map(tc => this.buildTemplateTest(tc, 1, resolvedByCase.get(tc.id), dataIndex)).join('\n\n')}\n});\n`;
   }
 
   /**
@@ -1245,7 +1316,12 @@ Return ONLY the TypeScript code. No markdown fences, no explanations.`;
    *     is honestly reported as "not yet implemented" instead of falsely
    *     passing. Coverage is still tracked via the `// @tc:` marker.
    */
-  private buildTemplateTest(tc: any, indentLevel = 1, resolved?: ResolvedLocator[]): string {
+  private buildTemplateTest(
+    tc: any,
+    indentLevel = 1,
+    resolved?: ResolvedLocator[],
+    dataIndex?: Map<string, Map<string, any>>,
+  ): string {
     const pad = '  '.repeat(indentLevel);
     const steps = this.parseJson(tc.steps, []);
     const stepsComment = steps.length
@@ -1253,6 +1329,37 @@ Return ONLY the TypeScript code. No markdown fences, no explanations.`;
       : `${pad}  // TODO: implement test steps`;
 
     const usable = (resolved || []).filter(r => r.confidence >= 40).slice(0, 3);
+
+    // Detect if this is a login-flow test case and bind test data if available.
+    const isLoginTest = /login|authenticate|sign.?in|credential/i.test(`${tc.title} ${steps.join(' ')}`);
+    let loginBlock = '';
+    let importGetRecord = false;
+    if (isLoginTest && dataIndex && this.hasResolvedData(dataIndex)) {
+      // Find the first dataset with "username" + "password" fields.
+      for (const [dsName, recMap] of dataIndex) {
+        const firstRec = recMap.values().next().value;
+        if (firstRec && (firstRec.username != null || firstRec.password != null)) {
+          // Check if this specific test targets a non-representative record (locked, etc.)
+          let recordKey: string | undefined;
+          let selector: string;
+          const haystack = `${tc.title} ${tc.test_data || ''} ${steps.join(' ')}`.toLowerCase();
+          for (const key of recMap.keys()) {
+            if (haystack.includes(key.toLowerCase()) && !this.isRepresentativeRecord(recMap, key)) {
+              recordKey = key;
+              break;
+            }
+          }
+          selector = this.datasetRef(dsName, recordKey);
+          loginBlock = `${pad}  const user = ${selector};
+${pad}  await page.locator('#user-name').fill(user.username ?? '');
+${pad}  await page.locator('#password').fill(user.password ?? '');
+${pad}  await page.locator('#login-button').click();
+`;
+          importGetRecord = true;
+          break;
+        }
+      }
+    }
 
     if (usable.length) {
       // Real, meaningful assertions on resolved locators.
@@ -1265,7 +1372,7 @@ Return ONLY the TypeScript code. No markdown fences, no explanations.`;
 ${pad}  // @tc:TC${tc.id}
 ${stepsComment}
 ${pad}  // Expected: ${this.escapeStr(tc.expected_result || 'Verify expected behavior')}
-${assertions}
+${loginBlock}${assertions}
 ${pad}});`;
     }
 
@@ -1274,8 +1381,7 @@ ${pad}});`;
 ${pad}  // @tc:TC${tc.id}
 ${stepsComment}
 ${pad}  // Expected: ${this.escapeStr(tc.expected_result || 'Verify expected behavior')}
-${pad}  // TODO: no locators could be resolved automatically — add real selectors + assertions.
-${pad}});`;
+${loginBlock ? loginBlock : `${pad}  // TODO: no locators could be resolved automatically — add real selectors + assertions.\n`}${pad}});`;
   }
 
   /**
@@ -1288,6 +1394,7 @@ ${pad}});`;
     baseUrl: string,
     cases: any[],
     resolvedByCase: Map<number, ResolvedLocator[]>,
+    dataIndex?: Map<string, Map<string, any>>,
   ): string {
     // Sub-group cases by scenario name for nested describe blocks.
     const byScenario = new Map<string, any[]>();
@@ -1298,7 +1405,7 @@ ${pad}});`;
     }
 
     const inner = [...byScenario.entries()].map(([scenario, scCases]) => {
-      const tests = scCases.map(tc => this.buildTemplateTest(tc, 2, resolvedByCase.get(tc.id))).join('\n\n');
+      const tests = scCases.map(tc => this.buildTemplateTest(tc, 2, resolvedByCase.get(tc.id), dataIndex)).join('\n\n');
       return `  test.describe('${this.escapeStr(scenario)}', () => {\n${tests}\n  });`;
     }).join('\n\n');
 
@@ -1306,7 +1413,13 @@ ${pad}});`;
       ? ` (part ${group.part}/${group.totalParts})`
       : '';
 
-    return `import { test, expect } from '@playwright/test';
+    // Detect if any test case uses test data (getRecord) to conditionally import it.
+    const usesTestData = inner.includes('getRecord(');
+    const importLine = usesTestData
+      ? `import { test, expect } from '@playwright/test';\nimport { getRecord } from './data/test-data';`
+      : `import { test, expect } from '@playwright/test';`;
+
+    return `${importLine}
 
 /**
  * ${this.escapeStr(group.feature)}${partNote}
@@ -1417,5 +1530,160 @@ import { expect } from '@playwright/test';
       try { return JSON.parse(val); } catch { return fallback; }
     }
     return fallback;
+  }
+
+  /* ── Test Data → Script traceability (ported from script-gen-engine) ── */
+
+  /**
+   * Flatten resolved dataset records into an index:
+   *   { datasetName -> { recordKey -> value } }
+   */
+  private buildTestDataIndex(
+    resolvedTestData?: Array<{ name: string; environment?: string; records: Array<{ key: string; value: any }> }>,
+  ): Map<string, Map<string, any>> {
+    const index = new Map<string, Map<string, any>>();
+    for (const ds of resolvedTestData || []) {
+      if (!ds?.name || !Array.isArray(ds.records)) continue;
+      const recMap = new Map<string, any>();
+      for (const rec of ds.records) {
+        if (rec?.key == null) continue;
+        recMap.set(String(rec.key), rec.value);
+      }
+      if (recMap.size > 0) index.set(ds.name, recMap);
+    }
+    return index;
+  }
+
+  /** True when the resolved-data index actually carries records. */
+  private hasResolvedData(index: Map<string, Map<string, any>>): boolean {
+    return index.size > 0;
+  }
+
+  /**
+   * Decide whether a record is the dataset's "representative" row — the
+   * default a generic valid-path test should use. When true we omit the record
+   * selector so the script binds to the dataset only.
+   */
+  private isRepresentativeRecord(recMap: Map<string, any>, key: string): boolean {
+    const keys = [...recMap.keys()];
+    if (keys[0] === key) return true;
+    if (/^(?!.*(lock|problem|glitch|invalid|expired|disabled|blocked|bad)).*(standard|valid|default|primary|active|good)/i.test(key)) {
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * Build a dataset-binding expression. Scripts bind to DATASET NAME + SCHEMA,
+   * not a hardcoded vendor record. Record selection is late-bound at runtime.
+   */
+  private datasetRef(datasetName: string, recordKey?: string): string {
+    return recordKey != null
+      ? `getRecord(${JSON.stringify(datasetName)}, ${JSON.stringify(recordKey)})`
+      : `getRecord(${JSON.stringify(datasetName)})`;
+  }
+
+  /**
+   * Generate the shared `tests/data/test-data.ts` module from resolved records.
+   * Schema-first: datasets are arrays, getDataset() returns all rows,
+   * getRecord() resolves one record late-bound (default first row, or by
+   * key/index/tag/predicate). Generated specs reference datasets by NAME.
+   */
+  private buildTestDataModule(index: Map<string, Map<string, any>>): GeneratedScriptFile | null {
+    if (!this.hasResolvedData(index)) return null;
+    // Normalize each record into { key, ...fields }
+    const datasetsObj: Record<string, Array<Record<string, any>>> = {};
+    const dsNames: string[] = [];
+    for (const [dsName, recMap] of index) {
+      dsNames.push(dsName);
+      const rows: Array<Record<string, any>> = [];
+      for (const [key, value] of recMap) {
+        const row: Record<string, any> =
+          value && typeof value === 'object' && !Array.isArray(value)
+            ? { key, ...value }
+            : { key, value };
+        rows.push(row);
+      }
+      datasetsObj[dsName] = rows;
+    }
+
+    const namedExports = dsNames.map(name => {
+      const camel = name.replace(/[_-]+(\w)/g, (_, c) => c.toUpperCase()).replace(/[^a-zA-Z0-9]/g, '');
+      const safe = /^[a-zA-Z_$]/.test(camel) ? camel : `dataset_${camel}`;
+      return `export const ${safe} = datasets[${JSON.stringify(name)}] ?? [];`;
+    }).join('\n');
+
+    const content = `/**
+ * Generated test-data module — sourced from the LevelUp Test Data Store.
+ *
+ * Datasets: ${dsNames.join(', ')}
+ *
+ * Generated specs bind to DATASET NAMES + SCHEMA and resolve a concrete record
+ * at runtime via getRecord(), so they keep working as the underlying data
+ * changes. Regenerate from the Test Data Store rather than editing by hand.
+ */
+
+export interface DataRecord {
+  /** The record's key within its dataset (e.g. "standard_user"). */
+  key: string;
+  username?: string;
+  password?: string;
+  /** Optional classification tags from the Test Data Store. */
+  tags?: string[];
+  [field: string]: unknown;
+}
+
+/** Selector for resolving one record from a dataset (late-bound). */
+export type RecordSelector =
+  | string                                   // match by record key
+  | number                                   // match by index
+  | { tag: string }                          // first record carrying a tag
+  | { where: (r: DataRecord) => boolean };   // first record matching a predicate
+
+/** All datasets, keyed by name → ordered list of records (schema-first). */
+const datasets: Record<string, DataRecord[]> = ${JSON.stringify(datasetsObj, null, 2)};
+
+/** Return every record in a dataset (its full schema/rows). */
+export function getDataset(name: string): DataRecord[] {
+  const ds = datasets[name];
+  if (!ds) throw new Error('Unknown dataset: ' + name);
+  return ds;
+}
+
+/**
+ * Resolve ONE record from a dataset. Selection is intentionally late-bound so
+ * the generated script keeps working as records are added/changed:
+ *   - no selector → the first record (a representative row)
+ *   - string      → match by record key
+ *   - number      → match by index
+ *   - { tag }     → first record carrying that tag
+ *   - { where }   → first record matching a predicate
+ */
+export function getRecord(name: string, selector?: RecordSelector): DataRecord {
+  const ds = getDataset(name);
+  let rec: DataRecord | undefined;
+  if (selector == null) rec = ds[0];
+  else if (typeof selector === 'number') rec = ds[selector];
+  else if (typeof selector === 'string') rec = ds.find(r => r.key === selector);
+  else if ('tag' in selector) rec = ds.find(r => (r.tags ?? []).includes(selector.tag));
+  else rec = ds.find(selector.where);
+  if (!rec) throw new Error('No record in dataset "' + name + '" for selector ' + JSON.stringify(selector));
+  return rec;
+}
+
+${namedExports}
+
+/** Flat object view, e.g. \`testData.valid_users[0]\`. */
+export const testData = datasets;
+
+export default datasets;
+`;
+    return {
+      filePath: 'tests/data/test-data.ts',
+      content,
+      testCount: 0,
+      feature: 'test-data',
+      testCaseIds: [],
+    };
   }
 }
