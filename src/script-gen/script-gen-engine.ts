@@ -106,6 +106,39 @@ export interface PageObjectSpec {
   }[];
 }
 
+/**
+ * One resolved interactive element and whether it was grounded in the REAL
+ * crawled DOM (App Profile) or fell back to a generic/hardcoded selector.
+ * Powers the "Locator Grounding Report" so the UI can show ✓ grounded vs
+ * ⚠ not-found-in-crawl per element instead of an opaque, hardcoded 0%.
+ */
+export interface LocatorGroundingEntry {
+  /** Logical element name, e.g. 'username', 'login', 'cart'. */
+  name: string;
+  /** The Playwright selector the generated script actually uses. */
+  selector: string;
+  /** True when matched against a real element in the crawl DOM. */
+  grounded: boolean;
+  /** Normalized confidence 0–100 (0 when ungrounded / fallback). */
+  confidence: number;
+  /** How the selector was derived: id | data-test | data-testid | name | css | fallback. */
+  source: string;
+}
+
+/**
+ * Aggregate grounding report for a generation. `groundedCount / total` is the
+ * REAL locator-validation percentage (replaces the old hardcoded 0%).
+ */
+export interface LocatorGroundingReport {
+  entries: LocatorGroundingEntry[];
+  total: number;
+  groundedCount: number;
+  /** Grounded percentage 0–100 = round(groundedCount / total * 100). */
+  groundedPct: number;
+  /** Average confidence across all reported entries, 0–100. */
+  avgConfidence: number;
+}
+
 export interface GenerationResult {
   testPlan: TestPlan;
   generatedFiles: GeneratedFile[];
@@ -126,6 +159,12 @@ export interface GenerationResult {
   rawCrawlData?: any;
   /** Framework audit analysis (Phase 1: Impact Analysis + Quality Report) */
   frameworkAnalysis?: FrameworkAuditResult;
+  /**
+   * Per-element locator grounding for the deterministic test-case / requirement
+   * paths — what was grounded in the real App Profile DOM vs fell back. Lets the
+   * route surface a truthful "REAL LOCATORS x/y" metric and a grounding report.
+   */
+  locatorGrounding?: LocatorGroundingReport;
 }
 
 export interface GeneratedFile {
@@ -600,18 +639,9 @@ export class ScriptGenEngine {
 
     // Resolve grounded selectors from the crawled DOM, with stable semantic
     // fallbacks for elements not present on the crawled (login) page.
-    const sel = {
-      username: this.resolveGroundedSelector(['username', 'user name', 'user-name', 'login'], crawl, `page.locator('#user-name')`, 'input'),
-      password: this.resolveGroundedSelector(['password'], crawl, `page.locator('#password')`, 'input'),
-      login: this.resolveGroundedSelector(['login button', 'login', 'sign in', 'submit'], crawl, `page.locator('#login-button')`, 'button'),
-      error: this.resolveGroundedSelector(['error', 'error message'], crawl, `page.locator('[data-test="error"]')`, 'any'),
-      menu: `page.locator('#react-burger-menu-btn')`,
-      logout: `page.locator('#logout_sidebar_link')`,
-      title: `page.locator('[data-test="title"]')`,
-      product: `page.locator('.inventory_item_name')`,
-      cart: `page.locator('.shopping_cart_link')`,
-      inventoryItem: `page.locator('.inventory_item')`,
-    };
+    // Resolve every semantic selector against the REAL crawl DOM (App Profile)
+    // and keep the tracking so we can emit a truthful Locator Grounding Report.
+    const { sel, tracked } = this.buildGroundedSelectors(crawl);
 
     // When a record was resolved, expose it as `user` (const ref in the test
     // body) so fills read `user.username` / `user.password`.
@@ -634,7 +664,8 @@ export class ScriptGenEngine {
       const generatedFiles: GeneratedFile[] = [{ path: `tests/${fileName}`, content, type: 'test' }];
       const moduleFile = this.buildTestDataModule(dataIndex);
       if (moduleFile) generatedFiles.push(moduleFile);
-      return this.buildTcResult(tc, title, baseUrl, crawl, tags, generatedFiles, 0, startTime);
+      const grounding = this.buildLocatorGroundingReport(tracked, content);
+      return this.buildTcResult(tc, title, baseUrl, crawl, tags, generatedFiles, 0, startTime, grounding);
     }
 
     const ctx = { url: baseUrl, creds, sel, data: dataRef };
@@ -705,7 +736,8 @@ ${assertions.map(l => `    ${l}`).join('\n')}
     if (moduleFile && usesModule) generatedFiles.push(moduleFile);
 
     const totalAssertions = assertions.filter(a => /\bexpect\s*\(/.test(a)).length;
-    return this.buildTcResult(tc, title, baseUrl, crawl, tags, generatedFiles, totalAssertions, startTime);
+    const grounding = this.buildLocatorGroundingReport(tracked, content);
+    return this.buildTcResult(tc, title, baseUrl, crawl, tags, generatedFiles, totalAssertions, startTime, grounding);
   }
 
   /** Assemble a single-case GenerationResult (test plan + stats). */
@@ -718,7 +750,13 @@ ${assertions.map(l => `    ${l}`).join('\n')}
     generatedFiles: GeneratedFile[],
     totalAssertions: number,
     startTime: number,
+    locatorGrounding?: LocatorGroundingReport,
   ): GenerationResult {
+    // Real selector quality = grounded locators / total locators (0–1), derived
+    // from what the spec actually uses — never the old hardcoded 0.
+    const selectorQuality = locatorGrounding && locatorGrounding.total > 0
+      ? locatorGrounding.groundedCount / locatorGrounding.total
+      : 0;
     const testPlan: TestPlan = {
       name: `Test Plan: ${title}`,
       description: `Deterministic test-case automation for "${title}"`,
@@ -738,7 +776,7 @@ ${assertions.map(l => `    ${l}`).join('\n')}
         generatedAt: new Date().toISOString(),
         crawlTimeMs: crawl.crawlTimeMs,
         totalElements: crawl.elements.length,
-        selectorQuality: 0,
+        selectorQuality,
         model: 'deterministic-test-case',
         tokensUsed: 0,
       },
@@ -750,7 +788,7 @@ ${assertions.map(l => `    ${l}`).join('\n')}
       stats: {
         totalTests: 1,
         totalAssertions,
-        avgSelectorScore: 0,
+        avgSelectorScore: locatorGrounding ? locatorGrounding.avgConfidence / 100 : 0,
         pageObjectsGenerated: 0,
         crawlTimeMs: crawl.crawlTimeMs,
         generationTimeMs: Date.now() - startTime,
@@ -758,6 +796,7 @@ ${assertions.map(l => `    ${l}`).join('\n')}
         model: 'deterministic-test-case',
       },
       errors: [],
+      ...(locatorGrounding ? { locatorGrounding } : {}),
     };
   }
 
@@ -778,6 +817,7 @@ ${assertions.map(l => `    ${l}`).join('\n')}
     let totalAssertions = 0;
     let totalTests = 0;
     const errors: string[] = [];
+    const groundingReports: LocatorGroundingReport[] = [];
 
     for (const tc of cases) {
       try {
@@ -787,6 +827,7 @@ ${assertions.map(l => `    ${l}`).join('\n')}
           errors.push(`Test case ${tc.id ?? tc.title ?? '?'} produced no script`);
           continue;
         }
+        if (single.locatorGrounding) groundingReports.push(single.locatorGrounding);
         for (const f of single.generatedFiles) {
           // The shared test-data module is identical across cases — emit it
           // once, never rename it (specs import a fixed './data/test-data' path).
@@ -816,6 +857,12 @@ ${assertions.map(l => `    ${l}`).join('\n')}
 
     if (generatedFiles.length === 0) return null;
 
+    // Aggregate per-case grounding into one report → real "REAL LOCATORS x/y".
+    const locatorGrounding = this.mergeLocatorGrounding(groundingReports);
+    const selectorQuality = locatorGrounding.total > 0
+      ? locatorGrounding.groundedCount / locatorGrounding.total
+      : 0;
+
     const reqLabel = cases[0]?.requirement_id ? `requirement ${cases[0].requirement_id}` : 'requirement';
     const testPlan: TestPlan = {
       name: `Test Plan: ${reqLabel} (${generatedFiles.length} cases)`,
@@ -829,7 +876,7 @@ ${assertions.map(l => `    ${l}`).join('\n')}
         generatedAt: new Date().toISOString(),
         crawlTimeMs: crawl.crawlTimeMs,
         totalElements: crawl.elements.length,
-        selectorQuality: 0,
+        selectorQuality,
         model: 'deterministic-requirement-batch',
         tokensUsed: 0,
       },
@@ -841,7 +888,7 @@ ${assertions.map(l => `    ${l}`).join('\n')}
       stats: {
         totalTests,
         totalAssertions,
-        avgSelectorScore: 0,
+        avgSelectorScore: locatorGrounding.avgConfidence / 100,
         pageObjectsGenerated: 0,
         crawlTimeMs: crawl.crawlTimeMs,
         generationTimeMs: Date.now() - startTime,
@@ -849,6 +896,7 @@ ${assertions.map(l => `    ${l}`).join('\n')}
         model: 'deterministic-requirement-batch',
       },
       errors,
+      ...(locatorGrounding.total > 0 ? { locatorGrounding } : {}),
     };
   }
 
@@ -1170,6 +1218,24 @@ export default datasets;
     fallback: string,
     kind: 'input' | 'button' | 'any',
   ): string {
+    return this.resolveGroundedSelectorTracked(intents, crawl, fallback, kind).selector;
+  }
+
+  /**
+   * Like `resolveGroundedSelector`, but also reports HOW the selector was
+   * resolved so callers can build a truthful Locator Grounding Report:
+   *   - `grounded`   — matched a real element in the crawl DOM (App Profile)
+   *   - `confidence` — 0–100 (0 when falling back to the generic selector)
+   *   - `source`     — id | data-test | data-testid | name | css | fallback
+   * When nothing matches we return the `fallback` selector with grounded=false
+   * so generation behaviour is unchanged — only the reporting is richer.
+   */
+  private resolveGroundedSelectorTracked(
+    intents: string[],
+    crawl: CrawlResult,
+    fallback: string,
+    kind: 'input' | 'button' | 'any',
+  ): { selector: string; grounded: boolean; confidence: number; source: string } {
     const pool = (crawl.elements || []).filter(el => {
       if (kind === 'input') return el.tag === 'input' || el.tag === 'textarea';
       if (kind === 'button') return el.tag === 'button' || el.type === 'submit' || el.tag === 'a';
@@ -1179,22 +1245,104 @@ export default datasets;
       const match = this.matchElement(intent, pool.length ? pool : (crawl.elements || []));
       if (match && match.score > 0) {
         const el = match.element;
+        // Normalize matchElement's raw score (≈50–150) to a 0–100 confidence.
+        const confidence = Math.max(1, Math.min(99, Math.round(match.score / 1.5)));
         // Prefer a stable id selector when present.
-        if (el.id) return `page.locator('#${el.id}')`;
+        if (el.id) return { selector: `page.locator('#${el.id}')`, grounded: true, confidence, source: 'id' };
         // SauceDemo (and many apps) expose the test hook as `data-test` rather
         // than `data-testid`. Playwright's getByTestId() defaults to
         // `data-testid`, so emit an explicit attribute locator for `data-test`.
         const attrs = (el as any).attributes as Record<string, string> | undefined;
         const dataTest = attrs?.['data-test'];
-        if (dataTest) return `page.locator('[data-test="${dataTest}"]')`;
+        if (dataTest) return { selector: `page.locator('[data-test="${dataTest}"]')`, grounded: true, confidence, source: 'data-test' };
         const dataTestId = attrs?.['data-testid'] || attrs?.['data-test-id'] || el.dataTestId;
-        if (dataTestId) return `page.getByTestId('${dataTestId}')`;
-        if (el.name) return `page.locator('[name="${el.name}"]')`;
+        if (dataTestId) return { selector: `page.getByTestId('${dataTestId}')`, grounded: true, confidence, source: 'data-testid' };
+        if (el.name) return { selector: `page.locator('[name="${el.name}"]')`, grounded: true, confidence, source: 'name' };
         const best = this.selectorEngine.getBestPlaywrightSelector(el);
-        if (best) return best;
+        if (best) return { selector: best, grounded: true, confidence, source: 'css' };
       }
     }
-    return fallback;
+    return { selector: fallback, grounded: false, confidence: 0, source: 'fallback' };
+  }
+
+  /**
+   * Resolve the full set of semantic selectors a generated spec may reference,
+   * grounding each against the real crawl DOM (App Profile) and TRACKING the
+   * outcome. Returns both the plain `sel` map (used during code emission) and a
+   * `tracked` map (used to build the Locator Grounding Report). Centralizes what
+   * used to be an inline literal so every path grounds — and reports — uniformly.
+   */
+  private buildGroundedSelectors(crawl: CrawlResult): {
+    sel: Record<string, string>;
+    tracked: Record<string, { selector: string; grounded: boolean; confidence: number; source: string }>;
+  } {
+    const t = (intents: string[], fallback: string, kind: 'input' | 'button' | 'any') =>
+      this.resolveGroundedSelectorTracked(intents, crawl, fallback, kind);
+    const tracked = {
+      username: t(['username', 'user name', 'user-name', 'login'], `page.locator('#user-name')`, 'input'),
+      password: t(['password'], `page.locator('#password')`, 'input'),
+      login: t(['login button', 'login', 'sign in', 'submit'], `page.locator('#login-button')`, 'button'),
+      error: t(['error', 'error message'], `page.locator('[data-test="error"]')`, 'any'),
+      menu: t(['menu', 'burger menu', 'hamburger', 'open menu'], `page.locator('#react-burger-menu-btn')`, 'button'),
+      logout: t(['logout', 'log out', 'sign out'], `page.locator('#logout_sidebar_link')`, 'any'),
+      title: t(['title', 'page title', 'products', 'header'], `page.locator('[data-test="title"]')`, 'any'),
+      product: t(['product', 'item name', 'product name'], `page.locator('.inventory_item_name')`, 'any'),
+      cart: t(['cart', 'shopping cart', 'cart icon', 'basket'], `page.locator('.shopping_cart_link')`, 'any'),
+      inventoryItem: t(['inventory item', 'product card', 'item'], `page.locator('.inventory_item')`, 'any'),
+    };
+    const sel: Record<string, string> = {};
+    for (const [k, v] of Object.entries(tracked)) sel[k] = v.selector;
+    return { sel, tracked };
+  }
+
+  /**
+   * Build a Locator Grounding Report from the tracked selectors, restricted to
+   * the ones the generated spec ACTUALLY references (so we never report a cart
+   * locator for a pure-login test). `content` is the emitted spec text; an entry
+   * is included when its selector string appears in it. This makes "REAL
+   * LOCATORS x/y" reflect exactly what the script depends on.
+   */
+  private buildLocatorGroundingReport(
+    tracked: Record<string, { selector: string; grounded: boolean; confidence: number; source: string }>,
+    content: string,
+  ): LocatorGroundingReport {
+    const entries: LocatorGroundingEntry[] = [];
+    const seen = new Set<string>();
+    for (const [name, info] of Object.entries(tracked)) {
+      if (!content.includes(info.selector)) continue; // only elements the spec uses
+      if (seen.has(name)) continue;
+      seen.add(name);
+      entries.push({ name, selector: info.selector, grounded: info.grounded, confidence: info.confidence, source: info.source });
+    }
+    const groundedCount = entries.filter(e => e.grounded).length;
+    const avgConfidence = entries.length
+      ? Math.round(entries.reduce((s, e) => s + e.confidence, 0) / entries.length)
+      : 0;
+    const total = entries.length;
+    const groundedPct = total ? Math.round((groundedCount / total) * 100) : 0;
+    return { entries, total, groundedCount, groundedPct, avgConfidence };
+  }
+
+  /** Merge several per-case grounding reports into one (dedupe by element name). */
+  private mergeLocatorGrounding(reports: LocatorGroundingReport[]): LocatorGroundingReport {
+    const byName = new Map<string, LocatorGroundingEntry>();
+    for (const r of reports) {
+      for (const e of r.entries) {
+        const prev = byName.get(e.name);
+        // Keep the strongest (grounded > fallback, then higher confidence).
+        if (!prev || (e.grounded && !prev.grounded) || (e.grounded === prev.grounded && e.confidence > prev.confidence)) {
+          byName.set(e.name, e);
+        }
+      }
+    }
+    const entries = [...byName.values()];
+    const groundedCount = entries.filter(e => e.grounded).length;
+    const avgConfidence = entries.length
+      ? Math.round(entries.reduce((s, e) => s + e.confidence, 0) / entries.length)
+      : 0;
+    const total = entries.length;
+    const groundedPct = total ? Math.round((groundedCount / total) * 100) : 0;
+    return { entries, total, groundedCount, groundedPct, avgConfidence };
   }
 
   /**

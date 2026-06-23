@@ -499,6 +499,31 @@ export function createScriptGenRouter(): Router {
         console.warn(`[ScriptGen] Locator resolution non-blocking error: ${locErr?.message}`);
       }
 
+      // ── Tier B: real locator grounding from the deterministic engine ──
+      // The deterministic requirement/test-case paths ground every selector
+      // against the cached App Profile DOM and emit a per-element grounding
+      // report. When present, it is the source of truth for the "REAL LOCATORS
+      // x/y" metric (it reflects selectors actually written into the generated
+      // files), so it overrides the heuristic LocatorResolver report above.
+      const engineGrounding = result.locatorGrounding;
+      if (engineGrounding && engineGrounding.entries.length > 0) {
+        locatorReport = {
+          totalLocators: engineGrounding.total,
+          validatedCount: engineGrounding.groundedCount,
+          avgConfidence: engineGrounding.avgConfidence,
+          todoCount: Math.max(0, engineGrounding.total - engineGrounding.groundedCount),
+          locators: engineGrounding.entries.map((e) => ({
+            element: e.name,
+            selector: e.selector,
+            confidence: e.confidence,
+            source: e.source,
+            validated: e.grounded,
+            status: e.grounded ? 'validated' : 'todo',
+          })),
+        } as unknown as LocatorReport;
+        console.log(`[ScriptGen] 🎯 Real locator grounding — ${engineGrounding.groundedCount}/${engineGrounding.total} grounded (${engineGrounding.groundedPct}%), avgConfidence=${engineGrounding.avgConfidence}`);
+      }
+
       // ── Sprint 4: Folder Placement Decision ──
       // Decide where the primary generated test file should live, honouring the
       // repo's existing conventions and never overwriting existing files.
@@ -735,6 +760,11 @@ export function createScriptGenRouter(): Router {
             crawlDecisionReason: crawlDecision.reason,
             crawlDecisionTimeMs: crawlDecision.decisionTimeMs,
             profileId: crawlDecision.profile?.id ?? null,
+            // Truthful crawl grounding signal for the UI. The dashboard derives
+            // its "App Profile Used" vs "AI only" label from this. A cached App
+            // Profile DOM is the fast path; a fresh crawl is the slow path.
+            crawlStrategy: crawlDecision.usedCache ? 'FAST_PATH' : 'SLOW_PATH',
+            crawlTimeMs: result.stats?.crawlTimeMs ?? 0,
             // Repository intelligence details
             repoIntelligenceUsed: !!repoIntelligence,
             repoId: repoId ?? null,
