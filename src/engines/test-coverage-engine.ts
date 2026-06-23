@@ -461,17 +461,17 @@ Return ONLY valid JSON, no markdown fences.`;
     missingRequirements: MissingRequirement[];
     tokensUsed: number;
   }> {
-    // EXPANDED mode only: auto-expand to a comprehensive baseline so the
-    // *suggested additional coverage* bucket is thorough. In STRICT mode we do
-    // NOT inflate the requested types — strict coverage must stay tightly scoped
-    // to what the requirement actually asks for (no forced negative/boundary/etc).
+    // GAP-ANALYSIS (expanded) mode only: auto-expand to a comprehensive baseline so
+    // the *suggested additional coverage* (assumption-based) bucket is thorough.
+    // In STANDARD mode we keep the requested types — committed coverage is grounded
+    // in the requirement AND the provided context (knowledge / profile / test data),
+    // not padded with ungrounded assumptions.
     const expand = mode === 'expanded';
     if (expand) {
       const baselineTypes: CoverageType[] = ['positive', 'negative', 'edge_cases', 'boundary', 'integration'];
       coverageTypes = Array.from(new Set([...coverageTypes, ...baselineTypes]));
     } else if (coverageTypes.length === 0) {
-      // Strict mode with no explicit types — default to positive (happy path)
-      // which is what a single requirement most directly implies.
+      // Standard mode with no explicit types — default to positive (happy path).
       coverageTypes = ['positive'];
     }
 
@@ -510,30 +510,35 @@ Return ONLY valid JSON, no markdown fences.`;
     }).join('\n  - ');
 
     // ── Mode-specific scope & volume guidance ──
-    // STRICT: tightly scoped to the requirement, small case count, no expansion.
-    // EXPANDED: strict coverage + a separate suggested-additional-coverage bucket.
+    // STANDARD (default): committed coverage grounded in requirement + context
+    //   (App Knowledge, App Profile, Test Data). No assumptions.
+    // GAP ANALYSIS (expanded): grounded coverage + a separate assumption-based
+    //   suggestions bucket + missing-requirement questions.
     const scopeBlock = expand
-      ? `GENERATION MODE: EXPANDED COVERAGE (Coverage Gap Analysis is ON)
-  - Produce TWO separate buckets:
-    1) "testCases" — STRICT requirement coverage (see the STRICT SCOPE rules below). This is still tightly scoped to the requirement.
-    2) "suggestedTestCases" — ADDITIONAL coverage the requirement does not state but a senior QA would consider (negative paths, security, edge/boundary, role/permission, concurrency). These are SUGGESTIONS for review — keep them OUT of "testCases".
-  - For suggestedTestCases you MAY use the requested coverage types as inspiration:
+      ? `GENERATION MODE: GAP ANALYSIS (Coverage Gap Analysis is ON)
+  - Produce THREE outputs:
+    1) "testCases" — GROUNDED coverage (see the GROUNDED SCOPE rules below): everything derived from the REQUIREMENT and the PROVIDED CONTEXT (App Knowledge, App Profile, Test Data). This is the same committed coverage you would produce in Standard mode.
+    2) "suggestedTestCases" — ADDITIONAL, ASSUMPTION-BASED coverage that is NOT grounded in the requirement or provided context but a senior QA would still consider (negative paths, security, edge/boundary, role/permission, concurrency, timeouts). These are SUGGESTIONS for review — keep them OUT of "testCases".
+    3) "missingRequirements" — open questions for unstated values/limits/behaviours (see the ASSUMPTIONS rule).
+  - Coverage-type guidance (applies to both grounded testCases and suggestions):
   - ${coverageExpectations}
-  - Aim for quality over quantity: a handful of high-value suggestions, not dozens.`
-      : `GENERATION MODE: STRICT REQUIREMENT COVERAGE (Coverage Gap Analysis is OFF)
-  - Produce ONLY "testCases" that trace DIRECTLY to the stated requirement.
-  - "suggestedTestCases" MUST be an empty array [].
-  - DO NOT add negative, boundary, security, concurrency, or permission cases unless the REQUIREMENT itself states them.`;
+  - Quality over quantity for suggestions: a handful of high-value ones, not dozens.`
+      : `GENERATION MODE: STANDARD COVERAGE (Coverage Gap Analysis is OFF)
+  - Produce "testCases" GROUNDED in the REQUIREMENT and the PROVIDED CONTEXT. App Knowledge, App Profile and Test Data are FIRST-CLASS inputs by default — use them to drive AND enrich real, committed test cases (see GROUNDED SCOPE below).
+  - Coverage-type guidance for the requested types:
+  - ${coverageExpectations}
+  - "suggestedTestCases" MUST be an empty array []. "missingRequirements" MUST be an empty array [] — assumptions are only surfaced when Gap Analysis is ON.
+  - Do NOT invent behaviours, limits, or values that are absent from BOTH the requirement AND all provided context (no assumptions).`;
 
     const volumeBlock = expand
       ? `OUTPUT VOLUME:
-  - "testCases" (strict): typically 3-6 — only what the requirement directly demands.
-  - "suggestedTestCases" (expansion): up to ~8 high-value additional cases. Fewer is fine.`
+  - "testCases" (grounded): a thorough set covering everything the requirement + App Knowledge + App Profile + Test Data genuinely support across the requested coverage types.
+  - "suggestedTestCases" (assumption-based expansion): up to ~8 high-value additional cases. Fewer is fine.`
       : `OUTPUT VOLUME:
-  - Generate ONLY as many cases as the requirement genuinely needs — typically 3-6 for a single, focused requirement.
-  - Do NOT pad to hit a number. A small, precise set is the CORRECT result. Quality over quantity.`;
+  - Generate a thorough set GROUNDED in the requirement and the provided context — as many cases as the requirement + App Knowledge + App Profile + Test Data genuinely support across the requested coverage types.
+  - Do NOT under-generate: if context legitimately supports more cases, include them. Do NOT pad with ungrounded assumptions either. Quality AND coverage.`;
 
-    const prompt = `You are a principal QA engineer. ${expand ? 'Generate strict requirement coverage PLUS clearly-separated suggested additional coverage.' : 'Generate ONLY the test cases that a single, focused requirement genuinely demands — no padding, no scope creep.'}
+    const prompt = `You are a principal QA engineer. ${expand ? 'Generate grounded coverage PLUS clearly-separated, assumption-based suggested additional coverage.' : 'Generate the committed test cases grounded in the requirement AND the provided context (App Knowledge, App Profile, Test Data) — thorough but no ungrounded assumptions.'}
 
 REQUIREMENT:
 Title: ${input.title}
@@ -552,16 +557,23 @@ ${scopeBlock}
 
 ${volumeBlock}
 
-STRICT SCOPE — the single most important rule (applies to "testCases"):
-  - A test case belongs in "testCases" ONLY if it verifies behaviour the REQUIREMENT (title / description / acceptance criteria / business flow) explicitly states or directly implies.
-  - APP KNOWLEDGE, TEST DATA, and APP PROFILE are CONTEXT — they ENRICH a requirement-derived case (e.g. use a real "standard_user" record as the test data for the login case). They DO NOT justify a brand-new case on their own.
-  - Concrete example: a requirement "standard user logs in and reaches Inventory" justifies: (a) successful login, (b) navigation to Inventory. It does NOT justify "locked-out user login", "invalid username", "empty credentials", "max character limit", "concurrent login", or "session persistence" — the requirement never asked for those.
-  - The existence of a "locked_users" or "problem_users" dataset is NOT a reason to generate a locked-user test for a valid-login requirement. Use such data only if the requirement is about that behaviour.
-
-ASSUMPTIONS → MISSING REQUIREMENTS (do NOT fabricate test cases):
-  - If you would need to ASSUME a value/limit/behaviour not stated anywhere (e.g. a username max length, a lockout threshold, a session timeout), DO NOT create a test case for it.
-  - Instead, add an entry to "missingRequirements" phrased as a question for the requirement author (e.g. { "question": "What is the maximum username length?", "area": "Input validation", "rationale": "No length limit is stated, so a boundary test cannot be written reliably." }).
-  - This is MORE valuable than a guessed test case. NEVER emit a test case with source "assumption".
+GROUNDED SCOPE — the single most important rule (defines what belongs in "testCases"):
+  - A test case belongs in "testCases" if it is GROUNDED in any of the following:
+      • the REQUIREMENT (title / description / acceptance criteria / business flow) — explicitly stated or directly implied; OR
+      • APP KNOWLEDGE — a documented business rule relevant to this feature (e.g. "accounts lock after 3 failed logins" makes a lockout case GROUNDED, not an assumption); OR
+      • APP PROFILE — real pages/forms/elements/selectors of the application; OR
+      • TEST DATA — a dataset/scenario RELEVANT to the requirement (use the real records as the case's test data, and cover the scenarios that dataset is meant to exercise).
+  - These four are FIRST-CLASS, DEFAULT inputs. Use them to DRIVE and ENRICH committed cases — do not hold back grounded coverage.
+  - The ONLY thing excluded from "testCases" is an ASSUMPTION: a behaviour/value/limit absent from BOTH the requirement AND all provided context.
+  - Guard against irrelevant grounding: an UNRELATED dataset alone (e.g. a "locked_users" set when the requirement and knowledge never mention lockout) is NOT a reason to test that behaviour. Ground in context that is RELEVANT to this requirement.
+  - Concrete example: requirement "standard user logs in and reaches Inventory", with a "standard_user" dataset and an App Profile of the login + inventory pages → GROUNDED testCases: successful login (using the real standard_user record), navigation to Inventory, and any login/inventory behaviour the App Knowledge documents. If nothing states lockout/length limits/concurrency, those are ASSUMPTIONS — ${expand ? 'put them in suggestedTestCases / missingRequirements.' : 'OMIT them (they appear only when Gap Analysis is ON).'}
+${expand ? `
+ASSUMPTIONS → SUGGESTIONS & MISSING REQUIREMENTS (Gap Analysis is ON):
+  - Assumption-based test ideas (ungrounded negative/boundary/security/concurrency/permission) go in "suggestedTestCases" with source "gap_analysis" — NEVER in "testCases".
+  - If an idea needs you to ASSUME a value/limit not stated anywhere (e.g. username max length, lockout threshold, session timeout), DO NOT invent a test — add a "missingRequirements" entry phrased as a question (e.g. { "question": "What is the maximum username length?", "area": "Input validation", "rationale": "No length limit is stated, so a boundary test cannot be written reliably." }).
+  - NEVER emit a test case with source "assumption".` : `
+ASSUMPTIONS (Gap Analysis is OFF):
+  - Do NOT generate assumption-based cases and do NOT fill "missingRequirements". Both "suggestedTestCases" and "missingRequirements" MUST be []. Assumptions are surfaced only when Gap Analysis is enabled.`}
 
 QUALITY STANDARDS — each test case must have:
   - Specific, actionable title (NOT vague like "Verify login works")
@@ -572,11 +584,11 @@ NO DUPLICATES:
 
 SOURCE TAGGING — every test case (in BOTH buckets) MUST include:
   - "source": one of "requirement" | "knowledge" | "test_data" | "app_profile" | "gap_analysis"
-      • "requirement" — directly verifies the stated requirement / acceptance criteria. (Most "testCases" should be this.)
-      • "knowledge"  — the requirement case is grounded in / enriched by APP KNOWLEDGE business rules.
-      • "test_data"  — the requirement case uses a real dataset listed under AVAILABLE TEST DATA.
-      • "app_profile"— grounded in the crawled APP PROFILE structure/selectors.
-      • "gap_analysis" — ONLY for "suggestedTestCases": coverage the requirement implies but does not state.
+      • "requirement" — directly verifies the stated requirement / acceptance criteria.
+      • "knowledge"  — grounded in an APP KNOWLEDGE business rule (a valid committed source by default).
+      • "test_data"  — grounded in / using a real dataset or scenario from AVAILABLE TEST DATA (a valid committed source by default).
+      • "app_profile"— grounded in the crawled APP PROFILE structure/selectors (a valid committed source by default).
+      • "gap_analysis" — ONLY for "suggestedTestCases": assumption-based coverage NOT grounded in the requirement or context.
   - "source" MUST NOT be "assumption" — assumptions go to "missingRequirements" instead.
   - "sourceEvidence": a short phrase naming the exact evidence (e.g. "AC: standard user logs in", "standard_user dataset", "Authentication Rules knowledge").
 
@@ -593,11 +605,11 @@ Return JSON (use [] for empty buckets):
     "automationComplexity": "low"|"medium"|"high", "selectorAvailability": "high"|"medium"|"low"|"unknown",
     "source": "requirement"|"knowledge"|"test_data"|"app_profile", "sourceEvidence": string
   }],
-  "suggestedTestCases": [ /* same shape as a testCase; source usually "gap_analysis". EMPTY [] in strict mode. */ ],
+  "suggestedTestCases": [ /* same shape as a testCase; source "gap_analysis". MUST be [] in Standard mode. */ ],
   "missingRequirements": [{ "question": string, "area": string, "rationale": string }]
 }
 
-Return ONLY valid JSON. ${expand ? 'Keep strict requirement coverage and suggestions in SEPARATE buckets.' : 'Stay strictly within the requirement scope.'}`;
+Return ONLY valid JSON. ${expand ? 'Keep grounded coverage and assumption-based suggestions in SEPARATE buckets.' : 'Use ALL provided context to ground committed coverage; keep suggestedTestCases and missingRequirements empty.'}`;
 
     const resp = await this.callLLM(prompt, 6000);
     let parsed: {
@@ -615,8 +627,11 @@ Return ONLY valid JSON. ${expand ? 'Keep strict requirement coverage and suggest
 
     let scenarios = parsed.scenarios || [];
     let testCases = parsed.testCases || [];
+    // Assumptions (suggestions + missing-requirement questions) are surfaced ONLY
+    // when Gap Analysis is ON. In Standard mode both buckets are forced empty so
+    // committed coverage stays grounded in the requirement + provided context.
     let suggestedTestCases = expand ? (parsed.suggestedTestCases || []) : [];
-    const missingRequirements = parsed.missingRequirements || [];
+    const missingRequirements = expand ? (parsed.missingRequirements || []) : [];
 
     // ── Safety net — enforce the strict/expanded contract even if the model
     //    misclassifies. Any case the model tagged "assumption" or "gap_analysis"
@@ -705,11 +720,14 @@ Return ONLY valid JSON array.`;
   ): Promise<GenerationResult> {
     // The "Coverage Gap Analysis" toggle drives BOTH the generation mode and the
     // separate gap-analysis LLM call:
-    //   • OFF → STRICT mode: only requirement-derived cases, no expansion, no gap call.
-    //   • ON  → EXPANDED mode: requirement coverage + a separate "suggested additional
-    //           coverage" bucket + the non-automatable gap analysis pass.
-    // This matches the product rule: "make it strict — only if gap analysis is enabled
-    // do we add extra cases." Callers can still force a mode via options.mode.
+    //   • OFF → STANDARD mode: committed coverage GROUNDED in the requirement AND all
+    //           provided context (App Knowledge, App Profile, Test Data). No assumptions,
+    //           no separate suggestions, no gap call.
+    //   • ON  → EXPANDED mode: the same grounded coverage + a separate assumption-based
+    //           "suggested additional coverage" bucket + missing-requirement questions +
+    //           the non-automatable gap analysis pass.
+    // Product rule: context is a first-class default input; assumptions appear only when
+    // Gap Analysis is enabled. Callers can still force a mode via options.mode.
     const includeCoverageGaps = options?.includeCoverageGaps !== false;
     const mode: GenerationMode = options?.mode ?? (includeCoverageGaps ? 'expanded' : 'strict');
     logger.info(MOD, 'Starting full coverage generation', { title: input.title, coverageTypes, includeCoverageGaps, mode });
