@@ -12,6 +12,19 @@ import { KnowledgeOptimizer, type KnowledgeItem as OptimizerKnowledgeItem } from
 
 const MOD = 'test-coverage-engine';
 
+/** Cosine similarity between two equal-length numeric vectors (0..1 for embeddings). */
+function cosineSimilarity(a: number[], b: number[]): number {
+  if (!a?.length || !b?.length || a.length !== b.length) return 0;
+  let dot = 0, magA = 0, magB = 0;
+  for (let i = 0; i < a.length; i++) {
+    dot += a[i] * b[i];
+    magA += a[i] * a[i];
+    magB += b[i] * b[i];
+  }
+  if (magA === 0 || magB === 0) return 0;
+  return dot / (Math.sqrt(magA) * Math.sqrt(magB));
+}
+
 /* ------------------------------------------------------------------ */
 /*  Types                                                              */
 /* ------------------------------------------------------------------ */
@@ -54,6 +67,18 @@ export interface TestScenario {
   riskArea: string;
 }
 
+/**
+ * Where a test case's coverage comes from — for traceability (RTM) and trust.
+ *  - requirement: directly traces to the requirement / acceptance criteria.
+ *  - knowledge:   grounded in provided App Knowledge / business rules.
+ *  - test_data:   driven by a real project dataset (e.g. valid_users).
+ *  - app_profile: grounded in the crawled application structure.
+ *  - assumption:  AI-extrapolated beyond any provided evidence (e.g. a boundary
+ *                 limit not stated anywhere). Surfaced explicitly so users can
+ *                 trust or prune it instead of mistaking it for requirement coverage.
+ */
+export type TestCaseSource = 'requirement' | 'knowledge' | 'test_data' | 'app_profile' | 'gap_analysis' | 'assumption';
+
 export interface TestCase {
   title: string;
   preconditions: string;
@@ -66,6 +91,10 @@ export interface TestCase {
   automationReady: boolean;
   automationComplexity: 'low' | 'medium' | 'high';
   selectorAvailability: 'high' | 'medium' | 'low' | 'unknown';
+  /** Primary provenance of this case (defaults to 'requirement' if the model omits it). */
+  source?: TestCaseSource;
+  /** Short, human-readable justification for the source tag (e.g. "AC: valid login"). */
+  sourceEvidence?: string;
 }
 
 export interface CoverageGap {
@@ -87,6 +116,8 @@ export interface GenerationResult {
     automationReadyCount: number;
     gapsFound: number;
     tokensUsed: number;
+    /** How many near-duplicate cases the semantic dedup pass removed. */
+    duplicatesRemoved?: number;
   };
 }
 
@@ -474,6 +505,26 @@ GOOD examples:
   - "Verify SQL injection prevention in search field with payload: ' OR 1=1 --"
   - "Verify form submission with maximum character limit (255 chars) in name field"
 
+NO DUPLICATES — critical quality rule:
+  - Do NOT emit multiple test cases that verify the same behaviour with different wording.
+  - Example of what to AVOID: "Verify successful login", "Verify navigation to Inventory after login", and "Verify login + inventory integration" are the SAME happy path — keep ONE, drop the rest.
+  - Each test case must assert something genuinely distinct. Merge overlapping cases.
+
+EVIDENCE-BASED ONLY — do not hallucinate:
+  - Only generate boundary/limit cases (max/min length, character limits, numeric ranges) when a concrete limit is stated in the REQUIREMENT, APP KNOWLEDGE, APP PROFILE, or TEST DATA above.
+  - If NO such limit exists in the provided context, DO NOT invent one. Either omit the boundary case, or, if it is genuinely valuable, generate it but set "source":"assumption" and explain in "sourceEvidence" (e.g. "assumed 255-char limit — not specified").
+  - The same applies to any behaviour not traceable to the inputs: tag it "assumption", never "requirement".
+
+SOURCE TAGGING — for traceability (RTM) and trust, every test case MUST include:
+  - "source": one of "requirement" | "knowledge" | "test_data" | "app_profile" | "gap_analysis" | "assumption"
+      • "requirement" — directly verifies the stated requirement / acceptance criteria.
+      • "knowledge"  — grounded in the APP KNOWLEDGE / business rules above.
+      • "test_data"  — driven by a real dataset listed under AVAILABLE TEST DATA.
+      • "app_profile"— grounded in the crawled APP PROFILE structure/selectors.
+      • "gap_analysis" — fills a coverage gap not explicitly stated in the requirement but clearly implied (e.g. an obvious negative/error path the requirement omitted).
+      • "assumption" — extrapolated beyond the provided evidence (see rule above).
+  - "sourceEvidence": a short phrase naming the exact evidence (e.g. "AC: standard user logs in", "valid_users dataset", "Authentication Rules knowledge", "assumed limit — not specified").
+
 IMPORTANT: Each test case must include a "scenarioIndex" field (0-based) linking it to the scenario it belongs to. This ensures proper grouping.
 
 Return JSON:
@@ -491,11 +542,13 @@ Return JSON:
     "tags": string[],
     "automationReady": boolean,
     "automationComplexity": "low"|"medium"|"high",
-    "selectorAvailability": "high"|"medium"|"low"|"unknown"
+    "selectorAvailability": "high"|"medium"|"low"|"unknown",
+    "source": "requirement"|"knowledge"|"test_data"|"app_profile"|"gap_analysis"|"assumption",
+    "sourceEvidence": string
   }]
 }
 
-Return ONLY valid JSON. Generate comprehensive coverage — this is for a production release.`;
+Return ONLY valid JSON. Generate comprehensive, NON-DUPLICATE coverage — this is for a production release.`;
 
     const resp = await this.callLLM(prompt, 6000);
     let parsed: { scenarios: TestScenario[]; testCases: TestCase[] };
@@ -568,7 +621,7 @@ Return ONLY valid JSON array.`;
     input: RequirementInput,
     coverageTypes: CoverageType[],
     knowledge?: KnowledgeContext,
-    options?: { includeCoverageGaps?: boolean }
+    options?: { includeCoverageGaps?: boolean; deduplicate?: boolean }
   ): Promise<GenerationResult> {
     // Gap analysis is a separate LLM round-trip. Skip it entirely when the caller
     // opts out (UI "Coverage Gaps" toggle off) — this removes one of three
@@ -581,10 +634,21 @@ Return ONLY valid JSON array.`;
     logger.info(MOD, 'Requirement analysis complete', { featureType: analysis.featureType, riskLevel: analysis.riskLevel });
 
     // Phase 5: Generate tests
-    const { scenarios, testCases, tokensUsed: t2 } = await this.generateTestCoverage(
+    const { scenarios, testCases: rawTestCases, tokensUsed: t2 } = await this.generateTestCoverage(
       input, analysis, coverageTypes, knowledge
     );
-    logger.info(MOD, 'Test generation complete', { scenarios: scenarios.length, testCases: testCases.length });
+    logger.info(MOD, 'Test generation complete', { scenarios: scenarios.length, testCases: rawTestCases.length });
+
+    // Phase 5b: Semantic de-duplication — drop near-identical cases (e.g. three
+    // variants of the same happy-path login). Cheap batched embeddings call; fails
+    // open. Can be disabled via options.deduplicate=false.
+    let testCases = rawTestCases;
+    let duplicatesRemoved = 0;
+    if (options?.deduplicate !== false && rawTestCases.length > 1) {
+      const dedup = await this.deduplicateTestCases(rawTestCases);
+      testCases = dedup.kept;
+      duplicatesRemoved = dedup.removed;
+    }
 
     // Phase 6: Gap analysis (optional — skipped when not requested to save a full LLM call)
     let gaps: CoverageGap[] = [];
@@ -611,8 +675,80 @@ Return ONLY valid JSON array.`;
         automationReadyCount: testCases.filter(tc => tc.automationReady).length,
         gapsFound: gaps.length,
         tokensUsed: totalTokens,
+        duplicatesRemoved,
       },
     };
+  }
+
+  /* ---- Semantic de-duplication of generated test cases ---- */
+  /**
+   * Removes near-duplicate test cases using embedding cosine similarity.
+   * Two cases above `threshold` similarity are treated as duplicates; the
+   * stronger one is kept (higher priority, then more detailed steps). This is a
+   * single batched embeddings call (cheap + fast — text-embedding-3-small) and
+   * FAILS OPEN: any error returns the original list unchanged so generation is
+   * never blocked. Returns the kept cases plus how many were removed.
+   */
+  async deduplicateTestCases(
+    testCases: TestCase[],
+    threshold = 0.9
+  ): Promise<{ kept: TestCase[]; removed: number }> {
+    if (testCases.length < 2) return { kept: testCases, removed: 0 };
+
+    try {
+      // Embed a compact signature for each case: title + expected result carry the
+      // semantic intent; including them keeps "same behaviour, different wording"
+      // cases close in vector space.
+      const signatures = testCases.map(tc =>
+        `${tc.title || ''}. ${tc.expectedResult || ''}`.trim().slice(0, 500)
+      );
+
+      const modelConfig = this.modelSelector.selectModel('similarity');
+      const resp = await this.openai.embeddings.create({
+        model: modelConfig.model,
+        input: signatures,
+      });
+      const vectors = resp.data.map(d => d.embedding as number[]);
+      if (vectors.length !== testCases.length) {
+        // Defensive: provider returned an unexpected count — skip dedup.
+        return { kept: testCases, removed: 0 };
+      }
+
+      const priorityRank = (p?: string) => ({ P0: 0, P1: 1, P2: 2, P3: 3 }[p || 'P2'] ?? 2);
+      // Prefer the "stronger" case to survive a duplicate pair.
+      const isStronger = (a: TestCase, b: TestCase) => {
+        const pr = priorityRank(a.priority) - priorityRank(b.priority);
+        if (pr !== 0) return pr < 0;                       // higher priority wins
+        const stepsDiff = (a.steps?.length || 0) - (b.steps?.length || 0);
+        if (stepsDiff !== 0) return stepsDiff > 0;          // more detailed wins
+        return (a.expectedResult?.length || 0) >= (b.expectedResult?.length || 0);
+      };
+
+      const removedIdx = new Set<number>();
+      for (let i = 0; i < testCases.length; i++) {
+        if (removedIdx.has(i)) continue;
+        for (let j = i + 1; j < testCases.length; j++) {
+          if (removedIdx.has(j)) continue;
+          const sim = cosineSimilarity(vectors[i], vectors[j]);
+          if (sim >= threshold) {
+            // Drop the weaker of the pair.
+            const loser = isStronger(testCases[i], testCases[j]) ? j : i;
+            removedIdx.add(loser);
+            if (loser === i) break; // i is gone — stop comparing it further
+          }
+        }
+      }
+
+      if (removedIdx.size === 0) return { kept: testCases, removed: 0 };
+      const kept = testCases.filter((_, idx) => !removedIdx.has(idx));
+      logger.info(MOD, 'Semantic dedup removed near-duplicate test cases', {
+        before: testCases.length, after: kept.length, removed: removedIdx.size, threshold,
+      });
+      return { kept, removed: removedIdx.size };
+    } catch (err: any) {
+      logger.warn(MOD, 'Dedup failed (continuing with full set)', { error: err.message });
+      return { kept: testCases, removed: 0 };
+    }
   }
 
   /* ---- LLM Call Helper (cost-optimized) ---- */
