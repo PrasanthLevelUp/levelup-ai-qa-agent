@@ -292,8 +292,11 @@ export function createTestCoverageRouter(): Router {
         deduplicate: deduplicate !== false, // default on — semantic near-duplicate removal
       });
       logger.info(MOD, 'AI engine returned', {
+        mode: result.mode,
         scenarios: result.scenarios.length,
         testCases: result.testCases.length,
+        suggestedTestCases: result.suggestedTestCases?.length || 0,
+        missingRequirements: result.missingRequirements?.length || 0,
         gaps: result.coverageGaps.length,
       });
 
@@ -342,10 +345,23 @@ export function createTestCoverageRouter(): Router {
         useRepoIntelligence: !!repoContextUsed,
         repoId: repoContextUsed ? repoId : undefined,
         includeCoverageGaps: includeCoverageGaps !== false, // default true
+        // Generation mode: 'strict' (requirement-only) or 'expanded' (+ suggestions).
+        mode: result.mode,
         // Persist the coverage gaps inside the analysis JSONB so they survive to
         // the History detail view (gaps are not stored in a separate table).
         coverageGaps: result.coverageGaps || [],
         gapsFound: result.stats?.gapsFound ?? (result.coverageGaps?.length || 0),
+        // Suggested Additional Coverage (expanded mode only): requirement-adjacent
+        // cases the model proposes but that the requirement did NOT ask for. Stored
+        // separately from committed test cases so they never inflate the coverage
+        // count — they live in the analysis JSONB for the History "Suggested
+        // Additional Coverage" panel.
+        suggestedTestCases: result.suggestedTestCases || [],
+        suggestedCount: result.stats?.suggestedCount ?? (result.suggestedTestCases?.length || 0),
+        // Potential Missing Requirements: open questions surfaced instead of inventing
+        // assumption-based test cases (e.g. "No username length limit found — add one?").
+        missingRequirements: result.missingRequirements || [],
+        missingRequirementsCount: result.stats?.missingRequirementsCount ?? (result.missingRequirements?.length || 0),
         // How many near-duplicate test cases the semantic dedup pass removed.
         duplicatesRemoved: result.stats?.duplicatesRemoved ?? 0,
         // Issue #2: record whether real app knowledge was used for this generation
