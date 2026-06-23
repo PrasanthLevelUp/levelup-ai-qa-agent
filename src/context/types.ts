@@ -155,6 +155,14 @@ export interface RepositoryProfile {
   sharedConstants: Array<{ name: string; value: string; filePath: string }>;
   dataFiles: Array<{ name: string; path: string; type: 'json' | 'ts' | 'js' | 'csv'; recordCount?: number }>;
 
+  // Environment awareness: how the framework is configured at runtime.
+  environment: {
+    envFiles: string[];          // .env, .env.example, .env.local, etc.
+    usesDotenv: boolean;         // depends on / imports dotenv
+    configModule: string | null; // e.g. utils/env.ts — the env loader/validator
+    envVars: string[];           // process.env.X names referenced in source
+  };
+
   // Business intelligence
   businessFlows: BusinessFlow[];
   testSuites: TestSuiteInfo[];

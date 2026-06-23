@@ -457,9 +457,13 @@ function extractTags(profile: RepositoryProfile): string[] {
 }
 
 function extractEnvFiles(profile: RepositoryProfile): string[] {
-  // TODO: Repo intelligence doesn't yet capture env files.
-  // When enhanced, populate this from profile.dependencies or a new field.
-  return [];
+  // Populated from the repo-intelligence environment scan (env files + a
+  // dedicated env loader module such as utils/env.ts).
+  const env = profile.environment;
+  if (!env) return [];
+  const files = [...(env.envFiles ?? [])];
+  if (env.configModule && !files.includes(env.configModule)) files.push(env.configModule);
+  return files;
 }
 
 function extractConfigFiles(profile: RepositoryProfile): string[] {
