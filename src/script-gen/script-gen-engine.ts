@@ -218,6 +218,23 @@ export interface GenerationConfig {
     scenario?: string;
     [k: string]: any;
   }>;
+  /**
+   * Resolved test-data RECORDS (values, not just key summaries) for the test
+   * case(s) being generated. Loaded by the route from the Test Data Store
+   * (datasets linked to each case → their records, secrets hydrated). When
+   * present, the engine emits a `tests/data/test-data.ts` module and references
+   * real records via `getUser('<key>')` instead of hardcoding/empty values —
+   * giving full Test Data → Script traceability. Fully optional and
+   * backward-compatible: when absent, generation behaves exactly as before.
+   */
+  resolvedTestData?: Array<{
+    /** Dataset name, e.g. 'valid_users'. */
+    name: string;
+    /** Environment the records were resolved from (e.g. 'shared', 'prod'). */
+    environment?: string;
+    /** Records keyed by their dataset key (e.g. 'standard_user'). */
+    records: Array<{ key: string; value: any }>;
+  }>;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -567,6 +584,20 @@ export class ScriptGenEngine {
 
     const creds = this.parseTestData(tc.test_data);
 
+    // ── Test Data → Script traceability (review priority #1) ──
+    // Resolve the REAL dataset record this case consumes so the script
+    // references getUser('<key>').username/.password instead of empty/hardcoded
+    // values. When no resolved data is supplied, fall back to literals/empties.
+    const dataIndex = this.buildTestDataIndex(config);
+    const caseData = this.resolveCaseData(tc, steps, dataIndex);
+    if (caseData) {
+      // Hydrate creds from the resolved record so any literal fallbacks (and the
+      // grounded selector parsing) have the real values too.
+      const v = caseData.value || {};
+      creds.username = String(v.username ?? v.user ?? creds.username ?? '');
+      creds.password = String(v.password ?? v.pass ?? creds.password ?? '');
+    }
+
     // Resolve grounded selectors from the crawled DOM, with stable semantic
     // fallbacks for elements not present on the crawled (login) page.
     const sel = {
@@ -578,19 +609,61 @@ export class ScriptGenEngine {
       logout: `page.locator('#logout_sidebar_link')`,
       title: `page.locator('[data-test="title"]')`,
       product: `page.locator('.inventory_item_name')`,
+      cart: `page.locator('.shopping_cart_link')`,
+      inventoryItem: `page.locator('.inventory_item')`,
     };
 
-    const ctx = { url: baseUrl, creds, sel };
+    // When a record was resolved, expose it as `user` (const ref in the test
+    // body) so fills read `user.username` / `user.password`.
+    const dataRef = caseData
+      ? { varName: 'user', ref: caseData.ref, hasUsername: caseData.value?.username != null || caseData.value?.user != null, hasPassword: caseData.value?.password != null || caseData.value?.pass != null }
+      : undefined;
+
+    const title = tc.title || 'Generated test';
+    const tags = this.tcTags(tc);
+    const idMarker = tc.id != null ? `\n  // @tc:TC${tc.id}` : '';
+    const stepComments = steps.map((s, i) => `   *   ${i + 1}. ${this.escapeBlockComment(s)}`).join('\n');
+
+    // ── Non-automatable detection (review priority #5) ──
+    // Concurrent / multi-browser cases (and anything flagged Automation Ready =
+    // No) need multiple browser contexts and human judgement. Emit a test.fixme
+    // with a correct multi-context skeleton instead of a broken single-page run.
+    if (this.isNonAutomatable(tc, steps)) {
+      const content = this.buildNonAutomatableSpec(tc, steps, baseUrl, sel, dataRef, { title, idMarker, stepComments, creds });
+      const fileName = `${toKebab(title).slice(0, 60) || `test-case-${tc.id ?? 'x'}`}.spec.ts`;
+      const generatedFiles: GeneratedFile[] = [{ path: `tests/${fileName}`, content, type: 'test' }];
+      const moduleFile = this.buildTestDataModule(dataIndex);
+      if (moduleFile) generatedFiles.push(moduleFile);
+      return this.buildTcResult(tc, title, baseUrl, crawl, tags, generatedFiles, 0, startTime);
+    }
+
+    const ctx = { url: baseUrl, creds, sel, data: dataRef };
+
+    // ── Precondition materialization (review TC2/TC5 fix) ──
+    // If the case assumes an authenticated session ("user is logged in") but its
+    // steps never perform a login, inject a real login setup using a valid user
+    // so the test actually starts from the intended state.
+    const preLines = this.buildPreconditionLogin(tc, steps, ctx, dataIndex);
+
     const { lines } = this.tcStepsToCode(steps, ctx);
     const assertions = this.buildTcAssertions(`${tc.expected_result || ''}`, ctx, tc);
 
-    const tags = this.tcTags(tc);
-    const title = tc.title || 'Generated test';
-    const idMarker = tc.id != null ? `\n  // @tc:TC${tc.id}` : '';
+    // Declare the resolved record once at the top of the test body so step code
+    // can read `user.username` / `user.password`.
+    const declLines: string[] = [];
+    if (dataRef) {
+      declLines.push(`// Test data resolved from the Test Data Store (${caseData!.datasetName}.${caseData!.recordKey}).`);
+      declLines.push(`const ${dataRef.varName} = ${dataRef.ref};`, '');
+    }
+    const body = [...declLines, ...preLines, ...lines];
 
-    const stepComments = steps.map((s, i) => `   *   ${i + 1}. ${this.escapeBlockComment(s)}`).join('\n');
+    // Reference the generated test-data module whenever the body uses getUser().
+    const usesModule = body.some(l => /\bgetUser\s*\(/.test(l));
+    const importLine = usesModule
+      ? `import { test, expect } from '@playwright/test';\nimport { getUser } from './data/test-data';`
+      : `import { test, expect } from '@playwright/test';`;
 
-    const content = `import { test, expect } from '@playwright/test';
+    const content = `${importLine}
 
 /**
  * ${this.escapeBlockComment(title)}
@@ -601,7 +674,7 @@ export class ScriptGenEngine {
  * Steps:
 ${stepComments}
  * Expected Result: ${this.escapeBlockComment(`${tc.expected_result || ''}`)}
- * Test Data: ${this.escapeBlockComment(`${tc.test_data || 'n/a'}`)}
+ * Test Data: ${this.escapeBlockComment(`${tc.test_data || 'n/a'}`)}${caseData ? `\n * Test Data Source: ${this.escapeBlockComment(`${caseData.datasetName}.${caseData.recordKey} (Test Data Store)`)}` : ''}
  *
  * Generated by LevelUp AI QA Engine (deterministic test-case build)
  * Base URL: ${baseUrl}
@@ -609,7 +682,7 @@ ${stepComments}
 
 test.describe('${escapeStr(title)}', () => {
   test('${escapeStr(title)}', async ({ page }) => {${idMarker}
-${lines.map(l => `    ${l}`).join('\n')}
+${body.map(l => `    ${l}`).join('\n')}
 
     // ── Verify Expected Result ──
 ${assertions.map(l => `    ${l}`).join('\n')}
@@ -624,7 +697,25 @@ ${assertions.map(l => `    ${l}`).join('\n')}
       type: 'test',
     }];
 
+    // Emit the shared test-data module alongside the spec when records were used.
+    const moduleFile = this.buildTestDataModule(dataIndex);
+    if (moduleFile && usesModule) generatedFiles.push(moduleFile);
+
     const totalAssertions = assertions.filter(a => /\bexpect\s*\(/.test(a)).length;
+    return this.buildTcResult(tc, title, baseUrl, crawl, tags, generatedFiles, totalAssertions, startTime);
+  }
+
+  /** Assemble a single-case GenerationResult (test plan + stats). */
+  private buildTcResult(
+    tc: NonNullable<GenerationConfig['testCase']>,
+    title: string,
+    baseUrl: string,
+    crawl: CrawlResult,
+    tags: string[],
+    generatedFiles: GeneratedFile[],
+    totalAssertions: number,
+    startTime: number,
+  ): GenerationResult {
     const testPlan: TestPlan = {
       name: `Test Plan: ${title}`,
       description: `Deterministic test-case automation for "${title}"`,
@@ -694,7 +785,16 @@ ${assertions.map(l => `    ${l}`).join('\n')}
           continue;
         }
         for (const f of single.generatedFiles) {
-          // De-duplicate file names within the batch (e.g. similar titles).
+          // The shared test-data module is identical across cases — emit it
+          // once, never rename it (specs import a fixed './data/test-data' path).
+          if (f.path === 'tests/data/test-data.ts') {
+            if (!usedNames.has(f.path)) {
+              usedNames.add(f.path);
+              generatedFiles.push(f);
+            }
+            continue;
+          }
+          // De-duplicate spec file names within the batch (e.g. similar titles).
           let path = f.path;
           if (usedNames.has(path)) {
             const idTag = tc.id != null ? `-tc${tc.id}` : `-${usedNames.size + 1}`;
@@ -785,6 +885,172 @@ ${assertions.map(l => `    ${l}`).join('\n')}
     return out;
   }
 
+  /* ──────────────────────────────────────────────────────────────────────── */
+  /*  Test Data → Script traceability                                          */
+  /*  Resolve REAL dataset records (not key summaries) into the generated      */
+  /*  script: emit a `tests/data/test-data.ts` module + reference records via  */
+  /*  getUser('<key>') so scripts consume the Test Data Store instead of       */
+  /*  hardcoding/empty credentials. Review priority #1.                        */
+  /* ──────────────────────────────────────────────────────────────────────── */
+
+  /**
+   * Flatten `config.resolvedTestData` into an index:
+   *   { datasetName -> { recordKey -> value } }
+   * `value` is the record payload (e.g. `{ username, password }`). Returns an
+   * empty index when no resolved data was supplied (url-based path unchanged).
+   */
+  private buildTestDataIndex(
+    config: GenerationConfig,
+  ): Map<string, Map<string, any>> {
+    const index = new Map<string, Map<string, any>>();
+    for (const ds of config.resolvedTestData || []) {
+      if (!ds?.name || !Array.isArray(ds.records)) continue;
+      const recMap = new Map<string, any>();
+      for (const rec of ds.records) {
+        if (rec?.key == null) continue;
+        recMap.set(String(rec.key), rec.value);
+      }
+      if (recMap.size > 0) index.set(ds.name, recMap);
+    }
+    return index;
+  }
+
+  /** True when the resolved-data index actually carries records. */
+  private hasResolvedData(index: Map<string, Map<string, any>>): boolean {
+    return index.size > 0;
+  }
+
+  /**
+   * Resolve which dataset RECORD a test case consumes, by scanning its
+   * `test_data` field and steps for a dataset name and/or record key that
+   * exist in the index. Returns the matched `{ datasetName, recordKey, value }`
+   * plus a `ref` expression (`getUser('standard_user')`) for code emission.
+   * Returns null when nothing matches (caller falls back to literals/empties).
+   */
+  private resolveCaseData(
+    tc: NonNullable<GenerationConfig['testCase']>,
+    steps: string[],
+    index: Map<string, Map<string, any>>,
+  ): { datasetName: string; recordKey: string; value: any; ref: string } | null {
+    if (!this.hasResolvedData(index)) return null;
+    const haystack = `${tc.test_data || ''}\n${steps.join('\n')}`.toLowerCase();
+
+    // 1) Best match: a dataset name AND one of its record keys both appear.
+    for (const [dsName, recMap] of index) {
+      if (!haystack.includes(dsName.toLowerCase())) continue;
+      for (const key of recMap.keys()) {
+        if (haystack.includes(key.toLowerCase())) {
+          return { datasetName: dsName, recordKey: key, value: recMap.get(key), ref: this.dataRef(key) };
+        }
+      }
+    }
+    // 2) A record key appears anywhere (infer its dataset).
+    for (const [dsName, recMap] of index) {
+      for (const key of recMap.keys()) {
+        if (haystack.includes(key.toLowerCase())) {
+          return { datasetName: dsName, recordKey: key, value: recMap.get(key), ref: this.dataRef(key) };
+        }
+      }
+    }
+    // 3) Only a dataset name appears → use its first record.
+    for (const [dsName, recMap] of index) {
+      if (haystack.includes(dsName.toLowerCase())) {
+        const key = [...recMap.keys()][0]!;
+        return { datasetName: dsName, recordKey: key, value: recMap.get(key), ref: this.dataRef(key) };
+      }
+    }
+    return null;
+  }
+
+  /** Pick a sensible "valid login" record for materialized preconditions. */
+  private resolveValidUserRecord(
+    index: Map<string, Map<string, any>>,
+  ): { recordKey: string; value: any; ref: string } | null {
+    if (!this.hasResolvedData(index)) return null;
+    // Prefer a dataset whose name signals validity, then a record that looks
+    // like a standard/valid user; otherwise the first available record.
+    const dsEntries = [...index.entries()].sort((a, b) => {
+      const va = /valid|standard|good|active/i.test(a[0]) ? 0 : 1;
+      const vb = /valid|standard|good|active/i.test(b[0]) ? 0 : 1;
+      return va - vb;
+    });
+    for (const [, recMap] of dsEntries) {
+      const keys = [...recMap.keys()];
+      const preferred = keys.find(k => /standard|valid|default|primary/i.test(k)) || keys[0];
+      if (preferred) return { recordKey: preferred, value: recMap.get(preferred), ref: this.dataRef(preferred) };
+    }
+    return null;
+  }
+
+  /** Build a `getUser('<key>')` expression. */
+  private dataRef(key: string): string {
+    return `getUser(${JSON.stringify(key)})`;
+  }
+
+  /**
+   * Generate the shared `tests/data/test-data.ts` module from the resolved
+   * index: a typed dataset map, a `getUser(key, dataset?)` resolver, and named
+   * dataset exports. This is what makes generated specs reference the Test Data
+   * Store (`getUser('standard_user').password`) instead of hardcoded secrets.
+   */
+  private buildTestDataModule(index: Map<string, Map<string, any>>): GeneratedFile | null {
+    if (!this.hasResolvedData(index)) return null;
+    const datasetsObj: Record<string, Record<string, any>> = {};
+    const dsNames: string[] = [];
+    for (const [dsName, recMap] of index) {
+      dsNames.push(dsName);
+      const recObj: Record<string, any> = {};
+      for (const [key, value] of recMap) recObj[key] = value;
+      datasetsObj[dsName] = recObj;
+    }
+
+    // Named exports (camelCase) for ergonomic access, e.g. `validUsers`.
+    const namedExports = dsNames.map(name => {
+      const camel = name.replace(/[_-]+(\w)/g, (_, c) => c.toUpperCase()).replace(/[^a-zA-Z0-9]/g, '');
+      const safe = /^[a-zA-Z_$]/.test(camel) ? camel : `dataset_${camel}`;
+      return `export const ${safe} = datasets[${JSON.stringify(name)}] ?? {};`;
+    }).join('\n');
+
+    const content = `/**
+ * Generated test-data module — sourced from the LevelUp Test Data Store.
+ *
+ * Datasets: ${dsNames.join(', ')}
+ *
+ * Generated specs consume these records via getUser('<key>') so credentials and
+ * other inputs trace back to the Test Data Store instead of being hardcoded.
+ * Regenerate from the Test Data Store rather than editing by hand.
+ */
+
+export interface DataRecord {
+  username?: string;
+  password?: string;
+  [key: string]: unknown;
+}
+
+const datasets: Record<string, Record<string, DataRecord>> = ${JSON.stringify(datasetsObj, null, 2)};
+
+/**
+ * Resolve a test-data record by key. Optionally scope to a dataset to
+ * disambiguate when the same key exists in multiple datasets.
+ */
+export function getUser(key: string, dataset?: string): DataRecord {
+  if (dataset) {
+    const scoped = datasets[dataset]?.[key];
+    if (scoped) return scoped;
+  }
+  for (const ds of Object.values(datasets)) {
+    if (ds[key]) return ds[key];
+  }
+  throw new Error('Test data record not found: ' + (dataset ? dataset + '.' : '') + key);
+}
+
+${namedExports}
+
+export default datasets;
+`;
+    return { path: 'tests/data/test-data.ts', content, type: 'test' };
+  }
+
   /** Tags for the deterministic test-case flow, derived from case metadata. */
   private tcTags(tc: NonNullable<GenerationConfig['testCase']>): string[] {
     const tags = new Set<string>(['authentication']);
@@ -838,6 +1104,159 @@ ${assertions.map(l => `    ${l}`).join('\n')}
   }
 
   /**
+   * Detect cases that cannot be faithfully automated as a single linear
+   * Playwright `page` flow — concurrent / multi-browser / simultaneous-session
+   * scenarios — or that the case itself flags as not automation-ready. These
+   * need multiple browser contexts and human judgement, so we emit a
+   * `test.fixme` skeleton instead of a script that silently does the wrong thing.
+   */
+  private isNonAutomatable(tc: NonNullable<GenerationConfig['testCase']>, steps: string[]): boolean {
+    // Respect an explicit automation-ready flag if the case carries one.
+    const readyRaw = (tc as any).automation_ready ?? (tc as any).automationReady ?? (tc as any)['Automation Ready'];
+    if (readyRaw != null) {
+      const r = String(readyRaw).toLowerCase();
+      if (/^(no|false|0|❌)/.test(r) || r.includes('not ready') || r.includes('no ')) return true;
+    }
+    const text = `${tc.title || ''}\n${tc.test_data || ''}\n${steps.join('\n')}`.toLowerCase();
+    return /\bconcurrent|two browser|multiple browser|simultaneous|simultaneously|both instances|two instances|two sessions|separate sessions|parallel session|second browser|different browsers\b/.test(text);
+  }
+
+  /**
+   * Build a `test.fixme` spec for a non-automatable case: a correct multi-context
+   * skeleton (browser.newContext per session) plus the case's steps as guidance
+   * and a manual-review note. `test.fixme` keeps it visible in the suite while
+   * never running a broken single-page flow.
+   */
+  private buildNonAutomatableSpec(
+    tc: NonNullable<GenerationConfig['testCase']>,
+    steps: string[],
+    baseUrl: string,
+    sel: Record<string, string>,
+    dataRef: { varName: string; ref: string; hasUsername: boolean; hasPassword: boolean } | undefined,
+    meta: { title: string; idMarker: string; stepComments: string; creds: { username: string; password: string } },
+  ): string {
+    const { title, idMarker, stepComments } = meta;
+    const usesModule = !!dataRef;
+    const importLine = usesModule
+      ? `import { test, expect, chromium } from '@playwright/test';\nimport { getUser } from './data/test-data';`
+      : `import { test, expect, chromium } from '@playwright/test';`;
+    const userDecl = dataRef ? `    const ${dataRef.varName} = ${dataRef.ref};\n` : '';
+    const uname = dataRef ? `${dataRef.varName}.username ?? ''` : `'${escapeStr(meta.creds.username)}'`;
+    const pwd = dataRef ? `${dataRef.varName}.password ?? ''` : `'${escapeStr(meta.creds.password)}'`;
+
+    return `${importLine}
+
+/**
+ * ${this.escapeBlockComment(title)}
+ *
+ * Test Case ID: ${tc.id ?? 'n/a'}
+ * Priority: ${tc.priority ?? tc['Priority'] ?? 'n/a'}
+ * Coverage: ${tc.scenario ?? tc.coverage_type ?? 'n/a'}
+ * Steps:
+${stepComments}
+ * Expected Result: ${this.escapeBlockComment(`${tc.expected_result || ''}`)}
+ *
+ * ⚠️ NOT AUTOMATION-READY (auto-detected): this case requires concurrent /
+ * multiple browser sessions, which cannot be exercised by a single linear
+ * Playwright \`page\`. Marked test.fixme so it stays visible without producing a
+ * misleading single-page run. A correct multi-context skeleton is provided
+ * below — complete the assertions and remove .fixme once verified manually.
+ *
+ * Generated by LevelUp AI QA Engine (deterministic test-case build)
+ * Base URL: ${baseUrl}
+ */
+
+test.fixme('${escapeStr(title)} (concurrent — needs multiple browser contexts)', async () => {${idMarker}
+${userDecl}    // Two isolated sessions, each with its own cookies/storage.
+    const browser = await chromium.launch();
+    const contextA = await browser.newContext();
+    const contextB = await browser.newContext();
+    const pageA = await contextA.newPage();
+    const pageB = await contextB.newPage();
+
+    // Session A — log in.
+    await pageA.goto('${escapeStr(baseUrl)}');
+    await ${sel.username.replace(/^page\./, 'pageA.')}.fill(${uname});
+    await ${sel.password.replace(/^page\./, 'pageA.')}.fill(${pwd});
+    await ${sel.login.replace(/^page\./, 'pageA.')}.click();
+
+    // Session B — log in with the same credentials.
+    await pageB.goto('${escapeStr(baseUrl)}');
+    await ${sel.username.replace(/^page\./, 'pageB.')}.fill(${uname});
+    await ${sel.password.replace(/^page\./, 'pageB.')}.fill(${pwd});
+    await ${sel.login.replace(/^page\./, 'pageB.')}.click();
+
+    // TODO: assert the application's documented concurrent-session behaviour,
+    // e.g. both sessions reach /inventory.html, or the first is invalidated.
+    await expect(pageA).toHaveURL(/inventory\\.html/);
+    await expect(pageB).toHaveURL(/inventory\\.html/);
+
+    await contextA.close();
+    await contextB.close();
+    await browser.close();
+});
+`;
+  }
+
+  /**
+   * Materialize an authenticated precondition into a real login setup. When the
+   * case's preconditions imply the user is already logged in but its own steps
+   * never perform a login, we inject goto + fill + click using a valid user
+   * (the case's resolved record when valid, else a resolved valid record from
+   * the index) so the test starts from the intended state instead of about:blank.
+   * Returns [] when no setup is needed.
+   */
+  private buildPreconditionLogin(
+    tc: NonNullable<GenerationConfig['testCase']>,
+    steps: string[],
+    ctx: { url: string; creds: { username: string; password: string }; sel: Record<string, string>; data?: { varName: string; ref: string; hasUsername: boolean; hasPassword: boolean } },
+    index: Map<string, Map<string, any>>,
+  ): string[] {
+    const pre = `${tc.preconditions || ''}`.toLowerCase();
+    const impliesAuth = /log(ged)? ?in|authenticat|signed in|valid session|active session/.test(pre);
+    if (!impliesAuth) return [];
+
+    // Does the body already perform a login? If so, don't double up.
+    const stepText = steps.join('\n').toLowerCase();
+    const stepsHaveLogin = /log ?in with|sign in with/.test(stepText)
+      || (/(user( ?name)?)/.test(stepText) && /(click|submit|press).*(login|log in|sign in|submit)/.test(stepText));
+    if (stepsHaveLogin) return [];
+
+    // Choose credentials: reuse the case's resolved `user` when it's a valid
+    // login; else resolve a valid record from the index; else literal fallback.
+    let unameExpr: string;
+    let pwdExpr: string;
+    const localDecls: string[] = [];
+    if (ctx.data && ctx.data.hasUsername && ctx.data.hasPassword) {
+      unameExpr = `${ctx.data.varName}.username ?? ''`;
+      pwdExpr = `${ctx.data.varName}.password ?? ''`;
+    } else {
+      const valid = this.resolveValidUserRecord(index);
+      if (valid && valid.value?.username != null && valid.value?.password != null) {
+        localDecls.push(`const loginUser = ${valid.ref};`);
+        unameExpr = `loginUser.username ?? ''`;
+        pwdExpr = `loginUser.password ?? ''`;
+      } else {
+        unameExpr = `'${escapeStr(ctx.creds.username)}'`;
+        pwdExpr = `'${escapeStr(ctx.creds.password)}'`;
+      }
+    }
+
+    const lines: string[] = [];
+    lines.push(`// Precondition: ${this.escapeBlockComment(tc.preconditions || 'user is logged in')}`);
+    if (localDecls.length) lines.push(...localDecls);
+    lines.push(`await page.goto('${escapeStr(ctx.url)}');`);
+    lines.push(`await page.waitForLoadState('domcontentloaded');`);
+    lines.push(`await ${ctx.sel.username}.fill(${unameExpr});`);
+    lines.push(`await ${ctx.sel.password}.fill(${pwdExpr});`);
+    lines.push(`await ${ctx.sel.login}.click();`);
+    lines.push(`await page.waitForLoadState('domcontentloaded');`);
+    lines.push(`await expect(page).toHaveURL(/inventory\\.html/);`);
+    lines.push('');
+    return lines;
+  }
+
+  /**
    * Convert ordered step strings into grounded Playwright statements. Handles
    * navigate / fill (with explicit or test-data values, empty fields, char
    * limits) / click (login, menu, logout, product) / back-navigation and the
@@ -845,7 +1264,7 @@ ${assertions.map(l => `    ${l}`).join('\n')}
    */
   private tcStepsToCode(
     steps: string[],
-    ctx: { url: string; creds: { username: string; password: string }; sel: Record<string, string> },
+    ctx: { url: string; creds: { username: string; password: string }; sel: Record<string, string>; data?: { varName: string; ref: string; hasUsername: boolean; hasPassword: boolean } },
   ): { lines: string[] } {
     const out: string[] = [];
     let attemptBlock: string[] = []; // statements since the last navigate (for "repeat N times")
@@ -856,6 +1275,28 @@ ${assertions.map(l => `    ${l}`).join('\n')}
       out.push('');
       if (isNav) attemptBlock = [];
       else attemptBlock.push(...stmts);
+    };
+
+    // Resolve the JS expression to fill a credential field. Precedence:
+    //   1. empty/blank/missing field  → '' (negative test)
+    //   2. explicit quoted literal in the step ('standard_use') → that literal
+    //   3. resolved Test Data Store record → user.username / user.password
+    //   4. parsed creds fallback (literal) → '<value>'
+    // This is what replaces the old empty fill('') for "<password>" placeholders.
+    const fieldExpr = (kind: 'username' | 'password', raw: string, t: string): string => {
+      if (/empty|blank|without|no\s+(user|pass)|leave.*(blank|empty)/.test(t)) return `''`;
+      const quoted = raw.match(/'([^']*)'|"([^"]*)"/);
+      if (quoted) {
+        const lit = quoted[1] ?? quoted[2] ?? '';
+        // A `<placeholder>` token is NOT a real literal — fall through to data.
+        if (!/^<.*>$/.test(lit.trim())) return `'${escapeStr(lit)}'`;
+      }
+      if (ctx.data) {
+        // `?? ''` keeps the fill type-safe (record fields are optional strings).
+        if (kind === 'username' && ctx.data.hasUsername) return `${ctx.data.varName}.username ?? ''`;
+        if (kind === 'password' && ctx.data.hasPassword) return `${ctx.data.varName}.password ?? ''`;
+      }
+      return `'${escapeStr(kind === 'username' ? ctx.creds.username : ctx.creds.password)}'`;
     };
 
     for (const raw of steps) {
@@ -896,8 +1337,8 @@ ${assertions.map(l => `    ${l}`).join('\n')}
       // ── "log in with valid credentials" — expand to fill+fill+click ──
       if (/log ?in with (valid )?credential|sign in with (valid )?credential/.test(t)) {
         push(raw, [
-          `await ${ctx.sel.username}.fill('${escapeStr(ctx.creds.username)}');`,
-          `await ${ctx.sel.password}.fill('${escapeStr(ctx.creds.password)}');`,
+          `await ${ctx.sel.username}.fill(${fieldExpr('username', raw, t)});`,
+          `await ${ctx.sel.password}.fill(${fieldExpr('password', raw, t)});`,
           `await ${ctx.sel.login}.click();`,
           `await page.waitForLoadState('domcontentloaded');`,
         ], false);
@@ -906,19 +1347,13 @@ ${assertions.map(l => `    ${l}`).join('\n')}
 
       // ── username field ──
       if (/user( ?name)?/.test(t) && !/click|button/.test(t)) {
-        const empty = /empty|blank|without/.test(t);
-        const quoted = raw.match(/'([^']*)'|"([^"]*)"/);
-        const val = empty ? '' : (quoted ? (quoted[1] ?? quoted[2] ?? '') : ctx.creds.username);
-        push(raw, [`await ${ctx.sel.username}.fill('${escapeStr(val)}');`], false);
+        push(raw, [`await ${ctx.sel.username}.fill(${fieldExpr('username', raw, t)});`], false);
         continue;
       }
 
       // ── password field ──
       if (/pass( ?word)?/.test(t) && !/click|button/.test(t)) {
-        const empty = /empty|blank|without/.test(t);
-        const quoted = raw.match(/'([^']*)'|"([^"]*)"/);
-        const val = empty ? '' : (quoted ? (quoted[1] ?? quoted[2] ?? '') : ctx.creds.password);
-        push(raw, [`await ${ctx.sel.password}.fill('${escapeStr(val)}');`], false);
+        push(raw, [`await ${ctx.sel.password}.fill(${fieldExpr('password', raw, t)});`], false);
         continue;
       }
 
@@ -952,6 +1387,19 @@ ${assertions.map(l => `    ${l}`).join('\n')}
         continue;
       }
 
+      // ── assertion-style steps (verify / check / confirm / ensure / should) ──
+      // These appear inline in the body (distinct from the Expected Result).
+      // Map them to real assertions instead of leaving an unmapped note.
+      if (/^(verify|check|confirm|ensure|assert|validate|should|the .* should|it should)/.test(t) || /\bis displayed\b|\bare displayed\b|\bis visible\b|\bis present\b|\bshould be\b/.test(t)) {
+        const asserted = this.mapAssertionStep(raw, t, ctx);
+        if (asserted.length) {
+          out.push(`// ${raw}`);
+          for (const s of asserted) out.push(s);
+          out.push('');
+          continue;
+        }
+      }
+
       // ── generic click ──
       if (/^click|^press|^tap|^select/.test(t)) {
         push(raw, [`await ${ctx.sel.login}.click();`], false);
@@ -970,6 +1418,57 @@ ${assertions.map(l => `    ${l}`).join('\n')}
   }
 
   /**
+   * Map an inline assertion-style step ("Verify URL is .../inventory.html",
+   * "Check inventory page elements displayed", "Confirm cart icon is present")
+   * into concrete Playwright assertions. Returns [] when nothing specific can
+   * be derived, so the caller can fall back to an explicit review note rather
+   * than emitting a no-op.
+   */
+  private mapAssertionStep(
+    raw: string,
+    t: string,
+    ctx: { url: string; sel: Record<string, string> },
+  ): string[] {
+    const lines: string[] = [];
+
+    // URL assertions — "verify/check URL is X" or any mention of a URL/path.
+    if (/\burl\b|\bredirect|\bnavigat/.test(t)) {
+      const urlM = raw.match(/\bhttps?:\/\/[^\s'")]+/i);
+      if (/inventory/.test(t) || (urlM && /inventory/.test(urlM[0]))) {
+        lines.push(`await expect(page).toHaveURL(/inventory\\.html/);`);
+      } else if (urlM) {
+        lines.push(`await expect(page).toHaveURL('${escapeStr(urlM[0])}');`);
+      } else if (/login/.test(t)) {
+        lines.push(`await expect(page).toHaveURL('${escapeStr(ctx.url)}');`);
+      }
+    }
+
+    // Shopping cart icon visible/present.
+    if (/cart/.test(t)) {
+      lines.push(`await expect(${ctx.sel['cart'] || `page.locator('.shopping_cart_link')`}).toBeVisible();`);
+    }
+
+    // Inventory / product list / products page elements visible.
+    if (/inventory|product list|products? (page|are|is|displayed|list|grid)|items? (are|is) displayed/.test(t)) {
+      lines.push(`await expect(${ctx.sel['title'] || `page.locator('[data-test="title"]')`}).toHaveText(/Products/i);`);
+      lines.push(`await expect(${ctx.sel['inventoryItem'] || `page.locator('.inventory_item')`}).toHaveCount(6);`);
+    }
+
+    // Error message visible.
+    if (/error|invalid|locked|epic sadface|required/.test(t)) {
+      lines.push(`await expect(${ctx.sel['error'] || `page.locator('[data-test="error"]')`}).toBeVisible();`);
+      const quoted = raw.match(/'([^']+)'|"([^"]+)"/);
+      const msg = quoted ? (quoted[1] ?? quoted[2] ?? '') : '';
+      if (msg && !/^<.*>$/.test(msg.trim())) {
+        lines.push(`await expect(${ctx.sel['error'] || `page.locator('[data-test="error"]')`}).toContainText('${escapeStr(msg.replace(/^epic sadface:\s*/i, '').trim())}');`);
+      }
+    }
+
+    // De-duplicate while preserving order.
+    return [...new Set(lines)];
+  }
+
+  /**
    * Derive REAL assertions from the Expected Result with correct logic:
    *  - error outcomes → error element visible + exact message text + stays on login
    *  - login-page outcomes (logout / session invalidation) → back on login URL
@@ -979,7 +1478,7 @@ ${assertions.map(l => `    ${l}`).join('\n')}
    */
   private buildTcAssertions(
     expected: string,
-    ctx: { url: string; creds: { username: string; password: string }; sel: Record<string, string> },
+    ctx: { url: string; creds: { username: string; password: string }; sel: Record<string, string>; data?: { varName: string; ref: string; hasUsername: boolean; hasPassword: boolean } },
     _tc: NonNullable<GenerationConfig['testCase']>,
   ): string[] {
     const exp = expected.trim();
@@ -993,6 +1492,7 @@ ${assertions.map(l => `    ${l}`).join('\n')}
     const isError = /error message|epic sadface|locked out|is required|do not match|invalid|not match|account is locked/.test(lc);
     const isConditional = /\bif\b.*\bvalid\b/.test(lc);
     const isLoginPage = /login page|logged out|cannot access|redirected to the login/.test(lc);
+    const isCart = /cart (icon|is|should)|shopping cart|cart is visible|cart badge/.test(lc);
     const isSuccess = /products page|inventory|remains logged in|access all product|redirected to the products/.test(lc);
 
     if (isConditional) {
@@ -1025,14 +1525,23 @@ ${assertions.map(l => `    ${l}`).join('\n')}
       return lines;
     }
 
+    if (isCart) {
+      // Cart visibility (e.g. TC5) — assert the cart link is actually present
+      // on the inventory page rather than a meaningless not.toHaveURL check.
+      lines.push(`await expect(${ctx.sel['cart'] || `page.locator('.shopping_cart_link')`}).toBeVisible();`);
+      return lines;
+    }
+
     if (isSuccess) {
       lines.push(`await expect(page).toHaveURL(/inventory\\.html/);`);
       lines.push(`await expect(${ctx.sel.title}).toHaveText(/Products/i);`);
       return lines;
     }
 
-    // Fallback — never emit a no-op. Assert we left the login page.
-    lines.push(`await expect(page).not.toHaveURL('${escapeStr(ctx.url)}');`);
+    // Fallback — never emit a no-op and never a meaningless not.toHaveURL.
+    // Assert the app reached the post-login Products page, which is the
+    // intended end-state for any non-error login flow.
+    lines.push(`await expect(${ctx.sel.title}).toBeVisible();`);
     return lines;
   }
 
