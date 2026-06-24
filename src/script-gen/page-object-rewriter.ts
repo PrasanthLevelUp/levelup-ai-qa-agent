@@ -167,6 +167,10 @@ const isLoginClick = (l: string) =>
  * Collapse a login fill/fill/click triad into a single `loginPage.login(u, p)`
  * call. Only fires when the LoginPage exposes a real `login` method. Preserves
  * whatever credential expressions the fills already used (dataset-aware).
+ *
+ * REVIEW FIX: loginPage.login() typically includes navigation to the login page,
+ * so we also remove any redundant goto(baseURL) that immediately precedes or
+ * follows the login sequence to prevent duplicate navigation.
  */
 function rewriteLogin(lines: string[], loginPO: MatchedPageObject): { lines: string[]; used: boolean } {
   const loginMethod = findPoMethod(loginPO.methods, /^log[_]?in$/i);
@@ -177,10 +181,11 @@ function rewriteLogin(lines: string[], loginPO: MatchedPageObject): { lines: str
 
   for (let i = 0; i < out.length; i++) {
     if (!isUserFill(out[i])) continue;
-    // Find password fill + login click within a small forward window.
+    // Find password fill + login click within a forward window (expanded to 15
+    // lines to catch precondition blocks that span comments/whitespace).
     let pIdx = -1;
     let cIdx = -1;
-    for (let j = i + 1; j < Math.min(out.length, i + 8); j++) {
+    for (let j = i + 1; j < Math.min(out.length, i + 15); j++) {
       if (pIdx === -1 && isPassFill(out[j])) { pIdx = j; continue; }
       if (pIdx !== -1 && isLoginClick(out[j])) { cIdx = j; break; }
     }
@@ -190,18 +195,62 @@ function rewriteLogin(lines: string[], loginPO: MatchedPageObject): { lines: str
     const pArg = extractFillArg(out[pIdx]) ?? `process.env.TEST_PASSWORD ?? ''`;
     const pad = indentOf(out[i]);
 
-    // Drop a trailing waitForLoadState immediately after the login click.
+    // Identify lines to remove: the triad itself plus any trailing waitForLoadState.
     let dropEnd = cIdx;
     if (/page\.waitForLoadState/i.test(out[cIdx + 1] || '')) dropEnd = cIdx + 1;
 
+    // Look backward for a preceding goto() (up to 5 lines before username fill).
+    // If found, remove it since loginPage.login() handles navigation.
+    let precedingGoto = -1;
+    for (let k = Math.max(0, i - 5); k < i; k++) {
+      if (/^\s*await\s+page\.goto\(/.test(out[k])) {
+        precedingGoto = k;
+        // Also check if there's a waitForLoadState right after the goto
+        if (k + 1 < i && /page\.waitForLoadState/i.test(out[k + 1])) {
+          // We'll remove both the goto and the wait
+        }
+      }
+    }
+
+    // Look forward for a following goto() (up to 3 lines after dropEnd).
+    // This catches the pattern where login is called then goto is called again.
+    let followingGoto = -1;
+    for (let k = dropEnd + 1; k < Math.min(out.length, dropEnd + 4); k++) {
+      if (/^\s*await\s+page\.goto\(/.test(out[k])) {
+        followingGoto = k;
+        break;
+      }
+    }
+
     const call = `${pad}await ${loginPO.varName}.${loginMethod}(${uArg}, ${pArg});`;
-    // Remove lines i..dropEnd, but skip the password/click lines that sit between
-    // i and dropEnd while keeping any unrelated lines in that window intact.
+    // Build the removal set: triad + goto lines + trailing waits.
     const removeSet = new Set<number>([i, pIdx, cIdx]);
     if (dropEnd === cIdx + 1) removeSet.add(cIdx + 1);
+    
+    // Add preceding goto + its potential waitForLoadState
+    if (precedingGoto !== -1) {
+      removeSet.add(precedingGoto);
+      if (precedingGoto + 1 < i && /page\.waitForLoadState/i.test(out[precedingGoto + 1])) {
+        removeSet.add(precedingGoto + 1);
+      }
+    }
+    
+    // Add following goto (loginPage.login already navigates, so this is redundant)
+    if (followingGoto !== -1) {
+      removeSet.add(followingGoto);
+      // Also remove waitForLoadState after the following goto
+      if (followingGoto + 1 < out.length && /page\.waitForLoadState/i.test(out[followingGoto + 1])) {
+        removeSet.add(followingGoto + 1);
+      }
+    }
+    
+    // Place the login call at the earliest removal point (if we removed a preceding goto,
+    // put the login where the goto was; otherwise at the username fill position).
+    const callPos = precedingGoto !== -1 ? precedingGoto : i;
+    
     const rebuilt: string[] = [];
     for (let k = 0; k < out.length; k++) {
-      if (k === i) { rebuilt.push(call); continue; }
+      if (k === callPos) { rebuilt.push(call); continue; }
       if (removeSet.has(k)) continue;
       rebuilt.push(out[k]);
     }

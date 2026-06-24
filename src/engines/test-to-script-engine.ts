@@ -1054,6 +1054,11 @@ Return ONLY the TypeScript code. No markdown fences, no explanations.`;
     // ── Reconcile: which test cases did the AI actually cover? ──
     const reconciled = this.reconcileCoverage(aiCode, group, requirement, baseUrl, resolvedByCase, dataIndex);
 
+    // ── REVIEW FIX (Issue 4): Strengthen negative assertions ───────────────
+    // Replace weak "toBeVisible on form field" assertions in negative tests
+    // with real error-element checks before any other post-processing.
+    reconciled.content = this.strengthenNegativeAssertions(reconciled.content, group.cases);
+
     // ── Repository Intelligence: Page Object reuse ──────────────────────────
     // Post-process the FINAL code (AI output OR deterministic template — same
     // path) so recognised raw locator sequences collapse into real Page Object
@@ -1282,6 +1287,57 @@ Return ONLY the TypeScript code. No markdown fences, no explanations.`;
   }
 
   /**
+   * REVIEW FIX (Issue 4): Replace weak negative assertions with real error-element
+   * checks. Detects tests that look negative (invalid/locked/error keywords) but
+   * only assert `expect(#user-name).toBeVisible()` + `toHaveURL(base)` — a pattern
+   * that verifies almost nothing — and injects proper error selector assertions.
+   */
+  private strengthenNegativeAssertions(code: string, cases: any[]): string {
+    const lines = code.split('\n');
+    const out: string[] = [];
+    let currentTestCaseId: number | null = null;
+
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      // Track which test case we're in via the marker
+      const marker = line.match(/@tc:TC(\d+)/);
+      if (marker) {
+        currentTestCaseId = parseInt(marker[1], 10);
+      }
+
+      // Detect weak negative assertion pattern: toBeVisible() on a form field in a negative test
+      const isWeakAssertion =
+        /expect\(.*?(#user-name|#password|#login-button|\['user|username|password).*?\)\.toBeVisible\(\)/.test(line);
+      
+      if (isWeakAssertion && currentTestCaseId) {
+        const tc = cases.find((c: any) => c.id === currentTestCaseId);
+        if (tc && this.isNegativeCase(tc)) {
+          // Replace this weak assertion with a strong error assertion
+          const pad = line.match(/^(\s*)/)?.[1] || '    ';
+          const errorSel = this.errorSelector();
+          const msg = this.deriveErrorMessage(tc);
+          
+          out.push(`${pad}// Strengthened: was weak ${line.match(/expect\((.*?)\)\.toBeVisible/)?.[1] || 'assertion'}`);
+          out.push(`${pad}await expect(page.locator('${errorSel}')).toBeVisible();`);
+          if (msg) {
+            out.push(`${pad}await expect(page.locator('${errorSel}')).toContainText(/${this.escapeRegex(msg)}/i);`);
+          }
+          
+          // Skip subsequent weak toHaveURL(base) assertion on the next line if present
+          if (i + 1 < lines.length && /expect\(page\)\.toHaveURL\(['"]https?:\/\/.*?['"]?\)/.test(lines[i + 1])) {
+            i++; // skip it
+          }
+          continue;
+        }
+      }
+
+      out.push(line);
+    }
+
+    return out.join('\n');
+  }
+
+  /**
    * PHASE 5 — Validate a generated script against the review's defect list.
    * Returns a list of human-readable issues (empty = clean). Detects:
    *  - placeholder / hallucinated navigation targets (e.g. goto('login page'))
@@ -1343,43 +1399,65 @@ Return ONLY the TypeScript code. No markdown fences, no explanations.`;
   }
 
   /**
-   * Item 3 — Semantic locator validation.
+   * Item 3 — Semantic locator validation (REVIEW ENHANCEMENT).
    *
    * A locator existing in the DOM does NOT mean it is the RIGHT element. The
    * reviewer flagged cases such as:
    *
-   *     await expect(page.locator('#item_4_title_link')).toHaveText(/Products/i);
+   *   1. await expect(page.locator('#item_4_title_link')).toHaveText(/Products/i);
+   *      → #item_4_title_link is a product link, not the "Products" page title
    *
-   * where `#item_4_title_link` is a product *link* ("Sauce Labs Backpack"), not
-   * the "Products" page title — yet the dashboard still reported 100% grounded.
+   *   2. error → #user-name (from dashboard screenshot)
+   *      → username field is NOT the error message container
    *
-   * This deterministic linter detects the common mismatch class WITHOUT needing
-   * the DOM: a text/value assertion whose ELEMENT TYPE (inferred from the
-   * selector) is inconsistent with the asserted CONTENT. It returns
-   * human-readable warnings so callers can downgrade a misleading "100% grounded"
-   * claim and trigger a corrective retry. Conservative by design — only flags
-   * confident mismatches to avoid false positives.
+   * This deterministic linter detects common mismatch classes WITHOUT needing
+   * the DOM: when ELEMENT TYPE (inferred from the selector) is inconsistent with
+   * ASSERTED CONTENT or when element descriptions clearly don't match selectors.
+   * Conservative by design — only flags confident mismatches.
    */
   private detectSemanticLocatorMismatches(code: string): string[] {
     const warnings: string[] = [];
-    // Match: expect(page.locator('<sel>'))...toHaveText|toContainText(<arg>)
-    const re = /expect\(\s*page\.locator\(\s*[`'"]([^`'"]+)[`'"]\s*\)\s*\)\s*(?:\.[a-zA-Z]+\([^)]*\)\s*)*?\.(toHaveText|toContainText)\(\s*([^)]+)\)/g;
-    // Selector fragments that denote an actionable/item element (link/button/item/field).
-    const itemLike = /(item|link|btn|button|add[-_]?to[-_]?cart|product[-_]?(link|img|name)|_title_link|user-name|username|password|cart[-_]?(link|badge|icon))/i;
-    // Asserted text that denotes a PAGE/SECTION TITLE or heading-level content.
+    
+    // Rule 1: Title-on-item mismatch
+    const textAssertRe = /expect\(\s*page\.locator\(\s*[`'"]([^`'"]+)[`'"]\s*\)\s*\)\s*(?:\.[a-zA-Z]+\([^)]*\)\s*)*?\.(toHaveText|toContainText)\(\s*([^)]+)\)/g;
+    const itemLike = /(item|link|btn|button|add[-_]?to[-_]?cart|product[-_]?(link|img|name)|_title_link|cart[-_]?(link|badge|icon))/i;
     const titleLike = /products?|inventory|dashboard|home\s*page|cart\s*page|checkout|your\s+cart|overview/i;
 
     let m: RegExpExecArray | null;
-    while ((m = re.exec(code)) !== null) {
+    while ((m = textAssertRe.exec(code)) !== null) {
       const sel = m[1];
       const asserted = m[3];
       if (itemLike.test(sel) && titleLike.test(asserted)) {
         warnings.push(
-          `Semantic locator mismatch: asserting page/section title text (${asserted.trim().slice(0, 40)}) on an item/link/field selector "${sel}". ` +
+          `Semantic locator mismatch: asserting page/section title (${asserted.trim().slice(0, 40)}) on an item/link selector "${sel}". ` +
           'This is "locator exists" but likely the WRONG element. Assert the title on a heading/title element (e.g. .title / [data-test="title"]).',
         );
       }
     }
+
+    // Rule 2: Error-on-input-field mismatch (REVIEW FIX Issue 5)
+    // Detects when looking for an "error" but the selector is clearly a form field.
+    const inputSelectors = /#user-name|#username|#password|#email|#login-button|data-test=["']username["']|data-test=["']password["']/i;
+    const errorContext = /error|message|alert|notification|invalid|incorrect|fail/i;
+    
+    // Check comments/variable names that suggest "error" but use input field selectors
+    const commentErrorRe = /\/\/.*?(error|message).*/gi;
+    let commentMatch: RegExpExecArray | null;
+    const codeLines = code.split('\n');
+    
+    for (let i = 0; i < codeLines.length; i++) {
+      const line = codeLines[i];
+      const nextLine = codeLines[i + 1] || '';
+      
+      // If comment mentions "error" but next line uses an input field selector
+      if (errorContext.test(line) && inputSelectors.test(nextLine)) {
+        warnings.push(
+          `Semantic mismatch (line ${i + 1}): comment/context suggests looking for "error" but selector targets a form field (user-name/password). ` +
+          `Error messages typically live in [data-test="error"] or .error-message elements, not input fields.`
+        );
+      }
+    }
+    
     return warnings;
   }
 
