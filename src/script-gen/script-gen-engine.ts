@@ -1248,7 +1248,8 @@ ${assertions.map(l => `    ${l}`).join('\n')}
       // BOTH username AND password fields (password omitted → falls back to env at
       // runtime) so ctx.data.hasPassword is true and applyPageObjectActions uses
       // the bound record instead of falling back to literal 'standard_user'.
-      const prev = m.get(key) || { username: key, password: undefined };
+      // Use `null` instead of `undefined` for visibility in the JSON output.
+      const prev = m.get(key) || { username: key, password: null };
       m.set(key, { ...prev, ...extra });
     };
 
@@ -1934,24 +1935,86 @@ ${userDecl}    // Two isolated sessions, each with its own cookies/storage.
        comments, then prepend a single high-level call. Only when login() exists. */
     if (loginPO) {
       const loginMethod = this.findPoMethod(loginPO.methods, /^log[_]?in$/i);
-      const hasUserFill = work.some((l) => /#user-name|username|login.*input/i.test(l) && /\.fill\(/i.test(l));
-      const hasPassFill = work.some((l) => /#password|\bpwd\b|\bpass\b/i.test(l) && /\.fill\(/i.test(l));
+      const userFillLine = work.find((l) => /#user-name|username|login.*input/i.test(l) && /\.fill\(/i.test(l));
+      const passFillLine = work.find((l) => /#password|\bpwd\b|\bpass\b/i.test(l) && /\.fill\(/i.test(l));
       const hasLoginClick = work.some((l) => /login.*button|#login-button/i.test(l) && /\.click\(/i.test(l));
-      if (loginMethod && hasUserFill && hasPassFill && hasLoginClick) {
-        // Review fix: consistent dataset usage — prefer Test Data Store records
-        // over hardcoded literals (same pattern as precondition builder). Priority:
-        //   1. Case-specific data binding (ctx.data) when present.
-        //   2. Generic valid user from the test data index (getRecord('valid_users')).
-        //   3. Literal fallback (ctx.creds or process.env).
+      if (loginMethod && userFillLine && passFillLine && hasLoginClick) {
+        // Review fix (final): negative scenario data mutation — parse the actual
+        // fill values from the generated lines to detect empty/invalid scenarios.
+        // When the test is "empty credentials" or "invalid username", we honor
+        // those fill values instead of substituting valid credentials.
+        const extractFillValue = (line: string): string | { literal: string; unquoted: string } | null => {
+          const m = line.match(/\.fill\(([^)]+)\)/);
+          if (!m) return null;
+          const arg = m[1].trim();
+          // Empty string literal
+          if (arg === `''` || arg === `""`) return `''`;
+          // Literal string 'some_value' or "some_value"
+          if (/^['"]/.test(arg)) {
+            const unquoted = arg.slice(1, -1);
+            return { literal: arg, unquoted };
+          }
+          // Expression like user.username or process.env.TEST_USERNAME
+          return null; // not a literal, use normal flow
+        };
+        const userFillVal = extractFillValue(userFillLine);
+        const passFillVal = extractFillValue(passFillLine);
+        
+        // Helper: check if a literal value matches a known test-data record key.
+        // If it does, it's a POSITIVE test referencing test data (should bind to
+        // the record, not use the literal). If it doesn't, it's a NEGATIVE value.
+        const isKnownRecordKey = (val: string | { literal: string; unquoted: string } | null): boolean => {
+          if (!val || typeof val === 'string') return false;
+          const key = val.unquoted;
+          for (const recMap of index.values()) {
+            if (recMap.has(key)) return true;
+          }
+          return false;
+        };
+        
+        // Determine credentials: distinguish positive (test-data reference) from
+        // negative (invalid/wrong/empty) scenarios by checking if literals match
+        // known record keys in the test-data index.
         let u: string;
         let p: string;
         const localDecls: string[] = [];
-        if (ctx.data?.varName && ctx.data.hasUsername && ctx.data.hasPassword) {
+        
+        // If BOTH fills are empty literals, it's an "empty credentials" test.
+        if (userFillVal === `''` && passFillVal === `''`) {
+          u = `''`;
+          p = `''`;
+        }
+        // If username is a literal that does NOT match a known record, it's negative.
+        else if (userFillVal && userFillVal !== `''` && !isKnownRecordKey(userFillVal)) {
+          u = typeof userFillVal === 'object' ? userFillVal.literal : userFillVal;
+          // For "invalid username" test, pair it with a VALID password.
+          const valid = this.resolveValidUserRecord(index);
+          if (valid && 'password' in (valid.value || {})) {
+            localDecls.push(`const validUser = ${valid.ref};`);
+            p = `validUser.password ?? ''`;
+          } else {
+            p = ctx.creds.password ? `'${escapeStr(ctx.creds.password)}'` : `process.env.TEST_PASSWORD ?? ''`;
+          }
+        }
+        // If password is a literal that does NOT match a known record, it's negative.
+        else if (passFillVal && passFillVal !== `''` && !isKnownRecordKey(passFillVal)) {
+          p = typeof passFillVal === 'object' ? passFillVal.literal : passFillVal;
+          // For "invalid password" test, pair it with a VALID username.
+          const valid = this.resolveValidUserRecord(index);
+          if (valid && 'username' in (valid.value || {})) {
+            localDecls.push(`const validUser = ${valid.ref};`);
+            u = `validUser.username ?? ''`;
+          } else {
+            u = ctx.creds.username ? `'${escapeStr(ctx.creds.username)}'` : `process.env.TEST_USERNAME ?? ''`;
+          }
+        }
+        // Normal positive case: bind to test data or valid record.
+        else if (ctx.data?.varName && ctx.data.hasUsername && ctx.data.hasPassword) {
           u = `${ctx.data.varName}.username ?? ''`;
           p = `${ctx.data.varName}.password ?? ''`;
         } else {
           const valid = this.resolveValidUserRecord(index);
-          if (valid && valid.value?.username != null && valid.value?.password != null) {
+          if (valid && 'username' in (valid.value || {}) && 'password' in (valid.value || {})) {
             localDecls.push(`const user = ${valid.ref};`);
             u = `user.username ?? ''`;
             p = `user.password ?? ''`;
