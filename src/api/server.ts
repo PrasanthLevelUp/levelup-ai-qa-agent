@@ -354,10 +354,15 @@ function createHealingWorker(
     const repo = repoManager.findRepo(job.repositoryId);
     // Use WORKSPACE_DIR env var for Railway/Docker, fallback to /tmp/healing-repos
     const workspaceDir = process.env['WORKSPACE_DIR'] || '/tmp/healing-repos';
-    const repoName = repo?.name || job.repositoryId.replace(/[^a-zA-Z0-9_-]/g, '_').slice(-50) || 'test_repo';
-    const testRepoPath = repo?.localPath || path.join(workspaceDir, repoName);
     const repoUrl = job.repositoryUrl || repo?.url || '';
     const branch = job.branch || repo?.branch || 'main';
+
+    // SECURITY: Derive a unique, tenant-isolated path using companyId/projectId + sanitized repoId
+    // NEVER use repo?.localPath — it can point to stale/wrong directories from other tenants
+    const repoName = repo?.name || job.repositoryId.replace(/[^a-zA-Z0-9_-]/g, '_').slice(-50) || 'test_repo';
+    const tenantPrefix = job.companyId ? `c${job.companyId}` : 'shared';
+    const projectPrefix = job.projectId ? `_p${job.projectId}` : '';
+    const testRepoPath = path.join(workspaceDir, `${tenantPrefix}${projectPrefix}`, repoName);
 
     logger.info(MOD, 'Starting healing worker', {
       jobId: job.id,
@@ -366,7 +371,9 @@ function createHealingWorker(
       branch,
       repoName,
       workspaceDir,
-      repoLocalPath: repo?.localPath,
+      companyId: job.companyId,
+      projectId: job.projectId,
+      tenantPrefix,
     });
 
     // Step 1: Clone/pull repo (MUST succeed — failing here means stale/missing code)

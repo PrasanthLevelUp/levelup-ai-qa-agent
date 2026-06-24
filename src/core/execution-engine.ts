@@ -23,10 +23,40 @@ export interface RunResult {
 export class ExecutionEngine {
   /**
    * Clone or pull latest code from a repository.
+   * SECURITY: Verifies the remote URL before reusing existing directories to prevent tenant isolation breaches.
    */
   static async cloneRepository(repoUrl: string, targetDir: string, branch = 'main'): Promise<void> {
     if (fs.existsSync(path.join(targetDir, '.git'))) {
-      logger.info(MOD, 'Repository exists, resetting and pulling latest', { targetDir, branch });
+      logger.info(MOD, 'Repository exists, verifying remote URL before reuse', { targetDir, branch });
+
+      // SECURITY: Verify the existing repo's remote URL matches the expected repoUrl
+      // This prevents cross-tenant contamination if directory paths collide
+      try {
+        const { stdout: existingRemote } = await ExecutionEngine.spawnAsync('git', ['remote', 'get-url', 'origin'], { cwd: targetDir });
+        const normalizedExpected = repoUrl.replace(/\.git$/, '').toLowerCase();
+        const normalizedExisting = existingRemote.trim().replace(/\.git$/, '').toLowerCase();
+
+        if (normalizedExisting !== normalizedExpected) {
+          logger.warn(MOD, 'Remote URL mismatch detected — wiping directory and cloning fresh', {
+            expected: normalizedExpected,
+            existing: normalizedExisting,
+            targetDir,
+          });
+          fs.rmSync(targetDir, { recursive: true, force: true });
+          fs.mkdirSync(targetDir, { recursive: true });
+          await ExecutionEngine.spawnAsync('git', ['clone', '-b', branch, repoUrl, targetDir]);
+          return;
+        }
+      } catch (err) {
+        logger.warn(MOD, 'Failed to verify remote URL — treating as corrupted, wiping and cloning fresh', { err, targetDir });
+        fs.rmSync(targetDir, { recursive: true, force: true });
+        fs.mkdirSync(targetDir, { recursive: true });
+        await ExecutionEngine.spawnAsync('git', ['clone', '-b', branch, repoUrl, targetDir]);
+        return;
+      }
+
+      // Remote URL matches — safe to reuse
+      logger.info(MOD, 'Remote URL verified, resetting and pulling latest', { targetDir, branch });
       // Always reset to clean state to discard any leftover healing patches
       await ExecutionEngine.spawnAsync('git', ['checkout', branch], { cwd: targetDir });
       await ExecutionEngine.spawnAsync('git', ['reset', '--hard', `origin/${branch}`], { cwd: targetDir });
