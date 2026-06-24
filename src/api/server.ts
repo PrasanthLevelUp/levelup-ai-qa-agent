@@ -25,7 +25,7 @@ import { initDb, closeDb, getDatabaseHealth } from '../db/postgres';
 
 // Import healing pipeline components
 import { ExecutionEngine } from '../core/execution-engine';
-import { ArtifactCollector } from '../core/artifact-collector';
+import { ArtifactCollector, extractTopLevelErrors } from '../core/artifact-collector';
 import { FailureAnalyzer } from '../core/failure-analyzer';
 import { HealingOrchestrator } from '../core/healing-orchestrator';
 import { HealingStrategySelector, type StrategyConfig } from '../core/healing-strategy-selector';
@@ -447,7 +447,21 @@ function createHealingWorker(
       if (run.exitCode === 127) {
         message = 'Command not found (exit code 127). This usually means playwright is not installed. Check that npm install completed successfully and node_modules/.bin/playwright exists.';
       } else if (run.exitCode !== 0) {
-        message = `Tests exited with code ${run.exitCode} but no failure artifacts were collected. stderr: ${(run.stderr || '').slice(0, 300)}`;
+        // Playwright records spec-load / global-setup / config failures under the
+        // results file's top-level `errors[]` (with an EMPTY `suites[]`), which the
+        // suite walker doesn't see. Surface them so a fast load-time crash (e.g. a
+        // required env var missing while a spec is imported) is actionable instead
+        // of a silent "no failure artifacts" with empty stderr.
+        const loadErrors = extractTopLevelErrors(run.resultsFile);
+        if (loadErrors.length > 0) {
+          const firstError = loadErrors[0].slice(0, 600);
+          message =
+            `Tests exited with code ${run.exitCode}: ${loadErrors.length} test file(s)/setup failed to load before any test ran ` +
+            `(this is NOT a healable locator failure — usually a missing env var, bad import, or config error). ` +
+            `First error: ${firstError}`;
+        } else {
+          message = `Tests exited with code ${run.exitCode} but no failure artifacts were collected. stderr: ${(run.stderr || '').slice(0, 300)}`;
+        }
       }
 
       const result = {
