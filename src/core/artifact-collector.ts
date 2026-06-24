@@ -140,3 +140,37 @@ export class ArtifactCollector {
     return artifacts;
   }
 }
+
+/** Strip ANSI colour codes Playwright embeds in error text. */
+function stripAnsi(s: string): string {
+  // eslint-disable-next-line no-control-regex
+  return s.replace(/\u001b\[[0-9;]*m/g, '');
+}
+
+/**
+ * Extract Playwright's TOP-LEVEL errors from a results file.
+ *
+ * Playwright records two distinct failure shapes:
+ *   - per-test failures live under `suites[].specs[].tests[].results[]`
+ *   - load-time / global errors (a spec file that throws while being imported,
+ *     a global-setup failure, a config error) live under the top-level
+ *     `errors[]` array, and in that case `suites` is usually EMPTY.
+ *
+ * The artifact collector only walks `suites`, so a load-time error would
+ * otherwise surface as "0 failures collected" with an empty stderr — a silent,
+ * un-actionable failure. This helper lets callers detect and report them.
+ */
+export function extractTopLevelErrors(resultsFilePath: string): string[] {
+  if (!fs.existsSync(resultsFilePath)) return [];
+  try {
+    const raw = JSON.parse(fs.readFileSync(resultsFilePath, 'utf-8')) as {
+      errors?: Array<{ message?: string } | string>;
+    };
+    return (raw.errors ?? [])
+      .map((e) => (typeof e === 'string' ? e : e?.message ?? ''))
+      .map((m) => stripAnsi(m).trim())
+      .filter(Boolean);
+  } catch {
+    return [];
+  }
+}
