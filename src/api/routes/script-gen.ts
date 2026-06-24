@@ -538,21 +538,32 @@ export function createScriptGenRouter(): Router {
       // files), so it overrides the heuristic LocatorResolver report above.
       const engineGrounding = result.locatorGrounding;
       if (engineGrounding && engineGrounding.entries.length > 0) {
+        // Honest "REAL LOCATORS x/y" headline (review fix #3): count every REAL,
+        // non-hallucinated selector — both DOM-verified AND curated known-good
+        // fallbacks (e.g. SauceDemo's documented `[data-test="error"]` that the
+        // login-page crawl couldn't confirm). The previous metric only counted
+        // DOM-verified locators, under-selling the curated real selectors as
+        // "todo" and reporting a misleading ~50%. `validatedCount` now reflects
+        // real locators; per-locator `validated` still distinguishes DOM-verified
+        // (grounded) from known-good for full transparency.
+        const realCount = engineGrounding.realCount ?? engineGrounding.groundedCount;
         locatorReport = {
           totalLocators: engineGrounding.total,
-          validatedCount: engineGrounding.groundedCount,
+          validatedCount: realCount,
           avgConfidence: engineGrounding.avgConfidence,
-          todoCount: Math.max(0, engineGrounding.total - engineGrounding.groundedCount),
+          todoCount: Math.max(0, engineGrounding.total - realCount),
           locators: engineGrounding.entries.map((e) => ({
             element: e.name,
             selector: e.selector,
             confidence: e.confidence,
             source: e.source,
+            // DOM-verified locators are validated; curated known-good fallbacks
+            // are real but flagged "known" so the UI can show ✓ vs ◐.
             validated: e.grounded,
-            status: e.grounded ? 'validated' : 'todo',
+            status: e.grounded ? 'validated' : (e.knownGood ? 'known' : 'todo'),
           })),
         } as unknown as LocatorReport;
-        console.log(`[ScriptGen] 🎯 Real locator grounding — ${engineGrounding.groundedCount}/${engineGrounding.total} grounded (${engineGrounding.groundedPct}%), avgConfidence=${engineGrounding.avgConfidence}`);
+        console.log(`[ScriptGen] 🎯 Locator grounding — ${realCount}/${engineGrounding.total} real (${engineGrounding.realPct ?? 0}%), DOM-verified ${engineGrounding.groundedCount}/${engineGrounding.total} (${engineGrounding.groundedPct}%), avgConfidence=${engineGrounding.avgConfidence}`);
       }
 
       // ── Sprint 4: Folder Placement Decision ──

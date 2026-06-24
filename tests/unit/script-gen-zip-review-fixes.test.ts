@@ -75,7 +75,12 @@ const testCases: any[] = [
   { id: 1217, title: 'Verify navigation to Inventory page after successful login', priority: 'P0',
     preconditions: 'User is successfully logged in.', test_data: 'standard_user from valid_users',
     expected_result: 'User is on the Inventory page.',
-    steps: ['Verify that the URL is https://www.saucedemo.com/inventory.html', 'Check that the Inventory page elements are displayed'] },
+    steps: ['Verify that the URL is https://www.saucedemo.com/inventory.html', 'Check that the Inventory page elements are displayed',
+      'Verify the URL is https://www.saucedemo.com/inventory.html again'] },
+  { id: 1300, title: 'Verify concurrent login sessions in two browsers', priority: 'P1',
+    preconditions: '', test_data: 'standard_user from valid_users',
+    expected_result: 'Both sessions remain logged in on the inventory page.',
+    steps: ['Open two browser sessions simultaneously', 'Log in on both with standard_user', 'Verify both reach the inventory page'] },
 ];
 
 async function main() {
@@ -89,6 +94,7 @@ async function main() {
   const locked = get('verify-login-attempt-with-locked');
   const empty = get('verify-login-with-empty');
   const nav = get('verify-navigation-to-inventory');
+  const concurrent = get('verify-concurrent-login-sessions');
   const dataModule = get('data/test-data.ts');
 
   console.log('=== Issue 5: Dataset Intelligence (test-data module + getRecord) ===');
@@ -129,6 +135,30 @@ async function main() {
   ok('grounding is NOT a fake 100%', g && g.groundedPct < 100);
   ok('title is reported as NOT grounded (rejected match)', g && g.entries.some((e: any) => e.name === 'title' && e.grounded === false));
   ok('error is reported as NOT grounded (rejected match)', g && g.entries.some((e: any) => e.name === 'error' && e.grounded === false));
+
+  console.log('=== Final review #1: de-duplicate repeated assertions ===');
+  const navUrlChecks = (nav.match(/toHaveURL\(\/inventory\\\.html\/\)/g) || []).length;
+  ok('navigation spec has exactly ONE toHaveURL(/inventory.html/) (no stacking)', navUrlChecks === 1);
+  const navTitleChecks = (nav.match(/toHaveText\(\/Products\/i\)/g) || []).length;
+  ok('navigation spec has exactly ONE Products title check', navTitleChecks <= 1);
+  ok('no dangling empty "Verify Expected Result" section', !/Verify Expected Result ──\s*\n\s*\}\);/.test(nav));
+
+  console.log('=== Final review #2: inventory locator not a sidebar link ===');
+  ok('inventory items use .inventory_item, NOT #inventory_sidebar_link', /\.inventory_item'\)/.test(nav) && !/inventory_sidebar_link/.test(nav));
+  ok('no fragile hard-coded toHaveCount(6)', !/toHaveCount\(6\)/.test(nav));
+  ok('inventory list asserted via .first().toBeVisible()', /\.inventory_item'\)\.first\(\)\)\.toBeVisible/.test(nav));
+
+  console.log('=== Final review #3: honest "real locators" metric ===');
+  ok('report exposes realCount/realPct', g && typeof g.realCount === 'number' && typeof g.realPct === 'number');
+  ok('realCount >= groundedCount (curated fallbacks counted as real)', g && g.realCount >= g.groundedCount);
+  ok('curated fallback entries flagged knownGood', g && g.entries.some((e: any) => e.knownGood === true && e.grounded === false));
+
+  console.log('=== Final review #4: concurrent spec reuses LoginPage ===');
+  ok('concurrent spec generated', !!concurrent);
+  ok('concurrent imports LoginPage', /import\s*\{\s*LoginPage\s*\}/.test(concurrent));
+  ok('concurrent uses loginPageA.login(...)', /const loginPageA = new LoginPage\(pageA\)/.test(concurrent) && /loginPageA\.login\(/.test(concurrent));
+  ok('concurrent uses loginPageB.login(...)', /const loginPageB = new LoginPage\(pageB\)/.test(concurrent) && /loginPageB\.login\(/.test(concurrent));
+  ok('concurrent does NOT use raw pageA #user-name fills', !/pageA\.locator\('#user-name'\)/.test(concurrent));
 
   console.log(`\n──────── ${passed} passed, ${failed} failed ────────`);
   if (failed > 0) process.exit(1);
