@@ -95,6 +95,7 @@ async function main() {
   ok('tests/data/test-data.ts is in the bundle', !!dataModule);
   ok('module declares the valid_users dataset', /valid_users/.test(dataModule));
   ok('module contains standard_user + locked_out_user records', /standard_user/.test(dataModule) && /locked_out_user/.test(dataModule));
+  ok('password field is visible (null, not undefined)', /"password":\s*null/.test(dataModule));
   ok('successful login imports getRecord', /import\s*\{\s*getRecord\s*\}\s*from\s*'\.\/data\/test-data'/.test(success));
   ok('successful login binds const user = getRecord("valid_users")', /const user = getRecord\("valid_users"\)/.test(success));
   ok('login() reads user.username', /\.login\(user\.username/.test(success));
@@ -114,6 +115,12 @@ async function main() {
   ok('locked asserts toContainText("locked out")', /toContainText\('locked out'\)/.test(locked));
   ok('empty asserts toContainText("is required")', /toContainText\('is required'\)/.test(empty));
   ok('no negative case asserts #user-name as the error', ![invalid, locked, empty].some(c => /locator\('#user-name'\)\)\.toBeVisible/.test(c)));
+
+  console.log('=== Final fix: negative scenario data mutation ===');
+  ok('empty credentials uses login("", "")', /loginPage\.login\('',\s*''\)/.test(empty));
+  ok('empty does NOT use process.env fallback', !/process\.env\.TEST_(USERNAME|PASSWORD)/.test(empty));
+  ok('invalid username uses literal invalid_user', /loginPage\.login\('invalid_user'/.test(invalid));
+  ok('invalid username pairs with VALID password', /const validUser = getRecord/.test(invalid) && /validUser\.password/.test(invalid));
 
   console.log('=== Issue 4/6: honest semantic grounding ===');
   ok('title resolves to [data-test="title"], not #item_4_title_link', /\[data-test="title"\]/.test(success) && !/#item_4_title_link/.test(success));
