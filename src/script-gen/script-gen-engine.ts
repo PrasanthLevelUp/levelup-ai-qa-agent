@@ -19,6 +19,7 @@
  */
 
 import OpenAI from 'openai';
+import * as nodePath from 'path';
 import { PageCrawler, type CrawlResult, type CrawlConfig, type PageElement } from './page-crawler';
 import type { AuthConfig, AuthResult } from './auth-engine';
 import { WorkflowMapper, type WorkflowMap, type WorkflowFlow, type WorkflowStep, type WorkflowAction } from './workflow-mapper';
@@ -165,6 +166,35 @@ export interface GenerationResult {
    * route surface a truthful "REAL LOCATORS x/y" metric and a grounding report.
    */
   locatorGrounding?: LocatorGroundingReport;
+  /**
+   * Repository Intelligence applied during generation — shows which Page Objects
+   * were discovered and their available methods. Lets users understand why a
+   * specific method was chosen. Present only when repo profile is available.
+   */
+  repositoryIntelligence?: RepositoryIntelligenceReport;
+}
+
+/** Page Object metadata exposed for transparency and debugging. */
+export interface PageObjectMetadata {
+  /** Page Object class name (e.g. "LoginPage") */
+  name: string;
+  /** File path in the repository (e.g. "src/pages/login.page.ts") */
+  filePath: string;
+  /** Available methods on this Page Object (e.g. ["login", "logout", "verifyError"]) */
+  methods: string[];
+  /** Import path used in generated code (e.g. "../src/pages/login.page") */
+  importPath: string;
+  /** Whether this PO was actually used in the generated script */
+  used: boolean;
+}
+
+export interface RepositoryIntelligenceReport {
+  /** Page Objects discovered from the repository scan */
+  pageObjects: PageObjectMetadata[];
+  /** Total number of Page Objects available in the repo */
+  totalAvailable: number;
+  /** Number of Page Objects actually used in generated code */
+  totalUsed: number;
 }
 
 export interface GeneratedFile {
@@ -701,6 +731,11 @@ export class ScriptGenEngine {
 
     const ctx = { url: baseUrl, creds, sel, data: dataRef };
 
+    // ── Repository Intelligence: match ALL relevant existing Page Objects ──
+    // (login / inventory / cart / checkout) with real methods + repo-derived
+    // import paths. Empty when no repo profile or no keyword match.
+    const matchedPOs = this.matchPageObjects(tc, steps, config.repoProfile);
+
     // ── Precondition materialization (review TC2/TC5 fix) ──
     // If the case assumes an authenticated session ("user is logged in") but its
     // steps never perform a login, inject a real login setup using a valid user
@@ -708,7 +743,28 @@ export class ScriptGenEngine {
     const preLines = this.buildPreconditionLogin(tc, steps, ctx, dataIndex);
 
     const { lines } = this.tcStepsToCode(steps, ctx);
+
+    // ── Rewrite raw locator steps to reuse high-level Page Object methods ──
+    // Only collapses when the method GENUINELY exists in scanned metadata; other
+    // lines are preserved verbatim (graceful fallback, no hallucinated methods).
+    let finalLines = lines;
+    const usedPOVars = new Set<string>();
+    if (matchedPOs.length) {
+      const applied = this.applyPageObjectActions(lines, matchedPOs, { creds, data: dataRef });
+      finalLines = applied.lines;
+      applied.used.forEach((v) => usedPOVars.add(v));
+    }
+
     const assertions = this.buildTcAssertions(`${tc.expected_result || ''}`, ctx, tc);
+
+    // ── Page-Object-based assertions (e.g. inventoryPage.verifyLoaded()) ──
+    if (matchedPOs.length) {
+      const poAsserts = this.applyPageObjectAssertions(`${tc.expected_result || ''}`, matchedPOs);
+      if (poAsserts.lines.length) {
+        assertions.push(...poAsserts.lines);
+        poAsserts.used.forEach((v) => usedPOVars.add(v));
+      }
+    }
 
     // ── Guarantee an initial navigation ──
     // Some cases (e.g. "Leave username field empty → click login") interact with
@@ -736,13 +792,31 @@ export class ScriptGenEngine {
       declLines.push(sourceNote);
       declLines.push(`const ${dataRef.varName} = ${dataRef.ref};`, '');
     }
-    const body = [...declLines, ...navLines, ...preLines, ...lines];
+
+    // ── Instantiate the Page Objects we actually reference ──
+    // Only the POs whose methods were genuinely used (usedPOVars) are imported
+    // and instantiated, so we never import a class the test doesn't exercise.
+    const activePOs = matchedPOs.filter((po) => usedPOVars.has(po.varName));
+    if (activePOs.length) {
+      declLines.push(`// Reusing repo Page Object${activePOs.length > 1 ? 's' : ''}: ${activePOs.map((p) => p.name).join(', ')}`);
+      for (const po of activePOs) {
+        declLines.push(`const ${po.varName} = new ${po.name}(page);`);
+      }
+      declLines.push('');
+    }
+
+    const body = [...declLines, ...navLines, ...preLines, ...finalLines];
 
     // Reference the generated test-data module whenever the body binds a dataset.
     const usesModule = body.some(l => /\bgetRecord\s*\(/.test(l));
-    const importLine = usesModule
+    let importLine = usesModule
       ? `import { test, expect } from '@playwright/test';\nimport { getRecord } from './data/test-data';`
       : `import { test, expect } from '@playwright/test';`;
+
+    // Add Page Object imports for the POs we actually reuse (repo-derived paths).
+    for (const po of activePOs) {
+      importLine += `\nimport { ${po.name} } from '${po.importPath}';`;
+    }
 
     const content = `${importLine}
 
@@ -784,7 +858,7 @@ ${assertions.map(l => `    ${l}`).join('\n')}
 
     const totalAssertions = assertions.filter(a => /\bexpect\s*\(/.test(a)).length;
     const grounding = this.buildLocatorGroundingReport(tracked, content);
-    return this.buildTcResult(tc, title, baseUrl, crawl, tags, generatedFiles, totalAssertions, startTime, grounding);
+    return this.buildTcResult(tc, title, baseUrl, crawl, tags, generatedFiles, totalAssertions, startTime, grounding, matchedPOs, usedPOVars);
   }
 
   /** Assemble a single-case GenerationResult (test plan + stats). */
@@ -798,6 +872,8 @@ ${assertions.map(l => `    ${l}`).join('\n')}
     totalAssertions: number,
     startTime: number,
     locatorGrounding?: LocatorGroundingReport,
+    matchedPOs?: Array<{ name: string; varName: string; filePath: string; methods: string[]; importPath: string; kind: string }>,
+    usedPOVars?: Set<string>,
   ): GenerationResult {
     // Real selector quality = grounded locators / total locators (0–1), derived
     // from what the spec actually uses — never the old hardcoded 0.
@@ -829,6 +905,25 @@ ${assertions.map(l => `    ${l}`).join('\n')}
       },
     };
 
+    // ── Build Repository Intelligence Report ──
+    // Expose which Page Objects were discovered and their methods for transparency.
+    let repositoryIntelligence: RepositoryIntelligenceReport | undefined;
+    if (matchedPOs && matchedPOs.length > 0) {
+      const usedSet = usedPOVars || new Set<string>();
+      const pageObjects: PageObjectMetadata[] = matchedPOs.map((po) => ({
+        name: po.name,
+        filePath: po.filePath,
+        methods: po.methods,
+        importPath: po.importPath,
+        used: usedSet.has(po.varName),
+      }));
+      repositoryIntelligence = {
+        pageObjects,
+        totalAvailable: matchedPOs.length,
+        totalUsed: pageObjects.filter((po) => po.used).length,
+      };
+    }
+
     return {
       testPlan,
       generatedFiles,
@@ -844,6 +939,7 @@ ${assertions.map(l => `    ${l}`).join('\n')}
       },
       errors: [],
       ...(locatorGrounding ? { locatorGrounding } : {}),
+      ...(repositoryIntelligence ? { repositoryIntelligence } : {}),
     };
   }
 
@@ -865,6 +961,7 @@ ${assertions.map(l => `    ${l}`).join('\n')}
     let totalTests = 0;
     const errors: string[] = [];
     const groundingReports: LocatorGroundingReport[] = [];
+    const repoIntelReports: RepositoryIntelligenceReport[] = [];
 
     for (const tc of cases) {
       try {
@@ -875,6 +972,7 @@ ${assertions.map(l => `    ${l}`).join('\n')}
           continue;
         }
         if (single.locatorGrounding) groundingReports.push(single.locatorGrounding);
+        if (single.repositoryIntelligence) repoIntelReports.push(single.repositoryIntelligence);
         for (const f of single.generatedFiles) {
           // The shared test-data module is identical across cases — emit it
           // once, never rename it (specs import a fixed './data/test-data' path).
@@ -910,6 +1008,9 @@ ${assertions.map(l => `    ${l}`).join('\n')}
       ? locatorGrounding.groundedCount / locatorGrounding.total
       : 0;
 
+    // Aggregate repository intelligence across all cases (de-duplicate Page Objects).
+    const repositoryIntelligence = this.mergeRepoIntelligence(repoIntelReports);
+
     const reqLabel = cases[0]?.requirement_id ? `requirement ${cases[0].requirement_id}` : 'requirement';
     const testPlan: TestPlan = {
       name: `Test Plan: ${reqLabel} (${generatedFiles.length} cases)`,
@@ -944,6 +1045,7 @@ ${assertions.map(l => `    ${l}`).join('\n')}
       },
       errors,
       ...(locatorGrounding.total > 0 ? { locatorGrounding } : {}),
+      ...(repositoryIntelligence ? { repositoryIntelligence } : {}),
     };
   }
 
@@ -1463,6 +1565,35 @@ export default datasets;
   }
 
   /**
+   * Merge repository intelligence reports from multiple test cases. De-duplicates
+   * Page Objects by name and aggregates usage (a PO is marked "used" if ANY case
+   * used it). Returns undefined when no reports were provided.
+   */
+  private mergeRepoIntelligence(reports: RepositoryIntelligenceReport[]): RepositoryIntelligenceReport | undefined {
+    if (!reports.length) return undefined;
+
+    const poByName = new Map<string, PageObjectMetadata>();
+    for (const r of reports) {
+      for (const po of r.pageObjects) {
+        const existing = poByName.get(po.name);
+        if (!existing) {
+          poByName.set(po.name, { ...po });
+        } else {
+          // Aggregate: if ANY case used this PO, mark it as used.
+          existing.used = existing.used || po.used;
+        }
+      }
+    }
+
+    const pageObjects = [...poByName.values()];
+    return {
+      pageObjects,
+      totalAvailable: pageObjects.length,
+      totalUsed: pageObjects.filter((po) => po.used).length,
+    };
+  }
+
+  /**
    * Detect cases that cannot be faithfully automated as a single linear
    * Playwright `page` flow — concurrent / multi-browser / simultaneous-session
    * scenarios — or that the case itself flags as not automation-ready. These
@@ -1565,6 +1696,228 @@ ${userDecl}    // Two isolated sessions, each with its own cookies/storage.
    * the index) so the test starts from the intended state instead of about:blank.
    * Returns [] when no setup is needed.
    */
+
+  /* ──────────────────────────────────────────────────────────────────────── */
+  /*  Repository Intelligence: Page Object Reuse                              */
+  /*  ───────────────────────────────────────────────────────────────────    */
+  /*  Design (addresses PR #142 review):                                      */
+  /*   • Issue 1 (method validation): NEVER emit a method that isn't present  */
+  /*     in the scanned PO metadata. We look up the real method NAME from the */
+  /*     profile and only collapse a step-group when that method exists.      */
+  /*   • Issue 2 (import paths): the import path is computed from the ACTUAL  */
+  /*     scanned `filePath` (path.relative from the tests/ output dir), never */
+  /*     hardcoded to `../pages/`.                                            */
+  /*   • Issue 3 (more than Login): Login, Inventory, Cart and Checkout page  */
+  /*     objects are all matched and exercised.                               */
+  /*   • Issue 4 (dataset + PO): credential args resolve to user.username /   */
+  /*     user.password when a dataset record is bound, else literals/env.     */
+  /* ──────────────────────────────────────────────────────────────────────── */
+
+  /**
+   * Compute the import path for a page object from its REAL scanned file path,
+   * relative to the generated spec's directory (`tests/`). Never hardcoded.
+   *
+   * Examples (spec lives in tests/):
+   *   pages/login.page.ts        → ../pages/login.page
+   *   src/pages/LoginPage.ts      → ../src/pages/LoginPage
+   *   e2e/pom/login.po.ts         → ../e2e/pom/login.po
+   */
+  private buildPageObjectImportPath(filePath: string, testDir = 'tests'): string {
+    const clean = filePath.replace(/\\/g, '/').replace(/^\.\//, '');
+    let rel = nodePath.posix.relative(testDir, clean).replace(/\.[tj]sx?$/, '');
+    if (!rel.startsWith('.')) rel = `./${rel}`;
+    return rel;
+  }
+
+  /**
+   * Find the real method name on a page object whose name matches `pattern`.
+   * Returns the actual scanned method name (preserving its casing) or null.
+   * This is the guard that prevents emitting hallucinated methods (Issue 1).
+   */
+  private findPoMethod(methods: string[], pattern: RegExp): string | null {
+    for (const m of methods) if (pattern.test(m)) return m;
+    return null;
+  }
+
+  /**
+   * Match a test case to ALL relevant existing Page Objects (login, inventory,
+   * cart, checkout) via simple keyword matching. Returns one entry per matched
+   * PO with its real methods + a repo-derived import path. Empty array when no
+   * profile or no match. Intentionally simple — no architecture inference.
+   */
+  private matchPageObjects(
+    tc: NonNullable<GenerationConfig['testCase']>,
+    steps: string[],
+    profile?: import('../context/types').RepositoryProfile,
+    testDir = 'tests',
+  ): Array<{ name: string; varName: string; filePath: string; methods: string[]; importPath: string; kind: string }> {
+    if (!profile?.pageObjects?.length) return [];
+
+    const text = `${tc.title || ''} ${steps.join(' ')} ${tc.expected_result || ''}`.toLowerCase();
+    // Map a semantic kind → keyword test + PO-name matcher.
+    const kinds: Array<{ kind: string; inText: RegExp; poName: RegExp }> = [
+      { kind: 'login',    inText: /\blogin|sign.?in|log.?in|auth|credential/i,           poName: /login|signin|auth/i },
+      { kind: 'inventory',inText: /inventory|products?|catalog|item list|browse/i,        poName: /inventory|product|catalog/i },
+      { kind: 'cart',     inText: /\bcart\b|basket|shopping.?cart|add to cart/i,          poName: /cart|basket/i },
+      { kind: 'checkout', inText: /checkout|purchase|payment|place order|complete order/i, poName: /checkout|payment|order/i },
+    ];
+
+    const out: Array<{ name: string; varName: string; filePath: string; methods: string[]; importPath: string; kind: string }> = [];
+    const seen = new Set<string>();
+    for (const k of kinds) {
+      if (!k.inText.test(text)) continue;
+      const po = profile.pageObjects.find((p) => k.poName.test(p.name));
+      if (!po || seen.has(po.name)) continue;
+      seen.add(po.name);
+      out.push({
+        name: po.name,
+        varName: po.name.charAt(0).toLowerCase() + po.name.slice(1),
+        filePath: po.filePath,
+        methods: (po.methods || []).map((m) => m.name),
+        importPath: this.buildPageObjectImportPath(po.filePath, testDir),
+        kind: k.kind,
+      });
+    }
+    return out;
+  }
+
+  /**
+   * Rewrite the raw locator action lines to reuse high-level Page Object methods
+   * where (a) the step pattern is recognised AND (b) the method genuinely exists
+   * in the scanned metadata. Lines that don't map are preserved verbatim, so the
+   * generated script never references a method the repo doesn't have (Issue 1).
+   *
+   * Returns the (possibly) rewritten lines and the set of PO var names actually
+   * used (so the caller only instantiates/imports the ones we reference).
+   */
+  private applyPageObjectActions(
+    lines: string[],
+    pos: Array<{ name: string; varName: string; methods: string[]; kind: string }>,
+    ctx: { creds: { username: string; password: string }; data?: { varName: string; ref: string; hasUsername: boolean; hasPassword: boolean } },
+  ): { lines: string[]; used: Set<string> } {
+    const used = new Set<string>();
+    let work = [...lines];
+
+    const loginPO = pos.find((p) => p.kind === 'login');
+    const cartPO = pos.find((p) => p.kind === 'cart');
+    const checkoutPO = pos.find((p) => p.kind === 'checkout');
+
+    /* ── Login collapse: fill(user) + fill(pass) + click(login) → login(u, p) ──
+       The fill lines carry the real selectors (#user-name / #password) so we can
+       detect the login triad directly. We drop those lines, the login click, the
+       login click's trailing waitForLoadState, and their leading `// <step>`
+       comments, then prepend a single high-level call. Only when login() exists. */
+    if (loginPO) {
+      const loginMethod = this.findPoMethod(loginPO.methods, /^log[_]?in$/i);
+      const hasUserFill = work.some((l) => /#user-name|username|login.*input/i.test(l) && /\.fill\(/i.test(l));
+      const hasPassFill = work.some((l) => /#password|\bpwd\b|\bpass\b/i.test(l) && /\.fill\(/i.test(l));
+      const hasLoginClick = work.some((l) => /login.*button|#login-button/i.test(l) && /\.click\(/i.test(l));
+      if (loginMethod && hasUserFill && hasPassFill && hasLoginClick) {
+        const u = ctx.data?.varName && ctx.data.hasUsername
+          ? `${ctx.data.varName}.username ?? ''`
+          : ctx.creds.username ? `'${escapeStr(ctx.creds.username)}'` : `process.env.TEST_USERNAME ?? ''`;
+        const p = ctx.data?.varName && ctx.data.hasPassword
+          ? `${ctx.data.varName}.password ?? ''`
+          : ctx.creds.password ? `'${escapeStr(ctx.creds.password)}'` : `process.env.TEST_PASSWORD ?? ''`;
+        const filtered: string[] = [];
+        for (let i = 0; i < work.length; i++) {
+          const l = work[i];
+          // Drop the leading step comment for fills/login-click.
+          if (/^\s*\/\/\s*(enter|type|input|fill).*(user|email|login|password|pwd|credential)/i.test(l)) continue;
+          if (/^\s*\/\/\s*(click|press|tap|submit).*(login|log in|sign in)/i.test(l)) continue;
+          // Drop the credential fills.
+          if (/\.fill\(/i.test(l) && /#user-name|username|#password|\bpwd\b|\bpass\b/i.test(l)) continue;
+          // Drop the login click and its trailing waitForLoadState.
+          if (/login.*button|#login-button/i.test(l) && /\.click\(/i.test(l)) {
+            if (/page\.waitForLoadState/i.test(work[i + 1] || '')) i++;
+            continue;
+          }
+          filtered.push(l);
+        }
+        work = [`await ${loginPO.varName}.${loginMethod}(${u}, ${p});`, ...filtered];
+        used.add(loginPO.varName);
+      }
+    }
+
+    /* ── Comment-context rewrite for cart / checkout ──
+       The deterministic emitter maps generic clicks to a single selector and
+       keeps the human intent in the leading `// <step>` comment. So we scan with
+       the preceding comment as semantic context and rewrite the following action
+       line into a PO method call — but ONLY when that method really exists. */
+    const cartAdd = cartPO ? this.findPoMethod(cartPO.methods, /^add.*(cart|item)|addto.*cart/i) : null;
+    const cartOpen = cartPO ? this.findPoMethod(cartPO.methods, /^(open|view|go.?to).*cart/i) : null;
+    const coMethod = checkoutPO ? this.findPoMethod(checkoutPO.methods, /complete.*checkout|^checkout$|finish.*(order|checkout)/i) : null;
+
+    if (cartAdd || cartOpen || coMethod) {
+      const rewritten: string[] = [];
+      let lastComment = '';
+      for (const l of work) {
+        const isComment = /^\s*\/\//.test(l);
+        if (isComment) lastComment = l;
+        // Semantic context = this line + the comment that introduced it.
+        const semantic = `${lastComment} ${l}`;
+        const isClick = /\.click\(/i.test(l);
+
+        if (isClick && cartAdd && /add.*cart|add_to_cart/i.test(semantic)) {
+          rewritten.push(`await ${cartPO!.varName}.${cartAdd}();`);
+          used.add(cartPO!.varName);
+          continue;
+        }
+        if (isClick && cartOpen && /(shopping_cart|cart.*(link|icon)|open.*cart|view.*cart|go to.*cart)/i.test(semantic)) {
+          rewritten.push(`await ${cartPO!.varName}.${cartOpen}();`);
+          used.add(cartPO!.varName);
+          continue;
+        }
+        if (isClick && coMethod && /(checkout|#finish|#continue|place.?order|finish)/i.test(semantic)) {
+          rewritten.push(`await ${checkoutPO!.varName}.${coMethod}();`);
+          used.add(checkoutPO!.varName);
+          continue;
+        }
+        rewritten.push(l);
+      }
+      // For checkout we collapse a multi-click flow into ONE completeCheckout()
+      // call: keep the first emitted checkout call, drop subsequent duplicates.
+      if (coMethod) {
+        let seenCheckout = false;
+        work = rewritten.filter((l) => {
+          if (l.includes(`.${coMethod}(`)) {
+            if (seenCheckout) return false;
+            seenCheckout = true;
+          }
+          return true;
+        });
+      } else {
+        work = rewritten;
+      }
+    }
+
+    return { lines: work, used };
+  }
+
+  /**
+   * Add Page Object based assertions where a verification method genuinely
+   * exists (e.g. InventoryPage.verifyLoaded / isLoaded). Returns extra lines to
+   * append to the assertions block, plus the PO var names referenced.
+   */
+  private applyPageObjectAssertions(
+    expected: string,
+    pos: Array<{ name: string; varName: string; methods: string[]; kind: string }>,
+  ): { lines: string[]; used: Set<string> } {
+    const used = new Set<string>();
+    const lines: string[] = [];
+    const e = expected.toLowerCase();
+
+    const inventoryPO = pos.find((p) => p.kind === 'inventory');
+    if (inventoryPO && /inventory|products? (page|are|is|displayed|loaded)|item list/i.test(e)) {
+      const verify = this.findPoMethod(inventoryPO.methods, /verify.*(load|inventory|displayed|page)|^is.*loaded|inventory.*loaded|assert.*inventory/i);
+      if (verify) {
+        lines.push(`await ${inventoryPO.varName}.${verify}();`);
+        used.add(inventoryPO.varName);
+      }
+    }
+    return { lines, used };
+  }
+
   private buildPreconditionLogin(
     tc: NonNullable<GenerationConfig['testCase']>,
     steps: string[],
@@ -1718,15 +2071,20 @@ ${userDecl}    // Two isolated sessions, each with its own cookies/storage.
         continue;
       }
 
-      // ── username field ──
-      if (/user( ?name)?/.test(t) && !/click|button/.test(t)) {
-        push(raw, [`await ${ctx.sel.username}.fill(${fieldExpr('username', raw, t)});`], false);
+      // ── password field ──
+      // NOTE: checked BEFORE username because phrases like "Enter password from
+      // valid_users" contain the substring "user" (in the dataset name) and would
+      // otherwise be mis-mapped to the username field. Password is unambiguous.
+      if (/pass( ?word)?|\bpwd\b/.test(t) && !/click|button/.test(t)) {
+        push(raw, [`await ${ctx.sel.password}.fill(${fieldExpr('password', raw, t)});`], false);
         continue;
       }
 
-      // ── password field ──
-      if (/pass( ?word)?/.test(t) && !/click|button/.test(t)) {
-        push(raw, [`await ${ctx.sel.password}.fill(${fieldExpr('password', raw, t)});`], false);
+      // ── username field ──
+      // Guard against the dataset-name false positive: don't treat a "password"
+      // step as username even if the dataset name embeds "user".
+      if (/user( ?name)?|email|login id/.test(t) && !/pass( ?word)?|\bpwd\b/.test(t) && !/click|button/.test(t)) {
+        push(raw, [`await ${ctx.sel.username}.fill(${fieldExpr('username', raw, t)});`], false);
         continue;
       }
 

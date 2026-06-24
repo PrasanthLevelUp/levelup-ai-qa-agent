@@ -995,6 +995,7 @@ function buildTestScriptPRBody(
       appKnowledgeUsed: boolean;
       repoPatternsUsed: boolean;
       locatorReport?: { totalLocators: number; validatedCount: number; avgConfidence: number; todoCount: number };
+      repositoryIntelligence?: import('../../script-gen/page-object-rewriter').PageObjectRewriteReport;
     };
     frameworkAnalysis?: import('../../script-gen/framework-auditor').FrameworkAuditResult;
   },
@@ -1054,6 +1055,15 @@ ${perFileRows}${missingNote}${extraNote}`;
     const lrRow = lr
       ? `\n| **Locators resolved** | ${lr.totalLocators} (validated ${lr.validatedCount}, avg confidence ${lr.avgConfidence}%, ${lr.todoCount} to verify) |`
       : '';
+    // Page Object reuse row: proves generated specs call into the repo's real
+    // Page Objects (e.g. loginPage.login(...)) instead of duplicating selectors.
+    const ri = intel.repositoryIntelligence;
+    let riRow = '';
+    if (ri && ri.totalAvailable > 0) {
+      const usedNames = ri.pageObjects.filter(p => p.used).map(p => p.name);
+      const namesNote = usedNames.length ? ` (${usedNames.join(', ')})` : '';
+      riRow = `\n| **Page Objects reused** | ${ri.totalUsed}/${ri.totalAvailable}${namesNote} |`;
+    }
     intelligenceSection = `
 
 ### 🧠 Intelligence Applied
@@ -1062,7 +1072,7 @@ ${perFileRows}${missingNote}${extraNote}`;
 |-------|------|
 | **Application Profile (real DOM/selectors)** | ${mark(intel.appProfileUsed)} |
 | **Application Knowledge** | ${mark(intel.appKnowledgeUsed)} |
-| **Repository Patterns** | ${mark(intel.repoPatternsUsed)} |${lrRow}`;
+| **Repository Patterns** | ${mark(intel.repoPatternsUsed)} |${lrRow}${riRow}`;
   }
 
   // Framework Analysis section (Phase 1): Impact Analysis + Quality Report
