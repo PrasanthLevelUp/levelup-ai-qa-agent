@@ -671,7 +671,7 @@ export class ScriptGenEngine {
     // Resolve the dataset this case consumes so the script binds to the dataset
     // via getRecord('<dataset>', selector?) and reads user.username/.password
     // from the schema. When no resolved data is supplied, fall back to literals.
-    const dataIndex = this.buildTestDataIndex(config);
+    const dataIndex = this.buildTestDataIndexWithFallback(config, [tc]);
     const caseData = this.resolveCaseData(tc, steps, dataIndex);
     if (caseData) {
       // Hydrate creds from the resolved record so any literal fallbacks (and the
@@ -735,12 +735,16 @@ export class ScriptGenEngine {
     // (login / inventory / cart / checkout) with real methods + repo-derived
     // import paths. Empty when no repo profile or no keyword match.
     const matchedPOs = this.matchPageObjects(tc, steps, config.repoProfile);
+    const usedPOVars = new Set<string>();
 
     // ── Precondition materialization (review TC2/TC5 fix) ──
     // If the case assumes an authenticated session ("user is logged in") but its
     // steps never perform a login, inject a real login setup using a valid user
-    // so the test actually starts from the intended state.
-    const preLines = this.buildPreconditionLogin(tc, steps, ctx, dataIndex);
+    // so the test actually starts from the intended state. Reuses the repo's
+    // login() Page Object method when one was matched (review issue #2).
+    const preResult = this.buildPreconditionLogin(tc, steps, ctx, dataIndex, matchedPOs);
+    const preLines = preResult.lines;
+    preResult.used.forEach((v) => usedPOVars.add(v));
 
     const { lines } = this.tcStepsToCode(steps, ctx);
 
@@ -748,7 +752,6 @@ export class ScriptGenEngine {
     // Only collapses when the method GENUINELY exists in scanned metadata; other
     // lines are preserved verbatim (graceful fallback, no hallucinated methods).
     let finalLines = lines;
-    const usedPOVars = new Set<string>();
     if (matchedPOs.length) {
       const applied = this.applyPageObjectActions(lines, matchedPOs, { creds, data: dataRef });
       finalLines = applied.lines;
@@ -772,8 +775,11 @@ export class ScriptGenEngine {
     // about:blank and fail. If nothing navigates yet the body touches the page,
     // prepend a goto so the test starts on the real base URL.
     const navLines: string[] = [];
-    const bodyTouchesPage = [...preLines, ...lines].some(l => /\bpage\.(locator|getBy|fill|click|goto)\b/.test(l));
-    const bodyNavigates = [...preLines, ...lines].some(l => /\bpage\.goto\s*\(/.test(l));
+    const bodyTouchesPage = [...preLines, ...finalLines].some(l => /\bpage\.(locator|getBy|fill|click|goto)\b/.test(l));
+    // A page.goto() OR a high-level Page Object login() (which navigates) both
+    // count as the test having an entry navigation — so we don't prepend a
+    // redundant goto on top of a login() that already lands on the app.
+    const bodyNavigates = [...preLines, ...finalLines].some(l => /\bpage\.goto\s*\(/.test(l) || /\.login\s*\(/.test(l));
     if (bodyTouchesPage && !bodyNavigates) {
       navLines.push(
         `await page.goto('${escapeStr(baseUrl)}');`,
@@ -954,6 +960,18 @@ ${assertions.map(l => `    ${l}`).join('\n')}
   private generateFromTestCases(config: GenerationConfig, crawl: CrawlResult): GenerationResult | null {
     const startTime = Date.now();
     const cases = config.testCases || [];
+
+    // ── Test-data fallback (review priority #2 / user request) ──
+    // When no datasets were explicitly linked, synthesize ONE shared dataset from
+    // ALL cases up front and pin it on the config. This guarantees the shared
+    // tests/data/test-data.ts module is COMPLETE (every record any case binds to
+    // is present) and that each per-case generation resolves the same dataset —
+    // exactly how the Test Case Lab path behaves. Real linked datasets win.
+    if (!config.resolvedTestData?.length) {
+      const synth = this.synthesizeResolvedTestData(cases);
+      if (synth.length) config = { ...config, resolvedTestData: synth };
+    }
+
     const generatedFiles: GeneratedFile[] = [];
     const usedNames = new Set<string>();
     const flows: TestPlan['flows'] = [];
@@ -1188,6 +1206,75 @@ ${assertions.map(l => `    ${l}`).join('\n')}
   /** True when the resolved-data index actually carries records. */
   private hasResolvedData(index: Map<string, Map<string, any>>): boolean {
     return index.size > 0;
+  }
+
+  /**
+   * Synthesize a dataset from the test cases themselves when no datasets were
+   * explicitly linked (review priority #2 — a `tests/data/test-data.ts` module
+   * should ship in EVERY ZIP, and the user's request: "add test data same as the
+   * Test Case Lab"). We mine the steps / test_data for dataset references the
+   * authors already wrote, e.g.:
+   *    "Enter valid username from valid_users: standard_user"
+   *    "standard_user from valid_users"
+   * and build an in-memory dataset → records map. Record values carry the
+   * username (the record key is typically the username for these data stores);
+   * a literal password is only stored when one actually appears (otherwise the
+   * generated login falls back to process.env.TEST_PASSWORD, never a fake value).
+   *
+   * Returns a `resolvedTestData`-shaped array (possibly empty). This is a pure,
+   * deterministic fallback — when real linked datasets ARE supplied they always
+   * win and this is never consulted.
+   */
+  private synthesizeResolvedTestData(
+    cases: Array<NonNullable<GenerationConfig['testCase']>>,
+  ): NonNullable<GenerationConfig['resolvedTestData']> {
+    const datasets = new Map<string, Map<string, any>>();
+    const STOP = /^(valid|invalid|the|a|an|username|user|users|password|account|empty|with|from|enter|click|valid_password|placeholder)$/i;
+    const add = (ds: string, key: string, extra: Record<string, any> = {}) => {
+      if (!ds || !key || STOP.test(key) || STOP.test(ds)) return;
+      // Only treat snake/identifier-ish tokens as dataset + record keys.
+      if (!/^[a-zA-Z][\w-]*$/.test(ds) || !/^[a-zA-Z][\w-]*$/.test(key)) return;
+      if (!datasets.has(ds)) datasets.set(ds, new Map());
+      const m = datasets.get(ds)!;
+      const prev = m.get(key) || { username: key };
+      m.set(key, { ...prev, ...extra });
+    };
+
+    for (const tc of cases) {
+      const steps = this.parseTestCaseSteps(tc);
+      const text = `${tc.test_data || ''}\n${steps.join('\n')}`;
+      // "from <dataset>: <record_key>"
+      const reFromColon = /from\s+([a-zA-Z][\w-]*)\s*:\s*([a-zA-Z][\w-]*)/gi;
+      // "<record_key> from <dataset>"
+      const reKeyFrom = /\b([a-zA-Z][\w-]*)\s+from\s+([a-zA-Z][\w-]*)\b/gi;
+      let m: RegExpExecArray | null;
+      while ((m = reFromColon.exec(text))) add(m[1], m[2]);
+      while ((m = reKeyFrom.exec(text))) add(m[2], m[1]);
+    }
+
+    const out: NonNullable<GenerationConfig['resolvedTestData']> = [];
+    for (const [name, recMap] of datasets) {
+      const records = [...recMap.entries()].map(([key, value]) => ({ key, value }));
+      if (records.length) out.push({ name, records });
+    }
+    return out;
+  }
+
+  /**
+   * Build the test-data index for a generation, falling back to a synthesized
+   * dataset (mined from the case text) when no datasets were explicitly linked,
+   * so generated specs always bind via getRecord() and a data module ships.
+   */
+  private buildTestDataIndexWithFallback(
+    config: GenerationConfig,
+    cases: Array<NonNullable<GenerationConfig['testCase']>>,
+  ): Map<string, Map<string, any>> {
+    let index = this.buildTestDataIndex(config);
+    if (index.size === 0) {
+      const synth = this.synthesizeResolvedTestData(cases);
+      if (synth.length) index = this.buildTestDataIndex({ ...config, resolvedTestData: synth });
+    }
+    return index;
   }
 
   /**
@@ -1454,6 +1541,7 @@ export default datasets;
     crawl: CrawlResult,
     fallback: string,
     kind: 'input' | 'button' | 'any',
+    reject?: (el: any) => boolean,
   ): { selector: string; grounded: boolean; confidence: number; source: string } {
     const pool = (crawl.elements || []).filter(el => {
       if (kind === 'input') return el.tag === 'input' || el.tag === 'textarea';
@@ -1464,6 +1552,13 @@ export default datasets;
       const match = this.matchElement(intent, pool.length ? pool : (crawl.elements || []));
       if (match && match.score > 0) {
         const el = match.element;
+        // Semantic-consistency guard (review priority #3 — honest grounding):
+        // reject a matched element that is clearly the WRONG kind of element for
+        // this intent (e.g. "error" resolving to the #user-name input, or "title"
+        // resolving to a product-item link). When rejected we skip it and fall
+        // through to the known-good fallback with grounded=false, so the Locator
+        // Grounding Report tells the truth (N/total) instead of a fake 100%.
+        if (reject && reject(el)) continue;
         // Normalize matchElement's raw score (≈50–150) to a 0–100 confidence.
         const confidence = Math.max(1, Math.min(99, Math.round(match.score / 1.5)));
         // Prefer a stable id selector when present.
@@ -1495,16 +1590,33 @@ export default datasets;
     sel: Record<string, string>;
     tracked: Record<string, { selector: string; grounded: boolean; confidence: number; source: string }>;
   } {
-    const t = (intents: string[], fallback: string, kind: 'input' | 'button' | 'any') =>
-      this.resolveGroundedSelectorTracked(intents, crawl, fallback, kind);
+    const t = (intents: string[], fallback: string, kind: 'input' | 'button' | 'any', reject?: (el: any) => boolean) =>
+      this.resolveGroundedSelectorTracked(intents, crawl, fallback, kind, reject);
+
+    // ── Semantic-consistency guards (review priority #3) ──
+    // An error container is NEVER an input/select field and should look error-ish
+    // — reject a match like the #user-name / #password input being passed off as
+    // the error element.
+    const blob = (el: any) =>
+      `${el?.id ?? ''} ${el?.name ?? ''} ${el?.className ?? el?.attributes?.class ?? ''} ${el?.attributes?.['data-test'] ?? ''} ${el?.dataTestId ?? ''}`.toLowerCase();
+    const rejectError = (el: any) => {
+      if (el?.tag === 'input' || el?.tag === 'select' || el?.tag === 'textarea') return true;
+      const b = blob(el);
+      if (/\b(user|pass|email|login|submit|button)\b|user-name|username|password/.test(b)) return true;
+      // Accept only when something actually signals an error/alert/message region.
+      return !/error|alert|message|invalid|danger|warn|fail/.test(b);
+    };
+    // A page title is NOT a product/item link, cart control, price or image.
+    const rejectTitle = (el: any) => /item|inventory_item|product|add|remove|cart|_link|\blink\b|btn|button|price|img|image|thumbnail/.test(blob(el));
+
     const tracked = {
       username: t(['username', 'user name', 'user-name', 'login'], `page.locator('#user-name')`, 'input'),
       password: t(['password'], `page.locator('#password')`, 'input'),
       login: t(['login button', 'login', 'sign in', 'submit'], `page.locator('#login-button')`, 'button'),
-      error: t(['error', 'error message'], `page.locator('[data-test="error"]')`, 'any'),
+      error: t(['error', 'error message'], `page.locator('[data-test="error"]')`, 'any', rejectError),
       menu: t(['menu', 'burger menu', 'hamburger', 'open menu'], `page.locator('#react-burger-menu-btn')`, 'button'),
       logout: t(['logout', 'log out', 'sign out'], `page.locator('#logout_sidebar_link')`, 'any'),
-      title: t(['title', 'page title', 'products', 'header'], `page.locator('[data-test="title"]')`, 'any'),
+      title: t(['title', 'page title', 'products', 'header'], `page.locator('[data-test="title"]')`, 'any', rejectTitle),
       product: t(['product', 'item name', 'product name'], `page.locator('.inventory_item_name')`, 'any'),
       cart: t(['cart', 'shopping cart', 'cart icon', 'basket'], `page.locator('.shopping_cart_link')`, 'any'),
       inventoryItem: t(['inventory item', 'product card', 'item'], `page.locator('.inventory_item')`, 'any'),
@@ -1820,6 +1932,7 @@ ${userDecl}    // Two isolated sessions, each with its own cookies/storage.
           ? `${ctx.data.varName}.password ?? ''`
           : ctx.creds.password ? `'${escapeStr(ctx.creds.password)}'` : `process.env.TEST_PASSWORD ?? ''`;
         const filtered: string[] = [];
+        let navDropped = false;
         for (let i = 0; i < work.length; i++) {
           const l = work[i];
           // Drop the leading step comment for fills/login-click.
@@ -1829,6 +1942,17 @@ ${userDecl}    // Two isolated sessions, each with its own cookies/storage.
           if (/\.fill\(/i.test(l) && /#user-name|username|#password|\bpwd\b|\bpass\b/i.test(l)) continue;
           // Drop the login click and its trailing waitForLoadState.
           if (/login.*button|#login-button/i.test(l) && /\.click\(/i.test(l)) {
+            if (/page\.waitForLoadState/i.test(work[i + 1] || '')) i++;
+            continue;
+          }
+          // Review issue #1 — duplicate navigation: the Page Object's login()
+          // already navigates to the app, so the INITIAL navigate step is
+          // redundant. Drop the first page.goto() (plus its leading "// Navigate"
+          // comment and trailing waitForLoadState). Only the first one is removed
+          // so a later goto (e.g. navigating to a cart/checkout page) is kept.
+          if (!navDropped && /await\s+page\.goto\s*\(/i.test(l)) {
+            navDropped = true;
+            if (filtered.length && /^\s*\/\/\s*navigat/i.test(filtered[filtered.length - 1])) filtered.pop();
             if (/page\.waitForLoadState/i.test(work[i + 1] || '')) i++;
             continue;
           }
@@ -1923,16 +2047,18 @@ ${userDecl}    // Two isolated sessions, each with its own cookies/storage.
     steps: string[],
     ctx: { url: string; creds: { username: string; password: string }; sel: Record<string, string>; data?: { varName: string; ref: string; hasUsername: boolean; hasPassword: boolean } },
     index: Map<string, Map<string, any>>,
-  ): string[] {
+    pos: Array<{ name: string; varName: string; methods: string[]; kind: string }> = [],
+  ): { lines: string[]; used: Set<string> } {
+    const used = new Set<string>();
     const pre = `${tc.preconditions || ''}`.toLowerCase();
     const impliesAuth = /log(ged)? ?in|authenticat|signed in|valid session|active session/.test(pre);
-    if (!impliesAuth) return [];
+    if (!impliesAuth) return { lines: [], used };
 
     // Does the body already perform a login? If so, don't double up.
     const stepText = steps.join('\n').toLowerCase();
     const stepsHaveLogin = /log ?in with|sign in with/.test(stepText)
       || (/(user( ?name)?)/.test(stepText) && /(click|submit|press).*(login|log in|sign in|submit)/.test(stepText));
-    if (stepsHaveLogin) return [];
+    if (stepsHaveLogin) return { lines: [], used };
 
     // Choose credentials: reuse the case's resolved `user` when it's a valid
     // login; else resolve a valid record from the index; else literal fallback.
@@ -1957,6 +2083,22 @@ ${userDecl}    // Two isolated sessions, each with its own cookies/storage.
     const lines: string[] = [];
     lines.push(`// Precondition: ${this.escapeBlockComment(tc.preconditions || 'user is logged in')}`);
     if (localDecls.length) lines.push(...localDecls);
+
+    // Review issue #2 — reuse the repo's high-level login() Page Object method
+    // for the precondition setup instead of re-emitting the raw
+    // #user-name / #password / #login-button triad. login() also navigates, so
+    // no separate page.goto() is needed. Falls back to the raw triad only when
+    // no login Page Object with a login() method was matched.
+    const loginPO = pos.find((p) => p.kind === 'login');
+    const loginMethod = loginPO ? this.findPoMethod(loginPO.methods, /^log[_]?in$/i) : null;
+    if (loginPO && loginMethod) {
+      lines.push(`await ${loginPO.varName}.${loginMethod}(${unameExpr}, ${pwdExpr});`);
+      lines.push(`await expect(page).toHaveURL(/inventory\\.html/);`);
+      lines.push('');
+      used.add(loginPO.varName);
+      return { lines, used };
+    }
+
     lines.push(`await page.goto('${escapeStr(ctx.url)}');`);
     lines.push(`await page.waitForLoadState('domcontentloaded');`);
     lines.push(`await ${ctx.sel.username}.fill(${unameExpr});`);
@@ -1965,7 +2107,7 @@ ${userDecl}    // Two isolated sessions, each with its own cookies/storage.
     lines.push(`await page.waitForLoadState('domcontentloaded');`);
     lines.push(`await expect(page).toHaveURL(/inventory\\.html/);`);
     lines.push('');
-    return lines;
+    return { lines, used };
   }
 
   /**
@@ -2241,9 +2383,20 @@ ${userDecl}    // Two isolated sessions, each with its own cookies/storage.
     }
 
     if (isError) {
+      // Review priority #1 — a negative case must assert the ERROR container
+      // (never the username input) AND verify the actual message. When the
+      // expected text doesn't quote a message, derive a deterministic fragment
+      // from the case intent so invalid / locked / empty all assert meaningfully.
+      let frag = messageFrag;
+      if (!frag) {
+        const hay = `${lc} ${`${_tc.title || ''}`.toLowerCase()} ${`${_tc.test_data || ''}`.toLowerCase()}`;
+        if (/locked|account is locked/.test(hay)) frag = 'locked out';
+        else if (/empty|required|blank|cannot be (empty|blank)|no .*(username|password)/.test(hay)) frag = 'is required';
+        else if (/do not match|not match|invalid|incorrect|wrong|bad credential/.test(hay)) frag = 'do not match';
+      }
       lines.push(`await expect(${ctx.sel.error}).toBeVisible();`);
-      if (messageFrag) {
-        lines.push(`await expect(${ctx.sel.error}).toContainText('${escapeStr(messageFrag)}');`);
+      if (frag) {
+        lines.push(`await expect(${ctx.sel.error}).toContainText('${escapeStr(frag)}');`);
       }
       // A failed/invalid login must KEEP the user on the login page.
       lines.push(`await expect(page).toHaveURL('${escapeStr(ctx.url)}');`);
