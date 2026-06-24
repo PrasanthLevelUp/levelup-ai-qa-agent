@@ -35,6 +35,11 @@ import { AIEngine } from '../engines/ai-engine';
 import { OpenAIClient } from '../ai/openai-client';
 import { ValidationLayer } from '../validation/validation-layer';
 import { acceptCandidate, type LiveValidationInput } from '../core/healing-acceptance';
+import {
+  HealingTrailBuilder,
+  summarizeHealingTrails,
+  type HealingTrail,
+} from '../core/healing-trail';
 import { generateReport, type ReportData, type ReportTest, type ReportHealing } from '../reports/html-report';
 import { RCAEngine, type RCAResult } from '../engines/rca-engine';
 import { createRCARouter } from './routes/rca';
@@ -552,6 +557,9 @@ function createHealingWorker(
     const healings: ReportHealing[] = [];
     const tests: ReportTest[] = [];
     const rcaResults: RCAResult[] = [];
+    // Per-failure 3-layer healing trail (observability): records what each healing
+    // layer tried and why it succeeded/failed — even when nothing was healable.
+    const healingTrails: HealingTrail[] = [];
     let healedCount = 0;
     let totalTokensUsed = 0;
 
@@ -644,6 +652,10 @@ function createHealingWorker(
       let lastConfidence = 0;
       let iterFixCount = 0;
 
+      // Observability: build a concise 3-layer trail for this failure regardless
+      // of whether anything is healable. Finalized after the healing branches.
+      const trail = new HealingTrailBuilder(failure.testName, failure.failureType);
+
       try {
         // Decide healing strategy based on failure type:
         // - assertion: Element found but assertion failed → add waits only, no locator change
@@ -654,6 +666,7 @@ function createHealingWorker(
           logger.info(MOD, 'Skipping healing — navigation/network error', {
             testName: failure.testName,
           });
+          trail.skip('Navigation/network error — page or site failed to load. Out of scope for locator healing (environment/infra issue).');
           restoreFile(failure.filePath);
         } else if (failure.failureType === 'assertion' || failure.failureType === 'timeout') {
           logger.info(MOD, 'Skipping locator healing — assertion failure (element found, assertion failed)', {
@@ -681,6 +694,13 @@ function createHealingWorker(
                   iterationSuccess = true;
                   healedCount++;
                   iterFixCount = 1;
+                  trail.record({
+                    layer: 'rule_based',
+                    candidate: "waitForLoadState('networkidle')",
+                    confidence: 0.85,
+                    decision: 'applied',
+                    reason: 'Timing-related assertion — injected explicit wait, test passed on rerun.',
+                  });
                   await updateExecution(executionId, { healing_succeeded: true, status: 'healed' });
                   healings.push({
                     testName: failure.testName,
@@ -697,6 +717,12 @@ function createHealingWorker(
                   if (testRow) { testRow.healed = true; testRow.status = 'healed'; }
                   cleanupBackup(failure.filePath);
                 } else {
+                  trail.record({
+                    layer: 'rule_based',
+                    candidate: "waitForLoadState('networkidle')",
+                    decision: 'rerun_failed',
+                    reason: 'Injected explicit wait, but the assertion still failed — not a timing issue.',
+                  });
                   restoreFile(failure.filePath);
                 }
               }
@@ -704,6 +730,16 @@ function createHealingWorker(
           }
 
           if (!iterationSuccess) {
+            // Non-timing assertion/timeout failure: element was found but the
+            // assertion did not match (or generic timeout). Nothing to heal.
+            // Only add the "skipped" note if no wait-injection attempt was recorded.
+            if (trail.attemptCount === 0) {
+              trail.skip(
+                failure.failureType === 'assertion'
+                  ? 'Assertion/functional failure — element found but assertion did not match. Not a locator issue (real product/data defect).'
+                  : 'Generic timeout not tied to a specific locator — no locator candidate to heal.',
+              );
+            }
             restoreFile(failure.filePath);
           }
 
@@ -802,6 +838,13 @@ function createHealingWorker(
               logger.warn(MOD, 'No more suggestions for this locator', {
                 iteration, retry, testName: failure.testName,
               });
+              trail.record({
+                layer: (outcome.attemptedStrategies?.[outcome.attemptedStrategies.length - 1]) ?? 'ai_reasoning',
+                decision: 'no_candidate',
+                reason: `No viable candidate from ${outcome.attemptedStrategies?.length
+                  ? outcome.attemptedStrategies.join(' → ')
+                  : 'any layer'} — exhausted suggestions for this locator.`,
+              });
               break;
             }
 
@@ -811,12 +854,26 @@ function createHealingWorker(
               logger.warn(MOD, 'Acceptance pre-check rejected', {
                 iteration, retry, reason: preCheck.reason, locator: outcome.suggestion.newLocator,
               });
+              trail.record({
+                layer: outcome.suggestion.strategy,
+                candidate: outcome.suggestion.newLocator,
+                confidence: outcome.suggestion.confidence,
+                decision: 'rejected',
+                reason: `Acceptance pre-check rejected: ${preCheck.reason}`,
+              });
               continue; // Skip this suggestion entirely
             }
 
             const validation = validationLayer.validate(outcome.suggestion, failure);
             if (!validation.approved || !validation.updatedContent) {
               logger.warn(MOD, 'Validation rejected', { iteration, retry, reason: validation.reason });
+              trail.record({
+                layer: outcome.suggestion.strategy,
+                candidate: outcome.suggestion.newLocator,
+                confidence: outcome.suggestion.confidence,
+                decision: 'rejected',
+                reason: `Validation layer rejected: ${validation.reason ?? 'no reason given'}`,
+              });
               continue; // Try next suggestion without reverting (no file change made)
             }
 
@@ -1218,6 +1275,22 @@ function createHealingWorker(
         if (fs.existsSync(backupPath)) cleanupBackup(failure.filePath);
       }
 
+      // --- Finalize the 3-layer healing trail for this failure ---
+      // If the failure was healed via the locator loop, synthesize the winning
+      // "applied" attempt from the recorded strategy/confidence + healed entry
+      // (the deep rerun branches don't record it inline).
+      if (iterationSuccess && !trail.hasApplied) {
+        const healedEntry = healings.find((h) => h.testName === failure.testName && h.success);
+        trail.record({
+          layer: lastStrategy,
+          candidate: healedEntry?.healedLocator,
+          confidence: lastConfidence || healedEntry?.confidence,
+          decision: 'applied',
+          reason: 'Candidate applied and the test passed on rerun.',
+        });
+      }
+      healingTrails.push(trail.finalize(iterationSuccess ? 'healed' : 'not_healed'));
+
       // --- RCA Analysis for this failure ---
       if (rcaEngine) {
         try {
@@ -1404,6 +1477,9 @@ function createHealingWorker(
       tokensUsed: totalTokensUsed,
       testResults: tests,
       healingActions: healings,
+      // 3-layer healing observability: per-failure attempt trail + honest summary.
+      healingTrails,
+      healingSummary: summarizeHealingTrails(healingTrails),
       rcaAnalyses: rcaResults.map((r) => ({
         testName: r.summary.split(':')[0] || 'unknown',
         classification: r.classification,

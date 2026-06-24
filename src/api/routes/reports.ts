@@ -40,6 +40,8 @@ export function createReportsRouter(jobQueue: JobQueue): Router {
       status: job.status,
       testResults: job.result?.testResults ?? {},
       healingActions: job.result?.healingActions ?? [],
+      healingTrails: job.result?.healingTrails ?? [],
+      healingSummary: job.result?.healingSummary ?? null,
       summary: {
         totalTests: job.result?.totalTests ?? 0,
         failed: job.result?.failed ?? 0,
