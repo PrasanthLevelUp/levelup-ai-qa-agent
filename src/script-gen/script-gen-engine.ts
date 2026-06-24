@@ -707,7 +707,15 @@ export class ScriptGenEngine {
     // When a record was resolved, expose it as `user` (const ref in the test
     // body) so fills read `user.username` / `user.password`.
     const dataRef = caseData
-      ? { varName: 'user', ref: caseData.ref, hasUsername: caseData.value?.username != null || caseData.value?.user != null, hasPassword: caseData.value?.password != null || caseData.value?.pass != null }
+      ? {
+          varName: 'user',
+          ref: caseData.ref,
+          hasUsername: caseData.value?.username != null || caseData.value?.user != null,
+          // Review fix: treat a record as "having password" when the password field
+          // EXISTS (even if undefined), so synthesized records (which carry
+          // `password: undefined`) trigger the `user.password ?? env` fallback.
+          hasPassword: 'password' in (caseData.value || {}) || 'pass' in (caseData.value || {}),
+        }
       : undefined;
 
     const title = tc.title || 'Generated test';
@@ -753,7 +761,7 @@ export class ScriptGenEngine {
     // lines are preserved verbatim (graceful fallback, no hallucinated methods).
     let finalLines = lines;
     if (matchedPOs.length) {
-      const applied = this.applyPageObjectActions(lines, matchedPOs, { creds, data: dataRef });
+      const applied = this.applyPageObjectActions(lines, matchedPOs, { creds, data: dataRef }, dataIndex);
       finalLines = applied.lines;
       applied.used.forEach((v) => usedPOVars.add(v));
     }
@@ -1236,7 +1244,11 @@ ${assertions.map(l => `    ${l}`).join('\n')}
       if (!/^[a-zA-Z][\w-]*$/.test(ds) || !/^[a-zA-Z][\w-]*$/.test(key)) return;
       if (!datasets.has(ds)) datasets.set(ds, new Map());
       const m = datasets.get(ds)!;
-      const prev = m.get(key) || { username: key };
+      // Review fix (consistent dataset usage): synthesized records always carry
+      // BOTH username AND password fields (password omitted → falls back to env at
+      // runtime) so ctx.data.hasPassword is true and applyPageObjectActions uses
+      // the bound record instead of falling back to literal 'standard_user'.
+      const prev = m.get(key) || { username: key, password: undefined };
       m.set(key, { ...prev, ...extra });
     };
 
@@ -1906,6 +1918,7 @@ ${userDecl}    // Two isolated sessions, each with its own cookies/storage.
     lines: string[],
     pos: Array<{ name: string; varName: string; methods: string[]; kind: string }>,
     ctx: { creds: { username: string; password: string }; data?: { varName: string; ref: string; hasUsername: boolean; hasPassword: boolean } },
+    index: Map<string, Map<string, any>>,
   ): { lines: string[]; used: Set<string> } {
     const used = new Set<string>();
     let work = [...lines];
@@ -1925,12 +1938,28 @@ ${userDecl}    // Two isolated sessions, each with its own cookies/storage.
       const hasPassFill = work.some((l) => /#password|\bpwd\b|\bpass\b/i.test(l) && /\.fill\(/i.test(l));
       const hasLoginClick = work.some((l) => /login.*button|#login-button/i.test(l) && /\.click\(/i.test(l));
       if (loginMethod && hasUserFill && hasPassFill && hasLoginClick) {
-        const u = ctx.data?.varName && ctx.data.hasUsername
-          ? `${ctx.data.varName}.username ?? ''`
-          : ctx.creds.username ? `'${escapeStr(ctx.creds.username)}'` : `process.env.TEST_USERNAME ?? ''`;
-        const p = ctx.data?.varName && ctx.data.hasPassword
-          ? `${ctx.data.varName}.password ?? ''`
-          : ctx.creds.password ? `'${escapeStr(ctx.creds.password)}'` : `process.env.TEST_PASSWORD ?? ''`;
+        // Review fix: consistent dataset usage — prefer Test Data Store records
+        // over hardcoded literals (same pattern as precondition builder). Priority:
+        //   1. Case-specific data binding (ctx.data) when present.
+        //   2. Generic valid user from the test data index (getRecord('valid_users')).
+        //   3. Literal fallback (ctx.creds or process.env).
+        let u: string;
+        let p: string;
+        const localDecls: string[] = [];
+        if (ctx.data?.varName && ctx.data.hasUsername && ctx.data.hasPassword) {
+          u = `${ctx.data.varName}.username ?? ''`;
+          p = `${ctx.data.varName}.password ?? ''`;
+        } else {
+          const valid = this.resolveValidUserRecord(index);
+          if (valid && valid.value?.username != null && valid.value?.password != null) {
+            localDecls.push(`const user = ${valid.ref};`);
+            u = `user.username ?? ''`;
+            p = `user.password ?? ''`;
+          } else {
+            u = ctx.creds.username ? `'${escapeStr(ctx.creds.username)}'` : `process.env.TEST_USERNAME ?? ''`;
+            p = ctx.creds.password ? `'${escapeStr(ctx.creds.password)}'` : `process.env.TEST_PASSWORD ?? ''`;
+          }
+        }
         const filtered: string[] = [];
         let navDropped = false;
         for (let i = 0; i < work.length; i++) {
@@ -1958,7 +1987,7 @@ ${userDecl}    // Two isolated sessions, each with its own cookies/storage.
           }
           filtered.push(l);
         }
-        work = [`await ${loginPO.varName}.${loginMethod}(${u}, ${p});`, ...filtered];
+        work = [...localDecls, `await ${loginPO.varName}.${loginMethod}(${u}, ${p});`, ...filtered];
         used.add(loginPO.varName);
       }
     }
@@ -2091,9 +2120,18 @@ ${userDecl}    // Two isolated sessions, each with its own cookies/storage.
     // no login Page Object with a login() method was matched.
     const loginPO = pos.find((p) => p.kind === 'login');
     const loginMethod = loginPO ? this.findPoMethod(loginPO.methods, /^log[_]?in$/i) : null;
+    
+    // Review fix: duplicate assertions — only emit the post-login URL check when
+    // the test's expected_result doesn't already verify the same thing (avoids
+    // three identical toHaveURL checks stacking from precondition + body + assertions).
+    const expected = `${tc.expected_result || ''}`.toLowerCase();
+    const alreadyChecksInventoryUrl = /inventory|navigate.*inventory|redirect.*inventory|url.*inventory/i.test(expected);
+    
     if (loginPO && loginMethod) {
       lines.push(`await ${loginPO.varName}.${loginMethod}(${unameExpr}, ${pwdExpr});`);
-      lines.push(`await expect(page).toHaveURL(/inventory\\.html/);`);
+      if (!alreadyChecksInventoryUrl) {
+        lines.push(`await expect(page).toHaveURL(/inventory\\.html/);`);
+      }
       lines.push('');
       used.add(loginPO.varName);
       return { lines, used };
@@ -2105,7 +2143,9 @@ ${userDecl}    // Two isolated sessions, each with its own cookies/storage.
     lines.push(`await ${ctx.sel.password}.fill(${pwdExpr});`);
     lines.push(`await ${ctx.sel.login}.click();`);
     lines.push(`await page.waitForLoadState('domcontentloaded');`);
-    lines.push(`await expect(page).toHaveURL(/inventory\\.html/);`);
+    if (!alreadyChecksInventoryUrl) {
+      lines.push(`await expect(page).toHaveURL(/inventory\\.html/);`);
+    }
     lines.push('');
     return { lines, used };
   }
