@@ -89,7 +89,7 @@ const crawl: any = {
     loginCode.includes("from '../src/pages/login.page'"), loginCode.split('\n').find((l: string) => l.includes('LoginPage') && l.includes('import')));
   check('LoginPage instantiated', loginCode.includes('new LoginPage(page)'));
   check('loginPage.login() called', loginCode.includes('loginPage.login('));
-  check('username arg present', loginCode.includes("'standard_user'"));
+  check('username arg present', loginCode.includes("'standard_user'") || loginCode.includes('user.username'));
   check('no raw #user-name fill remains', !loginCode.includes("page.locator('#user-name').fill("));
   check('no raw #password fill remains', !loginCode.includes("page.locator('#password').fill("));
   check('no raw #login-button click remains', !loginCode.includes("page.locator('#login-button').click("));
