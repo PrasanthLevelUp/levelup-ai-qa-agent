@@ -206,6 +206,54 @@ const crawl: any = {
   check('no PO import without profile', !rawCode.includes('LoginPage'));
   check('raw locators emitted as fallback', rawCode.includes("page.locator('#user-name').fill("));
 
+  /* ──────────────── Repository Intelligence metadata exposure ──────────────── */
+  console.log('\n=== Repository Intelligence metadata (PR #142 completion) ===');
+  // Generate a login flow that uses multiple Page Objects
+  const withRepoIntel = await engine.generate({
+    url: 'https://www.saucedemo.com', cachedCrawlData: crawl, repoProfile,
+    testCase: {
+      id: 7, title: 'Full flow with multiple POs',
+      steps: [
+        'Navigate to https://www.saucedemo.com',
+        'Enter username standard_user',
+        'Enter password secret_sauce',
+        'Click the login button',
+        'Verify inventory page is loaded',
+        'Add item to cart',
+        'Open cart',
+        'Complete checkout',
+      ],
+      expected_result: 'Order placed successfully',
+      test_data: 'standard_user',
+    },
+  });
+
+  check('repositoryIntelligence field is present', !!withRepoIntel.repositoryIntelligence);
+  const ri = withRepoIntel.repositoryIntelligence!;
+  check('pageObjects array is populated', ri.pageObjects.length > 0, `found ${ri.pageObjects.length} POs`);
+  check('totalAvailable count is correct', ri.totalAvailable === 4, `expected 4, got ${ri.totalAvailable}`);
+
+  // Verify LoginPage metadata
+  const loginPO = ri.pageObjects.find(po => po.name === 'LoginPage');
+  check('LoginPage discovered', !!loginPO);
+  check('LoginPage methods exposed', loginPO?.methods.includes('login'), `methods: ${loginPO?.methods.join(', ')}`);
+  check('LoginPage filePath exposed', loginPO?.filePath === 'src/pages/login.page.ts', `got: ${loginPO?.filePath}`);
+  check('LoginPage importPath exposed', loginPO?.importPath === '../src/pages/login.page', `got: ${loginPO?.importPath}`);
+  check('LoginPage marked as used', loginPO?.used === true, `used: ${loginPO?.used}`);
+
+  // Verify all 4 Page Objects are present
+  const poNames = ri.pageObjects.map(po => po.name).sort();
+  const expectedNames = ['CartPage', 'CheckoutPage', 'InventoryPage', 'LoginPage'];
+  check('all 4 POs discovered', JSON.stringify(poNames) === JSON.stringify(expectedNames), `got: ${poNames.join(', ')}`);
+
+  // Verify totalUsed reflects actual usage (only Login PO method is called in this flow)
+  check('totalUsed reflects real usage', ri.totalUsed >= 1, `got ${ri.totalUsed} used`);
+
+  // Verify each PO has non-empty methods array
+  for (const po of ri.pageObjects) {
+    check(`${po.name} has methods`, po.methods.length > 0, `methods: ${po.methods.join(', ')}`);
+  }
+
   console.log(`\n=== Results: ${passed} passed, ${failed} failed ===`);
   if (failed > 0) process.exit(1);
 })();

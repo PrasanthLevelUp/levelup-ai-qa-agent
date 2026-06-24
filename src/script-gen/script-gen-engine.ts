@@ -166,6 +166,35 @@ export interface GenerationResult {
    * route surface a truthful "REAL LOCATORS x/y" metric and a grounding report.
    */
   locatorGrounding?: LocatorGroundingReport;
+  /**
+   * Repository Intelligence applied during generation — shows which Page Objects
+   * were discovered and their available methods. Lets users understand why a
+   * specific method was chosen. Present only when repo profile is available.
+   */
+  repositoryIntelligence?: RepositoryIntelligenceReport;
+}
+
+/** Page Object metadata exposed for transparency and debugging. */
+export interface PageObjectMetadata {
+  /** Page Object class name (e.g. "LoginPage") */
+  name: string;
+  /** File path in the repository (e.g. "src/pages/login.page.ts") */
+  filePath: string;
+  /** Available methods on this Page Object (e.g. ["login", "logout", "verifyError"]) */
+  methods: string[];
+  /** Import path used in generated code (e.g. "../src/pages/login.page") */
+  importPath: string;
+  /** Whether this PO was actually used in the generated script */
+  used: boolean;
+}
+
+export interface RepositoryIntelligenceReport {
+  /** Page Objects discovered from the repository scan */
+  pageObjects: PageObjectMetadata[];
+  /** Total number of Page Objects available in the repo */
+  totalAvailable: number;
+  /** Number of Page Objects actually used in generated code */
+  totalUsed: number;
 }
 
 export interface GeneratedFile {
@@ -829,7 +858,7 @@ ${assertions.map(l => `    ${l}`).join('\n')}
 
     const totalAssertions = assertions.filter(a => /\bexpect\s*\(/.test(a)).length;
     const grounding = this.buildLocatorGroundingReport(tracked, content);
-    return this.buildTcResult(tc, title, baseUrl, crawl, tags, generatedFiles, totalAssertions, startTime, grounding);
+    return this.buildTcResult(tc, title, baseUrl, crawl, tags, generatedFiles, totalAssertions, startTime, grounding, matchedPOs, usedPOVars);
   }
 
   /** Assemble a single-case GenerationResult (test plan + stats). */
@@ -843,6 +872,8 @@ ${assertions.map(l => `    ${l}`).join('\n')}
     totalAssertions: number,
     startTime: number,
     locatorGrounding?: LocatorGroundingReport,
+    matchedPOs?: Array<{ name: string; varName: string; filePath: string; methods: string[]; importPath: string; kind: string }>,
+    usedPOVars?: Set<string>,
   ): GenerationResult {
     // Real selector quality = grounded locators / total locators (0–1), derived
     // from what the spec actually uses — never the old hardcoded 0.
@@ -874,6 +905,25 @@ ${assertions.map(l => `    ${l}`).join('\n')}
       },
     };
 
+    // ── Build Repository Intelligence Report ──
+    // Expose which Page Objects were discovered and their methods for transparency.
+    let repositoryIntelligence: RepositoryIntelligenceReport | undefined;
+    if (matchedPOs && matchedPOs.length > 0) {
+      const usedSet = usedPOVars || new Set<string>();
+      const pageObjects: PageObjectMetadata[] = matchedPOs.map((po) => ({
+        name: po.name,
+        filePath: po.filePath,
+        methods: po.methods,
+        importPath: po.importPath,
+        used: usedSet.has(po.varName),
+      }));
+      repositoryIntelligence = {
+        pageObjects,
+        totalAvailable: matchedPOs.length,
+        totalUsed: pageObjects.filter((po) => po.used).length,
+      };
+    }
+
     return {
       testPlan,
       generatedFiles,
@@ -889,6 +939,7 @@ ${assertions.map(l => `    ${l}`).join('\n')}
       },
       errors: [],
       ...(locatorGrounding ? { locatorGrounding } : {}),
+      ...(repositoryIntelligence ? { repositoryIntelligence } : {}),
     };
   }
 
@@ -910,6 +961,7 @@ ${assertions.map(l => `    ${l}`).join('\n')}
     let totalTests = 0;
     const errors: string[] = [];
     const groundingReports: LocatorGroundingReport[] = [];
+    const repoIntelReports: RepositoryIntelligenceReport[] = [];
 
     for (const tc of cases) {
       try {
@@ -920,6 +972,7 @@ ${assertions.map(l => `    ${l}`).join('\n')}
           continue;
         }
         if (single.locatorGrounding) groundingReports.push(single.locatorGrounding);
+        if (single.repositoryIntelligence) repoIntelReports.push(single.repositoryIntelligence);
         for (const f of single.generatedFiles) {
           // The shared test-data module is identical across cases — emit it
           // once, never rename it (specs import a fixed './data/test-data' path).
@@ -955,6 +1008,9 @@ ${assertions.map(l => `    ${l}`).join('\n')}
       ? locatorGrounding.groundedCount / locatorGrounding.total
       : 0;
 
+    // Aggregate repository intelligence across all cases (de-duplicate Page Objects).
+    const repositoryIntelligence = this.mergeRepoIntelligence(repoIntelReports);
+
     const reqLabel = cases[0]?.requirement_id ? `requirement ${cases[0].requirement_id}` : 'requirement';
     const testPlan: TestPlan = {
       name: `Test Plan: ${reqLabel} (${generatedFiles.length} cases)`,
@@ -989,6 +1045,7 @@ ${assertions.map(l => `    ${l}`).join('\n')}
       },
       errors,
       ...(locatorGrounding.total > 0 ? { locatorGrounding } : {}),
+      ...(repositoryIntelligence ? { repositoryIntelligence } : {}),
     };
   }
 
@@ -1505,6 +1562,35 @@ export default datasets;
     const total = entries.length;
     const groundedPct = total ? Math.round((groundedCount / total) * 100) : 0;
     return { entries, total, groundedCount, groundedPct, avgConfidence };
+  }
+
+  /**
+   * Merge repository intelligence reports from multiple test cases. De-duplicates
+   * Page Objects by name and aggregates usage (a PO is marked "used" if ANY case
+   * used it). Returns undefined when no reports were provided.
+   */
+  private mergeRepoIntelligence(reports: RepositoryIntelligenceReport[]): RepositoryIntelligenceReport | undefined {
+    if (!reports.length) return undefined;
+
+    const poByName = new Map<string, PageObjectMetadata>();
+    for (const r of reports) {
+      for (const po of r.pageObjects) {
+        const existing = poByName.get(po.name);
+        if (!existing) {
+          poByName.set(po.name, { ...po });
+        } else {
+          // Aggregate: if ANY case used this PO, mark it as used.
+          existing.used = existing.used || po.used;
+        }
+      }
+    }
+
+    const pageObjects = [...poByName.values()];
+    return {
+      pageObjects,
+      totalAvailable: pageObjects.length,
+      totalUsed: pageObjects.filter((po) => po.used).length,
+    };
   }
 
   /**
