@@ -162,13 +162,34 @@ export class ExecutionEngine {
   }
 
   /**
+   * Detect whether `xvfb-run` is available on the host. When present we wrap the
+   * Playwright command with it so customer configs that use `headless: false`
+   * (no `$DISPLAY` in a CI/Docker runner) still launch a browser instead of
+   * crashing at startup with "Missing X server or $DISPLAY".
+   */
+  private static hasXvfb(): boolean {
+    try {
+      const { execSync } = require('child_process');
+      execSync('command -v xvfb-run', { stdio: 'ignore' });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
    * Synchronous run method (backward compatible for orchestrator).
    * Always uses `npx playwright test` to resolve both local and global playwright.
    *
-   * IMPORTANT: We do NOT pass --reporter=json on the CLI because that overrides
-   * the playwright.config's reporters and sends JSON to stdout instead of a file.
-   * Instead, we rely on the config's ['json', { outputFile: 'test-results.json' }].
-   * If the config doesn't produce the file, we write stdout as a fallback.
+   * ROBUSTNESS: We MUST NOT rely on the customer's playwright.config providing a
+   * JSON reporter or headless mode — arbitrary repos won't. So we:
+   *   1. Force `--reporter=json` and point its output at `test-results.json` via
+   *      `PLAYWRIGHT_JSON_OUTPUT_NAME` (writes a FILE, not stdout). This overrides
+   *      whatever reporters the repo configured (e.g. html-only) so artifact
+   *      collection always has a results file to parse.
+   *   2. Wrap the command in `xvfb-run -a` when available, so configs that set
+   *      `headless: false` still run under a virtual X server instead of failing
+   *      to launch the browser in a headless runner.
    */
   static run(repoPath: string, testFile?: string, grepFilter?: string): RunResult {
     const { execSync } = require('child_process');
@@ -176,18 +197,25 @@ export class ExecutionEngine {
     const startTime = new Date().toISOString();
     const start = Date.now();
 
-    // Do NOT pass --reporter — let playwright.config.ts handle it
-    // The config should have: reporter: [['json', { outputFile: 'test-results.json' }]]
+    // Force the JSON reporter to a known file regardless of the repo's config.
+    // PLAYWRIGHT_JSON_OUTPUT_NAME makes the json reporter write to a file (it
+    // would otherwise stream JSON to stdout when invoked via --reporter=json).
     let cmd = testFile
-      ? `npx playwright test "${testFile}"`
-      : `npx playwright test`;
+      ? `npx playwright test "${testFile}" --reporter=json`
+      : `npx playwright test --reporter=json`;
 
     // --grep isolates a single test by name for efficient per-test reruns
     if (grepFilter) {
       cmd += ` --grep "${grepFilter.replace(/"/g, '\\"')}"`;
     }
 
-    logger.info(MOD, 'Executing Playwright tests (sync)', { repoPath, cmd });
+    // Wrap with xvfb-run so `headless: false` configs work without a real display.
+    const useXvfb = ExecutionEngine.hasXvfb();
+    if (useXvfb) {
+      cmd = `xvfb-run -a ${cmd}`;
+    }
+
+    logger.info(MOD, 'Executing Playwright tests (sync)', { repoPath, cmd, useXvfb });
 
     let stdout = '';
     let stderr = '';
@@ -197,7 +225,11 @@ export class ExecutionEngine {
       stdout = execSync(cmd, {
         cwd: repoPath,
         encoding: 'utf-8',
-        env: process.env,
+        env: {
+          ...process.env,
+          // Write the JSON report to repoPath/test-results.json (relative to cwd).
+          PLAYWRIGHT_JSON_OUTPUT_NAME: 'test-results.json',
+        },
         timeout: 600_000, // 10 minutes — tests run against live sites
         maxBuffer: 10_000_000,
         stdio: ['pipe', 'pipe', 'pipe'],
@@ -212,11 +244,14 @@ export class ExecutionEngine {
     const endTime = new Date().toISOString();
     const durationMs = Date.now() - start;
 
-    // If the config's JSON reporter didn't create the file, try writing stdout as fallback
+    // Defensive fallback: if the forced JSON reporter still didn't create the
+    // file (e.g. a fatal startup crash before the reporter initialised), try to
+    // recover JSON that may have been streamed to stdout instead.
     if (!fs.existsSync(resultsFile)) {
-      logger.warn(MOD, 'test-results.json not found from config reporter', {
+      logger.warn(MOD, 'test-results.json not found after forced json reporter', {
         stdoutLength: stdout.length,
         stderrLength: stderr.length,
+        stderrSample: stderr.slice(0, 300),
       });
       // If stdout contains JSON (from --reporter=json or stdout capture), write it
       const trimmed = stdout.trim();

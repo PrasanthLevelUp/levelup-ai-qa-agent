@@ -804,11 +804,21 @@ export class ScriptGenEngine {
     // about:blank and fail. If nothing navigates yet the body touches the page,
     // prepend a goto so the test starts on the real base URL.
     const navLines: string[] = [];
-    const bodyTouchesPage = [...preLines, ...finalLines].some(l => /\bpage\.(locator|getBy|fill|click|goto)\b/.test(l));
-    // A page.goto() OR a high-level Page Object login() (which navigates) both
-    // count as the test having an entry navigation — so we don't prepend a
-    // redundant goto on top of a login() that already lands on the app.
-    const bodyNavigates = [...preLines, ...finalLines].some(l => /\bpage\.goto\s*\(/.test(l) || /\.login\s*\(/.test(l));
+    // The body "touches the page" if it calls page.* OR a matched Page Object
+    // method (e.g. `loginPage.login(...)`). PO calls drive the page just like raw
+    // page.* calls do, so they also require the test to have navigated first.
+    const bodyUsesPO = matchedPOs.some((po) =>
+      [...preLines, ...finalLines].some((l) => new RegExp(`\\b${po.varName}\\.`).test(l)),
+    );
+    const bodyTouchesPage =
+      bodyUsesPO ||
+      [...preLines, ...finalLines].some((l) => /\bpage\.(locator|getBy|fill|click|goto)\b/.test(l));
+    // ONLY an explicit page.goto() counts as the entry navigation. We must NOT
+    // assume a Page Object login() navigates — most repo login() methods only
+    // fill the form and click, expecting the caller to already be on the page
+    // (e.g. SauceDemo's LoginPage). Treating login() as navigation previously
+    // left specs running against about:blank, timing out on `#user-name`.
+    const bodyNavigates = [...preLines, ...finalLines].some((l) => /\bpage\.goto\s*\(/.test(l));
     if (bodyTouchesPage && !bodyNavigates) {
       navLines.push(
         `await page.goto('${escapeStr(baseUrl)}');`,
@@ -1837,8 +1847,11 @@ export default datasets;
         + `    await ${sel.password.replace(/^page\./, `${pageVar}.`)}.fill(${pwd});\n`
         + `    await ${sel.login.replace(/^page\./, `${pageVar}.`)}.click();`;
     };
-    const gotoA = usePO ? '' : `    await pageA.goto('${escapeStr(baseUrl)}');\n`;
-    const gotoB = usePO ? '' : `    await pageB.goto('${escapeStr(baseUrl)}');\n`;
+    // Always navigate each session to the app first. We can't assume the repo's
+    // login() navigates (most only fill+click), so the goto is required even on
+    // the Page Object path — otherwise the session runs against about:blank.
+    const gotoA = `    await pageA.goto('${escapeStr(baseUrl)}');\n`;
+    const gotoB = `    await pageB.goto('${escapeStr(baseUrl)}');\n`;
 
     return `${importLine}
 
@@ -2099,33 +2112,41 @@ ${gotoB}${sessionLogin('pageB')}
           }
         }
         const filtered: string[] = [];
-        let navDropped = false;
+        // Position at which to splice in the single high-level login() call. We
+        // insert it where the FIRST credential fill was, so any preceding entry
+        // navigation (e.g. `await page.goto(baseUrl)` for step "Navigate to …")
+        // stays BEFORE login(). Inserting at the front instead would emit
+        // login() before the goto and run against about:blank.
+        let loginInsertIdx = -1;
         for (let i = 0; i < work.length; i++) {
           const l = work[i];
           // Drop the leading step comment for fills/login-click.
           if (/^\s*\/\/\s*(enter|type|input|fill).*(user|email|login|password|pwd|credential)/i.test(l)) continue;
           if (/^\s*\/\/\s*(click|press|tap|submit).*(login|log in|sign in)/i.test(l)) continue;
-          // Drop the credential fills.
-          if (/\.fill\(/i.test(l) && /#user-name|username|#password|\bpwd\b|\bpass\b/i.test(l)) continue;
+          // Drop the credential fills (and remember where the triad started).
+          if (/\.fill\(/i.test(l) && /#user-name|username|#password|\bpwd\b|\bpass\b/i.test(l)) {
+            if (loginInsertIdx === -1) loginInsertIdx = filtered.length;
+            continue;
+          }
           // Drop the login click and its trailing waitForLoadState.
           if (/login.*button|#login-button/i.test(l) && /\.click\(/i.test(l)) {
+            if (loginInsertIdx === -1) loginInsertIdx = filtered.length;
             if (/page\.waitForLoadState/i.test(work[i + 1] || '')) i++;
             continue;
           }
-          // Review issue #1 — duplicate navigation: the Page Object's login()
-          // already navigates to the app, so the INITIAL navigate step is
-          // redundant. Drop the first page.goto() (plus its leading "// Navigate"
-          // comment and trailing waitForLoadState). Only the first one is removed
-          // so a later goto (e.g. navigating to a cart/checkout page) is kept.
-          if (!navDropped && /await\s+page\.goto\s*\(/i.test(l)) {
-            navDropped = true;
-            if (filtered.length && /^\s*\/\/\s*navigat/i.test(filtered[filtered.length - 1])) filtered.pop();
-            if (/page\.waitForLoadState/i.test(work[i + 1] || '')) i++;
-            continue;
-          }
+          // IMPORTANT: We deliberately KEEP the initial page.goto(). We cannot
+          // assume the repo's login() navigates (most only fill+click, expecting
+          // the caller to already be on the page). Preserving the entry goto
+          // guarantees the test lands on the app before login() fills the form.
+          // A redundant goto in front of a login() that *does* navigate is
+          // harmless; a missing one makes the test run against about:blank.
           filtered.push(l);
         }
-        work = [...localDecls, `await ${loginPO.varName}.${loginMethod}(${u}, ${p});`, ...filtered];
+        const loginCall = `await ${loginPO.varName}.${loginMethod}(${u}, ${p});`;
+        // If no fill/click triad was found (idx stays -1), append login() at end.
+        if (loginInsertIdx === -1) loginInsertIdx = filtered.length;
+        filtered.splice(loginInsertIdx, 0, loginCall);
+        work = [...localDecls, ...filtered];
         used.add(loginPO.varName);
       }
     }
