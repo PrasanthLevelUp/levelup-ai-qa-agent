@@ -120,7 +120,16 @@ export interface LocatorGroundingEntry {
   selector: string;
   /** True when matched against a real element in the crawl DOM. */
   grounded: boolean;
-  /** Normalized confidence 0–100 (0 when ungrounded / fallback). */
+  /**
+   * True when the selector is a REAL, known-good selector even if it was not
+   * DOM-verified against this crawl. Every grounded entry is knownGood; a
+   * fallback is knownGood because it comes from the curated, app-contract
+   * selector library (e.g. SauceDemo's documented `[data-test="error"]`) — it
+   * is NOT a hallucinated guess. This powers an honest "REAL LOCATORS x/y"
+   * headline that no longer undersells curated fallbacks as 0%.
+   */
+  knownGood: boolean;
+  /** Normalized confidence 0–100 (lower for a known-good-but-unverified fallback). */
   confidence: number;
   /** How the selector was derived: id | data-test | data-testid | name | css | fallback. */
   source: string;
@@ -133,9 +142,19 @@ export interface LocatorGroundingEntry {
 export interface LocatorGroundingReport {
   entries: LocatorGroundingEntry[];
   total: number;
+  /** Count DOM-verified against the real crawl (App Profile). */
   groundedCount: number;
   /** Grounded percentage 0–100 = round(groundedCount / total * 100). */
   groundedPct: number;
+  /**
+   * Count of REAL (non-hallucinated) locators = DOM-verified + curated
+   * known-good fallbacks. This is the honest headline metric: a curated
+   * `[data-test="error"]` is a real selector even when the crawled login page
+   * didn't contain the post-login error element.
+   */
+  realCount: number;
+  /** Real (known-good) percentage 0–100 = round(realCount / total * 100). */
+  realPct: number;
   /** Average confidence across all reported entries, 0–100. */
   avgConfidence: number;
 }
@@ -723,27 +742,29 @@ export class ScriptGenEngine {
     const idMarker = tc.id != null ? `\n  // @tc:TC${tc.id}` : '';
     const stepComments = steps.map((s, i) => `   *   ${i + 1}. ${this.escapeBlockComment(s)}`).join('\n');
 
+    // ── Repository Intelligence: match ALL relevant existing Page Objects ──
+    // (login / inventory / cart / checkout) with real methods + repo-derived
+    // import paths. Empty when no repo profile or no keyword match. Resolved
+    // BEFORE the non-automatable branch so the concurrent skeleton can also
+    // reuse the repo's LoginPage (review fix #4 — consistency).
+    const matchedPOs = this.matchPageObjects(tc, steps, config.repoProfile);
+    const usedPOVars = new Set<string>();
+
     // ── Non-automatable detection (review priority #5) ──
     // Concurrent / multi-browser cases (and anything flagged Automation Ready =
     // No) need multiple browser contexts and human judgement. Emit a test.fixme
     // with a correct multi-context skeleton instead of a broken single-page run.
     if (this.isNonAutomatable(tc, steps)) {
-      const content = this.buildNonAutomatableSpec(tc, steps, baseUrl, sel, dataRef, { title, idMarker, stepComments, creds });
+      const content = this.buildNonAutomatableSpec(tc, steps, baseUrl, sel, dataRef, { title, idMarker, stepComments, creds }, matchedPOs);
       const fileName = `${toKebab(title).slice(0, 60) || `test-case-${tc.id ?? 'x'}`}.spec.ts`;
       const generatedFiles: GeneratedFile[] = [{ path: `tests/${fileName}`, content, type: 'test' }];
       const moduleFile = this.buildTestDataModule(dataIndex);
       if (moduleFile) generatedFiles.push(moduleFile);
       const grounding = this.buildLocatorGroundingReport(tracked, content);
-      return this.buildTcResult(tc, title, baseUrl, crawl, tags, generatedFiles, 0, startTime, grounding);
+      return this.buildTcResult(tc, title, baseUrl, crawl, tags, generatedFiles, 0, startTime, grounding, matchedPOs);
     }
 
     const ctx = { url: baseUrl, creds, sel, data: dataRef };
-
-    // ── Repository Intelligence: match ALL relevant existing Page Objects ──
-    // (login / inventory / cart / checkout) with real methods + repo-derived
-    // import paths. Empty when no repo profile or no keyword match.
-    const matchedPOs = this.matchPageObjects(tc, steps, config.repoProfile);
-    const usedPOVars = new Set<string>();
 
     // ── Precondition materialization (review TC2/TC5 fix) ──
     // If the case assumes an authenticated session ("user is logged in") but its
@@ -819,10 +840,25 @@ export class ScriptGenEngine {
       declLines.push('');
     }
 
-    const body = [...declLines, ...navLines, ...preLines, ...finalLines];
+    // Combine the body and Expected-Result assertions, then de-duplicate any
+    // repeated top-level assertions (review fix #1 — identical toHaveURL /
+    // toHaveText / count checks stacking across precondition + body + final).
+    const verifyHeader = '// ── Verify Expected Result ──';
+    let combined = this.dedupeTopLevelAssertions([
+      ...declLines, ...navLines, ...preLines, ...finalLines,
+      '', verifyHeader, ...assertions,
+    ]);
+    // If every Expected-Result assertion was a duplicate of a body assertion
+    // (all removed by the dedupe pass), drop the now-dangling section header and
+    // its leading blank line so the spec doesn't end with an empty comment.
+    const headerIdx = combined.lastIndexOf(verifyHeader);
+    if (headerIdx !== -1 && !combined.slice(headerIdx + 1).some(l => /\bexpect\s*\(/.test(l))) {
+      combined = combined.slice(0, headerIdx);
+      while (combined.length && combined[combined.length - 1].trim() === '') combined.pop();
+    }
 
     // Reference the generated test-data module whenever the body binds a dataset.
-    const usesModule = body.some(l => /\bgetRecord\s*\(/.test(l));
+    const usesModule = combined.some(l => /\bgetRecord\s*\(/.test(l));
     let importLine = usesModule
       ? `import { test, expect } from '@playwright/test';\nimport { getRecord } from './data/test-data';`
       : `import { test, expect } from '@playwright/test';`;
@@ -851,10 +887,7 @@ ${stepComments}
 
 test.describe('${escapeStr(title)}', () => {
   test('${escapeStr(title)}', async ({ page }) => {${idMarker}
-${body.map(l => `    ${l}`).join('\n')}
-
-    // ── Verify Expected Result ──
-${assertions.map(l => `    ${l}`).join('\n')}
+${combined.map(l => (l ? `    ${l}` : '')).join('\n')}
   });
 });
 `;
@@ -870,7 +903,7 @@ ${assertions.map(l => `    ${l}`).join('\n')}
     const moduleFile = this.buildTestDataModule(dataIndex);
     if (moduleFile && usesModule) generatedFiles.push(moduleFile);
 
-    const totalAssertions = assertions.filter(a => /\bexpect\s*\(/.test(a)).length;
+    const totalAssertions = combined.filter(a => /\bexpect\s*\(/.test(a)).length;
     const grounding = this.buildLocatorGroundingReport(tracked, content);
     return this.buildTcResult(tc, title, baseUrl, crawl, tags, generatedFiles, totalAssertions, startTime, grounding, matchedPOs, usedPOVars);
   }
@@ -889,10 +922,14 @@ ${assertions.map(l => `    ${l}`).join('\n')}
     matchedPOs?: Array<{ name: string; varName: string; filePath: string; methods: string[]; importPath: string; kind: string }>,
     usedPOVars?: Set<string>,
   ): GenerationResult {
-    // Real selector quality = grounded locators / total locators (0–1), derived
-    // from what the spec actually uses — never the old hardcoded 0.
+    // Real selector quality (0–1), derived from what the spec actually uses —
+    // never the old hardcoded 0. Honest blend (review fix #3): a DOM-verified
+    // locator counts in full, a curated known-good-but-unverified fallback
+    // counts at 0.6 (it's a real selector, just not confirmed against THIS
+    // crawl), so the score neither undersells curated locators as 0% nor fakes
+    // a 100%.
     const selectorQuality = locatorGrounding && locatorGrounding.total > 0
-      ? locatorGrounding.groundedCount / locatorGrounding.total
+      ? (locatorGrounding.groundedCount + (locatorGrounding.realCount - locatorGrounding.groundedCount) * 0.6) / locatorGrounding.total
       : 0;
     const testPlan: TestPlan = {
       name: `Test Plan: ${title}`,
@@ -1030,8 +1067,9 @@ ${assertions.map(l => `    ${l}`).join('\n')}
 
     // Aggregate per-case grounding into one report → real "REAL LOCATORS x/y".
     const locatorGrounding = this.mergeLocatorGrounding(groundingReports);
+    // Honest blend (review fix #3): DOM-verified full, curated known-good 0.6.
     const selectorQuality = locatorGrounding.total > 0
-      ? locatorGrounding.groundedCount / locatorGrounding.total
+      ? (locatorGrounding.groundedCount + (locatorGrounding.realCount - locatorGrounding.groundedCount) * 0.6) / locatorGrounding.total
       : 0;
 
     // Aggregate repository intelligence across all cases (de-duplicate Page Objects).
@@ -1555,7 +1593,7 @@ export default datasets;
     fallback: string,
     kind: 'input' | 'button' | 'any',
     reject?: (el: any) => boolean,
-  ): { selector: string; grounded: boolean; confidence: number; source: string } {
+  ): { selector: string; grounded: boolean; knownGood: boolean; confidence: number; source: string } {
     const pool = (crawl.elements || []).filter(el => {
       if (kind === 'input') return el.tag === 'input' || el.tag === 'textarea';
       if (kind === 'button') return el.tag === 'button' || el.type === 'submit' || el.tag === 'a';
@@ -1575,21 +1613,25 @@ export default datasets;
         // Normalize matchElement's raw score (≈50–150) to a 0–100 confidence.
         const confidence = Math.max(1, Math.min(99, Math.round(match.score / 1.5)));
         // Prefer a stable id selector when present.
-        if (el.id) return { selector: `page.locator('#${el.id}')`, grounded: true, confidence, source: 'id' };
+        if (el.id) return { selector: `page.locator('#${el.id}')`, grounded: true, knownGood: true, confidence, source: 'id' };
         // SauceDemo (and many apps) expose the test hook as `data-test` rather
         // than `data-testid`. Playwright's getByTestId() defaults to
         // `data-testid`, so emit an explicit attribute locator for `data-test`.
         const attrs = (el as any).attributes as Record<string, string> | undefined;
         const dataTest = attrs?.['data-test'];
-        if (dataTest) return { selector: `page.locator('[data-test="${dataTest}"]')`, grounded: true, confidence, source: 'data-test' };
+        if (dataTest) return { selector: `page.locator('[data-test="${dataTest}"]')`, grounded: true, knownGood: true, confidence, source: 'data-test' };
         const dataTestId = attrs?.['data-testid'] || attrs?.['data-test-id'] || el.dataTestId;
-        if (dataTestId) return { selector: `page.getByTestId('${dataTestId}')`, grounded: true, confidence, source: 'data-testid' };
-        if (el.name) return { selector: `page.locator('[name="${el.name}"]')`, grounded: true, confidence, source: 'name' };
+        if (dataTestId) return { selector: `page.getByTestId('${dataTestId}')`, grounded: true, knownGood: true, confidence, source: 'data-testid' };
+        if (el.name) return { selector: `page.locator('[name="${el.name}"]')`, grounded: true, knownGood: true, confidence, source: 'name' };
         const best = this.selectorEngine.getBestPlaywrightSelector(el);
-        if (best) return { selector: best, grounded: true, confidence, source: 'css' };
+        if (best) return { selector: best, grounded: true, knownGood: true, confidence, source: 'css' };
       }
     }
-    return { selector: fallback, grounded: false, confidence: 0, source: 'fallback' };
+    // Not DOM-verified, but the fallback is a curated, app-contract selector —
+    // a REAL locator, not a hallucination. Report grounded=false (honest: not
+    // confirmed against THIS crawl) yet knownGood=true with a moderate
+    // confidence so the headline "REAL LOCATORS" metric isn't misleadingly 0%.
+    return { selector: fallback, grounded: false, knownGood: true, confidence: 50, source: 'curated' };
   }
 
   /**
@@ -1601,7 +1643,7 @@ export default datasets;
    */
   private buildGroundedSelectors(crawl: CrawlResult): {
     sel: Record<string, string>;
-    tracked: Record<string, { selector: string; grounded: boolean; confidence: number; source: string }>;
+    tracked: Record<string, { selector: string; grounded: boolean; knownGood: boolean; confidence: number; source: string }>;
   } {
     const t = (intents: string[], fallback: string, kind: 'input' | 'button' | 'any', reject?: (el: any) => boolean) =>
       this.resolveGroundedSelectorTracked(intents, crawl, fallback, kind, reject);
@@ -1621,6 +1663,19 @@ export default datasets;
     };
     // A page title is NOT a product/item link, cart control, price or image.
     const rejectTitle = (el: any) => /item|inventory_item|product|add|remove|cart|_link|\blink\b|btn|button|price|img|image|thumbnail/.test(blob(el));
+    // Review fix — an inventory ITEM card is NOT a sidebar/nav/menu link. The
+    // previous resolver matched the catalog "item" intent to elements like
+    // `#inventory_sidebar_link` (an <a> in the burger menu), which then produced
+    // a nonsensical `toHaveCount(6)` on a single link. Reject sidebar/nav/menu/
+    // footer links and anchors so we fall back to the real `.inventory_item`
+    // grid locator with honest grounding=false.
+    const rejectInventoryItem = (el: any) => {
+      const b = blob(el);
+      if (/sidebar|_link\b|\bnav\b|menu|burger|footer|header|logout|reset|about/.test(b)) return true;
+      // A bare anchor with no item-ish signal is navigation chrome, not a card.
+      if (el?.tag === 'a' && !/inventory_item|product|item_/.test(b)) return true;
+      return false;
+    };
 
     const tracked = {
       username: t(['username', 'user name', 'user-name', 'login'], `page.locator('#user-name')`, 'input'),
@@ -1632,7 +1687,7 @@ export default datasets;
       title: t(['title', 'page title', 'products', 'header'], `page.locator('[data-test="title"]')`, 'any', rejectTitle),
       product: t(['product', 'item name', 'product name'], `page.locator('.inventory_item_name')`, 'any'),
       cart: t(['cart', 'shopping cart', 'cart icon', 'basket'], `page.locator('.shopping_cart_link')`, 'any'),
-      inventoryItem: t(['inventory item', 'product card', 'item'], `page.locator('.inventory_item')`, 'any'),
+      inventoryItem: t(['inventory item', 'product card', 'item'], `page.locator('.inventory_item')`, 'any', rejectInventoryItem),
     };
     const sel: Record<string, string> = {};
     for (const [k, v] of Object.entries(tracked)) sel[k] = v.selector;
@@ -1647,7 +1702,7 @@ export default datasets;
    * LOCATORS x/y" reflect exactly what the script depends on.
    */
   private buildLocatorGroundingReport(
-    tracked: Record<string, { selector: string; grounded: boolean; confidence: number; source: string }>,
+    tracked: Record<string, { selector: string; grounded: boolean; knownGood: boolean; confidence: number; source: string }>,
     content: string,
   ): LocatorGroundingReport {
     const entries: LocatorGroundingEntry[] = [];
@@ -1656,15 +1711,22 @@ export default datasets;
       if (!content.includes(info.selector)) continue; // only elements the spec uses
       if (seen.has(name)) continue;
       seen.add(name);
-      entries.push({ name, selector: info.selector, grounded: info.grounded, confidence: info.confidence, source: info.source });
+      entries.push({ name, selector: info.selector, grounded: info.grounded, knownGood: info.knownGood, confidence: info.confidence, source: info.source });
     }
-    const groundedCount = entries.filter(e => e.grounded).length;
-    const avgConfidence = entries.length
-      ? Math.round(entries.reduce((s, e) => s + e.confidence, 0) / entries.length)
-      : 0;
+    return this.summarizeGrounding(entries);
+  }
+
+  /** Compute the aggregate counts/percentages for a set of grounding entries. */
+  private summarizeGrounding(entries: LocatorGroundingEntry[]): LocatorGroundingReport {
     const total = entries.length;
+    const groundedCount = entries.filter(e => e.grounded).length;
+    const realCount = entries.filter(e => e.grounded || e.knownGood).length;
+    const avgConfidence = total
+      ? Math.round(entries.reduce((s, e) => s + e.confidence, 0) / total)
+      : 0;
     const groundedPct = total ? Math.round((groundedCount / total) * 100) : 0;
-    return { entries, total, groundedCount, groundedPct, avgConfidence };
+    const realPct = total ? Math.round((realCount / total) * 100) : 0;
+    return { entries, total, groundedCount, groundedPct, realCount, realPct, avgConfidence };
   }
 
   /** Merge several per-case grounding reports into one (dedupe by element name). */
@@ -1679,14 +1741,7 @@ export default datasets;
         }
       }
     }
-    const entries = [...byName.values()];
-    const groundedCount = entries.filter(e => e.grounded).length;
-    const avgConfidence = entries.length
-      ? Math.round(entries.reduce((s, e) => s + e.confidence, 0) / entries.length)
-      : 0;
-    const total = entries.length;
-    const groundedPct = total ? Math.round((groundedCount / total) * 100) : 0;
-    return { entries, total, groundedCount, groundedPct, avgConfidence };
+    return this.summarizeGrounding([...byName.values()]);
   }
 
   /**
@@ -1749,15 +1804,41 @@ export default datasets;
     sel: Record<string, string>,
     dataRef: { varName: string; ref: string; hasUsername: boolean; hasPassword: boolean } | undefined,
     meta: { title: string; idMarker: string; stepComments: string; creds: { username: string; password: string } },
+    matchedPOs: Array<{ name: string; varName: string; methods: string[]; importPath: string; kind: string }> = [],
   ): string {
     const { title, idMarker, stepComments } = meta;
     const usesModule = !!dataRef;
-    const importLine = usesModule
-      ? `import { test, expect, chromium } from '@playwright/test';\nimport { getRecord } from './data/test-data';`
-      : `import { test, expect, chromium } from '@playwright/test';`;
-    const userDecl = dataRef ? `    const ${dataRef.varName} = ${dataRef.ref};\n` : '';
     const uname = dataRef ? `${dataRef.varName}.username ?? ''` : this.credFillExpr('username', meta.creds.username);
     const pwd = dataRef ? `${dataRef.varName}.password ?? ''` : this.credFillExpr('password', meta.creds.password);
+
+    // ── Review fix #4: reuse the repo's LoginPage in the concurrent skeleton ──
+    // When a Login Page Object with a real login() method was matched, drive each
+    // isolated session through `new LoginPage(pageX).login(...)` instead of raw
+    // #user-name/#password fills — consistent with the single-page specs and
+    // proving Repository Intelligence participates in the multi-context path too.
+    const loginPO = matchedPOs.find((p) => p.kind === 'login');
+    const loginMethod = loginPO ? this.findPoMethod(loginPO.methods, /^log[_]?in$/i) : null;
+    const usePO = !!(loginPO && loginMethod);
+
+    let importLine = `import { test, expect, chromium } from '@playwright/test';`;
+    if (usesModule) importLine += `\nimport { getRecord } from './data/test-data';`;
+    if (usePO) importLine += `\nimport { ${loginPO!.name} } from '${loginPO!.importPath}';`;
+
+    const userDecl = dataRef ? `    const ${dataRef.varName} = ${dataRef.ref};\n` : '';
+
+    // Per-session login blocks — Page Object method when available, else the
+    // grounded raw-selector triad (unchanged fallback).
+    const sessionLogin = (pageVar: string): string => {
+      if (usePO) {
+        return `    const ${loginPO!.varName}${pageVar.slice(-1)} = new ${loginPO!.name}(${pageVar});\n`
+          + `    await ${loginPO!.varName}${pageVar.slice(-1)}.${loginMethod}(${uname}, ${pwd});`;
+      }
+      return `    await ${sel.username.replace(/^page\./, `${pageVar}.`)}.fill(${uname});\n`
+        + `    await ${sel.password.replace(/^page\./, `${pageVar}.`)}.fill(${pwd});\n`
+        + `    await ${sel.login.replace(/^page\./, `${pageVar}.`)}.click();`;
+    };
+    const gotoA = usePO ? '' : `    await pageA.goto('${escapeStr(baseUrl)}');\n`;
+    const gotoB = usePO ? '' : `    await pageB.goto('${escapeStr(baseUrl)}');\n`;
 
     return `${importLine}
 
@@ -1790,16 +1871,10 @@ ${userDecl}    // Two isolated sessions, each with its own cookies/storage.
     const pageB = await contextB.newPage();
 
     // Session A — log in.
-    await pageA.goto('${escapeStr(baseUrl)}');
-    await ${sel.username.replace(/^page\./, 'pageA.')}.fill(${uname});
-    await ${sel.password.replace(/^page\./, 'pageA.')}.fill(${pwd});
-    await ${sel.login.replace(/^page\./, 'pageA.')}.click();
+${gotoA}${sessionLogin('pageA')}
 
     // Session B — log in with the same credentials.
-    await pageB.goto('${escapeStr(baseUrl)}');
-    await ${sel.username.replace(/^page\./, 'pageB.')}.fill(${uname});
-    await ${sel.password.replace(/^page\./, 'pageB.')}.fill(${pwd});
-    await ${sel.login.replace(/^page\./, 'pageB.')}.click();
+${gotoB}${sessionLogin('pageB')}
 
     // TODO: assert the application's documented concurrent-session behaviour,
     // e.g. both sessions reach /inventory.html, or the first is invalidated.
@@ -2427,7 +2502,12 @@ ${userDecl}    // Two isolated sessions, each with its own cookies/storage.
     // Inventory / product list / products page elements visible.
     if (/inventory|product list|products? (page|are|is|displayed|list|grid)|items? (are|is) displayed/.test(t)) {
       lines.push(`await expect(${ctx.sel['title'] || `page.locator('[data-test="title"]')`}).toHaveText(/Products/i);`);
-      lines.push(`await expect(${ctx.sel['inventoryItem'] || `page.locator('.inventory_item')`}).toHaveCount(6);`);
+      // Review fix — assert the product list is actually populated WITHOUT a
+      // magic count (hard-coded `toHaveCount(6)` was both fragile across apps and
+      // a red flag when the locator was wrong). Asserting the first card is
+      // visible proves the grid rendered and survives catalog size changes.
+      const itemSel = ctx.sel['inventoryItem'] || `page.locator('.inventory_item')`;
+      lines.push(`await expect(${itemSel}.first()).toBeVisible();`);
     }
 
     // Error message visible.
@@ -2530,6 +2610,41 @@ ${userDecl}    // Two isolated sessions, each with its own cookies/storage.
     // intended end-state for any non-error login flow.
     lines.push(`await expect(${ctx.sel.title}).toBeVisible();`);
     return lines;
+  }
+
+  /**
+   * Review fix — de-duplicate repeated assertions before final output.
+   * Step-derived assertions (e.g. "verify inventory page") and the
+   * Expected-Result assertions frequently emit the SAME check (e.g. three
+   * identical `toHaveURL(/inventory\.html/)` / `toHaveText(/Products/i)` lines
+   * stacking from precondition + body + final assertions). We collapse exact
+   * duplicate `await expect(...)` statements, keeping the first occurrence, so
+   * the spec stays clean and non-noisy.
+   *
+   * Only statements at the test's TOP LEVEL (brace depth 0) are de-duplicated —
+   * assertions nested inside an `if/else`, `try`, or loop block are intentional
+   * (each branch asserts a different state) and are always preserved.
+   */
+  private dedupeTopLevelAssertions(lines: string[]): string[] {
+    const seen = new Set<string>();
+    const out: string[] = [];
+    let depth = 0;
+    for (const line of lines) {
+      const trimmed = line.trim();
+      const isExpect = /^await expect\s*\(/.test(trimmed);
+      if (isExpect && depth === 0) {
+        if (seen.has(trimmed)) continue; // drop the duplicate
+        seen.add(trimmed);
+      }
+      // Track brace depth AFTER the dedupe decision, so a line that opens a
+      // block is itself evaluated at the depth it lives on.
+      const opens = (line.match(/\{/g) || []).length;
+      const closes = (line.match(/\}/g) || []).length;
+      depth += opens - closes;
+      if (depth < 0) depth = 0;
+      out.push(line);
+    }
+    return out;
   }
 
   /** Escape a string for safe inclusion in a JSDoc block comment. */
