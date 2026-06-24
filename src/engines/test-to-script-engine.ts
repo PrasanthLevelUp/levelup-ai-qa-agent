@@ -37,6 +37,11 @@ import {
 } from '../services/locator-resolver';
 import { buildApplicationProfileContext } from '../utils/application-profile-context';
 import { analyzeRepoPatterns, type RepoPatternGuide } from '../script-gen/repo-pattern-analyzer';
+import {
+  applyPageObjectReuse,
+  mergeRewriteReports,
+  type PageObjectRewriteReport,
+} from '../script-gen/page-object-rewriter';
 import { auditFramework, type GenerationContext } from '../script-gen/framework-auditor';
 import { extractElementDescriptions } from '../utils/element-descriptions';
 import type { KnowledgeItem } from '../ai/knowledge-optimizer';
@@ -137,6 +142,13 @@ export interface IntelligenceUsage {
   testDataUsed: boolean;
   /** Aggregated locator-resolution quality across all generated files. */
   locatorReport?: LocatorReport;
+  /**
+   * Repository Intelligence — which Page Objects were discovered and which were
+   * actually reused (loginPage.login(...) etc.) in the generated ZIP. Lets the
+   * dashboard prove Page Object reuse instead of raw `page.locator(...)`.
+   * Present only when a repository profile with Page Objects was available.
+   */
+  repositoryIntelligence?: PageObjectRewriteReport;
 }
 
 /**
@@ -157,6 +169,12 @@ interface IntelligenceBundle {
   appKnowledgeUsed: boolean;
   /** Repo coding-style / locator / helper guide distilled from the repo profile. */
   repoGuide?: RepoPatternGuide;
+  /**
+   * Raw repository profile (scanned Page Objects, helpers, fixtures). Threaded
+   * to the deterministic emitter so generated specs can reuse real Page Objects
+   * (loginPage.login(...)) instead of raw `page.locator(...)` sequences.
+   */
+  repoProfile?: RepositoryProfile;
   /**
    * Real base URL from the Application Profile (e.g. https://www.saucedemo.com/).
    * Used to overwrite the generated `page.goto(...)` so scripts never navigate
@@ -345,8 +363,9 @@ export class TestToScriptEngine {
     // Build the test-data index for downstream use in script generation.
     const dataIndex = this.buildTestDataIndex(resolvedTestData);
 
+    const repoIntelReports: PageObjectRewriteReport[] = [];
     for (const group of groups) {
-      const { file, coverage, locatorReport } = await this.generateScriptForGroup(
+      const { file, coverage, locatorReport, repoIntelReport } = await this.generateScriptForGroup(
         group,
         requirement,
         framework,
@@ -359,6 +378,7 @@ export class TestToScriptEngine {
       files.push(file);
       perFile.push(coverage);
       if (locatorReport) locatorReports.push(locatorReport);
+      if (repoIntelReport) repoIntelReports.push(repoIntelReport);
     }
 
     // 6. Generate shared helpers file (not counted as coverage)
@@ -397,12 +417,14 @@ export class TestToScriptEngine {
     // 🧠 Summarise intelligence usage so callers can prove scripts were
     //    grounded in real data (and so token/quality wins are observable).
     const mergedLocatorReport = this.mergeLocatorReports(locatorReports);
+    const mergedRepoIntel = mergeRewriteReports(repoIntelReports);
     const intelligence: IntelligenceUsage = {
       appProfileUsed: intel.appProfileUsed,
       appKnowledgeUsed: intel.appKnowledgeUsed,
       repoPatternsUsed: !!intel.repoGuide,
       testDataUsed: intel.testDataUsed,
       locatorReport: mergedLocatorReport,
+      ...(mergedRepoIntel ? { repositoryIntelligence: mergedRepoIntel } : {}),
     };
     logger.info(MOD, '🧠 Intelligence usage', {
       appProfile: intelligence.appProfileUsed,
@@ -411,6 +433,8 @@ export class TestToScriptEngine {
       testData: intelligence.testDataUsed,
       locatorsResolved: mergedLocatorReport?.totalLocators ?? 0,
       avgLocatorConfidence: mergedLocatorReport?.avgConfidence ?? 0,
+      pageObjectsAvailable: mergedRepoIntel?.totalAvailable ?? 0,
+      pageObjectsReused: mergedRepoIntel?.totalUsed ?? 0,
     });
 
     // 🏗️ Framework Audit (Phase 1: Impact Analysis + Quality Report)
@@ -539,6 +563,7 @@ export class TestToScriptEngine {
       try {
         repoProfile = await getRepositoryContext(String(input.repositoryId), companyId, input.projectId);
         if (repoProfile) {
+          bundle.repoProfile = repoProfile;
           bundle.repoGuide = analyzeRepoPatterns(repoProfile);
           if (bundle.repoGuide) {
             logger.info(MOD, '✅ Repo patterns loaded for grounding', {
@@ -795,7 +820,7 @@ export class TestToScriptEngine {
     knowledgeContext: string,
     intel: IntelligenceBundle,
     dataIndex?: Map<string, Map<string, any>>,
-  ): Promise<{ file: GeneratedScriptFile; coverage: FileCoverage; locatorReport?: LocatorReport }> {
+  ): Promise<{ file: GeneratedScriptFile; coverage: FileCoverage; locatorReport?: LocatorReport; repoIntelReport?: PageObjectRewriteReport }> {
     // Use the repo's own file-naming convention when we have a repo guide so the
     // committed file looks native to the target codebase; otherwise default.
     const partSuffix = group.part && (group.totalParts || 1) > 1 ? `.part${group.part}` : '';
@@ -1029,6 +1054,37 @@ Return ONLY the TypeScript code. No markdown fences, no explanations.`;
     // ── Reconcile: which test cases did the AI actually cover? ──
     const reconciled = this.reconcileCoverage(aiCode, group, requirement, baseUrl, resolvedByCase, dataIndex);
 
+    // ── Repository Intelligence: Page Object reuse ──────────────────────────
+    // Post-process the FINAL code (AI output OR deterministic template — same
+    // path) so recognised raw locator sequences collapse into real Page Object
+    // method calls (loginPage.login(...)), with validated methods + repo-derived
+    // import paths. No-op when the repo profile carries no matching Page Object.
+    let repoIntelReport: PageObjectRewriteReport | undefined;
+    if (intel.repoProfile?.pageObjects?.length) {
+      try {
+        const contextText = [
+          group.feature,
+          ...group.cases.map((c: any) =>
+            `${c.title || ''} ${this.parseJson(c.steps, []).join(' ')} ${c.expected_result || ''}`,
+          ),
+        ].join(' ');
+        const rewrite = applyPageObjectReuse(reconciled.content, intel.repoProfile, contextText, outputDir);
+        reconciled.content = rewrite.code;
+        repoIntelReport = rewrite.report;
+        if (rewrite.report.totalUsed > 0) {
+          logger.info(MOD, '✅ Page Object reuse applied', {
+            feature: group.feature,
+            used: rewrite.report.pageObjects.filter((p) => p.used).map((p) => p.name),
+            available: rewrite.report.totalAvailable,
+          });
+        }
+      } catch (err: any) {
+        logger.warn(MOD, 'Page Object reuse failed (non-blocking)', {
+          feature: group.feature, error: err?.message,
+        });
+      }
+    }
+
     const coverage: FileCoverage = {
       filePath,
       feature: group.feature,
@@ -1062,6 +1118,7 @@ Return ONLY the TypeScript code. No markdown fences, no explanations.`;
       },
       coverage,
       locatorReport,
+      repoIntelReport,
     };
   }
 
@@ -1115,9 +1172,18 @@ Return ONLY the TypeScript code. No markdown fences, no explanations.`;
         /\b(dashboard|home ?page|inventory|profile|cart|checkout|landing)\b/.test(lc)) {
       hints.push(`Assert navigation with \`await expect(page).toHaveURL(/<real-path>/)\` (derive the path from the destination named in the Expected Result; base URL is "${baseUrl}"). Do NOT use \`toHaveURL(/.*/)\`.`);
     }
-    // Error / validation messages → toContainText / toBeVisible on the message.
+    // Error / validation messages → assert on the dedicated error container.
     if (/\b(error|invalid|fail|not allowed|denied|required|warning|message|alert|toast)\b/.test(lc)) {
-      hints.push('Assert the exact message text is visible, e.g. `await expect(page.getByText(/<message>/i)).toBeVisible()` or `toContainText("<message>")`.');
+      const msg = this.deriveErrorMessage(tc);
+      const containsHint = msg
+        ? `Then assert its text with \`.toContainText(${JSON.stringify(msg)})\`.`
+        : 'Then assert it contains the exact message named in the Expected Result with `.toContainText("<message>")`.';
+      hints.push(
+        `Assert the error message is shown on the dedicated error element, e.g. ` +
+        '`await expect(page.locator(\'[data-test="error"]\')).toBeVisible()`. ' +
+        containsHint +
+        ' Do NOT settle for asserting the username field is still visible or that the URL is unchanged.',
+      );
     }
     // Visibility / presence outcomes.
     if (/\b(display|shown|appear|visible|see|present|render)\b/.test(lc)) {
@@ -1145,6 +1211,74 @@ Return ONLY the TypeScript code. No markdown fences, no explanations.`;
       hints.push(`Add at least one meaningful assertion that verifies: "${expected.slice(0, 160)}". Never use a no-op like \`toHaveURL(/.*/)\`.`);
     }
     return hints;
+  }
+
+  /**
+   * Selector used to assert error/validation messages in generated scripts.
+   * Defaults to the conventional `[data-test="error"]` (SauceDemo-style) but is
+   * overridable per-deployment via SCRIPTGEN_ERROR_SELECTOR.
+   */
+  private errorSelector(): string {
+    return process.env.SCRIPTGEN_ERROR_SELECTOR || '[data-test="error"]';
+  }
+
+  /**
+   * Is this a NEGATIVE test case (one whose Expected Result is an error/denial)?
+   * Detected from the title, expected result and any embedded test-data hints —
+   * the cases the reviewer flagged: invalid user, locked user, empty/missing
+   * credentials, wrong password, etc.
+   */
+  private isNegativeCase(tc: any): boolean {
+    const hay = `${tc?.title || ''} ${tc?.expected_result || ''} ${tc?.test_data || ''} ${this.parseJson(tc?.steps, []).join(' ')}`.toLowerCase();
+    const expectsError = /\berror\b|not match|do not match|invalid|incorrect|denied|not allowed|locked|blank|empty|required|missing|unauthori[sz]ed|fail/i.test(hay);
+    const expectsSuccess = /redirect|inventory|dashboard|logged in|success|land on/i.test(`${tc?.expected_result || ''}`.toLowerCase());
+    // A case is negative when it expects an error AND does not primarily assert a success outcome.
+    return expectsError && !expectsSuccess;
+  }
+
+  /**
+   * Best-effort exact error message for a negative case. Pulls a quoted/explicit
+   * message from the Expected Result when present, else maps well-known SauceDemo
+   * failure modes. Returns null when nothing specific can be derived (caller then
+   * asserts visibility only — still far better than the old no-op).
+   */
+  private deriveErrorMessage(tc: any): string | null {
+    const expected = `${tc?.expected_result || ''}`.trim();
+    // 1. Explicit quoted message in the expected result.
+    const quoted = expected.match(/["“']([^"”']{6,})["”']/);
+    if (quoted) return quoted[1].trim();
+
+    // 2. Known failure modes (text fragments are matched case-insensitively at runtime).
+    const hay = `${tc?.title || ''} ${expected} ${tc?.test_data || ''}`.toLowerCase();
+    if (/locked/.test(hay)) return 'Sorry, this user has been locked out';
+    if (/(empty|blank|missing).*(user|email)|user(name)? (is )?required/.test(hay)) return 'Username is required';
+    if (/(empty|blank|missing).*(pass)|password (is )?required/.test(hay)) return 'Password is required';
+    if (/invalid|incorrect|wrong|do not match|not match|bad credential/.test(hay)) return 'Username and password do not match';
+    return null;
+  }
+
+  /**
+   * Build real negative assertions for a failing case: assert the dedicated error
+   * element is visible and (when derivable) contains the expected message. This
+   * replaces the weak `expect(usernameField).toBeVisible()` / `toHaveURL(base)`
+   * pattern the reviewer flagged as "verifies almost nothing".
+   */
+  private buildNegativeAssertions(tc: any, pad: string): string[] {
+    const sel = this.errorSelector();
+    const lines: string[] = [
+      `${pad}// Negative case — the requirement says an error message must be displayed.`,
+      `${pad}await expect(page.locator('${sel}')).toBeVisible();`,
+    ];
+    const msg = this.deriveErrorMessage(tc);
+    if (msg) {
+      lines.push(`${pad}await expect(page.locator('${sel}')).toContainText(/${this.escapeRegex(msg)}/i);`);
+    }
+    return lines;
+  }
+
+  /** Escape a literal string for safe embedding inside a RegExp literal. */
+  private escapeRegex(s: string): string {
+    return String(s).replace(/[.*+?^${}()|[\]\\/]/g, '\\$&');
   }
 
   /**
@@ -1202,7 +1336,51 @@ Return ONLY the TypeScript code. No markdown fences, no explanations.`;
       issues.push('No `expect(...)` assertions found. Every test must verify its Expected Result.');
     }
 
+    // 6. Semantic locator mismatches — "locator exists" ≠ "correct locator".
+    issues.push(...this.detectSemanticLocatorMismatches(code));
+
     return issues;
+  }
+
+  /**
+   * Item 3 — Semantic locator validation.
+   *
+   * A locator existing in the DOM does NOT mean it is the RIGHT element. The
+   * reviewer flagged cases such as:
+   *
+   *     await expect(page.locator('#item_4_title_link')).toHaveText(/Products/i);
+   *
+   * where `#item_4_title_link` is a product *link* ("Sauce Labs Backpack"), not
+   * the "Products" page title — yet the dashboard still reported 100% grounded.
+   *
+   * This deterministic linter detects the common mismatch class WITHOUT needing
+   * the DOM: a text/value assertion whose ELEMENT TYPE (inferred from the
+   * selector) is inconsistent with the asserted CONTENT. It returns
+   * human-readable warnings so callers can downgrade a misleading "100% grounded"
+   * claim and trigger a corrective retry. Conservative by design — only flags
+   * confident mismatches to avoid false positives.
+   */
+  private detectSemanticLocatorMismatches(code: string): string[] {
+    const warnings: string[] = [];
+    // Match: expect(page.locator('<sel>'))...toHaveText|toContainText(<arg>)
+    const re = /expect\(\s*page\.locator\(\s*[`'"]([^`'"]+)[`'"]\s*\)\s*\)\s*(?:\.[a-zA-Z]+\([^)]*\)\s*)*?\.(toHaveText|toContainText)\(\s*([^)]+)\)/g;
+    // Selector fragments that denote an actionable/item element (link/button/item/field).
+    const itemLike = /(item|link|btn|button|add[-_]?to[-_]?cart|product[-_]?(link|img|name)|_title_link|user-name|username|password|cart[-_]?(link|badge|icon))/i;
+    // Asserted text that denotes a PAGE/SECTION TITLE or heading-level content.
+    const titleLike = /products?|inventory|dashboard|home\s*page|cart\s*page|checkout|your\s+cart|overview/i;
+
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(code)) !== null) {
+      const sel = m[1];
+      const asserted = m[3];
+      if (itemLike.test(sel) && titleLike.test(asserted)) {
+        warnings.push(
+          `Semantic locator mismatch: asserting page/section title text (${asserted.trim().slice(0, 40)}) on an item/link/field selector "${sel}". ` +
+          'This is "locator exists" but likely the WRONG element. Assert the title on a heading/title element (e.g. .title / [data-test="title"]).',
+        );
+      }
+    }
+    return warnings;
   }
 
   /**
@@ -1361,18 +1539,35 @@ ${pad}  await page.locator('#login-button').click();
       }
     }
 
+    // Negative case → assert the error message is actually displayed. The
+    // requirement explicitly says "an error message should be displayed", so a
+    // login attempt followed by an error-element assertion is a real, runnable
+    // test — far stronger than the old `expect(usernameField).toBeVisible()`.
+    const negative = this.isNegativeCase(tc);
+    if (negative && loginBlock) {
+      const negAssertions = this.buildNegativeAssertions(tc, `${pad}  `).join('\n');
+      return `${pad}test('${this.escapeStr(tc.title)}', async ({ page }) => {
+${pad}  // @tc:TC${tc.id}
+${stepsComment}
+${pad}  // Expected: ${this.escapeStr(tc.expected_result || 'Verify expected behavior')}
+${loginBlock}${negAssertions}
+${pad}});`;
+    }
+
     if (usable.length) {
-      // Real, meaningful assertions on resolved locators.
+      // Real, meaningful assertions on resolved locators. For negative cases we
+      // additionally assert the error element so the failure is truly verified.
       const assertions = usable.map(r => {
         const note = r.confidence < 60 ? '  // verify: low-confidence locator' : '';
         return `${pad}  await expect(${r.locator}).toBeVisible();${note}`;
       }).join('\n');
+      const extra = negative ? `\n${this.buildNegativeAssertions(tc, `${pad}  `).join('\n')}` : '';
 
       return `${pad}test('${this.escapeStr(tc.title)}', async ({ page }) => {
 ${pad}  // @tc:TC${tc.id}
 ${stepsComment}
 ${pad}  // Expected: ${this.escapeStr(tc.expected_result || 'Verify expected behavior')}
-${loginBlock}${assertions}
+${loginBlock}${assertions}${extra}
 ${pad}});`;
     }
 
