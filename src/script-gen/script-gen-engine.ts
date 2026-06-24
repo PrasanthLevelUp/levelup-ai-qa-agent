@@ -701,6 +701,9 @@ export class ScriptGenEngine {
 
     const ctx = { url: baseUrl, creds, sel, data: dataRef };
 
+    // ── Repository Intelligence: try to match & use an existing Page Object ──
+    const matchedPO = this.matchPageObject(tc, steps, config.repoProfile);
+
     // ── Precondition materialization (review TC2/TC5 fix) ──
     // If the case assumes an authenticated session ("user is logged in") but its
     // steps never perform a login, inject a real login setup using a valid user
@@ -708,6 +711,18 @@ export class ScriptGenEngine {
     const preLines = this.buildPreconditionLogin(tc, steps, ctx, dataIndex);
 
     const { lines } = this.tcStepsToCode(steps, ctx);
+
+    // ── Try to collapse raw locator steps into Page Object method calls ──
+    let finalLines = lines;
+    if (matchedPO) {
+      const varName = matchedPO.name.charAt(0).toLowerCase() + matchedPO.name.slice(1); // LoginPage → loginPage
+      const poMethod = this.tryPageObjectMethod(lines, matchedPO, varName, { creds, data: dataRef });
+      if (poMethod) {
+        // Replace the raw locator sequence with the high-level method call.
+        finalLines = [poMethod];
+      }
+    }
+
     const assertions = this.buildTcAssertions(`${tc.expected_result || ''}`, ctx, tc);
 
     // ── Guarantee an initial navigation ──
@@ -736,13 +751,26 @@ export class ScriptGenEngine {
       declLines.push(sourceNote);
       declLines.push(`const ${dataRef.varName} = ${dataRef.ref};`, '');
     }
-    const body = [...declLines, ...navLines, ...preLines, ...lines];
+
+    // ── Instantiate the matched Page Object ──
+    if (matchedPO) {
+      const varName = matchedPO.name.charAt(0).toLowerCase() + matchedPO.name.slice(1);
+      declLines.push(`// Reusing ${matchedPO.name} from the repo`);
+      declLines.push(`const ${varName} = new ${matchedPO.name}(page);`, '');
+    }
+
+    const body = [...declLines, ...navLines, ...preLines, ...finalLines];
 
     // Reference the generated test-data module whenever the body binds a dataset.
     const usesModule = body.some(l => /\bgetRecord\s*\(/.test(l));
-    const importLine = usesModule
+    let importLine = usesModule
       ? `import { test, expect } from '@playwright/test';\nimport { getRecord } from './data/test-data';`
       : `import { test, expect } from '@playwright/test';`;
+
+    // Add Page Object import when reusing an existing PO from the repo.
+    if (matchedPO) {
+      importLine += `\nimport { ${matchedPO.name} } from '${matchedPO.importPath}';`;
+    }
 
     const content = `${importLine}
 
@@ -1565,6 +1593,101 @@ ${userDecl}    // Two isolated sessions, each with its own cookies/storage.
    * the index) so the test starts from the intended state instead of about:blank.
    * Returns [] when no setup is needed.
    */
+
+  /* ──────────────────────────────────────────────────────────────────────── */
+  /*  Repository Intelligence: Page Object Reuse (simple keyword matching)    */
+  /* ──────────────────────────────────────────────────────────────────────── */
+
+  /**
+   * Match a test case to an existing Page Object based on simple keyword
+   * matching. Returns the matched PO's metadata or null when no match exists.
+   * Intentionally simple — no complex inference, just login/inventory/cart/checkout.
+   */
+  private matchPageObject(
+    tc: NonNullable<GenerationConfig['testCase']>,
+    steps: string[],
+    profile?: import('../context/types').RepositoryProfile,
+  ): { name: string; filePath: string; methods: string[]; importPath: string } | null {
+    if (!profile?.pageObjects?.length) return null;
+
+    // Extract semantic keywords from title + steps.
+    const text = `${tc.title || ''} ${steps.join(' ')}`.toLowerCase();
+    const keywords = new Set<string>();
+    if (/\blogin|sign.?in|log.?in|auth/i.test(text)) keywords.add('login');
+    if (/inventory|products?|catalog|items?/i.test(text)) keywords.add('inventory');
+    if (/cart|basket|shopping.?cart/i.test(text)) keywords.add('cart');
+    if (/checkout|purchase|payment|order/i.test(text)) keywords.add('checkout');
+
+    if (!keywords.size) return null;
+
+    // Match to a page object by name similarity (simple substring match).
+    for (const po of profile.pageObjects) {
+      const poName = po.name.toLowerCase();
+      for (const kw of keywords) {
+        if (poName.includes(kw)) {
+          // Build relative import path from tests/ to the page object file.
+          // Example: pages/login.page.ts → ../pages/login.page
+          const importPath = po.filePath
+            .replace(/^(src\/)?/, '../') // strip leading src/, prepend ../
+            .replace(/\.[tj]sx?$/, '');  // strip extension
+          return {
+            name: po.name,
+            filePath: po.filePath,
+            methods: (po.methods || []).map((m) => m.name),
+            importPath,
+          };
+        }
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Try to collapse a sequence of raw locator steps into a single high-level
+   * Page Object method call. Returns the transformed line when a method is
+   * found, otherwise null (caller emits raw locators).
+   *
+   * Example: username fill + password fill + login click → loginPage.login()
+   */
+  private tryPageObjectMethod(
+    stepLines: string[],
+    pageObj: { name: string; methods: string[] },
+    varName: string,
+    ctx: { creds: { username: string; password: string }; data?: { varName: string; ref: string; hasUsername: boolean; hasPassword: boolean } },
+  ): string | null {
+    // Pattern 1: login (username + password + click login)
+    if (
+      pageObj.methods.some((m) => /^login$/i.test(m)) &&
+      stepLines.some((l) => /#user-name|username|login.*input/i.test(l) && /\.fill\(/i.test(l)) &&
+      stepLines.some((l) => /#password|pwd|pass/i.test(l) && /\.fill\(/i.test(l)) &&
+      stepLines.some((l) => /login.*button|#login-button/i.test(l) && /\.click\(/i.test(l))
+    ) {
+      const usernameExpr = ctx.data?.varName && ctx.data.hasUsername
+        ? `${ctx.data.varName}.username ?? ''`
+        : ctx.creds.username
+          ? `'${escapeStr(ctx.creds.username)}'`
+          : `process.env.TEST_USERNAME ?? ''`;
+      const passwordExpr = ctx.data?.varName && ctx.data.hasPassword
+        ? `${ctx.data.varName}.password ?? ''`
+        : ctx.creds.password
+          ? `'${escapeStr(ctx.creds.password)}'`
+          : `process.env.TEST_PASSWORD ?? ''`;
+      return `await ${varName}.login(${usernameExpr}, ${passwordExpr});`;
+    }
+
+    // Pattern 2: addToCart (click add-to-cart button)
+    if (
+      pageObj.methods.some((m) => /^add.*cart|addto.*cart/i.test(m)) &&
+      stepLines.some((l) => /add.*cart|cart.*button/i.test(l) && /\.click\(/i.test(l))
+    ) {
+      const methodName = pageObj.methods.find((m) => /^add.*cart|addto.*cart/i.test(m))!;
+      return `await ${varName}.${methodName}();`;
+    }
+
+    // No high-level method matched — caller emits raw locators.
+    return null;
+  }
+
   private buildPreconditionLogin(
     tc: NonNullable<GenerationConfig['testCase']>,
     steps: string[],
