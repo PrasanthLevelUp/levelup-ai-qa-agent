@@ -111,6 +111,10 @@ import {
   getHealingIntelligenceContext,
   emptyHealingContext,
 } from '../services/healing-intelligence-context';
+import {
+  buildAppProfileHealingInput,
+  type AppProfileHealingInput,
+} from '../services/app-profile-healing';
 import type { HealingJob } from './queue/job-queue';
 
 const MOD = 'api-server';
@@ -807,6 +811,32 @@ function createHealingWorker(
           logger.warn(MOD, 'Healing intelligence context build failed (non-critical)', { error: err?.message });
         }
 
+        // ── Application Profile recovery (Application Intelligence) ──
+        // Ask the crawl we already built for this app. The Application Profile
+        // holds the real, stable selectors (data-test* ids, grounded role/label
+        // locators); this connects that asset to healing so a broken locator is
+        // recovered from real DOM evidence — 0 AI tokens — before we ever guess.
+        // Always available (no feature flag); fully defensive (never throws).
+        let appProfileHealing: AppProfileHealingInput | undefined;
+        try {
+          appProfileHealing = await buildAppProfileHealingInput(
+            failure,
+            job.companyId,
+            resolvedProjectId,
+          );
+          if (appProfileHealing.candidates.length > 0) {
+            logger.info(MOD, 'Application Profile healing candidates ready', {
+              testName: failure.testName,
+              url: failure.url,
+              description: appProfileHealing.description,
+              candidateCount: appProfileHealing.candidates.length,
+              topLocator: appProfileHealing.candidates[0]?.locator,
+            });
+          }
+        } catch (err: any) {
+          logger.warn(MOD, 'Application Profile healing build failed (non-critical)', { error: err?.message });
+        }
+
         for (let iteration = 0; iteration < MAX_HEAL_ITERATIONS; iteration++) {
           jobQueue.updateJob(job.id, {
             progress: `Healing: ${failure.testName} (locator ${iteration + 1})...`,
@@ -826,7 +856,7 @@ function createHealingWorker(
 
           // Try multiple suggestions for the SAME broken locator
           for (let retry = 0; retry < RETRIES_PER_LOCATOR; retry++) {
-            const outcome = await orchestrator.heal(failure, domHtmlForFailure, triedLocators, resolvedProjectId, job.companyId, repoHealingContext);
+            const outcome = await orchestrator.heal(failure, domHtmlForFailure, triedLocators, resolvedProjectId, job.companyId, repoHealingContext, appProfileHealing);
             if (outcome.suggestion) {
               triedLocators.add(outcome.suggestion.newLocator);
             }

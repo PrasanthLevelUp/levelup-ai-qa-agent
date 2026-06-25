@@ -28,6 +28,7 @@ import {
   emptyHealingContext,
   type HealingContextResult,
 } from '../services/healing-intelligence-context';
+import type { AppProfileHealingInput } from '../services/app-profile-healing';
 import { logger } from '../utils/logger';
 import {
   logHealing,
@@ -217,6 +218,7 @@ export class HealingOrchestrator {
     projectId?: number,
     companyId?: number,
     repoContext?: HealingContextResult,
+    appProfile?: AppProfileHealingInput,
   ): Promise<HealingOutcome> {
     // Repository grounding (Sprint 2 — Healing Intelligence). Inert when the
     // feature is OFF: the worker passes an empty context, so prompt building and
@@ -225,6 +227,20 @@ export class HealingOrchestrator {
     const attemptedStrategies: HealingStrategy[] = [];
     let domCandidates: DOMExtractionResult | undefined;
     let domMemoryInsight: DOMMemoryInsight | undefined;
+
+    // ── Step 0 (Application Intelligence): Application Profile recovery ──
+    // BEFORE anything else, ask the crawl we already built. The Application
+    // Profile holds the real, stable selectors for this app (data-test* ids,
+    // grounded role/label locators). This is the most authoritative source we
+    // have — more trustworthy than past-heal history or an AI guess — and it
+    // costs 0 tokens. It also works even when `failedLocator` could not be
+    // parsed (the candidates are derived from the failing source line too).
+    const appProfileOutcome = this.tryAppProfile(failure, appProfile, skipLocators);
+    if (appProfileOutcome) {
+      // Honour the audit's "Similarity participates BEFORE AI": grounded
+      // candidates are already ranked by DOM evidence; no AI was consulted.
+      return appProfileOutcome;
+    }
 
     // ── Step 0a: DOM Memory Query (THE MOAT) ──────────────────
     // Query historical selector data BEFORE doing anything else.
@@ -450,6 +466,100 @@ export class HealingOrchestrator {
     }
 
     return { suggestion, attemptedStrategies, selectedEngine: selected.engine, confidenceResult, domCandidates, domMemoryInsight };
+  }
+
+  /**
+   * Step 0 — Application Profile recovery (Application Intelligence).
+   *
+   * Validates the grounded candidates the worker resolved from the crawled
+   * Application Profile and, when one is syntactically valid and confident
+   * enough, returns it immediately as the heal — 0 AI tokens, sourced from real
+   * DOM evidence. Candidates are ranked by the Semantic Similarity engine
+   * against the failed locator's intent, so the *most relevant* grounded
+   * selector wins (Similarity participating BEFORE the AI layer).
+   *
+   * Returns `null` when there is no usable Application-Profile candidate, in
+   * which case the pipeline proceeds exactly as before.
+   */
+  private tryAppProfile(
+    failure: FailureDetails,
+    appProfile?: AppProfileHealingInput,
+    skipLocators?: Set<string>,
+  ): HealingOutcome | null {
+    const candidates = appProfile?.candidates;
+    if (!candidates || candidates.length === 0) return null;
+
+    // Rank candidates: stability/confidence is the primary signal (a grounded
+    // data-test* selector beats a role/text one), and Semantic Similarity to the
+    // failed locator breaks ties among comparably-confident candidates — so
+    // Similarity participates BEFORE the AI layer without overriding the
+    // strongest grounded evidence.
+    const failedValue = failure.failedLocator || failure.failedLineCode || '';
+    const ranked = [...candidates].sort((a, b) => {
+      if (Math.abs(b.confidence - a.confidence) > 0.02) return b.confidence - a.confidence;
+      return this.appProfileRelevance(failedValue, b.locator) - this.appProfileRelevance(failedValue, a.locator);
+    });
+
+    for (const candidate of ranked) {
+      if (skipLocators?.has(candidate.locator)) continue;
+
+      const validation = this.validationEngine.validate({
+        newLocator: candidate.locator,
+        confidence: candidate.confidence,
+        originalCode: '',
+        filePath: failure.filePath,
+      });
+      if (!validation.isValid) {
+        logger.debug(MOD, 'App Profile candidate rejected by validation', {
+          locator: candidate.locator,
+          reason: validation.reason,
+        });
+        continue;
+      }
+
+      logger.info(MOD, '🗺️  Application Profile alternative accepted — 0 AI tokens!', {
+        selector: candidate.locator,
+        confidence: candidate.confidence,
+        description: appProfile?.description,
+        elementsScanned: appProfile?.elementsScanned,
+      });
+
+      const suggestion: HealingSuggestion = {
+        newLocator: candidate.locator,
+        // Deterministic, evidence-grounded recovery — surfaced as a rule-based
+        // (non-AI) heal in the 3-layer trail.
+        strategy: 'rule_based',
+        confidence: candidate.confidence,
+        tokensUsed: 0,
+        reasoning: `[App Profile] ${candidate.reasoning}`,
+        addExplicitWait: false,
+      };
+
+      return {
+        suggestion,
+        attemptedStrategies: ['rule_based'],
+        selectedEngine: 'app_profile',
+      };
+    }
+
+    return null;
+  }
+
+  /**
+   * Lightweight relevance score (0–1) between the failed locator text and a
+   * candidate locator, reusing the Semantic Similarity engine. Used only to
+   * order Application-Profile candidates; never throws.
+   */
+  private appProfileRelevance(failedValue: string, candidateLocator: string): number {
+    if (!failedValue) return 0;
+    try {
+      return this.similarityEngine.compare(
+        selectorCore(failedValue),
+        selectorCore(candidateLocator),
+      ).score;
+    } catch {
+      return 0;
+    }
   }
 
   /**
