@@ -5,11 +5,19 @@
 import { Router, type Request, type Response } from 'express';
 import { JobQueue } from '../queue/job-queue';
 import { RepoManager } from '../services/repo-manager';
+import { listAllRepositories } from '../../db/postgres';
+import { logger } from '../../utils/logger';
 
+const MOD = 'heal-route';
 const router = Router();
 
+/** Normalize a git URL for comparison: drop protocol, trailing .git, lowercase. */
+function normalizeRepoUrl(url: string): string {
+  return url.trim().replace(/^https?:\/\//, '').replace(/\.git$/, '').replace(/\/$/, '').toLowerCase();
+}
+
 export function createHealRouter(jobQueue: JobQueue, repoManager: RepoManager): Router {
-  router.post('/', (req: Request, res: Response) => {
+  router.post('/', async (req: Request, res: Response) => {
     const { repository, branch, commit, projectId, testFile } = req.body as {
       repository?: string;
       branch?: string;
@@ -54,6 +62,38 @@ export function createHealRouter(jobQueue: JobQueue, repoManager: RepoManager): 
 
     const cid = (req as any).companyId;
     const pid = typeof projectId === 'number' ? projectId : (req as any).projectId;
+
+    // SECURITY: For company-scoped requests, the repo being healed MUST be one of
+    // that company's configured repositories. This prevents healing an arbitrary or
+    // another tenant's repo URL (cross-tenant contamination). We also resolve the
+    // CANONICAL url/branch from the DB record so the job never trusts a client-supplied
+    // URL that doesn't belong to the tenant.
+    if (cid && repoUrl) {
+      try {
+        const companyRepos = await listAllRepositories(cid);
+        const target = normalizeRepoUrl(repoUrl);
+        const match = companyRepos.find((r: any) => r.url && normalizeRepoUrl(r.url) === target);
+        if (!match) {
+          logger.warn(MOD, 'Rejected heal: repo not configured for company', {
+            companyId: cid, requestedUrl: repoUrl,
+            configuredUrls: companyRepos.map((r: any) => r.url),
+          });
+          res.status(403).json({
+            error: 'Forbidden',
+            message: `Repository "${repoUrl}" is not configured for your account. Add it under Configured Repositories before healing.`,
+          });
+          return;
+        }
+        // Use the DB record as the source of truth for url/branch/project scoping.
+        repoUrl = match.url;
+        if (match.id != null) repoId = String(match.id);
+      } catch (err: any) {
+        logger.error(MOD, 'Failed to validate repo ownership', { error: err?.message, companyId: cid });
+        res.status(500).json({ error: 'Internal Error', message: 'Failed to validate repository ownership' });
+        return;
+      }
+    }
+
     const job = jobQueue.createJob(repoId, branch ?? 'main', commit, repoUrl, cid, pid, testFile);
 
     res.status(202).json({
