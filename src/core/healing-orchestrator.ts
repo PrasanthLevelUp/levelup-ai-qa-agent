@@ -29,6 +29,10 @@ import {
   type HealingContextResult,
 } from '../services/healing-intelligence-context';
 import type { AppProfileHealingInput } from '../services/app-profile-healing';
+import {
+  classifyFailureFile,
+  type PageObjectSource,
+} from '../services/repo-intelligence-healing';
 import { logger } from '../utils/logger';
 import {
   logHealing,
@@ -152,6 +156,55 @@ export interface DecisionTrailEntry {
   reasoning?: string; // why it won, why it missed, or error message
 }
 
+/**
+ * Repo Intelligence targeting (Phase 4 / PR #160 — "Patch the Page Object").
+ *
+ * When the broken selector lives inside a shared Page Object / helper, the
+ * failure's own stack file (`failure.filePath` + `lineNumber`) already points at
+ * that abstraction. Repo Intelligence is a deterministic *router*: it does not
+ * invent a selector (the waterfall already grounded one) — it decides WHERE the
+ * patch should be written and how many tests one patch repairs.
+ *
+ * When present on a `HealingOutcome`, the apply flow patches `targetFile` (the
+ * shared Page Object) instead of grepping for an individual spec.
+ */
+export interface PageObjectPatchTarget {
+  /** Shared file to patch — the failing file when it is a Page Object/helper. */
+  targetFile: string;
+  /** Line within `targetFile` to patch (from the failure stack), when known. */
+  targetLine?: number;
+  /** Owning class (e.g. "LoginPage"), when known. */
+  className?: string | null;
+  /** Owning method (e.g. "login"), when known. */
+  methodName?: string | null;
+  /** Tests repaired by this single patch (0 when the count is unknown). */
+  impactedTests: number;
+  /** How the Page Object was detected. */
+  source: PageObjectSource;
+  /** Human-readable explanation for the decision trail / PR body. */
+  reasoning: string;
+}
+
+/**
+ * Map a healing outcome's Repo Intelligence targeting onto the `healing_actions`
+ * persistence fields. Keeps the four columns in lock-step across every
+ * `logHealing` call site (returns NULL/false/0 for ordinary spec heals).
+ */
+export function pageObjectPatchLogFields(outcome: Pick<HealingOutcome, 'pageObjectPatch'>): {
+  target_file_path: string | null;
+  target_line: number | null;
+  is_page_object_patch: boolean;
+  page_object_impact: number;
+} {
+  const p = outcome.pageObjectPatch;
+  return {
+    target_file_path: p?.targetFile ?? null,
+    target_line: p?.targetLine ?? null,
+    is_page_object_patch: !!p,
+    page_object_impact: p?.impactedTests ?? 0,
+  };
+}
+
 export interface HealingOutcome {
   suggestion: HealingSuggestion | null;
   attemptedStrategies: HealingStrategy[];
@@ -167,6 +220,12 @@ export interface HealingOutcome {
    * for the "Healing Decision" observability card.
    */
   decisionTrail?: DecisionTrailEntry[];
+  /**
+   * Repo Intelligence targeting. Present (with `isPageObject` semantics) when the
+   * failing file is a shared Page Object / helper, so the apply flow patches that
+   * one file and repairs every dependent test. Absent for ordinary spec heals.
+   */
+  pageObjectPatch?: PageObjectPatchTarget;
 }
 
 export interface FinalizeResult {
@@ -229,6 +288,108 @@ export class HealingOrchestrator {
    * @param companyId - Optional: company ID for company-scoped queries
    */
   async heal(
+    failure: FailureDetails,
+    domHtml?: string,
+    skipLocators?: Set<string>,
+    projectId?: number,
+    companyId?: number,
+    repoContext?: HealingContextResult,
+    appProfile?: AppProfileHealingInput,
+  ): Promise<HealingOutcome> {
+    // Run the full waterfall (Learning → App Profile → DOM Memory → … → AI).
+    const outcome = await this.healCore(
+      failure,
+      domHtml,
+      skipLocators,
+      projectId,
+      companyId,
+      repoContext,
+      appProfile,
+    );
+
+    // ── Repo Intelligence (Phase 4) — deterministic targeting router ──
+    // Orthogonal to selector production: it does not change WHICH selector we
+    // use, only WHERE the patch is written. If the failing file is a shared Page
+    // Object/helper, one patch repairs every dependent test. Cheap + safe:
+    // degrades to "not a page object" on any error, leaving the spec path intact.
+    try {
+      const target = await this.classifyPageObjectTarget(failure, repoContext);
+      if (target) {
+        outcome.pageObjectPatch = target;
+        this.insertRepoIntelligenceTrail(outcome, target);
+      } else {
+        this.insertRepoIntelligenceTrail(outcome, undefined);
+      }
+    } catch (err: any) {
+      logger.debug(MOD, 'Repo Intelligence targeting failed (non-fatal)', { error: err?.message });
+    }
+
+    return outcome;
+  }
+
+  /**
+   * Repo Intelligence targeting — classify the failing file and, when it is a
+   * shared Page Object / helper, build the patch target (the file itself, the
+   * stack line, and the dependent-test impact count). Returns `undefined` for
+   * ordinary specs so the normal spec-healing path is used.
+   */
+  private async classifyPageObjectTarget(
+    failure: FailureDetails,
+    repoContext?: HealingContextResult,
+  ): Promise<PageObjectPatchTarget | undefined> {
+    if (!failure.filePath) return undefined;
+
+    const classification = await classifyFailureFile({
+      filePath: failure.filePath,
+      brokenLocator: failure.failedLocator || failure.failedLineCode,
+      repoContextId: repoContext?.contextId ?? undefined,
+      source: failure.surroundingCode,
+    });
+
+    if (!classification.isPageObject || !classification.source) return undefined;
+
+    return {
+      targetFile: failure.filePath,
+      targetLine: failure.lineNumber,
+      className: classification.className,
+      methodName: classification.methodName,
+      impactedTests: classification.impactedTests,
+      source: classification.source,
+      reasoning: classification.reasoning,
+    };
+  }
+
+  /**
+   * Insert the "Repo Intelligence" entry into the decision trail, positioned
+   * right after "App Profile" to honour the Phase 4 waterfall order
+   * (Learning → App Profile → Repo Intelligence → DOM Memory → … → AI).
+   */
+  private insertRepoIntelligenceTrail(
+    outcome: HealingOutcome,
+    target: PageObjectPatchTarget | undefined,
+  ): void {
+    if (!outcome.decisionTrail) return;
+    const entry: DecisionTrailEntry = target
+      ? {
+          layer: 'Repo Intelligence',
+          outcome: 'hit',
+          reasoning: target.reasoning,
+        }
+      : {
+          layer: 'Repo Intelligence',
+          outcome: 'miss',
+          reasoning: 'Failing file is an individual spec — patching the test file directly',
+        };
+    // Place directly after the last "App Profile" entry; fall back to append.
+    let idx = -1;
+    for (let i = 0; i < outcome.decisionTrail.length; i++) {
+      if (outcome.decisionTrail[i].layer === 'App Profile') idx = i;
+    }
+    if (idx >= 0) outcome.decisionTrail.splice(idx + 1, 0, entry);
+    else outcome.decisionTrail.push(entry);
+  }
+
+  private async healCore(
     failure: FailureDetails,
     domHtml?: string,
     skipLocators?: Set<string>,

@@ -62,6 +62,16 @@ export interface HealingAction {
     reasoning?: string;
   }>;
   /**
+   * Repo Intelligence "Patch the Page Object" targeting (Phase 4 / PR #160).
+   * When the broken selector lived in a shared Page Object / helper, these
+   * capture WHERE the patch was written (the shared file + line) and how many
+   * dependent tests one patch repaired. NULL/false for ordinary spec heals.
+   */
+  target_file_path?: string | null;
+  target_line?: number | null;
+  is_page_object_patch?: boolean;
+  page_object_impact?: number;
+  /**
    * Write-path attribution (Phase 2). Optional — NULL lets the DB triggers
    * stamp the project's current sprint / default environment when project_id is
    * known; explicit values are respected.
@@ -639,6 +649,10 @@ async function initSchema(client: PoolClient): Promise<void> {
     validation_reason TEXT,
     patch_path TEXT,
     decision_trail JSONB,
+    target_file_path TEXT,
+    target_line INTEGER,
+    is_page_object_patch BOOLEAN DEFAULT FALSE,
+    page_object_impact INTEGER DEFAULT 0,
     created_at TIMESTAMPTZ DEFAULT NOW()
   )`);
 
@@ -1690,6 +1704,23 @@ async function migrateDefaultCompany(client: PoolClient): Promise<void> {
     END IF;
     IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='healing_actions' AND column_name='project_id') THEN
       ALTER TABLE healing_actions ADD COLUMN project_id INTEGER REFERENCES projects(id) ON DELETE SET NULL;
+    END IF;
+    -- Decision-trail observability (PR #157) — migrate existing tables.
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='healing_actions' AND column_name='decision_trail') THEN
+      ALTER TABLE healing_actions ADD COLUMN decision_trail JSONB;
+    END IF;
+    -- Repo Intelligence "Patch the Page Object" targeting (PR #160).
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='healing_actions' AND column_name='target_file_path') THEN
+      ALTER TABLE healing_actions ADD COLUMN target_file_path TEXT;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='healing_actions' AND column_name='target_line') THEN
+      ALTER TABLE healing_actions ADD COLUMN target_line INTEGER;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='healing_actions' AND column_name='is_page_object_patch') THEN
+      ALTER TABLE healing_actions ADD COLUMN is_page_object_patch BOOLEAN DEFAULT FALSE;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='healing_actions' AND column_name='page_object_impact') THEN
+      ALTER TABLE healing_actions ADD COLUMN page_object_impact INTEGER DEFAULT 0;
     END IF;
     IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='healing_jobs' AND column_name='project_id') THEN
       ALTER TABLE healing_jobs ADD COLUMN project_id INTEGER REFERENCES projects(id) ON DELETE SET NULL;
@@ -3014,8 +3045,9 @@ export async function logHealing(data: HealingAction, companyId?: number): Promi
     `INSERT INTO healing_actions
       (test_execution_id, test_name, failed_locator, healed_locator, healing_strategy, ai_tokens_used,
        success, confidence, error_context, validation_status, validation_reason, patch_path, decision_trail,
+       target_file_path, target_line, is_page_object_patch, page_object_impact,
        company_id, project_id, environment_id, sprint_id)
-    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
     RETURNING id`,
     [
       data.test_execution_id,
@@ -3031,6 +3063,10 @@ export async function logHealing(data: HealingAction, companyId?: number): Promi
       data.validation_reason ?? null,
       data.patch_path ?? null,
       data.decision_trail ? JSON.stringify(data.decision_trail) : null,
+      data.target_file_path ?? null,
+      data.target_line ?? null,
+      data.is_page_object_patch ?? false,
+      data.page_object_impact ?? 0,
       companyId ?? null,
       data.project_id ?? null,
       data.environment_id ?? null,
@@ -9151,6 +9187,9 @@ export interface MethodSearchHit {
   usageCount: number;
   sourceCode: string;
   similarity: number;
+  /** 1-based start/end line of the method in its source file, when indexed. */
+  lineStart?: number | null;
+  lineEnd?: number | null;
 }
 
 /**
@@ -9338,6 +9377,49 @@ export async function findMethodByHash(
   );
   if (res.rows.length === 0) return null;
   return { ...mapMethodHit(res.rows[0]), similarity: 1 };
+}
+
+/**
+ * Find indexed methods whose source file matches a failing file path, restricted
+ * to page-object / helper method types. Used by Repo Intelligence healing
+ * (Phase 4) to answer deterministically: "is the file this failure occurred in a
+ * shared Page Object, and how many tests depend on it?"
+ *
+ * `filePath` from a failure stack is often repo-relative (e.g. `pages/LoginPage.ts`)
+ * while `repository_methods.file_path` may be absolute or differently-rooted, so
+ * we match on a normalised path SUFFIX rather than equality. Returns [] when the
+ * method index is unavailable (degrades safely — heuristics still apply).
+ */
+export async function findPageObjectMethodsByFile(
+  filePath: string,
+  opts: { repoContextId?: number } = {},
+): Promise<MethodSearchHit[]> {
+  if (!isMethodIntelAvailable() || !filePath) return [];
+  const p = getPool();
+  // Normalise to a forward-slash basename-ish suffix for robust matching.
+  const norm = filePath.replace(/\\/g, '/').replace(/^.*?([^/]+\/[^/]+)$/, '$1');
+  const params: any[] = [`%${norm}`];
+  let ctxClause = '';
+  if (opts.repoContextId != null) {
+    params.push(opts.repoContextId);
+    ctxClause = `AND repository_context_id = $${params.length}`;
+  }
+  const res = await p.query(
+    `SELECT id, method_name, file_path, class_name, method_type,
+            usage_count, source_code, line_start, line_end
+       FROM repository_methods
+      WHERE method_type IN ('page_object_method', 'helper')
+        AND REPLACE(file_path, '\\', '/') LIKE $1
+        ${ctxClause}
+      ORDER BY usage_count DESC NULLS LAST, id ASC`,
+    params,
+  );
+  return res.rows.map((r: any) => ({
+    ...mapMethodHit(r),
+    similarity: 1,
+    lineStart: r.line_start ?? null,
+    lineEnd: r.line_end ?? null,
+  }));
 }
 
 /** Direct callees of a method (the method's outgoing dependency edges). */

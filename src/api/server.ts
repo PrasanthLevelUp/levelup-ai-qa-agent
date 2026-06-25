@@ -27,7 +27,7 @@ import { initDb, closeDb, getDatabaseHealth } from '../db/postgres';
 import { ExecutionEngine } from '../core/execution-engine';
 import { ArtifactCollector, extractTopLevelErrors } from '../core/artifact-collector';
 import { FailureAnalyzer } from '../core/failure-analyzer';
-import { HealingOrchestrator } from '../core/healing-orchestrator';
+import { HealingOrchestrator, pageObjectPatchLogFields } from '../core/healing-orchestrator';
 import { HealingStrategySelector, type StrategyConfig } from '../core/healing-strategy-selector';
 import { RuleEngine } from '../engines/rule-engine';
 import { PatternEngine } from '../engines/pattern-engine';
@@ -957,6 +957,7 @@ function createHealingWorker(
                 validation_reason: `[Iter ${iteration + 1} R${retry + 1}] ${outcome.suggestion.reasoning}`,
                 patch_path: validation.patchPath,
                 decision_trail: outcome.decisionTrail,
+                ...pageObjectPatchLogFields(outcome),
                 project_id: resolvedProjectId ?? null,
               }, job.companyId);
 
@@ -1057,6 +1058,7 @@ function createHealingWorker(
                   validation_reason: `[Iter ${iteration + 1} R${retry + 1}] Confirmed healed via confirmation rerun.`,
                   patch_path: validation.patchPath,
                   decision_trail: outcome.decisionTrail,
+                  ...pageObjectPatchLogFields(outcome),
                   project_id: resolvedProjectId ?? null,
                 }, job.companyId);
 
@@ -1163,6 +1165,7 @@ function createHealingWorker(
                 validation_reason: `[Iter ${iteration + 1} R${retry + 1}] ${outcome.suggestion.reasoning}`,
                 patch_path: validation.patchPath,
                 decision_trail: outcome.decisionTrail,
+                ...pageObjectPatchLogFields(outcome),
                 project_id: resolvedProjectId ?? null,
               }, job.companyId);
 
@@ -1242,6 +1245,7 @@ function createHealingWorker(
               validation_reason: `[Iter ${iteration + 1} R${retry + 1}] Reverted — same locator still failing.`,
               patch_path: validation.patchPath,
               decision_trail: outcome.decisionTrail,
+              ...pageObjectPatchLogFields(outcome),
               project_id: resolvedProjectId ?? null,
             }, job.companyId);
 

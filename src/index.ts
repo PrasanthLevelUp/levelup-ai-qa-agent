@@ -8,7 +8,7 @@ import { backupFile, cleanupBackup, restoreFile } from './utils/file-utils';
 import { ExecutionEngine } from './core/execution-engine';
 import { ArtifactCollector } from './core/artifact-collector';
 import { FailureAnalyzer } from './core/failure-analyzer';
-import { HealingOrchestrator } from './core/healing-orchestrator';
+import { HealingOrchestrator, pageObjectPatchLogFields } from './core/healing-orchestrator';
 import { RuleEngine } from './engines/rule-engine';
 import { PatternEngine } from './engines/pattern-engine';
 import { AIEngine } from './engines/ai-engine';
@@ -328,6 +328,7 @@ async function runCLI(): Promise<void> {
               validation_status: 'approved',
               validation_reason: `[Iter ${iteration + 1} R${retry + 1}] ${outcome.suggestion.reasoning}`,
               patch_path: validation.patchPath,
+              ...pageObjectPatchLogFields(outcome),
             });
             healings.push({
               testName: failure.testName, failedLocator: failure.failedLocator,
