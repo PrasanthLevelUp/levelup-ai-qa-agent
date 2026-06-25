@@ -38,8 +38,35 @@ import {
   logHealing,
   storePattern,
 } from '../db/postgres';
+import {
+  rankCandidates,
+  type RankableCandidate,
+  type ScoredCandidate,
+  type CandidateSource,
+} from './candidate-ranker';
+import {
+  buildDefaultAdvisors,
+  type HealingAdvisor,
+  type AdvisorContext,
+} from './advisors';
 
 const MOD = 'healing-orchestrator';
+
+/** Parse a non-negative float env var, falling back to a default. */
+function envFloat(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw === '') return fallback;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? n : fallback;
+}
+
+/** Parse a non-negative integer env var, falling back to a default. */
+function envIntLocal(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw === '') return fallback;
+  const n = parseInt(raw, 10);
+  return Number.isFinite(n) && n >= 0 ? n : fallback;
+}
 
 /** Method types whose selectors are the most trustworthy grounding signal. */
 const PAGE_OBJECT_METHOD_TYPES = new Set(['page_object_method', 'helper']);
@@ -228,6 +255,23 @@ export interface HealingOutcome {
   pageObjectPatch?: PageObjectPatchTarget;
 }
 
+/**
+ * Result of {@link HealingOrchestrator.collectRankedCandidates} — a pre-ranked,
+ * already statically-validated set of candidates that the worker can try against
+ * the browser best-first, plus the shared observability artifacts (decision
+ * trail + Page Object targeting) that apply to the whole failure.
+ */
+export interface RankedCandidateSet {
+  /** Candidates, best-first. Each already passed cheap syntax/static validation. */
+  candidates: ScoredCandidate[];
+  /** Waterfall/ranking summary for the "Healing Decision" observability card. */
+  decisionTrail: DecisionTrailEntry[];
+  /** Repo Intelligence targeting — present when the failing file is a Page Object. */
+  pageObjectPatch?: PageObjectPatchTarget;
+  /** DOM Memory insight for the failed selector (when available). */
+  domMemoryInsight?: DOMMemoryInsight;
+}
+
 export interface FinalizeResult {
   success: boolean;
   patchPath?: string;
@@ -251,6 +295,13 @@ export class HealingOrchestrator {
   private readonly similarityEngine: SemanticSimilarityEngine;
   private readonly confidenceEngine: ConfidenceEngine;
   private readonly domMemory: DOMMemoryQuery;
+  /**
+   * Pluggable candidate sources. The orchestrator never references a concrete
+   * intelligence layer when collecting candidates — it only iterates this list.
+   * New intelligence (Knowledge Graph, Component / Framework / API Intelligence)
+   * is added by registering another {@link HealingAdvisor}, with no changes here.
+   */
+  private readonly advisors: HealingAdvisor[];
 
   constructor(
     private readonly ruleEngine: RuleEngine,
@@ -260,6 +311,7 @@ export class HealingOrchestrator {
     patchEngine?: PatchEngine,
     rerunEngine?: RerunEngine,
     strategySelector?: HealingStrategySelector,
+    advisors?: HealingAdvisor[],
   ) {
     this.validationEngine = validationEngine ?? new ValidationEngine();
     this.patchEngine = patchEngine ?? new PatchEngine();
@@ -269,6 +321,16 @@ export class HealingOrchestrator {
     this.similarityEngine = new SemanticSimilarityEngine();
     this.confidenceEngine = new ConfidenceEngine();
     this.domMemory = new DOMMemoryQuery();
+    // Default advisor registry (override-able for testing / custom pipelines).
+    this.advisors =
+      advisors ??
+      buildDefaultAdvisors({
+        patternEngine: this.patternEngine,
+        ruleEngine: this.ruleEngine,
+        aiEngine: this.aiEngine,
+        domExtractor: this.domExtractor,
+        domMemory: this.domMemory,
+      });
   }
 
   /**
@@ -325,6 +387,207 @@ export class HealingOrchestrator {
     }
 
     return outcome;
+  }
+
+  /**
+   * Collect ALL candidates from every intelligence layer in ONE pass, score them
+   * with cheap browser-free heuristics, and return them best-first.
+   *
+   * This is the performance counterpart to {@link heal} (which returns only the
+   * single top candidate). The worker calls this ONCE per broken locator and then
+   * runs the browser on the best candidate(s) only — instead of launching a
+   * browser after every single candidate. AI is consulted only to "top up" when
+   * the cheap/grounded layers did not yield enough confident candidates, so token
+   * cost stays bounded.
+   *
+   * Every returned candidate has already passed cheap static/syntax validation
+   * (`syntaxValid`), so obviously-broken selectors never reach the browser.
+   */
+  async collectRankedCandidates(
+    failure: FailureDetails,
+    domHtml?: string,
+    skipLocators?: Set<string>,
+    projectId?: number,
+    companyId?: number,
+    repoContext?: HealingContextResult,
+    appProfile?: AppProfileHealingInput,
+  ): Promise<RankedCandidateSet> {
+    const repoCtx: HealingContextResult = repoContext ?? emptyHealingContext();
+    const scope: PatternTenantScope = { companyId, projectId };
+    const failedValue = failure.failedLocator || failure.failedLineCode || '';
+
+    // Repo Intelligence targeting (shared across all candidates for this failure).
+    let pageObjectPatch: PageObjectPatchTarget | undefined;
+    try {
+      pageObjectPatch = await this.classifyPageObjectTarget(failure, repoContext);
+    } catch (err: any) {
+      logger.debug(MOD, 'Repo Intelligence targeting failed during collection (non-fatal)', {
+        error: err?.message,
+      });
+    }
+    const matchesPageObject = !!pageObjectPatch;
+
+    const raw: RankableCandidate[] = [];
+    const seen = new Set<string>();
+    const norm = (loc: string): string => {
+      try {
+        return selectorCore(loc) || loc.trim();
+      } catch {
+        return loc.trim();
+      }
+    };
+
+    const push = (input: {
+      newLocator: string;
+      strategy: HealingStrategy;
+      source: CandidateSource;
+      confidence: number;
+      tokensUsed: number;
+      reasoning: string;
+      addExplicitWait: boolean;
+      inAppProfile?: boolean;
+      domMemoryStability?: number;
+    }): void => {
+      const loc = input.newLocator?.trim();
+      if (!loc) return;
+      const key = norm(loc);
+      if (!key || seen.has(key)) return;
+      if (skipLocators?.has(loc)) return;
+      seen.add(key);
+
+      // Cheap static/syntax validation — no browser. Invalid candidates are kept
+      // but flagged so the ranker can hard-reject them (and they show in the trail).
+      let syntaxValid = true;
+      try {
+        syntaxValid = this.validationEngine.validate({
+          newLocator: loc,
+          confidence: input.confidence,
+          originalCode: '',
+          filePath: failure.filePath,
+        }).isValid;
+      } catch {
+        syntaxValid = false;
+      }
+
+      let similarityToFailed: number | undefined;
+      if (failedValue) {
+        try {
+          similarityToFailed = this.similarityEngine.compare(selectorCore(failedValue), key).score;
+        } catch {
+          similarityToFailed = undefined;
+        }
+      }
+
+      raw.push({
+        newLocator: loc,
+        strategy: input.strategy,
+        source: input.source,
+        confidence: input.confidence,
+        tokensUsed: input.tokensUsed,
+        reasoning: input.reasoning,
+        addExplicitWait: input.addExplicitWait,
+        stabilityScore: input.domMemoryStability,
+        signals: {
+          baseConfidence: input.confidence,
+          syntaxValid,
+          inAppProfile: !!input.inAppProfile,
+          domMemoryStability: input.domMemoryStability,
+          matchesPageObject,
+          similarityToFailed,
+        },
+      });
+    };
+
+    // ── Advisor pipeline ──────────────────────────────────────────────────
+    // The orchestrator does not know about any concrete intelligence layer; it
+    // just runs the registered advisors. Grounded advisors (Learning, App
+    // Profile, DOM Memory, DOM Candidate, Rule) always run. Fallback advisors
+    // (AI) run ONLY when the grounded ones did not produce enough confident
+    // candidates — so OpenAI is not invoked on every heal.
+    let domMemoryInsight: DOMMemoryInsight | undefined;
+    const ctx: AdvisorContext = {
+      failure,
+      domHtml,
+      skipLocators,
+      projectId,
+      companyId,
+      repoContext: repoCtx,
+      appProfile,
+      scope,
+      shared: {
+        appLocatorKeys: new Set<string>(),
+        domMemoryInsight: undefined,
+        matchesPageObject,
+      },
+      norm,
+    };
+
+    const runAdvisor = async (advisor: HealingAdvisor): Promise<void> => {
+      try {
+        const proposal = await advisor.propose(ctx);
+        if (proposal.domMemoryInsight) domMemoryInsight = proposal.domMemoryInsight;
+        for (const cand of proposal.candidates) push(cand);
+      } catch (err: any) {
+        logger.debug(MOD, `Advisor "${advisor.name}" failed (non-fatal)`, { error: err?.message });
+      }
+    };
+
+    // Grounded advisors first (cheap, 0-token, evidence-based).
+    for (const advisor of this.advisors.filter((a) => a.tier === 'grounded')) {
+      await runAdvisor(advisor);
+    }
+
+    // AI gate: consult fallback advisors only when grounded candidates are thin.
+    const aiSkipConfidence = envFloat('HEALING_RANK_AI_SKIP_CONFIDENCE', 0.8);
+    const minGrounded = envIntLocal('HEALING_RANK_MIN_GROUNDED', 2);
+    const groundedCount = raw.filter(
+      (c) => c.signals.syntaxValid && c.source !== 'ai' && c.confidence >= aiSkipConfidence,
+    ).length;
+    const fallbackAdvisors = this.advisors.filter((a) => a.tier === 'fallback');
+    if (groundedCount < minGrounded) {
+      for (const advisor of fallbackAdvisors) await runAdvisor(advisor);
+    } else if (fallbackAdvisors.length) {
+      logger.info(MOD, 'Skipping fallback (AI) advisors — enough grounded candidates', {
+        testName: failure.testName,
+        groundedCount,
+        minGrounded,
+        skipped: fallbackAdvisors.map((a) => a.name),
+      });
+    }
+
+    const ranked = rankCandidates(raw);
+
+    const sources = Array.from(new Set(raw.map((c) => c.source)));
+    const decisionTrail: DecisionTrailEntry[] = [
+      {
+        layer: 'Candidate Ranking',
+        outcome: ranked.length ? 'hit' : 'miss',
+        confidence: ranked[0]?.confidence,
+        reasoning: ranked.length
+          ? `Collected ${raw.length} candidate(s) from [${sources.join(', ')}] and ranked them ` +
+            `without a browser. Best: ${ranked[0].newLocator} ` +
+            `(score ${ranked[0].score.toFixed(2)}, source ${ranked[0].source}).`
+          : `No syntactically valid candidate from any layer (${raw.length} raw, all rejected).`,
+      },
+    ];
+    if (pageObjectPatch) {
+      decisionTrail.push({
+        layer: 'Repo Intelligence',
+        outcome: 'hit',
+        reasoning: pageObjectPatch.reasoning,
+      });
+    }
+
+    logger.info(MOD, 'Ranked healing candidates (no browser)', {
+      testName: failure.testName,
+      failedLocator: failure.failedLocator,
+      rawCount: raw.length,
+      rankedCount: ranked.length,
+      sources,
+      top: ranked.slice(0, 3).map((c) => ({ locator: c.newLocator, score: Number(c.score.toFixed(3)), source: c.source })),
+    });
+
+    return { candidates: ranked, decisionTrail, pageObjectPatch, domMemoryInsight };
   }
 
   /**
