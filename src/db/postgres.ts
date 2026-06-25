@@ -52,6 +52,16 @@ export interface HealingAction {
   validation_reason?: string;
   patch_path?: string;
   /**
+   * Decision trail — waterfall view of which intelligence layers were tried,
+   * which won, which missed, and which were skipped (for observability).
+   */
+  decision_trail?: Array<{
+    layer: string;
+    outcome: 'hit' | 'miss' | 'skipped' | 'not_reached' | 'error';
+    confidence?: number;
+    reasoning?: string;
+  }>;
+  /**
    * Write-path attribution (Phase 2). Optional — NULL lets the DB triggers
    * stamp the project's current sprint / default environment when project_id is
    * known; explicit values are respected.
@@ -628,6 +638,7 @@ async function initSchema(client: PoolClient): Promise<void> {
     validation_status TEXT,
     validation_reason TEXT,
     patch_path TEXT,
+    decision_trail JSONB,
     created_at TIMESTAMPTZ DEFAULT NOW()
   )`);
 
@@ -3002,9 +3013,9 @@ export async function logHealing(data: HealingAction, companyId?: number): Promi
   const result = await getPool().query(
     `INSERT INTO healing_actions
       (test_execution_id, test_name, failed_locator, healed_locator, healing_strategy, ai_tokens_used,
-       success, confidence, error_context, validation_status, validation_reason, patch_path, company_id,
-       project_id, environment_id, sprint_id)
-    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+       success, confidence, error_context, validation_status, validation_reason, patch_path, decision_trail,
+       company_id, project_id, environment_id, sprint_id)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
     RETURNING id`,
     [
       data.test_execution_id,
@@ -3019,6 +3030,7 @@ export async function logHealing(data: HealingAction, companyId?: number): Promi
       data.validation_status ?? null,
       data.validation_reason ?? null,
       data.patch_path ?? null,
+      data.decision_trail ? JSON.stringify(data.decision_trail) : null,
       companyId ?? null,
       data.project_id ?? null,
       data.environment_id ?? null,
