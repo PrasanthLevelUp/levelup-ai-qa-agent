@@ -141,6 +141,17 @@ export interface HealingSuggestion {
   stabilityAssessment?: string;
 }
 
+/**
+ * Decision trail entry — captures whether a healing layer won, was tried and
+ * missed, was skipped (because an earlier layer won), or errored.
+ */
+export interface DecisionTrailEntry {
+  layer: string; // e.g. "Learned Pattern", "App Profile", "DOM Memory", "AI"
+  outcome: 'hit' | 'miss' | 'skipped' | 'not_reached' | 'error';
+  confidence?: number; // present when outcome='hit'
+  reasoning?: string; // why it won, why it missed, or error message
+}
+
 export interface HealingOutcome {
   suggestion: HealingSuggestion | null;
   attemptedStrategies: HealingStrategy[];
@@ -150,6 +161,12 @@ export interface HealingOutcome {
   domCandidates?: DOMExtractionResult;
   /** DOM Memory insight for the failed selector */
   domMemoryInsight?: DOMMemoryInsight;
+  /**
+   * Decision trail — waterfall view of which intelligence layers were tried,
+   * which won, which missed, and which were skipped. Surfaced to the frontend
+   * for the "Healing Decision" observability card.
+   */
+  decisionTrail?: DecisionTrailEntry[];
 }
 
 export interface FinalizeResult {
@@ -228,6 +245,10 @@ export class HealingOrchestrator {
     let domCandidates: DOMExtractionResult | undefined;
     let domMemoryInsight: DOMMemoryInsight | undefined;
 
+    // Decision trail — waterfall view of which intelligence layers were tried,
+    // which won, which missed, and which were skipped (for observability).
+    const trail: DecisionTrailEntry[] = [];
+
     // ── Step 0 (Application Intelligence): Application Profile recovery ──
     // BEFORE anything else, ask the crawl we already built. The Application
     // Profile holds the real, stable selectors for this app (data-test* ids,
@@ -239,8 +260,25 @@ export class HealingOrchestrator {
     if (appProfileOutcome) {
       // Honour the audit's "Similarity participates BEFORE AI": grounded
       // candidates are already ranked by DOM evidence; no AI was consulted.
-      return appProfileOutcome;
+      trail.push({
+        layer: 'App Profile',
+        outcome: 'hit',
+        confidence: appProfileOutcome.suggestion?.confidence,
+        reasoning: appProfileOutcome.suggestion?.reasoning || 'Grounded from crawl',
+      });
+      trail.push({ layer: 'DOM Memory', outcome: 'skipped', reasoning: 'App Profile won' });
+      trail.push({ layer: 'Rule/Pattern', outcome: 'skipped', reasoning: 'App Profile won' });
+      trail.push({ layer: 'AI', outcome: 'skipped', reasoning: 'App Profile won' });
+      return { ...appProfileOutcome, decisionTrail: trail };
     }
+    // App Profile miss
+    trail.push({
+      layer: 'App Profile',
+      outcome: appProfile?.candidates?.length ? 'miss' : 'not_reached',
+      reasoning: appProfile?.candidates?.length
+        ? 'No valid candidate passed validation'
+        : 'No crawl data available',
+    });
 
     // ── Step 0a: DOM Memory Query (THE MOAT) ──────────────────
     // Query historical selector data BEFORE doing anything else.
@@ -293,18 +331,48 @@ export class HealingOrchestrator {
               stabilityAssessment: domMemoryInsight.selectorHistory.assessment,
             };
 
+            trail.push({
+              layer: 'DOM Memory',
+              outcome: 'hit',
+              confidence: bestAlt.compositeScore,
+              reasoning: bestAlt.reasoning,
+            });
+            trail.push({ layer: 'Rule/Pattern', outcome: 'skipped', reasoning: 'DOM Memory won' });
+            trail.push({ layer: 'AI', outcome: 'skipped', reasoning: 'DOM Memory won' });
+
             return {
               suggestion,
               attemptedStrategies: ['database_pattern'],
               selectedEngine: 'dom_memory',
               domMemoryInsight,
+              decisionTrail: trail,
             };
           }
         }
+        // DOM Memory miss (no high-confidence alternative or validation failed)
+        trail.push({
+          layer: 'DOM Memory',
+          outcome: 'miss',
+          reasoning: domMemoryInsight?.bestAlternative
+            ? 'Alternative found but validation failed'
+            : 'No high-confidence historical alternative',
+        });
       } catch (err: any) {
         // Non-critical — DOM Memory is an enhancement, not a requirement
         logger.warn(MOD, 'DOM Memory query failed (non-critical)', { error: err.message });
+        trail.push({
+          layer: 'DOM Memory',
+          outcome: 'error',
+          reasoning: err.message || 'Query failed',
+        });
       }
+    } else {
+      // No failed locator → DOM Memory not applicable
+      trail.push({
+        layer: 'DOM Memory',
+        outcome: 'not_reached',
+        reasoning: 'No failed locator to query',
+      });
     }
 
     // ── Step 0b: DOM Candidate Extraction (from live DOM HTML) ──
@@ -410,8 +478,27 @@ export class HealingOrchestrator {
       if (outcome.suggestion) {
         await this.enrichWithStability(outcome.suggestion, domMemoryInsight, scope.projectId);
         this.applyRepositoryConfidenceBoost(outcome.suggestion, repoCtx, domMemoryInsight);
+        // Record engine hit
+        const engineName =
+          outcome.suggestion.strategy === 'rule_based' ? 'Rule Engine' :
+          outcome.suggestion.strategy === 'database_pattern' ? 'Pattern Engine' :
+          'AI';
+        trail.push({
+          layer: engineName,
+          outcome: 'hit',
+          confidence: outcome.suggestion.confidence,
+          reasoning: outcome.suggestion.reasoning || 'Engine produced valid suggestion',
+        });
+      } else {
+        // All engines missed
+        trail.push({
+          layer: 'Rule/Pattern/AI',
+          outcome: 'miss',
+          reasoning: `Tried ${attemptedStrategies.length} engine(s), none produced valid suggestion`,
+        });
       }
       outcome.domMemoryInsight = domMemoryInsight;
+      outcome.decisionTrail = trail;
       return outcome;
     }
 
@@ -437,7 +524,16 @@ export class HealingOrchestrator {
         testName: failure.testName,
         attemptedStrategies,
       });
-      return { suggestion: null, attemptedStrategies, selectedEngine: selected.engine, domCandidates, domMemoryInsight };
+      // All engines missed
+      const engineLabel = attemptedStrategies.includes('rule_based') || attemptedStrategies.includes('database_pattern') || attemptedStrategies.includes('ai_reasoning')
+        ? 'Rule/Pattern/AI'
+        : 'Rule/Pattern/AI';
+      trail.push({
+        layer: engineLabel,
+        outcome: 'miss',
+        reasoning: `Tried ${attemptedStrategies.length} engine(s), none produced valid suggestion`,
+      });
+      return { suggestion: null, attemptedStrategies, selectedEngine: selected.engine, domCandidates, domMemoryInsight, decisionTrail: trail };
     }
 
     // Calculate enhanced confidence for the chosen suggestion
@@ -465,7 +561,19 @@ export class HealingOrchestrator {
       await this.strategySelector.recordUsage('ai', suggestion.tokensUsed);
     }
 
-    return { suggestion, attemptedStrategies, selectedEngine: selected.engine, confidenceResult, domCandidates, domMemoryInsight };
+    // Record the winning engine in the decision trail
+    const engineName =
+      suggestion.strategy === 'rule_based' ? 'Rule Engine' :
+      suggestion.strategy === 'database_pattern' ? 'Pattern Engine' :
+      'AI';
+    trail.push({
+      layer: engineName,
+      outcome: 'hit',
+      confidence: suggestion.confidence,
+      reasoning: suggestion.reasoning || 'Engine produced valid suggestion',
+    });
+
+    return { suggestion, attemptedStrategies, selectedEngine: selected.engine, confidenceResult, domCandidates, domMemoryInsight, decisionTrail: trail };
   }
 
   /**

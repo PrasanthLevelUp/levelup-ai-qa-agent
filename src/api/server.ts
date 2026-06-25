@@ -956,6 +956,7 @@ function createHealingWorker(
                 validation_status: 'approved',
                 validation_reason: `[Iter ${iteration + 1} R${retry + 1}] ${outcome.suggestion.reasoning}`,
                 patch_path: validation.patchPath,
+                decision_trail: outcome.decisionTrail,
                 project_id: resolvedProjectId ?? null,
               }, job.companyId);
 
@@ -1055,6 +1056,7 @@ function createHealingWorker(
                   validation_status: 'approved',
                   validation_reason: `[Iter ${iteration + 1} R${retry + 1}] Confirmed healed via confirmation rerun.`,
                   patch_path: validation.patchPath,
+                  decision_trail: outcome.decisionTrail,
                   project_id: resolvedProjectId ?? null,
                 }, job.companyId);
 
@@ -1160,6 +1162,7 @@ function createHealingWorker(
                 validation_status: 'approved',
                 validation_reason: `[Iter ${iteration + 1} R${retry + 1}] ${outcome.suggestion.reasoning}`,
                 patch_path: validation.patchPath,
+                decision_trail: outcome.decisionTrail,
                 project_id: resolvedProjectId ?? null,
               }, job.companyId);
 
@@ -1238,6 +1241,7 @@ function createHealingWorker(
               validation_status: 'reverted',
               validation_reason: `[Iter ${iteration + 1} R${retry + 1}] Reverted — same locator still failing.`,
               patch_path: validation.patchPath,
+              decision_trail: outcome.decisionTrail,
               project_id: resolvedProjectId ?? null,
             }, job.companyId);
 
