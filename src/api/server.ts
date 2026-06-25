@@ -18,7 +18,7 @@ import { createStatusRouter } from './routes/status';
 import { createReportsRouter } from './routes/reports';
 import { createReposRouter } from './routes/repos';
 import { createWebhookRouter } from './routes/webhook';
-import { JobQueue } from './queue/job-queue';
+import { JobQueue, JobStatus } from './queue/job-queue';
 import { RepoManager } from './services/repo-manager';
 import { logger } from '../utils/logger';
 import { initDb, closeDb, getDatabaseHealth } from '../db/postgres';
@@ -354,6 +354,36 @@ function createHealingWorker(
     const reportDir = process.env['REPORT_DIR'] || '/tmp/healing_reports';
     fs.mkdirSync(reportDir, { recursive: true });
 
+    // ── Wall-clock budgets & loop bounds (configurable via env) ──────────────
+    // The healing worker reruns each failing test inside nested retry loops. To
+    // guarantee a job ALWAYS finishes in a reasonable time (and never hangs like
+    // the stuck "Healing: ..." job), we bound it three ways:
+    //   1. A hard job-level wall-clock budget.
+    //   2. A per-test wall-clock budget.
+    //   3. Much smaller iteration/retry caps (was 15×8 = up to 120 reruns/test).
+    // We also honor user cancellation (the Cancel button) between reruns.
+    const envInt = (name: string, def: number): number => {
+      const v = Number(process.env[name]);
+      return Number.isFinite(v) && v > 0 ? v : def;
+    };
+    const jobStartMs = Date.now();
+    const JOB_BUDGET_MS = envInt('HEALING_JOB_BUDGET_MS', 900_000);       // 15 min total
+    const PER_TEST_BUDGET_MS = envInt('HEALING_PER_TEST_BUDGET_MS', 240_000); // 4 min/test
+    const MAX_HEAL_ITERATIONS = envInt('HEALING_MAX_ITERATIONS', 6);      // locator fixes/test
+    const RETRIES_PER_LOCATOR = envInt('HEALING_RETRIES_PER_LOCATOR', 3); // suggestions/locator
+
+    /** True once the user has cancelled this job (Cancel sets status=FAILED). */
+    const isCancelled = (): boolean => jobQueue.getJob(job.id)?.status === JobStatus.FAILED;
+    /** Remaining job wall-clock budget in ms (never negative). */
+    const jobBudgetRemainingMs = (): number => Math.max(0, JOB_BUDGET_MS - (Date.now() - jobStartMs));
+    /** True when the overall job time budget is exhausted. */
+    const jobBudgetExhausted = (): boolean => jobBudgetRemainingMs() <= 0;
+    /**
+     * Effective per-rerun timeout: never exceed the remaining job budget so a
+     * single rerun can't blow past the global limit.
+     */
+    const rerunTimeoutMs = (): number => Math.max(15_000, Math.min(120_000, jobBudgetRemainingMs()));
+
     // Resolve repo configuration
     const repo = repoManager.findRepo(job.repositoryId);
     // Use WORKSPACE_DIR env var for Railway/Docker, fallback to /tmp/healing-repos
@@ -444,7 +474,9 @@ function createHealingWorker(
     jobQueue.updateJob(job.id, {
       progress: job.testFile ? `Running tests (${job.testFile})...` : 'Running tests...',
     });
-    const run = ExecutionEngine.run(testRepoPath, job.testFile);
+    // Non-blocking full run, bounded by the overall job budget so the initial
+    // suite execution can't itself hang the job indefinitely.
+    const run = await ExecutionEngine.runAsync(testRepoPath, job.testFile, undefined, jobBudgetRemainingMs());
 
     // Step 4: Collect artifacts
     jobQueue.updateJob(job.id, { progress: 'Collecting failure artifacts...' });
@@ -579,7 +611,8 @@ function createHealingWorker(
       ? new RCAEngine({ apiKey: process.env['OPENAI_API_KEY'] })
       : null;
 
-    const MAX_HEAL_ITERATIONS = 15; // Max locator fixes per test before giving up
+    // MAX_HEAL_ITERATIONS / RETRIES_PER_LOCATOR are defined at the top of the
+    // worker (env-configurable) so they can be tuned alongside the time budgets.
 
     // De-duplicate artifacts by test name (multiple artifacts may come from the same test)
     const seenTests = new Set<string>();
@@ -590,13 +623,30 @@ function createHealingWorker(
       return true;
     });
 
+    let timedOutTests = 0;
     for (const artifact of uniqueArtifacts) {
+      // Stop the whole job cleanly if the user cancelled or we ran out of budget.
+      if (isCancelled()) {
+        logger.warn(MOD, 'Healing job cancelled by user — stopping', { jobId: job.id });
+        break;
+      }
+      if (jobBudgetExhausted()) {
+        logger.warn(MOD, 'Job time budget exhausted — stopping before next test', {
+          jobId: job.id, budgetMs: JOB_BUDGET_MS,
+        });
+        break;
+      }
+
       let failure = analyzer.analyze(artifact);
+      const testStartMs = Date.now();
+      // Per-test deadline = min(per-test budget, remaining job budget).
+      const testDeadlineMs = testStartMs + Math.min(PER_TEST_BUDGET_MS, jobBudgetRemainingMs());
+      const testBudgetExhausted = (): boolean => Date.now() >= testDeadlineMs;
 
       // PRE-CHECK: Re-run this specific test to see if it still fails.
       // A previous test's healing may have already fixed shared locators in the same file.
       const preCheckRelFile = path.relative(path.join(testRepoPath, 'tests'), failure.filePath);
-      const preCheck = ExecutionEngine.run(testRepoPath, preCheckRelFile, failure.testName);
+      const preCheck = await ExecutionEngine.runAsync(testRepoPath, preCheckRelFile, failure.testName, rerunTimeoutMs());
       if (preCheck.exitCode === 0) {
         logger.info(MOD, 'Test already passes (fixed by prior healing) — skipping', {
           testName: failure.testName,
@@ -662,6 +712,7 @@ function createHealingWorker(
       let lastStrategy = 'rule_based';
       let lastConfidence = 0;
       let iterFixCount = 0;
+      const healedBeforeTest = healedCount;
 
       // Observability: build a concise 3-layer trail for this failure regardless
       // of whether anything is healable. Finalized after the healing branches.
@@ -700,7 +751,7 @@ function createHealingWorker(
               if (updatedContent !== originalContent) {
                 fs.writeFileSync(failure.filePath, updatedContent, 'utf-8');
                 const relativeTestFile = path.relative(path.join(testRepoPath, 'tests'), failure.filePath);
-                const rerun = ExecutionEngine.run(testRepoPath, relativeTestFile, failure.testName);
+                const rerun = await ExecutionEngine.runAsync(testRepoPath, relativeTestFile, failure.testName, rerunTimeoutMs());
                 if (rerun.exitCode === 0) {
                   iterationSuccess = true;
                   healedCount++;
@@ -763,7 +814,6 @@ function createHealingWorker(
         //   Only advance to the next locator when the current one is truly fixed.
         const healedLocators = new Set<string>(); // Cycle detection across locators
         const triedLocators = new Set<string>();   // All tried suggestions (global across retries)
-        const RETRIES_PER_LOCATOR = 8;             // Max suggestions to try per broken locator
 
         // ── Re-enable DOM-grounded candidate extraction ──
         // The production worker reruns tests in a subprocess and has no live
@@ -838,6 +888,18 @@ function createHealingWorker(
         }
 
         for (let iteration = 0; iteration < MAX_HEAL_ITERATIONS; iteration++) {
+          // Stop healing this test if cancelled or out of time (job- or test-level).
+          if (isCancelled()) {
+            logger.warn(MOD, 'Cancelled mid-test — aborting locator loop', { testName: failure.testName });
+            break;
+          }
+          if (jobBudgetExhausted() || testBudgetExhausted()) {
+            logger.warn(MOD, 'Time budget exhausted — stopping locator loop for test', {
+              testName: failure.testName, iteration,
+              jobElapsedMs: Date.now() - jobStartMs, testElapsedMs: Date.now() - testStartMs,
+            });
+            break;
+          }
           jobQueue.updateJob(job.id, {
             progress: `Healing: ${failure.testName} (locator ${iteration + 1})...`,
           });
@@ -856,6 +918,14 @@ function createHealingWorker(
 
           // Try multiple suggestions for the SAME broken locator
           for (let retry = 0; retry < RETRIES_PER_LOCATOR; retry++) {
+            // Bail out of the (expensive) AI-heal + rerun cycle if cancelled or
+            // out of time — each retry can trigger a full Playwright rerun.
+            if (isCancelled() || jobBudgetExhausted() || testBudgetExhausted()) {
+              logger.warn(MOD, 'Stopping retry loop — cancelled or time budget exhausted', {
+                testName: failure.testName, iteration, retry,
+              });
+              break;
+            }
             const outcome = await orchestrator.heal(failure, domHtmlForFailure, triedLocators, resolvedProjectId, job.companyId, repoHealingContext, appProfileHealing);
             if (outcome.suggestion) {
               triedLocators.add(outcome.suggestion.newLocator);
@@ -928,7 +998,7 @@ function createHealingWorker(
               path.join(testRepoPath, 'tests'), failure.filePath,
             );
             const currentTestName = failure.testName;
-            const rerun = ExecutionEngine.run(testRepoPath, relativeTestFile, currentTestName);
+            const rerun = await ExecutionEngine.runAsync(testRepoPath, relativeTestFile, currentTestName, rerunTimeoutMs());
 
             logger.info(MOD, 'Rerun result', {
               exitCode: rerun.exitCode, iteration, retry,
@@ -1035,7 +1105,7 @@ function createHealingWorker(
                 testName: failure.testName, iteration, retry,
                 exitCode: rerun.exitCode,
               });
-              const confirmRerun = ExecutionEngine.run(testRepoPath, relativeTestFile, currentTestName);
+              const confirmRerun = await ExecutionEngine.runAsync(testRepoPath, relativeTestFile, currentTestName, rerunTimeoutMs());
               if (confirmRerun.exitCode === 0) {
                 // Confirmed healed!
                 locatorFixed = true;
@@ -1336,8 +1406,19 @@ function createHealingWorker(
       }
       healingTrails.push(trail.finalize(iterationSuccess ? 'healed' : 'not_healed'));
 
+      // Record tests we had to stop early due to the time budget (not healed and
+      // we were out of time). Surfaced in the job summary so a partial run is honest.
+      if (healedCount === healedBeforeTest && (testBudgetExhausted() || jobBudgetExhausted() || isCancelled())) {
+        timedOutTests++;
+        logger.warn(MOD, 'Test left unhealed due to time budget/cancellation', {
+          testName: failure.testName,
+        });
+      }
+
       // --- RCA Analysis for this failure ---
-      if (rcaEngine) {
+      // Skip the (AI-backed) RCA step entirely when cancelled or out of budget so
+      // cancellation/timeout takes effect promptly instead of running more AI calls.
+      if (rcaEngine && !isCancelled() && !jobBudgetExhausted()) {
         try {
           const healingForTest = healings.find((h) => h.testName === failure.testName);
           const rcaResult = await rcaEngine.analyze({
@@ -1518,6 +1599,11 @@ function createHealingWorker(
       totalTests: tests.length,
       failed: tests.filter((t) => t.status !== 'passed' && t.status !== 'healed').length,
       healed: healedCount,
+      // Honest reporting: how many tests we stopped on due to the time budget or
+      // a user cancellation, plus the total job wall-clock time.
+      timedOut: timedOutTests,
+      stoppedEarly: timedOutTests > 0 || isCancelled() || jobBudgetExhausted(),
+      durationMs: Date.now() - jobStartMs,
       strategy: healings[0]?.strategy || 'none',
       tokensUsed: totalTokensUsed,
       testResults: tests,

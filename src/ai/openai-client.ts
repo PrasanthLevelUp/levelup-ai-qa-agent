@@ -56,10 +56,22 @@ export class OpenAIClient {
       throw new Error('OPENAI_API_KEY is missing.');
     }
 
-    this.client = new OpenAI({ apiKey });
+    // Bound every OpenAI request with a hard timeout and disable the SDK's own
+    // internal retries (we manage retries ourselves below). Without a timeout the
+    // SDK default is ~10 min PER request with built-in retries — a single stuck
+    // call could hang a healing iteration for many minutes and, multiplied across
+    // the retry loops, was a contributor to runaway healing jobs.
+    const timeoutMs = (() => {
+      const v = Number(process.env['OPENAI_TIMEOUT_MS']);
+      return Number.isFinite(v) && v > 0 ? v : 30_000; // 30s default
+    })();
+    this.client = new OpenAI({ apiKey, timeout: timeoutMs, maxRetries: 0 });
     this.model = config?.model || process.env['OPENAI_PRIMARY_MODEL'] || DEFAULT_MODEL;
     this.embeddingModel = config?.embeddingModel || process.env['OPENAI_EMBEDDING_MODEL'] || 'text-embedding-3-small';
-    this.retries = config?.retries ?? 2;
+    // Our own bounded retry count (default 1 = 2 total attempts).
+    const envRetries = Number(process.env['OPENAI_MAX_RETRIES']);
+    const resolvedRetries = config?.retries ?? (Number.isFinite(envRetries) ? envRetries : 1);
+    this.retries = Number.isFinite(resolvedRetries) && resolvedRetries >= 0 ? resolvedRetries : 1;
   }
 
   async suggestSemanticLocator(req: LocatorSuggestionRequest): Promise<LocatorSuggestionResponse> {
