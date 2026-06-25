@@ -10,6 +10,7 @@
 import * as crypto from 'crypto';
 import { logger } from '../utils/logger';
 import { normalizeBaseUrl } from '../utils/url-normalize';
+import { seedSelectorHistoryFromCrawl } from '../services/dom-memory-seeder';
 import {
   getProfileByUrl,
   getProfileById,
@@ -182,6 +183,21 @@ export class ProfileService {
         });
       }
     }
+
+    // ── Phase 2: warm DOM Memory from this crawl ──────────────────────────
+    // Seed `selector_history` so the DOM Memory healing layer has real data to
+    // query on day one — not just after the first failure. Best-effort and
+    // non-fatal: a seeding error must never fail a profile save. We seed from
+    // `crawlData` because that is the exact shape the App Profile healer's
+    // `collectElements` already consumes, so element coverage is identical.
+    void seedSelectorHistoryFromCrawl({
+      crawlData: input.crawlData,
+      pageUrl: normalizedUrl,
+      projectId,
+      companyId,
+    }).catch((err) =>
+      logger.warn(MOD, 'DOM Memory seeding rejected (non-fatal)', { error: err?.message }),
+    );
 
     logger.info(MOD, 'Profile saved successfully', { profileId: profile.id });
     return profile;
