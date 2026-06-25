@@ -38,8 +38,30 @@ import {
   logHealing,
   storePattern,
 } from '../db/postgres';
+import {
+  rankCandidates,
+  type RankableCandidate,
+  type ScoredCandidate,
+  type CandidateSource,
+} from './candidate-ranker';
 
 const MOD = 'healing-orchestrator';
+
+/** Parse a non-negative float env var, falling back to a default. */
+function envFloat(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw === '') return fallback;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? n : fallback;
+}
+
+/** Parse a non-negative integer env var, falling back to a default. */
+function envIntLocal(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw === '') return fallback;
+  const n = parseInt(raw, 10);
+  return Number.isFinite(n) && n >= 0 ? n : fallback;
+}
 
 /** Method types whose selectors are the most trustworthy grounding signal. */
 const PAGE_OBJECT_METHOD_TYPES = new Set(['page_object_method', 'helper']);
@@ -228,6 +250,23 @@ export interface HealingOutcome {
   pageObjectPatch?: PageObjectPatchTarget;
 }
 
+/**
+ * Result of {@link HealingOrchestrator.collectRankedCandidates} — a pre-ranked,
+ * already statically-validated set of candidates that the worker can try against
+ * the browser best-first, plus the shared observability artifacts (decision
+ * trail + Page Object targeting) that apply to the whole failure.
+ */
+export interface RankedCandidateSet {
+  /** Candidates, best-first. Each already passed cheap syntax/static validation. */
+  candidates: ScoredCandidate[];
+  /** Waterfall/ranking summary for the "Healing Decision" observability card. */
+  decisionTrail: DecisionTrailEntry[];
+  /** Repo Intelligence targeting — present when the failing file is a Page Object. */
+  pageObjectPatch?: PageObjectPatchTarget;
+  /** DOM Memory insight for the failed selector (when available). */
+  domMemoryInsight?: DOMMemoryInsight;
+}
+
 export interface FinalizeResult {
   success: boolean;
   patchPath?: string;
@@ -325,6 +364,285 @@ export class HealingOrchestrator {
     }
 
     return outcome;
+  }
+
+  /**
+   * Collect ALL candidates from every intelligence layer in ONE pass, score them
+   * with cheap browser-free heuristics, and return them best-first.
+   *
+   * This is the performance counterpart to {@link heal} (which returns only the
+   * single top candidate). The worker calls this ONCE per broken locator and then
+   * runs the browser on the best candidate(s) only — instead of launching a
+   * browser after every single candidate. AI is consulted only to "top up" when
+   * the cheap/grounded layers did not yield enough confident candidates, so token
+   * cost stays bounded.
+   *
+   * Every returned candidate has already passed cheap static/syntax validation
+   * (`syntaxValid`), so obviously-broken selectors never reach the browser.
+   */
+  async collectRankedCandidates(
+    failure: FailureDetails,
+    domHtml?: string,
+    skipLocators?: Set<string>,
+    projectId?: number,
+    companyId?: number,
+    repoContext?: HealingContextResult,
+    appProfile?: AppProfileHealingInput,
+  ): Promise<RankedCandidateSet> {
+    const repoCtx: HealingContextResult = repoContext ?? emptyHealingContext();
+    const scope: PatternTenantScope = { companyId, projectId };
+    const failedValue = failure.failedLocator || failure.failedLineCode || '';
+
+    // Repo Intelligence targeting (shared across all candidates for this failure).
+    let pageObjectPatch: PageObjectPatchTarget | undefined;
+    try {
+      pageObjectPatch = await this.classifyPageObjectTarget(failure, repoContext);
+    } catch (err: any) {
+      logger.debug(MOD, 'Repo Intelligence targeting failed during collection (non-fatal)', {
+        error: err?.message,
+      });
+    }
+    const matchesPageObject = !!pageObjectPatch;
+
+    const raw: RankableCandidate[] = [];
+    const seen = new Set<string>();
+    const norm = (loc: string): string => {
+      try {
+        return selectorCore(loc) || loc.trim();
+      } catch {
+        return loc.trim();
+      }
+    };
+
+    const push = (input: {
+      newLocator: string;
+      strategy: HealingStrategy;
+      source: CandidateSource;
+      confidence: number;
+      tokensUsed: number;
+      reasoning: string;
+      addExplicitWait: boolean;
+      inAppProfile?: boolean;
+      domMemoryStability?: number;
+    }): void => {
+      const loc = input.newLocator?.trim();
+      if (!loc) return;
+      const key = norm(loc);
+      if (!key || seen.has(key)) return;
+      if (skipLocators?.has(loc)) return;
+      seen.add(key);
+
+      // Cheap static/syntax validation — no browser. Invalid candidates are kept
+      // but flagged so the ranker can hard-reject them (and they show in the trail).
+      let syntaxValid = true;
+      try {
+        syntaxValid = this.validationEngine.validate({
+          newLocator: loc,
+          confidence: input.confidence,
+          originalCode: '',
+          filePath: failure.filePath,
+        }).isValid;
+      } catch {
+        syntaxValid = false;
+      }
+
+      let similarityToFailed: number | undefined;
+      if (failedValue) {
+        try {
+          similarityToFailed = this.similarityEngine.compare(selectorCore(failedValue), key).score;
+        } catch {
+          similarityToFailed = undefined;
+        }
+      }
+
+      raw.push({
+        newLocator: loc,
+        strategy: input.strategy,
+        source: input.source,
+        confidence: input.confidence,
+        tokensUsed: input.tokensUsed,
+        reasoning: input.reasoning,
+        addExplicitWait: input.addExplicitWait,
+        stabilityScore: input.domMemoryStability,
+        signals: {
+          baseConfidence: input.confidence,
+          syntaxValid,
+          inAppProfile: !!input.inAppProfile,
+          domMemoryStability: input.domMemoryStability,
+          matchesPageObject,
+          similarityToFailed,
+        },
+      });
+    };
+
+    // ── 1. Learned pattern (our own previously-proven heal) ──
+    try {
+      const pr = await this.patternEngine.findMatch(failure, scope);
+      if (pr) {
+        push({
+          newLocator: pr.newLocator,
+          strategy: 'database_pattern',
+          source: 'learned_pattern',
+          confidence: pr.confidence,
+          tokensUsed: 0,
+          reasoning: `[Learned Pattern] ${pr.reasoning}`,
+          addExplicitWait: false,
+        });
+      }
+    } catch (err: any) {
+      logger.debug(MOD, 'Learned-pattern collection failed (non-fatal)', { error: err?.message });
+    }
+
+    // ── 2. Application Profile candidates (real, crawled DOM evidence) ──
+    const appCandidates = appProfile?.candidates ?? [];
+    const appLocatorKeys = new Set(appCandidates.map((c) => norm(c.locator)));
+    for (const cand of appCandidates) {
+      push({
+        newLocator: cand.locator,
+        strategy: 'rule_based',
+        source: 'app_profile',
+        confidence: cand.confidence,
+        tokensUsed: 0,
+        reasoning: `[App Profile] ${cand.reasoning}`,
+        addExplicitWait: false,
+        inAppProfile: true,
+      });
+    }
+
+    // ── 3. DOM Memory alternatives (historical stability) ──
+    let domMemoryInsight: DOMMemoryInsight | undefined;
+    if (failure.failedLocator) {
+      try {
+        domMemoryInsight = await this.domMemory.getInsight(failure.failedLocator, projectId, companyId);
+      } catch (err: any) {
+        logger.debug(MOD, 'DOM Memory collection failed (non-fatal)', { error: err?.message });
+      }
+    }
+    for (const alt of domMemoryInsight?.alternatives ?? []) {
+      push({
+        newLocator: alt.selector,
+        strategy: 'database_pattern',
+        source: 'dom_memory',
+        confidence: alt.compositeScore,
+        tokensUsed: 0,
+        reasoning: `[DOM Memory] ${alt.reasoning}`,
+        addExplicitWait: false,
+        domMemoryStability: alt.stabilityScore,
+        inAppProfile: appLocatorKeys.has(norm(alt.selector)),
+      });
+    }
+
+    // ── 4. DOM candidate extraction (from a live DOM snapshot, when available) ──
+    if (domHtml && failure.failedLocator) {
+      try {
+        const dom = this.domExtractor.extractFromHTML(
+          domHtml,
+          failure.failedLocator,
+          failure.failedLineCode || '',
+        );
+        for (const dc of dom.candidates ?? []) {
+          const stability = domMemoryInsight?.alternatives.find((a) => a.selector === dc.selector)?.stabilityScore;
+          push({
+            newLocator: dc.selector,
+            strategy: 'rule_based',
+            source: 'dom_candidate',
+            confidence: dc.score,
+            tokensUsed: 0,
+            reasoning: `[DOM Candidate] ${dc.reasoning}`,
+            addExplicitWait: false,
+            domMemoryStability: stability,
+            inAppProfile: appLocatorKeys.has(norm(dc.selector)),
+          });
+        }
+      } catch (err: any) {
+        logger.debug(MOD, 'DOM candidate collection failed (non-fatal)', { error: err?.message });
+      }
+    }
+
+    // ── 5. Rule engine (deterministic, 0 tokens) ──
+    try {
+      const ruleResult = this.ruleEngine.generate(failure, skipLocators);
+      for (const s of ruleResult.suggestions ?? []) {
+        push({
+          newLocator: s.newLocator,
+          strategy: 'rule_based',
+          source: 'rule',
+          confidence: s.confidence,
+          tokensUsed: 0,
+          reasoning: s.reasoning,
+          addExplicitWait: ruleResult.addExplicitWait,
+          inAppProfile: appLocatorKeys.has(norm(s.newLocator)),
+        });
+      }
+    } catch (err: any) {
+      logger.debug(MOD, 'Rule-engine collection failed (non-fatal)', { error: err?.message });
+    }
+
+    // ── 6. AI — only top up when grounded layers were thin (bounds token cost) ──
+    const aiSkipConfidence = envFloat('HEALING_RANK_AI_SKIP_CONFIDENCE', 0.8);
+    const minGrounded = envIntLocal('HEALING_RANK_MIN_GROUNDED', 2);
+    const groundedCount = raw.filter(
+      (c) => c.signals.syntaxValid && c.source !== 'ai' && c.confidence >= aiSkipConfidence,
+    ).length;
+    if (groundedCount < minGrounded) {
+      try {
+        const grounding = repoCtx?.promptBlock || undefined;
+        const ai = await this.aiEngine.suggest(failure, grounding);
+        if (ai) {
+          push({
+            newLocator: ai.newLocator,
+            strategy: 'ai_reasoning',
+            source: 'ai',
+            confidence: ai.confidence,
+            tokensUsed: ai.tokensUsed,
+            reasoning: ai.reasoning,
+            addExplicitWait: false,
+          });
+        }
+      } catch (err: any) {
+        logger.debug(MOD, 'AI collection failed (non-fatal)', { error: err?.message });
+      }
+    } else {
+      logger.info(MOD, 'Skipping AI candidate top-up — enough grounded candidates', {
+        testName: failure.testName,
+        groundedCount,
+        minGrounded,
+      });
+    }
+
+    const ranked = rankCandidates(raw);
+
+    const sources = Array.from(new Set(raw.map((c) => c.source)));
+    const decisionTrail: DecisionTrailEntry[] = [
+      {
+        layer: 'Candidate Ranking',
+        outcome: ranked.length ? 'hit' : 'miss',
+        confidence: ranked[0]?.confidence,
+        reasoning: ranked.length
+          ? `Collected ${raw.length} candidate(s) from [${sources.join(', ')}] and ranked them ` +
+            `without a browser. Best: ${ranked[0].newLocator} ` +
+            `(score ${ranked[0].score.toFixed(2)}, source ${ranked[0].source}).`
+          : `No syntactically valid candidate from any layer (${raw.length} raw, all rejected).`,
+      },
+    ];
+    if (pageObjectPatch) {
+      decisionTrail.push({
+        layer: 'Repo Intelligence',
+        outcome: 'hit',
+        reasoning: pageObjectPatch.reasoning,
+      });
+    }
+
+    logger.info(MOD, 'Ranked healing candidates (no browser)', {
+      testName: failure.testName,
+      failedLocator: failure.failedLocator,
+      rawCount: raw.length,
+      rankedCount: ranked.length,
+      sources,
+      top: ranked.slice(0, 3).map((c) => ({ locator: c.newLocator, score: Number(c.score.toFixed(3)), source: c.source })),
+    });
+
+    return { candidates: ranked, decisionTrail, pageObjectPatch, domMemoryInsight };
   }
 
   /**

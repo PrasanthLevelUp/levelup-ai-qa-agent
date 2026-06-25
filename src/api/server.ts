@@ -27,7 +27,7 @@ import { initDb, closeDb, getDatabaseHealth } from '../db/postgres';
 import { ExecutionEngine } from '../core/execution-engine';
 import { ArtifactCollector, extractTopLevelErrors } from '../core/artifact-collector';
 import { FailureAnalyzer } from '../core/failure-analyzer';
-import { HealingOrchestrator, pageObjectPatchLogFields } from '../core/healing-orchestrator';
+import { HealingOrchestrator, pageObjectPatchLogFields, type HealingOutcome } from '../core/healing-orchestrator';
 import { HealingStrategySelector, type StrategyConfig } from '../core/healing-strategy-selector';
 import { RuleEngine } from '../engines/rule-engine';
 import { PatternEngine } from '../engines/pattern-engine';
@@ -371,6 +371,10 @@ function createHealingWorker(
     const PER_TEST_BUDGET_MS = envInt('HEALING_PER_TEST_BUDGET_MS', 240_000); // 4 min/test
     const MAX_HEAL_ITERATIONS = envInt('HEALING_MAX_ITERATIONS', 6);      // locator fixes/test
     const RETRIES_PER_LOCATOR = envInt('HEALING_RETRIES_PER_LOCATOR', 3); // suggestions/locator
+    // With candidate pre-ranking the best candidate is tried first, so very few
+    // candidates ever need a real browser rerun. This is the hard cap on browser
+    // reruns per broken locator (the old code ran one rerun PER candidate).
+    const MAX_BROWSER_TRIES_PER_LOCATOR = envInt('HEALING_MAX_BROWSER_TRIES_PER_LOCATOR', 2);
 
     /** True once the user has cancelled this job (Cancel sets status=FAILED). */
     const isCancelled = (): boolean => jobQueue.getJob(job.id)?.status === JobStatus.FAILED;
@@ -916,44 +920,95 @@ function createHealingWorker(
           const fileContentBeforeFix = fs.readFileSync(failure.filePath, 'utf-8');
           let locatorFixed = false;
 
-          // Try multiple suggestions for the SAME broken locator
-          for (let retry = 0; retry < RETRIES_PER_LOCATOR; retry++) {
-            // Bail out of the (expensive) AI-heal + rerun cycle if cancelled or
-            // out of time — each retry can trigger a full Playwright rerun.
+          // ── Candidate ranking BEFORE browser execution (the big perf win) ──
+          // Collect candidates from EVERY layer in one pass, rank them with cheap
+          // browser-free heuristics (syntax validity, source trust, App Profile /
+          // DOM Memory / Page Object grounding, confidence, similarity), and try
+          // only the best candidate(s) against the browser. This replaces the old
+          // "one full Playwright rerun per candidate" loop — the single biggest
+          // healing-time bottleneck (≈18 reruns/test → 1–2).
+          const ranked = await orchestrator.collectRankedCandidates(
+            failure, domHtmlForFailure, triedLocators, resolvedProjectId,
+            job.companyId, repoHealingContext, appProfileHealing,
+          );
+
+          if (ranked.candidates.length === 0) {
+            logger.warn(MOD, 'No viable candidate for locator — skipping', {
+              testName: failure.testName, failedLocator: failure.failedLocator, iteration,
+            });
+            trail.record({
+              layer: 'ai_reasoning',
+              decision: 'no_candidate',
+              reason: 'No syntactically valid candidate from any layer for this locator.',
+            });
+            break; // nothing to try for this locator → give up on the test
+          }
+
+          // Hard cap on how many candidates may actually reach the browser for a
+          // single locator. Pre-ranking puts the best candidate first, so 1–2
+          // browser reruns typically suffice.
+          const maxBrowserTries = Math.min(MAX_BROWSER_TRIES_PER_LOCATOR, ranked.candidates.length);
+          // Examine at most this many ranked candidates (cheap rejections aside).
+          const maxCandidatesToExamine = Math.min(
+            ranked.candidates.length,
+            Math.max(RETRIES_PER_LOCATOR, MAX_BROWSER_TRIES_PER_LOCATOR),
+          );
+          let browserTries = 0;
+
+          // Try the pre-ranked candidates best-first for the SAME broken locator.
+          for (let retry = 0; retry < maxCandidatesToExamine; retry++) {
+            // Bail out of the (expensive) rerun cycle if cancelled or out of time.
             if (isCancelled() || jobBudgetExhausted() || testBudgetExhausted()) {
               logger.warn(MOD, 'Stopping retry loop — cancelled or time budget exhausted', {
                 testName: failure.testName, iteration, retry,
               });
               break;
             }
-            const outcome = await orchestrator.heal(failure, domHtmlForFailure, triedLocators, resolvedProjectId, job.companyId, repoHealingContext, appProfileHealing);
-            if (outcome.suggestion) {
-              triedLocators.add(outcome.suggestion.newLocator);
-            }
 
-            logger.info(MOD, 'Orchestrator result', {
-              testName: failure.testName, failedLocator: failure.failedLocator,
-              iteration, retry, hasSuggestion: !!outcome.suggestion,
-              suggestion: outcome.suggestion ? {
-                newLocator: outcome.suggestion.newLocator,
-                strategy: outcome.suggestion.strategy,
-                confidence: outcome.suggestion.confidence,
-              } : null,
-            });
-
-            if (!outcome.suggestion) {
-              logger.warn(MOD, 'No more suggestions for this locator', {
-                iteration, retry, testName: failure.testName,
-              });
-              trail.record({
-                layer: (outcome.attemptedStrategies?.[outcome.attemptedStrategies.length - 1]) ?? 'ai_reasoning',
-                decision: 'no_candidate',
-                reason: `No viable candidate from ${outcome.attemptedStrategies?.length
-                  ? outcome.attemptedStrategies.join(' → ')
-                  : 'any layer'} — exhausted suggestions for this locator.`,
+            // Stop once we have spent our browser-rerun budget for this locator.
+            if (browserTries >= maxBrowserTries) {
+              logger.info(MOD, 'Browser-rerun budget for locator exhausted', {
+                testName: failure.testName, failedLocator: failure.failedLocator,
+                iteration, browserTries, maxBrowserTries,
               });
               break;
             }
+
+            const candidate = ranked.candidates[retry];
+            triedLocators.add(candidate.newLocator);
+
+            // Adapt the ranked candidate into the HealingOutcome shape the rest of
+            // the apply / rerun / learn machinery already understands.
+            const outcome: HealingOutcome = {
+              suggestion: {
+                newLocator: candidate.newLocator,
+                strategy: candidate.strategy,
+                confidence: candidate.confidence,
+                tokensUsed: candidate.tokensUsed,
+                reasoning: candidate.reasoning,
+                addExplicitWait: candidate.addExplicitWait,
+                stabilityScore: candidate.stabilityScore,
+              },
+              attemptedStrategies: [candidate.strategy],
+              decisionTrail: ranked.decisionTrail,
+              pageObjectPatch: ranked.pageObjectPatch,
+              domMemoryInsight: ranked.domMemoryInsight,
+            };
+
+            logger.info(MOD, 'Trying ranked candidate', {
+              testName: failure.testName, failedLocator: failure.failedLocator,
+              iteration, retry, browserTries,
+              candidate: {
+                newLocator: candidate.newLocator,
+                strategy: candidate.strategy,
+                source: candidate.source,
+                confidence: Number(candidate.confidence.toFixed(3)),
+                score: Number(candidate.score.toFixed(3)),
+              },
+            });
+
+            // Narrow the type for the rest of the loop (always set above).
+            if (!outcome.suggestion) continue;
 
             // Pre-flight: static validation via Healing Acceptance Engine
             const preCheck = acceptCandidate(outcome.suggestion, failure, fileContentBeforeFix);
@@ -998,6 +1053,7 @@ function createHealingWorker(
               path.join(testRepoPath, 'tests'), failure.filePath,
             );
             const currentTestName = failure.testName;
+            browserTries++; // count this candidate against the per-locator browser budget
             const rerun = await ExecutionEngine.runAsync(testRepoPath, relativeTestFile, currentTestName, rerunTimeoutMs());
 
             logger.info(MOD, 'Rerun result', {
