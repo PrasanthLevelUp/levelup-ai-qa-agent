@@ -44,6 +44,11 @@ import {
   type ScoredCandidate,
   type CandidateSource,
 } from './candidate-ranker';
+import {
+  buildDefaultAdvisors,
+  type HealingAdvisor,
+  type AdvisorContext,
+} from './advisors';
 
 const MOD = 'healing-orchestrator';
 
@@ -290,6 +295,13 @@ export class HealingOrchestrator {
   private readonly similarityEngine: SemanticSimilarityEngine;
   private readonly confidenceEngine: ConfidenceEngine;
   private readonly domMemory: DOMMemoryQuery;
+  /**
+   * Pluggable candidate sources. The orchestrator never references a concrete
+   * intelligence layer when collecting candidates — it only iterates this list.
+   * New intelligence (Knowledge Graph, Component / Framework / API Intelligence)
+   * is added by registering another {@link HealingAdvisor}, with no changes here.
+   */
+  private readonly advisors: HealingAdvisor[];
 
   constructor(
     private readonly ruleEngine: RuleEngine,
@@ -299,6 +311,7 @@ export class HealingOrchestrator {
     patchEngine?: PatchEngine,
     rerunEngine?: RerunEngine,
     strategySelector?: HealingStrategySelector,
+    advisors?: HealingAdvisor[],
   ) {
     this.validationEngine = validationEngine ?? new ValidationEngine();
     this.patchEngine = patchEngine ?? new PatchEngine();
@@ -308,6 +321,16 @@ export class HealingOrchestrator {
     this.similarityEngine = new SemanticSimilarityEngine();
     this.confidenceEngine = new ConfidenceEngine();
     this.domMemory = new DOMMemoryQuery();
+    // Default advisor registry (override-able for testing / custom pipelines).
+    this.advisors =
+      advisors ??
+      buildDefaultAdvisors({
+        patternEngine: this.patternEngine,
+        ruleEngine: this.ruleEngine,
+        aiEngine: this.aiEngine,
+        domExtractor: this.domExtractor,
+        domMemory: this.domMemory,
+      });
   }
 
   /**
@@ -475,138 +498,60 @@ export class HealingOrchestrator {
       });
     };
 
-    // ── 1. Learned pattern (our own previously-proven heal) ──
-    try {
-      const pr = await this.patternEngine.findMatch(failure, scope);
-      if (pr) {
-        push({
-          newLocator: pr.newLocator,
-          strategy: 'database_pattern',
-          source: 'learned_pattern',
-          confidence: pr.confidence,
-          tokensUsed: 0,
-          reasoning: `[Learned Pattern] ${pr.reasoning}`,
-          addExplicitWait: false,
-        });
-      }
-    } catch (err: any) {
-      logger.debug(MOD, 'Learned-pattern collection failed (non-fatal)', { error: err?.message });
-    }
-
-    // ── 2. Application Profile candidates (real, crawled DOM evidence) ──
-    const appCandidates = appProfile?.candidates ?? [];
-    const appLocatorKeys = new Set(appCandidates.map((c) => norm(c.locator)));
-    for (const cand of appCandidates) {
-      push({
-        newLocator: cand.locator,
-        strategy: 'rule_based',
-        source: 'app_profile',
-        confidence: cand.confidence,
-        tokensUsed: 0,
-        reasoning: `[App Profile] ${cand.reasoning}`,
-        addExplicitWait: false,
-        inAppProfile: true,
-      });
-    }
-
-    // ── 3. DOM Memory alternatives (historical stability) ──
+    // ── Advisor pipeline ──────────────────────────────────────────────────
+    // The orchestrator does not know about any concrete intelligence layer; it
+    // just runs the registered advisors. Grounded advisors (Learning, App
+    // Profile, DOM Memory, DOM Candidate, Rule) always run. Fallback advisors
+    // (AI) run ONLY when the grounded ones did not produce enough confident
+    // candidates — so OpenAI is not invoked on every heal.
     let domMemoryInsight: DOMMemoryInsight | undefined;
-    if (failure.failedLocator) {
+    const ctx: AdvisorContext = {
+      failure,
+      domHtml,
+      skipLocators,
+      projectId,
+      companyId,
+      repoContext: repoCtx,
+      appProfile,
+      scope,
+      shared: {
+        appLocatorKeys: new Set<string>(),
+        domMemoryInsight: undefined,
+        matchesPageObject,
+      },
+      norm,
+    };
+
+    const runAdvisor = async (advisor: HealingAdvisor): Promise<void> => {
       try {
-        domMemoryInsight = await this.domMemory.getInsight(failure.failedLocator, projectId, companyId);
+        const proposal = await advisor.propose(ctx);
+        if (proposal.domMemoryInsight) domMemoryInsight = proposal.domMemoryInsight;
+        for (const cand of proposal.candidates) push(cand);
       } catch (err: any) {
-        logger.debug(MOD, 'DOM Memory collection failed (non-fatal)', { error: err?.message });
+        logger.debug(MOD, `Advisor "${advisor.name}" failed (non-fatal)`, { error: err?.message });
       }
-    }
-    for (const alt of domMemoryInsight?.alternatives ?? []) {
-      push({
-        newLocator: alt.selector,
-        strategy: 'database_pattern',
-        source: 'dom_memory',
-        confidence: alt.compositeScore,
-        tokensUsed: 0,
-        reasoning: `[DOM Memory] ${alt.reasoning}`,
-        addExplicitWait: false,
-        domMemoryStability: alt.stabilityScore,
-        inAppProfile: appLocatorKeys.has(norm(alt.selector)),
-      });
+    };
+
+    // Grounded advisors first (cheap, 0-token, evidence-based).
+    for (const advisor of this.advisors.filter((a) => a.tier === 'grounded')) {
+      await runAdvisor(advisor);
     }
 
-    // ── 4. DOM candidate extraction (from a live DOM snapshot, when available) ──
-    if (domHtml && failure.failedLocator) {
-      try {
-        const dom = this.domExtractor.extractFromHTML(
-          domHtml,
-          failure.failedLocator,
-          failure.failedLineCode || '',
-        );
-        for (const dc of dom.candidates ?? []) {
-          const stability = domMemoryInsight?.alternatives.find((a) => a.selector === dc.selector)?.stabilityScore;
-          push({
-            newLocator: dc.selector,
-            strategy: 'rule_based',
-            source: 'dom_candidate',
-            confidence: dc.score,
-            tokensUsed: 0,
-            reasoning: `[DOM Candidate] ${dc.reasoning}`,
-            addExplicitWait: false,
-            domMemoryStability: stability,
-            inAppProfile: appLocatorKeys.has(norm(dc.selector)),
-          });
-        }
-      } catch (err: any) {
-        logger.debug(MOD, 'DOM candidate collection failed (non-fatal)', { error: err?.message });
-      }
-    }
-
-    // ── 5. Rule engine (deterministic, 0 tokens) ──
-    try {
-      const ruleResult = this.ruleEngine.generate(failure, skipLocators);
-      for (const s of ruleResult.suggestions ?? []) {
-        push({
-          newLocator: s.newLocator,
-          strategy: 'rule_based',
-          source: 'rule',
-          confidence: s.confidence,
-          tokensUsed: 0,
-          reasoning: s.reasoning,
-          addExplicitWait: ruleResult.addExplicitWait,
-          inAppProfile: appLocatorKeys.has(norm(s.newLocator)),
-        });
-      }
-    } catch (err: any) {
-      logger.debug(MOD, 'Rule-engine collection failed (non-fatal)', { error: err?.message });
-    }
-
-    // ── 6. AI — only top up when grounded layers were thin (bounds token cost) ──
+    // AI gate: consult fallback advisors only when grounded candidates are thin.
     const aiSkipConfidence = envFloat('HEALING_RANK_AI_SKIP_CONFIDENCE', 0.8);
     const minGrounded = envIntLocal('HEALING_RANK_MIN_GROUNDED', 2);
     const groundedCount = raw.filter(
       (c) => c.signals.syntaxValid && c.source !== 'ai' && c.confidence >= aiSkipConfidence,
     ).length;
+    const fallbackAdvisors = this.advisors.filter((a) => a.tier === 'fallback');
     if (groundedCount < minGrounded) {
-      try {
-        const grounding = repoCtx?.promptBlock || undefined;
-        const ai = await this.aiEngine.suggest(failure, grounding);
-        if (ai) {
-          push({
-            newLocator: ai.newLocator,
-            strategy: 'ai_reasoning',
-            source: 'ai',
-            confidence: ai.confidence,
-            tokensUsed: ai.tokensUsed,
-            reasoning: ai.reasoning,
-            addExplicitWait: false,
-          });
-        }
-      } catch (err: any) {
-        logger.debug(MOD, 'AI collection failed (non-fatal)', { error: err?.message });
-      }
-    } else {
-      logger.info(MOD, 'Skipping AI candidate top-up — enough grounded candidates', {
+      for (const advisor of fallbackAdvisors) await runAdvisor(advisor);
+    } else if (fallbackAdvisors.length) {
+      logger.info(MOD, 'Skipping fallback (AI) advisors — enough grounded candidates', {
         testName: failure.testName,
         groundedCount,
         minGrounded,
+        skipped: fallbackAdvisors.map((a) => a.name),
       });
     }
 
