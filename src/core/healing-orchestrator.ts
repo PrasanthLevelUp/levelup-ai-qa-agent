@@ -249,13 +249,42 @@ export class HealingOrchestrator {
     // which won, which missed, and which were skipped (for observability).
     const trail: DecisionTrailEntry[] = [];
 
-    // ── Step 0 (Application Intelligence): Application Profile recovery ──
-    // BEFORE anything else, ask the crawl we already built. The Application
-    // Profile holds the real, stable selectors for this app (data-test* ids,
-    // grounded role/label locators). This is the most authoritative source we
-    // have — more trustworthy than past-heal history or an AI guess — and it
-    // costs 0 tokens. It also works even when `failedLocator` could not be
-    // parsed (the candidates are derived from the failing source line too).
+    // Tenant scope — built up-front because the learned-pattern lookup (the very
+    // first thing we try) must be tenant-isolated: a healed locator from one
+    // company/project is never served to another.
+    const scope: PatternTenantScope = { companyId, projectId };
+
+    // ── Step 0 (Learning Engine): reuse a previously successful heal ──
+    // Learning outranks everything else. If we have already healed THIS exact
+    // failure before (same test + error pattern + failed locator), nothing is
+    // more reliable than our own proven history — not App Profile, not DOM
+    // Memory, and certainly not an AI guess. 0 tokens, instant. The historical
+    // locator is still re-validated so a pattern that no longer makes sense is
+    // skipped rather than blindly re-applied.
+    const learnedOutcome = await this.tryLearnedPattern(failure, scope);
+    if (learnedOutcome) {
+      trail.push({
+        layer: 'Learning',
+        outcome: 'hit',
+        confidence: learnedOutcome.suggestion?.confidence,
+        reasoning: learnedOutcome.suggestion?.reasoning || 'Reused a previously successful heal',
+      });
+      trail.push({ layer: 'App Profile', outcome: 'skipped', reasoning: 'Learning won' });
+      trail.push({ layer: 'DOM Memory', outcome: 'skipped', reasoning: 'Learning won' });
+      trail.push({ layer: 'Rule/Pattern', outcome: 'skipped', reasoning: 'Learning won' });
+      trail.push({ layer: 'AI', outcome: 'skipped', reasoning: 'Learning won' });
+      return { ...learnedOutcome, decisionTrail: trail };
+    }
+    // Learning miss — fall through to Application Intelligence.
+    trail.push({ layer: 'Learning', outcome: 'miss', reasoning: 'No prior successful heal for this failure' });
+
+    // ── Step 1 (Application Intelligence): Application Profile recovery ──
+    // After Learning, ask the crawl we already built. The Application Profile
+    // holds the real, stable selectors for this app (data-test* ids, grounded
+    // role/label locators) — the most authoritative source for what exists on
+    // the page *right now*, and it costs 0 tokens. It also works even when
+    // `failedLocator` could not be parsed (the candidates are derived from the
+    // failing source line too).
     const appProfileOutcome = this.tryAppProfile(failure, appProfile, skipLocators);
     if (appProfileOutcome) {
       // Honour the audit's "Similarity participates BEFORE AI": grounded
@@ -450,12 +479,10 @@ export class HealingOrchestrator {
       }
     }
 
-    // Tenant scope — propagated to every learned-pattern lookup so a healed
-    // locator from one company/project is never served to another (multi-tenant
-    // isolation fix).
-    const scope: PatternTenantScope = { companyId, projectId };
+    // `scope` (tenant isolation) is declared at the top of heal() because the
+    // Step 0 learned-pattern lookup needs it before anything else runs.
 
-    // ── Step 1: Use strategy selector to determine best approach ──
+    // ── Step 2: Use strategy selector to determine best approach ──
     const selected = await this.strategySelector.selectStrategy(
       failure,
       this.ruleEngine,
@@ -577,7 +604,70 @@ export class HealingOrchestrator {
   }
 
   /**
-   * Step 0 — Application Profile recovery (Application Intelligence).
+   * Step 0 — Learning Engine: reuse a previously successful heal.
+   *
+   * Looks up the learned-pattern store for an exact match to this failure
+   * (test name + error pattern + failed locator, tenant-scoped). A proven past
+   * fix is the single most reliable signal we have, so it runs before App
+   * Profile, DOM Memory and — most importantly — before any AI call. The
+   * historical locator is still re-validated, so a pattern that no longer makes
+   * sense is skipped rather than blindly re-applied.
+   *
+   * Returns `null` when there is no usable learned pattern, in which case the
+   * pipeline proceeds to Step 1 (Application Profile) exactly as before.
+   */
+  private async tryLearnedPattern(
+    failure: FailureDetails,
+    scope: PatternTenantScope,
+  ): Promise<HealingOutcome | null> {
+    let patternResult;
+    try {
+      patternResult = await this.patternEngine.findMatch(failure, scope);
+    } catch (err: any) {
+      // Non-critical — a learned-pattern miss must never block healing.
+      logger.warn(MOD, 'Learned-pattern lookup failed (non-critical)', { error: err.message });
+      return null;
+    }
+    if (!patternResult) return null;
+
+    const validation = this.validationEngine.validate({
+      newLocator: patternResult.newLocator,
+      confidence: patternResult.confidence,
+      originalCode: '',
+      filePath: failure.filePath,
+    });
+    if (!validation.isValid) {
+      logger.debug(MOD, 'Learned pattern rejected by validation', {
+        locator: patternResult.newLocator,
+        reason: validation.reason,
+      });
+      return null;
+    }
+
+    logger.info(MOD, '🎓 Learned pattern reused — 0 AI tokens!', {
+      testName: failure.testName,
+      locator: patternResult.newLocator,
+      usageCount: patternResult.usageCount,
+    });
+
+    const suggestion: HealingSuggestion = {
+      newLocator: patternResult.newLocator,
+      strategy: 'database_pattern',
+      confidence: patternResult.confidence,
+      tokensUsed: 0,
+      reasoning: `[Learned Pattern] ${patternResult.reasoning}`,
+      addExplicitWait: false,
+    };
+
+    return {
+      suggestion,
+      attemptedStrategies: ['database_pattern'],
+      selectedEngine: 'learned_pattern',
+    };
+  }
+
+  /**
+   * Step 1 — Application Profile recovery (Application Intelligence).
    *
    * Validates the grounded candidates the worker resolved from the crawled
    * Application Profile and, when one is syntactically valid and confident
