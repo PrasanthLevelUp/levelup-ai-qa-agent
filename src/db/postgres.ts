@@ -10624,6 +10624,13 @@ export async function recordSelectorObservation(data: {
   selector: string;
   previousSelector?: string;
   elementType?: string;
+  /**
+   * Stable cross-selector key for the SAME DOM element. This is what
+   * `getAlternativeSelectors` joins on to surface sibling selectors as
+   * healing alternatives — without it, a recorded selector can never be
+   * linked to its alternatives.
+   */
+  elementIdentifier?: string;
   changeType?: string;
   source?: string;
   metadata?: Record<string, any>;
@@ -10632,8 +10639,8 @@ export async function recordSelectorObservation(data: {
   await pool.query(
     `INSERT INTO selector_history
        (project_id, company_id, page_url, selector, previous_selector,
-        element_type, change_type, source, stability_score, metadata)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 1.0, $9)`,
+        element_type, element_identifier, change_type, source, stability_score, metadata)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 1.0, $10)`,
     [
       data.projectId ?? null,
       data.companyId ?? null,
@@ -10641,11 +10648,96 @@ export async function recordSelectorObservation(data: {
       data.selector,
       data.previousSelector ?? null,
       data.elementType ?? null,
+      data.elementIdentifier ?? null,
       data.changeType ?? 'observed',
       data.source ?? 'scan',
       JSON.stringify(data.metadata ?? {}),
     ],
   );
+}
+
+/**
+ * Batch-insert many selector observations in a single statement. Used to seed
+ * DOM Memory from a crawl (Phase 2 — "DOM Snapshot Persistence"): every element
+ * the crawler sees contributes its grounded selector variants, all sharing one
+ * `elementIdentifier` so they become mutual alternatives during healing.
+ *
+ * Returns the number of rows inserted. Safe to call with an empty array.
+ */
+export async function recordSelectorObservations(
+  rows: Array<{
+    projectId?: number;
+    companyId?: number;
+    pageUrl?: string;
+    selector: string;
+    elementType?: string;
+    elementIdentifier?: string;
+    changeType?: string;
+    source?: string;
+    stabilityScore?: number;
+    metadata?: Record<string, any>;
+  }>,
+): Promise<number> {
+  if (!rows.length) return 0;
+  const pool = getPool();
+  const cols = 10;
+  const values: any[] = [];
+  const tuples: string[] = [];
+  rows.forEach((r, i) => {
+    const b = i * cols;
+    tuples.push(
+      `($${b + 1}, $${b + 2}, $${b + 3}, $${b + 4}, $${b + 5}, $${b + 6}, $${b + 7}, $${b + 8}, $${b + 9}, $${b + 10})`,
+    );
+    values.push(
+      r.projectId ?? null,
+      r.companyId ?? null,
+      r.pageUrl ?? null,
+      r.selector,
+      r.elementType ?? null,
+      r.elementIdentifier ?? null,
+      r.changeType ?? 'observed',
+      r.source ?? 'crawl',
+      r.stabilityScore ?? 1.0,
+      JSON.stringify(r.metadata ?? {}),
+    );
+  });
+
+  await pool.query(
+    `INSERT INTO selector_history
+       (project_id, company_id, page_url, selector, element_type,
+        element_identifier, change_type, source, stability_score, metadata)
+     VALUES ${tuples.join(', ')}`,
+    values,
+  );
+  return rows.length;
+}
+
+/**
+ * Clear previously crawl-seeded selector history for a page so a re-crawl does
+ * not pile up duplicate observations. Only removes rows we wrote from a crawl
+ * (`source = 'crawl'`) — real heal/scan history is preserved.
+ */
+export async function clearCrawlSelectorHistory(data: {
+  projectId?: number;
+  companyId?: number;
+  pageUrl: string;
+}): Promise<number> {
+  const pool = getPool();
+  const conditions = [`source = 'crawl'`, 'page_url = $1'];
+  const params: any[] = [data.pageUrl];
+  if (data.projectId != null) {
+    conditions.push(`project_id = $${params.length + 1}`);
+    params.push(data.projectId);
+  }
+  if (data.companyId != null) {
+    conditions.push(`company_id = $${params.length + 1}`);
+    params.push(data.companyId);
+  }
+  const res = await pool.query(
+    `DELETE FROM selector_history WHERE ${conditions.join(' AND ')}`,
+    params,
+  );
+  return res.rowCount ?? 0;
 }
 
 
