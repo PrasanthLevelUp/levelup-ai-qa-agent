@@ -10,6 +10,18 @@ import { logger } from '../utils/logger';
 
 const MOD = 'execution-engine';
 
+/**
+ * Per-test-run timeout (ms). A single Playwright rerun is a per-test, isolated
+ * run during healing — it must NOT be allowed to hang for many minutes. The old
+ * hard-coded 600_000 (10 min) per rerun, multiplied across the nested healing
+ * retry loops, was the primary cause of healing jobs running for hours.
+ * Override with HEALING_RERUN_TIMEOUT_MS. Default: 120s.
+ */
+const DEFAULT_RERUN_TIMEOUT_MS = (() => {
+  const v = Number(process.env['HEALING_RERUN_TIMEOUT_MS']);
+  return Number.isFinite(v) && v > 0 ? v : 120_000;
+})();
+
 export interface RunResult {
   exitCode: number;
   stdout: string;
@@ -221,7 +233,7 @@ export class ExecutionEngine {
    *      `headless: false` still run under a virtual X server instead of failing
    *      to launch the browser in a headless runner.
    */
-  static run(repoPath: string, testFile?: string, grepFilter?: string): RunResult {
+  static run(repoPath: string, testFile?: string, grepFilter?: string, timeoutMs: number = DEFAULT_RERUN_TIMEOUT_MS): RunResult {
     const { execSync } = require('child_process');
     const resultsFile = path.join(repoPath, 'test-results.json');
     const startTime = new Date().toISOString();
@@ -260,7 +272,7 @@ export class ExecutionEngine {
           // Write the JSON report to repoPath/test-results.json (relative to cwd).
           PLAYWRIGHT_JSON_OUTPUT_NAME: 'test-results.json',
         },
-        timeout: 600_000, // 10 minutes — tests run against live sites
+        timeout: timeoutMs, // configurable per-test rerun timeout (default 120s)
         maxBuffer: 10_000_000,
         stdio: ['pipe', 'pipe', 'pipe'],
       });
@@ -309,6 +321,133 @@ export class ExecutionEngine {
     logger.info(MOD, 'Playwright execution complete', {
       exitCode, durationMs, resultsFile,
       resultsFileExists: fs.existsSync(resultsFile),
+    });
+
+    return { exitCode, stdout, stderr, resultsFile, startTime, endTime, durationMs };
+  }
+
+  /**
+   * Non-blocking async variant of {@link run}. Behaves identically (forced JSON
+   * reporter, optional --grep isolation, xvfb wrapping, stdout-JSON fallback) but
+   * uses `spawn` instead of `execSync` so it NEVER blocks the Node event loop.
+   *
+   * Why this matters: the healing worker reruns a single test many times inside
+   * nested retry loops. With the old blocking execSync, the entire server (status
+   * polling, the Cancel endpoint, health checks) froze for the duration of every
+   * rerun, and a hung test held the loop hostage for the full timeout. Running the
+   * rerun async keeps the API responsive and lets the worker honor cancellation
+   * and wall-clock budgets between reruns.
+   *
+   * On timeout the child is killed (SIGTERM → SIGKILL) and exitCode 124 is
+   * returned, matching shell timeout semantics.
+   */
+  static async runAsync(
+    repoPath: string,
+    testFile?: string,
+    grepFilter?: string,
+    timeoutMs: number = DEFAULT_RERUN_TIMEOUT_MS,
+  ): Promise<RunResult> {
+    const { spawn } = require('child_process');
+    const resultsFile = path.join(repoPath, 'test-results.json');
+    const startTime = new Date().toISOString();
+    const start = Date.now();
+
+    let cmd = testFile
+      ? `npx playwright test "${testFile}" --reporter=json`
+      : `npx playwright test --reporter=json`;
+    if (grepFilter) {
+      cmd += ` --grep "${grepFilter.replace(/"/g, '\\"')}"`;
+    }
+    if (ExecutionEngine.hasXvfb()) {
+      cmd = `xvfb-run -a ${cmd}`;
+    }
+
+    logger.info(MOD, 'Executing Playwright tests (async/non-blocking)', { repoPath, cmd, timeoutMs });
+
+    const { exitCode, stdout, stderr } = await new Promise<{ exitCode: number; stdout: string; stderr: string }>((resolve) => {
+      // `detached: true` puts the child (the `sh -c` wrapper) into its OWN process
+      // group. Playwright spawns its own child processes (browsers, workers); if we
+      // only SIGTERM the shell, those grandchildren survive AND keep the stdout pipe
+      // open, so the 'close' event never fires until they finish on their own — i.e.
+      // the timeout would not actually free the slot. Signalling the whole process
+      // group (negative PID) tears down the entire tree promptly.
+      const child = spawn(cmd, {
+        cwd: repoPath,
+        shell: true,
+        detached: true,
+        env: { ...process.env, PLAYWRIGHT_JSON_OUTPUT_NAME: 'test-results.json' },
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+
+      let out = '';
+      let err = '';
+      let timedOut = false;
+      let settled = false;
+
+      const killGroup = (sig: NodeJS.Signals) => {
+        try {
+          if (child.pid) process.kill(-child.pid, sig); // negative PID = whole group
+          else child.kill(sig);
+        } catch {
+          try { child.kill(sig); } catch { /* noop */ }
+        }
+      };
+
+      const timer = setTimeout(() => {
+        timedOut = true;
+        logger.warn(MOD, 'Async rerun timed out — killing process group', { timeoutMs, cmd });
+        killGroup('SIGTERM');
+        // Hard-kill the group if it ignores SIGTERM.
+        setTimeout(() => killGroup('SIGKILL'), 5_000);
+      }, timeoutMs);
+
+      child.stdout?.on('data', (d: Buffer) => {
+        const t = d.toString();
+        // Cap captured stdout to ~10MB to avoid unbounded memory growth.
+        if (out.length < 10_000_000) out += t;
+      });
+      child.stderr?.on('data', (d: Buffer) => {
+        const t = d.toString();
+        if (err.length < 2_000_000) err += t;
+      });
+
+      const finish = (code: number) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve({ exitCode: timedOut ? 124 : code, stdout: out, stderr: err });
+      };
+
+      child.on('close', (code: number | null) => finish(code ?? (timedOut ? 124 : 1)));
+      child.on('error', (e: Error) => {
+        err += `\n${e.message}`;
+        finish(1);
+      });
+    });
+
+    const endTime = new Date().toISOString();
+    const durationMs = Date.now() - start;
+
+    // Same stdout-JSON fallback as the sync path.
+    if (!fs.existsSync(resultsFile)) {
+      const trimmed = stdout.trim();
+      if (trimmed.startsWith('{')) {
+        try {
+          JSON.parse(trimmed);
+          fs.writeFileSync(resultsFile, trimmed, 'utf-8');
+          logger.info(MOD, 'Wrote test-results.json from stdout (async)');
+        } catch {
+          logger.warn(MOD, 'Async stdout is not valid JSON');
+        }
+      }
+    }
+
+    if (exitCode === 124) {
+      logger.warn(MOD, 'Async Playwright run hit timeout', { repoPath, durationMs, timeoutMs });
+    }
+
+    logger.info(MOD, 'Playwright execution complete (async)', {
+      exitCode, durationMs, resultsFile, resultsFileExists: fs.existsSync(resultsFile),
     });
 
     return { exitCode, stdout, stderr, resultsFile, startTime, endTime, durationMs };
