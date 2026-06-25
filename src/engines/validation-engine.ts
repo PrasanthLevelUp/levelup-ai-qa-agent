@@ -331,10 +331,17 @@ export class ValidationEngine {
 
   validateSemanticCheck(locator: string): ValidationCheckDetail {
     const isSemantic = SEMANTIC_LOCATORS.some((s) => locator.includes(s));
-    // Also accept stable CSS attribute selectors like input[name="username"], #id
-    const isStableCSS = /^[a-z]+\[[a-z-]+="[^"]+"\]$/i.test(locator)
-      || /^#[\w-]+$/.test(locator)
-      || /^\[data-testid="[^"]+"\]$/.test(locator);
+    // Unwrap a `page.locator('X')` / `locator("X")` wrapper so the inner CSS
+    // selector can be checked for stability (grounded App-Profile candidates and
+    // attribute-healing suggestions arrive wrapped).
+    const wrap = /^(?:page\.)?locator\((.*)\)$/s.exec(locator.trim());
+    const inner = wrap ? wrap[1].trim().replace(/^['"`]|['"`]$/g, '') : locator;
+    // Accept stable CSS attribute selectors: tag[attr="v"], #id, and grounded
+    // test-hook attributes (data-test / data-testid / data-test-id / data-cy /
+    // data-qa / name) — these are the most resilient selectors a heal can use.
+    const isStableCSS = /^[a-z]+\[[a-z-]+="[^"]+"\]$/i.test(inner)
+      || /^#[\w-]+$/.test(inner)
+      || /^\[(?:data-testid|data-test|data-test-id|data-cy|data-qa|name)="[^"]+"\]$/i.test(inner);
 
     const passed = isSemantic || isStableCSS;
     return {
