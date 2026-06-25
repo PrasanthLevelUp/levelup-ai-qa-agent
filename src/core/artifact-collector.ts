@@ -88,9 +88,16 @@ export class ArtifactCollector {
               const lineNumber = location?.line ?? 0;
 
               // Use modular extractors
-              const locatorInfo = extractLocator(errorMessage);
               const normalizedError = normalizeError(errorMessage);
               const codeContext = extractCodeContext(filePath, lineNumber);
+              // Extract the failing locator from the error message first. Modern
+              // Playwright errors don't always echo the locator in a parseable
+              // form, so fall back to the failing source line (which always
+              // contains the locator, e.g. `await page.getByRole(...).click()`).
+              // Without this fallback, failed_locator ends up empty and ALL
+              // healing layers (rule / pattern / validation / DOM) are starved.
+              const locatorInfo =
+                extractLocator(errorMessage) || extractLocator(codeContext.failedLineCode || '');
 
               const screenshotPath = (result.attachments ?? []).find((a: any) =>
                 a.name === 'screenshot' || a.contentType?.startsWith('image/')

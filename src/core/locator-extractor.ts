@@ -32,6 +32,19 @@ const LOCATOR_PATTERNS = [
   { pattern: /page\.getByLabel\(([^)]+)\)/, group: 0 },
   { pattern: /page\.getByPlaceholder\(([^)]+)\)/, group: 0 },
   { pattern: /page\.getByTestId\(([^)]+)\)/, group: 0 },
+  // Modern Playwright error format uses a "Locator:" prefix block, e.g.
+  //   Locator: getByRole('button', { name: 'Log in' })
+  //   Locator: locator('#login-button')
+  // These must be matched BEFORE the generic patterns so the real failing
+  // locator wins. Without this, failed_locator comes back empty and ALL three
+  // healing layers (rule / pattern / validation) are starved.
+  { pattern: /Locator:\s*(getByRole\([^)]+\))/m, group: 1, prefix: 'page.' },
+  { pattern: /Locator:\s*(getByText\([^)]+\))/m, group: 1, prefix: 'page.' },
+  { pattern: /Locator:\s*(getByLabel\([^)]+\))/m, group: 1, prefix: 'page.' },
+  { pattern: /Locator:\s*(getByPlaceholder\([^)]+\))/m, group: 1, prefix: 'page.' },
+  { pattern: /Locator:\s*(getByTestId\([^)]+\))/m, group: 1, prefix: 'page.' },
+  { pattern: /Locator:\s*locator\("([^"\\]*(?:\\.[^"\\]*)*)"\)/m, group: 1 },
+  { pattern: /Locator:\s*locator\('([^']+)'\)/m, group: 1 },
   // Without page. prefix (Playwright error "waiting for getByRole(...)")
   // Use group:1 to capture just the getByRole(...) part, prefix adds "page."
   { pattern: /(?:waiting for\s+)(getByRole\([^)]+\))/m, group: 1, prefix: 'page.' },

@@ -87,6 +87,44 @@ function stringSimilarity(a: string, b: string): number {
   return Math.max(0, 1 - dist / maxLen);
 }
 
+/** Heuristic: is this id auto-generated/unstable? (numeric suffixes, GUIDs) */
+function isDynamicId(id: string): boolean {
+  return /[-_]\d{2,}$/.test(id) ||
+    /[0-9a-f]{8}-[0-9a-f]{4}-/i.test(id) ||
+    /\d{6,}/.test(id);
+}
+
+/** Build a Playwright selector for a given attribute match. */
+function buildAttrSelector(tag: string, attr: string, val: string): string {
+  if (attr === 'id') return `#${val}`;
+  if (attr === 'data-testid') return `page.getByTestId('${val}')`;
+  const tagPart = tag && tag !== '*' ? tag : '';
+  return `page.locator('${tagPart}[${attr}="${val}"]')`;
+}
+
+/**
+ * Pick the most STABLE selector an element exposes, in priority order:
+ *   data-testid → data-test/data-cy/data-qa → non-dynamic id.
+ * Returns null when the element has no stable hook (caller keeps its fuzzy match).
+ */
+function bestStableSelector(
+  tag: string,
+  attributes: Record<string, string>,
+): { selector: string; attr: string } | null {
+  if (attributes['data-testid']) {
+    return { selector: `page.getByTestId('${attributes['data-testid']}')`, attr: 'data-testid' };
+  }
+  for (const attr of ['data-test', 'data-cy', 'data-qa']) {
+    if (attributes[attr]) {
+      return { selector: `page.locator('[${attr}="${attributes[attr]}"]')`, attr };
+    }
+  }
+  if (attributes['id'] && !isDynamicId(attributes['id'])) {
+    return { selector: `#${attributes['id']}`, attr: 'id' };
+  }
+  return null;
+}
+
 /* -------------------------------------------------------------------------- */
 /*  Locator Parser                                                            */
 /* -------------------------------------------------------------------------- */
@@ -144,6 +182,49 @@ export function parseFailedLocator(locator: string, codeLine: string = ''): Pars
     return { tag: 'input', attribute, value, action };
   }
 
+  // Match Playwright role: page.getByRole('button', { name: 'Log in' })
+  // The accessible name is the value we ground on; the role maps to a tag hint.
+  const roleMatch = /getByRole\(\s*['"]([^'"]+)['"]/.exec(locator);
+  if (roleMatch) {
+    const role = roleMatch[1].toLowerCase();
+    const nameMatch = /name:\s*\/?["']?([^/"'}]+)["']?\/?/.exec(locator);
+    const roleTagMap: Record<string, string> = {
+      // '*' so action-based scanning also covers <input type="submit"> and
+      // <a role="button"> — many "buttons" are not <button> tags.
+      button: '*',
+      link: 'a',
+      textbox: 'input',
+      checkbox: 'input',
+      radio: 'input',
+      combobox: 'select',
+      heading: 'h1',
+    };
+    return {
+      tag: roleTagMap[role] || '*',
+      attribute: 'role',
+      value: (nameMatch?.[1] || '').replace(/\/i$/, '').trim(),
+      action,
+    };
+  }
+
+  // Match Playwright testid: page.getByTestId('login-button')
+  const testIdMatch = /getByTestId\(\s*['"]([^'"]+)['"]/.exec(locator);
+  if (testIdMatch) {
+    return { tag: '*', attribute: 'data-testid', value: testIdMatch[1].trim(), action };
+  }
+
+  // Match Playwright text: page.getByText(/Log in/i) or getByText('Log in')
+  const textMatch = /getByText\(\s*\/?['"]?([^/)'"]+)['"]?\/?/.exec(locator);
+  if (textMatch) {
+    return { tag: '*', attribute: 'text', value: textMatch[1].replace(/\/i$/, '').trim(), action };
+  }
+
+  // Match Playwright placeholder: page.getByPlaceholder(/Username/i)
+  const placeholderMatch = /getByPlaceholder\(\s*\/?['"]?([^/)'"]+)['"]?\/?/.exec(locator);
+  if (placeholderMatch) {
+    return { tag: 'input', attribute: 'placeholder', value: placeholderMatch[1].replace(/\/i$/, '').trim(), action };
+  }
+
   // Match: page.fill('selector', 'value') — extract the selector part
   const fillMatch = /(?:fill|click|type)\(['"]([^'"]+)['"]/.exec(combined);
   if (fillMatch) {
@@ -185,8 +266,12 @@ export class DOMCandidateExtractor {
     for (const tag of targetTags) {
       // Extract all elements of this tag type from DOM HTML using regex
       // (We avoid a full DOM parser dependency — regex is sufficient for attribute extraction)
+      // Matches all three serializations:
+      //   <input ...>            (void element — how page.content() writes inputs/imgs)
+      //   <input .../>           (self-closing)
+      //   <button ...>Text</button>  (text content captured in group 2)
       const tagRegex = new RegExp(
-        `<${tag}\\b([^>]*)(?:>([^<]*)<\\/${tag}>|\\/>)`,
+        `<${tag}\\b([^>]*?)\\s*\\/?>(?:([^<]*)<\\/${tag}>)?`,
         'gi',
       );
 
@@ -325,8 +410,12 @@ export class DOMCandidateExtractor {
       }
     }
 
-    // Strategy 2: Cross-attribute matching (name vs id vs placeholder)
-    const crossAttrs = ['name', 'id', 'placeholder', 'aria-label', 'data-testid', 'title'];
+    // Strategy 2: Cross-attribute matching (name vs id vs placeholder vs value)
+    // `value` is included so submit inputs (<input type="submit" value="Login">)
+    // match a role-name like "Log in". `data-test`/`data-cy`/`data-qa` are the
+    // primary test hooks in many real apps (SauceDemo et al.) — not just
+    // `data-testid`.
+    const crossAttrs = ['name', 'id', 'placeholder', 'aria-label', 'data-testid', 'data-test', 'data-cy', 'data-qa', 'value', 'title'];
     for (const attr of crossAttrs) {
       if (attr === parsed.attribute) continue; // Already checked above
       const val = attributes[attr];
@@ -336,8 +425,8 @@ export class DOMCandidateExtractor {
         const score = 0.40 + sim * 0.40; // Range: 0.40 - 0.80
         if (score > bestScore) {
           bestScore = score;
-          bestSelector = attr === 'id' ? `#${val}` : `${tag}[${attr}="${val}"]`;
-          bestReasoning = `Cross-attribute match: [${parsed.attribute}="${failedValue}"] → [${attr}="${val}"] (similarity: ${sim.toFixed(2)})`;
+          bestSelector = buildAttrSelector(tag, attr, val);
+          bestReasoning = `Cross-attribute match: [${parsed.attribute || 'name'}="${failedValue}"] → [${attr}="${val}"] (similarity: ${sim.toFixed(2)})`;
           bestMatchType = 'fuzzy_attribute';
         }
       }
@@ -373,6 +462,19 @@ export class DOMCandidateExtractor {
     }
 
     if (bestScore < 0.45) return null;
+
+    // Stabilize: once we've confidently identified the target element, prefer
+    // the MOST STABLE selector that element actually exposes (data-testid >
+    // data-test/cy/qa > non-dynamic id) over a fuzzy name/value match. This is
+    // what turns "guessed getByRole('button', { name: 'Log in' })" into the
+    // rock-solid "[data-test='login-button']" the element really has.
+    const stable = bestStableSelector(tag, attributes);
+    if (stable && stable.selector !== bestSelector) {
+      bestReasoning = `${bestReasoning}; stabilized to ${stable.attr} → ${stable.selector}`;
+      bestSelector = stable.selector;
+      bestMatchType = 'exact_attribute';
+      bestScore = Math.max(bestScore, 0.92); // stable hooks are reliable
+    }
 
     return {
       selector: bestSelector,
