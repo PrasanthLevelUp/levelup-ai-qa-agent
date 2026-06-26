@@ -82,10 +82,23 @@ export class ArtifactCollector {
                 ?? result.error?.location
                 ?? result.errors?.[0]?.location;
 
-              const filePath = location?.file
+              // Parse the full error stack to find the ACTUAL source file where the
+              // broken code lives. When a Page Object method fails (e.g. LoginPage.login()),
+              // Playwright's top-of-stack location points to the TEST FILE that CALLED
+              // the method, not the PO file where the broken locator is. Healing then
+              // searches the test spec for the locator string, finds nothing, and rejects
+              // every fix with "Original locator not found in file."
+              //
+              // Solution: walk the stack frames and prefer files in known PO directories
+              // (pages/, page-objects/, pom/, src/pages/) over test specs. If no PO is
+              // found, fall back to the top frame (original behavior for inline tests).
+              const stack = result.error?.stack ?? result.errors?.[0]?.stack;
+              const resolvedLocation = this.findActualSourceLocation(stack, location, testRepoPath);
+
+              const filePath = resolvedLocation.file
                 ?? path.join(testRepoPath, 'tests', spec.file ?? suiteFile ?? '');
 
-              const lineNumber = location?.line ?? 0;
+              const lineNumber = resolvedLocation.line ?? 0;
 
               // Use modular extractors
               const normalizedError = normalizeError(errorMessage);
@@ -145,6 +158,80 @@ export class ArtifactCollector {
     });
 
     return artifacts;
+  }
+
+  /**
+   * Parse a Playwright error stack to find the ACTUAL source file where the broken
+   * code lives. When a Page Object method fails, the top-of-stack location points
+   * to the test file that called it, not the PO where the locator is.
+   *
+   * Strategy:
+   * 1. Parse all stack frames from the error
+   * 2. Skip test specs (tests/*.spec.ts)
+   * 3. Prefer frames in known Page Object directories (pages/, page-objects/, pom/, src/pages/)
+   * 4. Fall back to the original location if no PO frame is found
+   */
+  private findActualSourceLocation(
+    stack: string | undefined,
+    originalLocation: { file?: string; line?: number } | null | undefined,
+    testRepoPath: string,
+  ): { file: string | null; line: number } {
+    // Default: use the original location if present
+    if (!stack) {
+      return {
+        file: originalLocation?.file ?? null,
+        line: originalLocation?.line ?? 0,
+      };
+    }
+
+    // Parse stack frames. Common formats:
+    // "    at LoginPage.login (/path/pages/LoginPage.ts:12:34)"
+    // "    at /path/pages/LoginPage.ts:12:34"
+    const frameRegex = /^\s*at\s+(?:.*?\s+)?\(?([^)]+\.ts):(\d+):\d+\)?/gm;
+    const frames: Array<{ file: string; line: number }> = [];
+    let match: RegExpExecArray | null;
+
+    while ((match = frameRegex.exec(stack)) !== null) {
+      frames.push({
+        file: match[1],
+        line: parseInt(match[2], 10),
+      });
+    }
+
+    if (frames.length === 0) {
+      return {
+        file: originalLocation?.file ?? null,
+        line: originalLocation?.line ?? 0,
+      };
+    }
+
+    // Known Page Object directory patterns
+    const poPatterns = [
+      /[/\\]pages[/\\]/i,
+      /[/\\]page-objects?[/\\]/i,
+      /[/\\]pom[/\\]/i,
+      /[/\\]src[/\\]pages[/\\]/i,
+      /[/\\]e2e[/\\]pom[/\\]/i,
+    ];
+
+    // Filter out test specs and prefer PO files
+    const nonSpecFrames = frames.filter(f => !/(tests?[/\\].*\.spec\.ts|\.test\.ts)$/i.test(f.file));
+    const poFrames = nonSpecFrames.filter(f => poPatterns.some(p => p.test(f.file)));
+
+    // Priority: PO frames > non-spec frames > original location
+    const best = poFrames[0] ?? nonSpecFrames[0];
+    if (best) {
+      // Normalize to absolute path if relative
+      const absFile = path.isAbsolute(best.file)
+        ? best.file
+        : path.join(testRepoPath, best.file);
+      return { file: absFile, line: best.line };
+    }
+
+    return {
+      file: originalLocation?.file ?? null,
+      line: originalLocation?.line ?? 0,
+    };
   }
 }
 
