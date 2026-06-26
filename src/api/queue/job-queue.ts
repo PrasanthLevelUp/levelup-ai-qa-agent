@@ -27,6 +27,18 @@ export interface HealingJob {
   projectId?: number;
   /** Optional spec file to scope the run to a single test file (relative path). Empty ⇒ run whole suite. */
   testFile?: string;
+  /**
+   * Per-request execution profile override. When set, this wins over the
+   * project-level ExecutionSettings default (CI smoke → 'fast', investigation →
+   * 'debug', etc.). Resolved via resolveExecutionProfile() in the worker.
+   */
+  requestedProfile?: import('../../core/execution/execution-profile').ExecutionProfile;
+  /**
+   * Per-request override for collecting extra healing artifacts (trace/video/HAR).
+   * When set, wins over the project default. Resolved via
+   * resolveCollectHealingArtifacts() in the worker.
+   */
+  requestedCollectHealingArtifacts?: boolean;
   status: JobStatus;
   progress: string;
   createdAt: string;
@@ -62,7 +74,17 @@ export class JobQueue {
   /**
    * Create a new healing job and add to queue.
    */
-  createJob(repositoryId: string, branch = 'main', commit?: string, repositoryUrl?: string, companyId?: number, projectId?: number, testFile?: string): HealingJob {
+  createJob(
+    repositoryId: string,
+    branch = 'main',
+    commit?: string,
+    repositoryUrl?: string,
+    companyId?: number,
+    projectId?: number,
+    testFile?: string,
+    requestedProfile?: import('../../core/execution/execution-profile').ExecutionProfile,
+    requestedCollectHealingArtifacts?: boolean,
+  ): HealingJob {
     const job: HealingJob = {
       id: `job_${uuidv4().slice(0, 12)}`,
       repositoryId,
@@ -71,6 +93,9 @@ export class JobQueue {
       companyId,
       projectId,
       testFile: testFile || undefined,
+      requestedProfile: requestedProfile || undefined,
+      requestedCollectHealingArtifacts:
+        typeof requestedCollectHealingArtifacts === 'boolean' ? requestedCollectHealingArtifacts : undefined,
       commit,
       status: JobStatus.PENDING,
       progress: 'Queued for processing',

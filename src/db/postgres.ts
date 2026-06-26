@@ -13,6 +13,44 @@ import {
   applyEnvSprintSchema,
 } from './environment-sprint-schema';
 import { FEATURE_FLAGS } from '../config/features';
+import {
+  type ExecutionSettings,
+  DEFAULT_EXECUTION_SETTINGS,
+} from '../core/execution/execution-settings';
+import type { ExecutionRecord } from '../core/execution/execution-record';
+
+// Re-export execution domain models so existing `from '../db/postgres'` imports
+// keep working during/after the refactor. The models are OWNED by
+// src/core/execution/* — postgres.ts only persists them.
+export type { ExecutionProfile } from '../core/execution/execution-profile';
+export {
+  type ExecutionSettings,
+  DEFAULT_EXECUTION_SETTINGS,
+  resolveExecutionProfile,
+  resolveCollectHealingArtifacts,
+} from '../core/execution/execution-settings';
+export {
+  type ExecutionRecord,
+  type EvidenceManifest,
+  type ArtifactDescriptor,
+  type ArtifactStorage,
+  type ArtifactType,
+  type ExecutionArtifacts,
+  type ExecutionMetadata,
+  type ObservationRecord,
+  type DiagnosisRecord,
+  type HealingDecisionRecord,
+  type ValidationRecord,
+  type LearningRecord,
+  EXECUTION_RECORD_SCHEMA_VERSION,
+  createExecutionRecord,
+  recordArtifacts,
+  recordObservations,
+  recordDiagnosis,
+  recordHealingDecision,
+  recordValidation,
+  recordLearning,
+} from '../core/execution/execution-record';
 
 const MOD = 'postgres';
 
@@ -1795,6 +1833,45 @@ async function migrateDefaultCompany(client: PoolClient): Promise<void> {
   await safeExec(client, 'idx_healing_settings_scope',
     `CREATE UNIQUE INDEX IF NOT EXISTS idx_healing_settings_scope
        ON healing_settings(COALESCE(company_id, 0), COALESCE(project_id, 0))`);
+
+  // ── Execution settings (project-level execution configuration) ──
+  // Separate from healing_settings because execution is used by multiple consumers:
+  // script validation, healing, regression, smoke, nightly, GitHub Actions, etc.
+  // Authorization layer enforces which profiles are available per subscription plan.
+  console.log('🔧 [DB] Migration: execution_settings table...');
+  await safeExec(client, 'execution_settings', `CREATE TABLE IF NOT EXISTS execution_settings (
+    id SERIAL PRIMARY KEY,
+    company_id INTEGER REFERENCES companies(id),
+    project_id INTEGER REFERENCES projects(id) ON DELETE CASCADE,
+    settings JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+  )`);
+  await safeExec(client, 'idx_execution_settings_scope',
+    `CREATE UNIQUE INDEX IF NOT EXISTS idx_execution_settings_scope
+       ON execution_settings(COALESCE(company_id, 0), COALESCE(project_id, 0))`);
+
+  // ── Execution records (the canonical per-execution record) ──
+  // One JSONB document per execution that accumulates artifacts → observations →
+  // diagnosis → healing → validation → learning. The dashboard/analytics read
+  // THIS table instead of separate diagnosis/healing/evidence/artifact tables.
+  // Fully additive — absence of rows simply means no executions recorded yet.
+  console.log('🔧 [DB] Migration: execution_records table...');
+  await safeExec(client, 'execution_records', `CREATE TABLE IF NOT EXISTS execution_records (
+    execution_id TEXT PRIMARY KEY,
+    company_id INTEGER REFERENCES companies(id),
+    project_id INTEGER REFERENCES projects(id) ON DELETE CASCADE,
+    test_name TEXT,
+    status TEXT,
+    profile TEXT,
+    schema_version INTEGER NOT NULL DEFAULT 1,
+    record JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+  )`);
+  await safeExec(client, 'idx_execution_records_scope',
+    `CREATE INDEX IF NOT EXISTS idx_execution_records_scope
+       ON execution_records(COALESCE(company_id, 0), COALESCE(project_id, 0), created_at DESC)`);
 
   // ── Crawl snapshots (proactive script maintenance: change detection) ──
   // Stores a lightweight, versioned "signature" of each crawl so we can diff
@@ -7158,6 +7235,127 @@ export async function setRequirementGenerationState(
       `UPDATE test_requirements SET generation_state = $2, updated_at = NOW() WHERE id = $1`,
       [id, state]
     );
+  }
+}
+
+/** Read execution settings for a scope, merged over defaults (never throws on missing table). */
+export async function getExecutionSettings(companyId?: number, projectId?: number): Promise<ExecutionSettings> {
+  const pool = getPool();
+  try {
+    const r = await pool.query(
+      `SELECT settings FROM execution_settings
+       WHERE COALESCE(company_id, 0) = COALESCE($1, 0)
+         AND COALESCE(project_id, 0) = COALESCE($2, 0)
+       LIMIT 1`,
+      [companyId ?? null, projectId ?? null]
+    );
+    const stored = r.rows[0]?.settings || {};
+    return { ...DEFAULT_EXECUTION_SETTINGS, ...stored };
+  } catch (err: any) {
+    if (err?.code === '42P01' || err?.message?.includes('does not exist')) {
+      return { ...DEFAULT_EXECUTION_SETTINGS };
+    }
+    throw err;
+  }
+}
+
+/** Upsert execution settings for a scope. Returns the merged effective settings. */
+export async function upsertExecutionSettings(
+  settings: Partial<ExecutionSettings>, companyId?: number, projectId?: number
+): Promise<ExecutionSettings> {
+  const pool = getPool();
+  const current = await getExecutionSettings(companyId, projectId);
+  const merged: ExecutionSettings = { ...current, ...settings };
+  await pool.query(
+    `INSERT INTO execution_settings (company_id, project_id, settings, created_at, updated_at)
+     VALUES ($1, $2, $3::jsonb, NOW(), NOW())
+     ON CONFLICT (COALESCE(company_id, 0), COALESCE(project_id, 0))
+     DO UPDATE SET settings = $3::jsonb, updated_at = NOW()`,
+    [companyId ?? null, projectId ?? null, JSON.stringify(merged)]
+  );
+  return merged;
+}
+
+// ---- Execution records (the canonical per-execution record) ----
+//
+// The ExecutionRecord business model lives in src/core/execution/execution-record.ts.
+// postgres.ts only persists and reads it. The dashboard/analytics read THIS row
+// (one record per execution) rather than separate diagnosis/healing/evidence tables.
+
+/**
+ * Persist (insert or update) a canonical execution record. Stored as a single
+ * JSONB document keyed by executionId, scoped by company/project. Safe no-op
+ * fallback if the table does not exist yet (never throws on missing table).
+ */
+export async function saveExecutionRecord(
+  record: ExecutionRecord, companyId?: number, projectId?: number
+): Promise<void> {
+  const pool = getPool();
+  try {
+    await pool.query(
+      `INSERT INTO execution_records
+         (execution_id, company_id, project_id, test_name, status, profile, schema_version, record, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, NOW(), NOW())
+       ON CONFLICT (execution_id)
+       DO UPDATE SET record = $8::jsonb, status = $5, test_name = $4, profile = $6,
+                     schema_version = $7, updated_at = NOW()`,
+      [
+        record.executionId,
+        companyId ?? null,
+        projectId ?? null,
+        record.testName,
+        record.status,
+        record.profile,
+        record.schemaVersion,
+        JSON.stringify(record),
+      ]
+    );
+  } catch (err: any) {
+    if (err?.code === '42P01' || err?.message?.includes('does not exist')) {
+      logger.warn(MOD, 'execution_records table missing — skipping persist', { executionId: record.executionId });
+      return;
+    }
+    throw err;
+  }
+}
+
+/** Read a single canonical execution record by its executionId (null if absent). */
+export async function getExecutionRecord(executionId: string): Promise<ExecutionRecord | null> {
+  const pool = getPool();
+  try {
+    const r = await pool.query(
+      `SELECT record FROM execution_records WHERE execution_id = $1 LIMIT 1`,
+      [executionId]
+    );
+    return (r.rows[0]?.record as ExecutionRecord) ?? null;
+  } catch (err: any) {
+    if (err?.code === '42P01' || err?.message?.includes('does not exist')) {
+      return null;
+    }
+    throw err;
+  }
+}
+
+/** List recent execution records for a project scope (most recent first). */
+export async function listExecutionRecords(
+  companyId?: number, projectId?: number, limit = 50
+): Promise<ExecutionRecord[]> {
+  const pool = getPool();
+  try {
+    const r = await pool.query(
+      `SELECT record FROM execution_records
+       WHERE COALESCE(company_id, 0) = COALESCE($1, 0)
+         AND COALESCE(project_id, 0) = COALESCE($2, 0)
+       ORDER BY created_at DESC
+       LIMIT $3`,
+      [companyId ?? null, projectId ?? null, limit]
+    );
+    return r.rows.map((row) => row.record as ExecutionRecord);
+  } catch (err: any) {
+    if (err?.code === '42P01' || err?.message?.includes('does not exist')) {
+      return [];
+    }
+    throw err;
   }
 }
 

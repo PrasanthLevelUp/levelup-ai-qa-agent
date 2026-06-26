@@ -30,6 +30,26 @@ import { FailureAnalyzer } from '../core/failure-analyzer';
 import { HealingOrchestrator, pageObjectPatchLogFields, type HealingOutcome } from '../core/healing-orchestrator';
 import { HealingStrategySelector, type StrategyConfig } from '../core/healing-strategy-selector';
 import { routeHealingStrategy } from '../core/healing-strategy-router';
+import { EvidenceCollector } from '../core/evidence-collector';
+import { refineDiagnosisWithEvidence } from '../core/failure-classifier';
+// Canonical Execution Record — the single lifecycle record the dashboard reads.
+import {
+  createExecutionRecord,
+  recordArtifacts,
+  recordObservations,
+  recordDiagnosis,
+  recordHealingDecision,
+  recordValidation,
+  recordLearning,
+  type ExecutionRecord,
+} from '../core/execution/execution-record';
+import {
+  mapEvidenceToObservations,
+  mapDiagnosisToRecord,
+  artifactsFromPaths,
+  buildHealingDecision,
+} from '../core/execution/execution-record-mappers';
+import { saveExecutionRecord } from '../db/postgres';
 import { RuleEngine } from '../engines/rule-engine';
 import { PatternEngine } from '../engines/pattern-engine';
 import { AIEngine } from '../engines/ai-engine';
@@ -60,6 +80,7 @@ import { createRCAIntelligenceRouter } from './routes/rca-intelligence';
 import { createTestCoverageRouter } from './routes/test-coverage';
 import { createTestDataRouter } from './routes/test-data';
 import { createHealingSettingsRouter } from './routes/healing-settings';
+import { createExecutionRecordsRouter } from './routes/execution-records';
 import { createRequirementsRouter } from './routes/requirements';
 import { createTestCasesRouter } from './routes/test-cases';
 import { createRtmRouter } from './routes/rtm';
@@ -104,8 +125,12 @@ import {
   logPR,
   getProjectIdForRepo,
   getHealingSettings,
+  getExecutionSettings,
+  resolveExecutionProfile,
+  resolveCollectHealingArtifacts,
   getLatestDomHtmlForUrl,
   type HealingSettings,
+  type ExecutionSettings,
 } from '../db/postgres';
 import {
   HealingIntelligenceContext,
@@ -247,6 +272,8 @@ export function createServer(): express.Application {
   app.use('/api/test-coverage', authMiddleware, companyMiddleware, sessionMiddleware, projectContextMiddleware, contextMiddleware, createTestCoverageRouter());
   app.use('/api/test-data', authMiddleware, companyMiddleware, sessionMiddleware, projectContextMiddleware, contextMiddleware, createTestDataRouter());
   app.use('/api/healing-settings', authMiddleware, companyMiddleware, sessionMiddleware, projectContextMiddleware, contextMiddleware, createHealingSettingsRouter());
+  // Canonical Execution Records — the single lifecycle record per test execution.
+  app.use('/api/execution-records', authMiddleware, companyMiddleware, sessionMiddleware, projectContextMiddleware, contextMiddleware, createExecutionRecordsRouter());
   app.use('/api/requirements', authMiddleware, companyMiddleware, sessionMiddleware, projectContextMiddleware, contextMiddleware, createRequirementsRouter());
   app.use('/api/test-cases', authMiddleware, companyMiddleware, sessionMiddleware, projectContextMiddleware, contextMiddleware, createTestCasesRouter());
   app.use('/api/rtm', authMiddleware, companyMiddleware, sessionMiddleware, projectContextMiddleware, contextMiddleware, createRtmRouter());
@@ -377,6 +404,39 @@ function createHealingWorker(
     // reruns per broken locator (the old code ran one rerun PER candidate).
     const MAX_BROWSER_TRIES_PER_LOCATOR = envInt('HEALING_MAX_BROWSER_TRIES_PER_LOCATOR', 2);
 
+    // Execution settings — load early so they're available for initial test run
+    // Use job.projectId if available (will be refined later with resolvedProjectId for healing)
+    // Profiles are project-level DEFAULTS overridden per execution request:
+    //   request override (job.requestedProfile) > project default > system default.
+    let executionProfile: import('../db/postgres').ExecutionProfile = resolveExecutionProfile(
+      job.requestedProfile,
+      undefined,
+    );
+    let collectHealingArtifacts = resolveCollectHealingArtifacts(
+      job.requestedCollectHealingArtifacts,
+      undefined,
+    );
+    try {
+      const es: ExecutionSettings = await getExecutionSettings(job.companyId, job.projectId);
+      // Per-request override wins over the project default; project default wins over system default.
+      executionProfile = resolveExecutionProfile(job.requestedProfile, es.executionProfile);
+      collectHealingArtifacts = resolveCollectHealingArtifacts(
+        job.requestedCollectHealingArtifacts,
+        es.collectHealingArtifacts,
+      );
+      logger.info(MOD, '⚙️ Execution settings resolved (early)', {
+        companyId: job.companyId ?? null,
+        projectId: job.projectId ?? null,
+        projectDefaultProfile: es.executionProfile,
+        requestedProfile: job.requestedProfile ?? null,
+        effectiveProfile: executionProfile,
+        requestedCollectHealingArtifacts: job.requestedCollectHealingArtifacts ?? null,
+        effectiveCollectHealingArtifacts: collectHealingArtifacts,
+      });
+    } catch (settingsErr: any) {
+      logger.warn(MOD, 'Could not load execution settings — using defaults', { error: settingsErr.message });
+    }
+
     /** True once the user has cancelled this job (Cancel sets status=FAILED). */
     const isCancelled = (): boolean => jobQueue.getJob(job.id)?.status === JobStatus.FAILED;
     /** Remaining job wall-clock budget in ms (never negative). */
@@ -480,8 +540,17 @@ function createHealingWorker(
       progress: job.testFile ? `Running tests (${job.testFile})...` : 'Running tests...',
     });
     // Non-blocking full run, bounded by the overall job budget so the initial
-    // suite execution can't itself hang the job indefinitely.
-    const run = await ExecutionEngine.runAsync(testRepoPath, job.testFile, undefined, jobBudgetRemainingMs());
+    // suite execution can't itself hang the job indefinitely. Initial test run
+    // uses base profile without healing artifacts (not a healing attempt yet).
+    const run = await ExecutionEngine.runAsync(
+      testRepoPath,
+      job.testFile,
+      undefined,
+      jobBudgetRemainingMs(),
+      executionProfile,
+      collectHealingArtifacts,
+      false // isHealingRun=false for initial test run
+    );
 
     // Step 4: Collect artifacts
     jobQueue.updateJob(job.id, { progress: 'Collecting failure artifacts...' });
@@ -560,7 +629,7 @@ function createHealingWorker(
       logger.warn(MOD, '⚠️ OPENAI_API_KEY not set — AI healing strategy disabled (rule + pattern still active)');
     }
 
-    // ── Issue #3: apply admin-configured healing strategy settings ──
+    // ── Load healing strategy settings (thresholds + cost caps) ──
     // Load per-company/project thresholds + cost caps and build a configured
     // strategy selector. When no settings are stored, getHealingSettings returns
     // the engine defaults, preserving prior behaviour. AI fallback off is modelled
@@ -643,6 +712,9 @@ function createHealingWorker(
       }
 
       let failure = analyzer.analyze(artifact);
+      // Track which artifact `failure` was derived from, so the Evidence
+      // Collector can read its trace/video/screenshot paths (Failure Replay).
+      let evidenceArtifact = artifact;
       const testStartMs = Date.now();
       // Per-test deadline = min(per-test budget, remaining job budget).
       const testDeadlineMs = testStartMs + Math.min(PER_TEST_BUDGET_MS, jobBudgetRemainingMs());
@@ -650,8 +722,17 @@ function createHealingWorker(
 
       // PRE-CHECK: Re-run this specific test to see if it still fails.
       // A previous test's healing may have already fixed shared locators in the same file.
+      // Use the base execution profile (not a healing attempt yet).
       const preCheckRelFile = path.relative(path.join(testRepoPath, 'tests'), failure.filePath);
-      const preCheck = await ExecutionEngine.runAsync(testRepoPath, preCheckRelFile, failure.testName, rerunTimeoutMs());
+      const preCheck = await ExecutionEngine.runAsync(
+        testRepoPath,
+        preCheckRelFile,
+        failure.testName,
+        rerunTimeoutMs(),
+        executionProfile,
+        collectHealingArtifacts,
+        false // isHealingRun=false for precheck
+      );
       if (preCheck.exitCode === 0) {
         logger.info(MOD, 'Test already passes (fixed by prior healing) — skipping', {
           testName: failure.testName,
@@ -683,6 +764,7 @@ function createHealingWorker(
         });
         if (freshForTest) {
           failure = analyzer.analyze(freshForTest);
+          evidenceArtifact = freshForTest;
           logger.info(MOD, 'Using fresh artifacts for test', {
             testName: failure.testName,
             failedLocator: failure.failedLocator,
@@ -712,6 +794,37 @@ function createHealingWorker(
         progress: `Healing: ${failure.testName}...`,
       });
 
+      // ── Canonical Execution Record ──
+      // One record per failing test, threaded through the whole pipeline:
+      //   Execution → Diagnosis → Healing → Validation → Learning.
+      // The dashboard reads THIS single record rather than stitching together
+      // separate diagnosis/healing/evidence/artifact tables. Lifecycle sections
+      // are accumulated immutably (each record* returns a new record) and the
+      // final record is persisted once at the end of this test's iteration.
+      let execRecord: ExecutionRecord = createExecutionRecord({
+        executionId: String(executionId),
+        testName: failure.testName,
+        status: 'failed',
+        durationMs: 0,
+        startTime: new Date(testStartMs).toISOString(),
+        endTime: new Date(testStartMs).toISOString(),
+        profile: executionProfile,
+      });
+      // Stage 1 — artifacts captured by the failing run (storage-agnostic
+      // descriptors, local today). Inline metadata stays cheap/structured.
+      execRecord = recordArtifacts(execRecord, {
+        ...artifactsFromPaths({
+          screenshotPath: evidenceArtifact.screenshot_path,
+          tracePath: evidenceArtifact.trace_path,
+          videoPath: evidenceArtifact.video_path,
+        }),
+        metadata: {
+          ...(failure.url ? { url: failure.url } : {}),
+          ...(failure.diagnosis?.locator ? { locator: failure.diagnosis.locator } : {}),
+          ...(failure.diagnosis?.line != null ? { failedLine: failure.diagnosis.line } : {}),
+        },
+      });
+
       const backupPath = backupFile(failure.filePath);
       let iterationSuccess = false;
       let lastStrategy = 'rule_based';
@@ -719,8 +832,68 @@ function createHealingWorker(
       let iterFixCount = 0;
       const healedBeforeTest = healedCount;
 
-      // Observability: build a concise 3-layer trail for this failure regardless
-      // of whether anything is healable. Finalized after the healing branches.
+      // ── Evidence-Based Diagnosis (runs BEFORE classification is consumed) ──
+      // The parser-based classifier produced `failure.diagnosis` from the error
+      // text. Before anyone acts on it, aggregate the OBSERVED facts Playwright
+      // already captured (DOM snapshot → locator state, console/network signals,
+      // trace/video/screenshot artifacts) and upgrade the diagnosis with them.
+      // This is what turns inference ("looks like a broken locator") into
+      // evidence ("element exists/visible/enabled but is covered by an overlay →
+      // wait_for_overlay"). Best-effort: any failure here degrades gracefully to
+      // the parser-based diagnosis.
+      if (failure.diagnosis) {
+        try {
+          let domSnapshot: string | null = null;
+          if (failure.url) {
+            domSnapshot = await getLatestDomHtmlForUrl(
+              failure.url,
+              job.companyId,
+              resolvedProjectId,
+            );
+          }
+          const evidence = await new EvidenceCollector().collect({
+            failure,
+            domSnapshot,
+            tracePath: evidenceArtifact.trace_path,
+            videoPath: evidenceArtifact.video_path,
+            consoleLog: failure.errorMessage,
+          });
+          const refined = refineDiagnosisWithEvidence(failure.diagnosis, evidence);
+          failure.diagnosis = refined;
+          // Stage 2 + 3 — record the OBSERVED facts and the classifier's verdict.
+          execRecord = recordObservations(execRecord, mapEvidenceToObservations(evidence));
+          execRecord = recordDiagnosis(execRecord, mapDiagnosisToRecord(refined));
+          logger.info(MOD, 'Evidence-based diagnosis', {
+            testName: failure.testName,
+            category: refined.category,
+            recommendedStrategy: refined.recommendedStrategy,
+            confidence: refined.confidence,
+            evidenceBased: refined.evidenceBased,
+            locatorState: evidence.locatorState
+              ? {
+                  exists: evidence.locatorState.exists,
+                  visible: evidence.locatorState.visible,
+                  enabled: evidence.locatorState.enabled,
+                  clickable: evidence.locatorState.clickable,
+                  interceptedBy: evidence.locatorState.interceptedBy,
+                }
+              : null,
+          });
+        } catch (e) {
+          logger.warn(MOD, 'Evidence collection failed — using parser-based diagnosis', {
+            testName: failure.testName,
+            error: (e as Error).message,
+          });
+        }
+      }
+      // Ensure the record carries a diagnosis even when evidence collection
+      // failed/was skipped (falls back to the parser-based verdict).
+      if (failure.diagnosis && !execRecord.diagnosis) {
+        execRecord = recordDiagnosis(execRecord, mapDiagnosisToRecord(failure.diagnosis));
+      }
+
+      // Observability: build a concise trail for this failure regardless of
+      // whether anything is healable. Finalized after the healing branches.
       const trail = new HealingTrailBuilder(failure.testName, failure.failureType, failure.diagnosis);
 
       // ── Diagnosis-first strategy routing ──
@@ -739,6 +912,13 @@ function createHealingWorker(
           shouldAttemptLocatorHealing: strategyPlan.shouldAttemptLocatorHealing,
         });
       }
+
+      // Explicit artifact collection control: collectHealingArtifacts flag is set at
+      // project level by the user (explicit, visible, never auto-upgraded). When true,
+      // healing runs will collect trace/video/HAR regardless of base profile (unless
+      // profile is 'fast', which explicitly disables all artifacts). When false, only
+      // the base profile artifacts are collected. This makes artifact costs predictable
+      // and prevents hidden storage surprises.
 
       try {
         // Decide healing strategy based on failure type:
@@ -773,7 +953,15 @@ function createHealingWorker(
               if (updatedContent !== originalContent) {
                 fs.writeFileSync(failure.filePath, updatedContent, 'utf-8');
                 const relativeTestFile = path.relative(path.join(testRepoPath, 'tests'), failure.filePath);
-                const rerun = await ExecutionEngine.runAsync(testRepoPath, relativeTestFile, failure.testName, rerunTimeoutMs());
+                const rerun = await ExecutionEngine.runAsync(
+                  testRepoPath,
+                  relativeTestFile,
+                  failure.testName,
+                  rerunTimeoutMs(),
+                  executionProfile,
+                  collectHealingArtifacts,
+                  true // isHealingRun=true (wait injection is a healing attempt)
+                );
                 if (rerun.exitCode === 0) {
                   iterationSuccess = true;
                   healedCount++;
@@ -940,6 +1128,7 @@ function createHealingWorker(
             });
             break;
           }
+          
           jobQueue.updateJob(job.id, {
             progress: `Healing: ${failure.testName} (locator ${iteration + 1})...`,
           });
@@ -1090,7 +1279,15 @@ function createHealingWorker(
             );
             const currentTestName = failure.testName;
             browserTries++; // count this candidate against the per-locator browser budget
-            const rerun = await ExecutionEngine.runAsync(testRepoPath, relativeTestFile, currentTestName, rerunTimeoutMs());
+            const rerun = await ExecutionEngine.runAsync(
+              testRepoPath,
+              relativeTestFile,
+              currentTestName,
+              rerunTimeoutMs(),
+              executionProfile,
+              collectHealingArtifacts,
+              true // isHealingRun=true (locator healing attempt)
+            );
 
             logger.info(MOD, 'Rerun result', {
               exitCode: rerun.exitCode, iteration, retry,
@@ -1197,7 +1394,15 @@ function createHealingWorker(
                 testName: failure.testName, iteration, retry,
                 exitCode: rerun.exitCode,
               });
-              const confirmRerun = await ExecutionEngine.runAsync(testRepoPath, relativeTestFile, currentTestName, rerunTimeoutMs());
+              const confirmRerun = await ExecutionEngine.runAsync(
+                testRepoPath,
+                relativeTestFile,
+                currentTestName,
+                rerunTimeoutMs(),
+                executionProfile,
+                collectHealingArtifacts,
+                true // isHealingRun=true (confirmation rerun)
+              );
               if (confirmRerun.exitCode === 0) {
                 // Confirmed healed!
                 locatorFixed = true;
@@ -1496,7 +1701,65 @@ function createHealingWorker(
           reason: 'Candidate applied and the test passed on rerun.',
         });
       }
-      healingTrails.push(trail.finalize(iterationSuccess ? 'healed' : 'not_healed'));
+      const finalizedTrail = trail.finalize(iterationSuccess ? 'healed' : 'not_healed');
+      healingTrails.push(finalizedTrail);
+
+      // ── Finalize the canonical Execution Record (Stages 4–6) ──
+      // Healing / Validation / Learning are derived from the per-test aggregates
+      // the loop already computed (the deep nested branches mutate
+      // healings/lastStrategy/iterationSuccess), so the canonical decision is the
+      // final applied outcome. The dashboard reads this one record.
+      try {
+        const healingForTest = healings.find((h) => h.testName === failure.testName);
+        const appliedAttempt = finalizedTrail.attempts.find((a) => a.decision === 'applied');
+        const attemptedStrategies = Array.from(
+          new Set(finalizedTrail.attempts.map((a) => a.layer)),
+        );
+        // Stage 4 — what we decided to do and the fix we applied.
+        execRecord = recordHealingDecision(execRecord, buildHealingDecision({
+          remedy: strategyPlan?.recommendedStrategy ?? failure.diagnosis?.recommendedStrategy,
+          attemptedStrategies,
+          appliedStrategy: appliedAttempt?.layer ?? (healingForTest?.success ? healingForTest.strategy : null),
+          source: healingForTest?.success ? healingForTest.strategy : null,
+          brokenLocator: healingForTest?.failedLocator ?? failure.diagnosis?.locator ?? null,
+          newLocator: healingForTest?.success ? healingForTest.healedLocator : null,
+          candidatesConsidered: finalizedTrail.attempts.length,
+          reportOnly: !healingForTest?.success && finalizedTrail.outcome === 'not_healed',
+          rationale: finalizedTrail.summary,
+        }));
+        // Stage 5 — did the applied fix hold up on rerun?
+        execRecord = recordValidation(execRecord, {
+          reran: !!healingForTest,
+          passedAfterHealing: healingForTest ? healingForTest.success : null,
+          notes: healingForTest?.validationReason ? [healingForTest.validationReason] : [],
+        });
+        // Stage 6 — what we wrote back to memory (a successful heal closes the
+        // learning loop + updates DOM Memory in the locator branches above).
+        execRecord = recordLearning(execRecord, {
+          recorded: !!(healingForTest?.success),
+          domMemoryUpdated: !!(healingForTest?.success),
+        });
+        // Promote final status + timing, then persist the single record.
+        const testEndMs = Date.now();
+        execRecord = {
+          ...execRecord,
+          status: iterationSuccess ? 'passed' : 'failed',
+          durationMs: testEndMs - testStartMs,
+          endTime: new Date(testEndMs).toISOString(),
+        };
+        await saveExecutionRecord(execRecord, job.companyId, resolvedProjectId);
+        logger.info(MOD, 'Execution Record persisted', {
+          executionId: execRecord.executionId,
+          testName: execRecord.testName,
+          status: execRecord.status,
+          healed: !!healingForTest?.success,
+        });
+      } catch (recErr) {
+        logger.warn(MOD, 'Failed to persist Execution Record (non-blocking)', {
+          testName: failure.testName,
+          error: (recErr as Error).message,
+        });
+      }
 
       // Record tests we had to stop early due to the time budget (not healed and
       // we were out of time). Surfaced in the job summary so a partial run is honest.

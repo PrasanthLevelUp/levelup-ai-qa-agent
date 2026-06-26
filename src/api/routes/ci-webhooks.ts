@@ -212,7 +212,9 @@ async function handleWorkflowRun(
     });
   }
 
-  // Queue healing job
+  // Queue healing job. No per-request profile override here — GitHub webhook
+  // payloads don't carry one, so the worker resolves the project-level default.
+  // (Pipelines that need a specific profile can call POST /api/heal with `profile`.)
   const job = jobQueue.createJob(
     parsed.repoFullName || parsed.repoUrl,
     parsed.branch,
