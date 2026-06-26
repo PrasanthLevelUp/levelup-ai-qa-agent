@@ -16,6 +16,7 @@ import {
   getExecutionRecord,
 } from '../../db/postgres';
 import { buildExecutionTimeline } from '../../core/execution/execution-timeline';
+import { toDisplayStage } from '../../core/execution/execution-lifecycle';
 import { logger } from '../../utils/logger';
 
 const MOD = 'dashboard-api';
@@ -212,14 +213,23 @@ export function createDashboardRouter(): Router {
       const result = records.map((r) => ({
         executionId: r.executionId,
         testName: r.testName,
+        // Lifecycle status (queued|running|completed|failed|cancelled|timed_out)
+        // is kept separate from the test outcome (`result`).
         status: r.status,
+        result: r.result ?? null,
+        // Internal pipeline stage + its clean user-facing label (derived, never
+        // stored) so the UI can show "Preparing Environment" instead of leaking
+        // cloning/installing/building.
+        stage: r.stage ?? null,
+        displayStage: toDisplayStage(r.stage) ?? null,
+        jobId: r.jobId ?? null,
         profile: r.profile,
         durationMs: r.durationMs,
         startTime: r.startTime,
         endTime: r.endTime,
         diagnosisCategory: r.diagnosis?.category ?? null,
         confidence: r.diagnosis?.confidence ?? null,
-        healed: r.validation?.passedAfterHealing === true,
+        healed: r.result === 'healed' || r.validation?.passedAfterHealing === true,
         appliedStrategy: r.healing?.appliedStrategy ?? null,
       }));
       res.json({ executions: result, count: result.length });

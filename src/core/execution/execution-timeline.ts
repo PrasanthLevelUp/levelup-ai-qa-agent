@@ -6,13 +6,13 @@
  * captured (execution → evidence → diagnosis → healing → validation → learning).
  * The dashboard's Execution Details page renders this directly.
  *
- * Note on timestamps: a record only knows its own `startTime`/`endTime`, so the
- * first event carries `startTime`, the last carries `endTime`, and intermediate
- * lifecycle stages intentionally omit a clock time (we surface ORDER + outcome,
- * not invented per-step timestamps). Capturing true per-action timing would need
- * richer execution instrumentation, which is deliberately out of scope here.
+ * Note on timestamps: this human-readable timeline surfaces ORDER + outcome and
+ * carries clock times only where the record reliably knows them (start/end). For
+ * TRUE per-stage timing, use {@link deriveStageHistory} below — it derives exact
+ * start/end/duration for every stage straight from the record's append-only
+ * `events` log (no invented timestamps).
  */
-import type { ExecutionRecord } from './execution-record';
+import { coerceLegacyRecord, type ExecutionRecord, type ExecutionStage } from './execution-record';
 
 /** Outcome marker for a timeline event (drives the icon/colour in the UI). */
 export type TimelineEventStatus = 'done' | 'failed' | 'skipped' | 'info';
@@ -35,7 +35,10 @@ export interface TimelineEvent {
  * the record actually has data for them, so an un-diagnosed/un-healed run yields
  * a shorter, honest timeline.
  */
-export function buildExecutionTimeline(record: ExecutionRecord): TimelineEvent[] {
+export function buildExecutionTimeline(input: ExecutionRecord): TimelineEvent[] {
+  // Normalize legacy (v2) records so we can reason about the {status, result}
+  // split uniformly. v3+ records pass through unchanged.
+  const record = coerceLegacyRecord(input);
   const events: TimelineEvent[] = [];
 
   // 1) Execution started.
@@ -47,26 +50,46 @@ export function buildExecutionTimeline(record: ExecutionRecord): TimelineEvent[]
     time: record.startTime,
   });
 
-  // 2) Outcome of the run itself.
-  const failed = record.status === 'failed' || record.status === 'timedout';
-  events.push({
-    key: 'run_result',
-    label: failed
-      ? (record.status === 'timedout' ? 'Test timed out' : 'Test failed')
-      : (record.status === 'skipped' ? 'Test skipped' : 'Test passed'),
-    status: failed ? 'failed' : (record.status === 'skipped' ? 'skipped' : 'done'),
-    detail: record.artifacts?.metadata?.locator
+  // 2) Outcome of the run itself — driven by RESULT (the test outcome), not the
+  // lifecycle status. A record still in flight (no terminal result) shows as
+  // "running" rather than a misleading pass/fail.
+  const result = record.result ?? null;
+  const timedOut = record.status === 'timed_out';
+  const runEvent: TimelineEvent = (() => {
+    const detail = record.artifacts?.metadata?.locator
       ? `at ${record.artifacts.metadata.locator}`
-      : undefined,
-  });
+      : undefined;
+    if (result === null) {
+      return { key: 'run_result', label: 'Test running', status: 'info' as const, detail };
+    }
+    if (result === 'skipped') {
+      return { key: 'run_result', label: 'Test skipped', status: 'skipped' as const, detail };
+    }
+    if (result === 'fail') {
+      return {
+        key: 'run_result',
+        label: timedOut ? 'Test timed out' : 'Test failed',
+        status: 'failed' as const,
+        detail,
+      };
+    }
+    // pass or healed
+    return {
+      key: 'run_result',
+      label: result === 'healed' ? 'Test healed' : 'Test passed',
+      status: 'done' as const,
+      detail,
+    };
+  })();
+  events.push(runEvent);
 
-  // 3) Evidence collected (observations present).
-  if (record.observations) {
-    const ls = record.observations.locatorState;
+  // 3) Evidence collected (evidence present).
+  if (record.evidence) {
+    const ls = record.evidence.locatorState;
     const detail = ls
       ? `locator ${ls.exists ? 'exists' : 'missing'}` +
         (ls.interceptedBy ? `, intercepted by ${ls.interceptedBy}` : '')
-      : (record.observations.summary?.[0] ?? undefined);
+      : (record.evidence.summary?.[0] ?? undefined);
     events.push({
       key: 'evidence',
       label: 'Evidence collected',
@@ -149,4 +172,61 @@ export function buildExecutionTimeline(record: ExecutionRecord): TimelineEvent[]
   });
 
   return events;
+}
+
+// ---------------------------------------------------------------------------
+// Stage history — a DERIVED view (never stored). Reconstructs each stage the
+// execution passed through, with exact start/end/duration, straight from the
+// record's append-only `events` log. This is the substrate for the dashboard's
+// per-stage timing bar, bottleneck analysis ("Healing was the slowest stage at
+// 2.8s") and replay scrubber — all without persisting anything extra.
+// ---------------------------------------------------------------------------
+
+/** One stage the execution occupied, with its measured span. */
+export interface StageHistoryEntry {
+  stage: ExecutionStage;
+  /** ISO time the stage began. */
+  startedAt: string;
+  /** ISO time the stage ended (the next stage's start, or the record end). */
+  completedAt?: string;
+  /** Milliseconds spent in this stage (completedAt − startedAt), when known. */
+  durationMs?: number;
+}
+
+function closeSpan(entry: StageHistoryEntry, endAt: string): void {
+  if (Date.parse(endAt) >= Date.parse(entry.startedAt)) {
+    entry.completedAt = endAt;
+    entry.durationMs = Math.max(0, Date.parse(endAt) - Date.parse(entry.startedAt));
+  }
+}
+
+/**
+ * Derive the ordered stage history from the record's `events` log. Each distinct
+ * stage opens a span that closes when the next distinct stage begins; the final
+ * open span is closed by the record's end time. Consecutive duplicate stages are
+ * merged. Returns `[]` for legacy records with no captured history.
+ */
+export function deriveStageHistory(input: ExecutionRecord): StageHistoryEntry[] {
+  const record = coerceLegacyRecord(input);
+  const stamps = (record.events ?? [])
+    .filter((e) => e.stage !== undefined)
+    .map((e) => ({ stage: e.stage as ExecutionStage, at: e.timestamp }));
+  if (stamps.length === 0) return [];
+
+  const history: StageHistoryEntry[] = [];
+  for (const s of stamps) {
+    const prev = history[history.length - 1];
+    if (prev && prev.stage === s.stage) {
+      // Same stage repeated (e.g. created + finalize both 'completed') — extend
+      // the existing span's end marker rather than opening a duplicate.
+      closeSpan(prev, s.at);
+      continue;
+    }
+    if (prev && !prev.completedAt) closeSpan(prev, s.at);
+    history.push({ stage: s.stage, startedAt: s.at });
+  }
+  // Close the final open span using the record's end time when sane.
+  const last = history[history.length - 1];
+  if (last && !last.completedAt && record.endTime) closeSpan(last, record.endTime);
+  return history;
 }
