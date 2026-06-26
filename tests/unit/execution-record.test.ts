@@ -14,6 +14,10 @@ import {
   recordHealingDecision,
   recordValidation,
   recordLearning,
+  setStage,
+  setLifecycle,
+  appendEvent,
+  coerceLegacyRecord,
   EXECUTION_RECORD_SCHEMA_VERSION,
   type ArtifactDescriptor,
   type ExecutionRecord,
@@ -153,5 +157,78 @@ describe('Execution Record — canonical lifecycle accumulation', () => {
     });
     expect(rec.artifacts.metadata?.failedLine).toBe(42);
     expect(rec.artifacts.screenshot?.storage).toBe('local');
+  });
+});
+
+describe('Execution Record — events log (HISTORY, separate from STATE)', () => {
+  function base(stage?: ExecutionRecord['stage']): ExecutionRecord {
+    return createExecutionRecord({
+      executionId: 'exec_evt',
+      testName: 'login should work',
+      status: 'running',
+      stage,
+      durationMs: 0,
+      startTime: '2026-01-01T00:00:00.000Z',
+      endTime: '2026-01-01T00:00:00.000Z',
+      profile: 'healing',
+    });
+  }
+
+  it('seeds the history with a single execution_created event carrying the start stage', () => {
+    const rec = base('collecting_evidence');
+    expect(rec.events).toHaveLength(1);
+    expect(rec.events[0]).toMatchObject({
+      type: 'execution_created',
+      stage: 'collecting_evidence',
+      timestamp: '2026-01-01T00:00:00.000Z',
+    });
+  });
+
+  it('setStage appends a stage_changed event and advances the current stage', () => {
+    let rec = base('collecting_evidence');
+    rec = setStage(rec, 'diagnosing');
+    rec = setStage(rec, 'healing');
+    expect(rec.stage).toBe('healing');
+    const stageChanges = rec.events.filter((e) => e.type === 'stage_changed').map((e) => e.stage);
+    expect(stageChanges).toEqual(['diagnosing', 'healing']);
+  });
+
+  it('setStage does NOT log a duplicate when the stage is unchanged', () => {
+    let rec = base('healing');
+    rec = setStage(rec, 'healing'); // no-op repeat of the current stage
+    expect(rec.stage).toBe('healing');
+    expect(rec.events.filter((e) => e.type === 'stage_changed')).toHaveLength(0);
+  });
+
+  it('setLifecycle logs exactly ONE execution_finalized event on reaching a terminal status', () => {
+    let rec = base('learning');
+    rec = setLifecycle(rec, { status: 'completed', result: 'healed', stage: 'completed' });
+    // Calling again must not append a second finalize event.
+    rec = setLifecycle(rec, { status: 'completed', result: 'healed' });
+    const finals = rec.events.filter((e) => e.type === 'execution_finalized');
+    expect(finals).toHaveLength(1);
+    expect(finals[0]).toMatchObject({ stage: 'completed', note: 'completed/healed' });
+  });
+
+  it('does NOT log a finalize event for a still-running lifecycle update', () => {
+    let rec = base('executing');
+    rec = setLifecycle(rec, { status: 'running' });
+    expect(rec.events.some((e) => e.type === 'execution_finalized')).toBe(false);
+  });
+
+  it('appendEvent is immutable and auto-stamps a timestamp when omitted', () => {
+    const rec = base('executing');
+    const next = appendEvent(rec, { type: 'evidence_collected' });
+    expect(rec.events).toHaveLength(1); // original untouched
+    expect(next.events).toHaveLength(2);
+    expect(next.events[1].type).toBe('evidence_collected');
+    expect(typeof next.events[1].timestamp).toBe('string');
+  });
+
+  it('coerceLegacyRecord defaults a missing events log to [] (no fabricated history)', () => {
+    const legacy = { ...base('executing') } as ExecutionRecord;
+    delete (legacy as Partial<ExecutionRecord>).events;
+    const coerced = coerceLegacyRecord(legacy);
+    expect(coerced.events).toEqual([]);
   });
 });

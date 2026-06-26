@@ -44,6 +44,7 @@ import {
   setStage,
   setLifecycle,
   makeSectionTiming,
+  appendEvent,
   type ExecutionRecord,
 } from '../core/execution/execution-record';
 import {
@@ -192,7 +193,7 @@ function buildNonFailureRecord(
   const durationMs = Number.isFinite(test.durationMs) ? Math.max(0, test.durationMs) : 0;
   const startIso = new Date(endMs - durationMs).toISOString();
   const endIso = new Date(endMs).toISOString();
-  return createExecutionRecord({
+  const rec = createExecutionRecord({
     executionId: syntheticExecutionId(jobId, test.testName),
     testName: test.testName,
     status,
@@ -203,6 +204,15 @@ function buildNonFailureRecord(
     startTime: startIso,
     endTime: endIso,
     profile,
+  });
+  // Pass/skip records are born already terminal — close the history with a
+  // finalize event (timestamped at end) so derived views see a created→finalized
+  // pair just like a healed record's history.
+  return appendEvent(rec, {
+    type: 'execution_finalized',
+    stage: 'completed',
+    note: `${status}/${result ?? 'null'}`,
+    timestamp: endIso,
   });
 }
 
@@ -1020,6 +1030,7 @@ function createHealingWorker(
             ...mapEvidenceToObservations(evidence),
             timing: makeSectionTiming(evidenceStartMs, evidenceEndMs),
           });
+          execRecord = appendEvent(execRecord, { type: 'evidence_collected' });
           // Evidence captured — advance the stage before diagnosis is recorded.
           execRecord = setStage(execRecord, 'diagnosing');
           execRecord = recordDiagnosis(execRecord, mapDiagnosisToRecord(refined));
@@ -1061,6 +1072,7 @@ function createHealingWorker(
         execRecord = recordDiagnosis(execRecord, {
           timing: makeSectionTiming(diagStartMs, healStartMs),
         });
+        execRecord = appendEvent(execRecord, { type: 'diagnosis_completed' });
       }
       execRecord = setStage(execRecord, 'healing');
 
@@ -1906,6 +1918,7 @@ function createHealingWorker(
         execRecord = recordHealingDecision(execRecord, {
           timing: makeSectionTiming(healStartMs, healEndMs),
         });
+        execRecord = appendEvent(execRecord, { type: 'healing_completed' });
         // Stage 5 — did the applied fix hold up on rerun? (Validation reruns are
         // interleaved with healing, so its wall-clock span is the healing window.)
         execRecord = recordValidation(execRecord, {
@@ -1914,6 +1927,12 @@ function createHealingWorker(
           notes: healingForTest?.validationReason ? [healingForTest.validationReason] : [],
           timing: healingForTest ? makeSectionTiming(healStartMs, healEndMs) : undefined,
         });
+        if (healingForTest) {
+          execRecord = appendEvent(execRecord, {
+            type: 'validation_completed',
+            note: healingForTest.success ? 'passed' : 'failed',
+          });
+        }
         // Stage 6 — what we wrote back to memory (a successful heal closes the
         // learning loop + updates DOM Memory in the locator branches above).
         execRecord = setStage(execRecord, 'learning');
@@ -1922,6 +1941,7 @@ function createHealingWorker(
           domMemoryUpdated: !!(healingForTest?.success),
           timing: makeSectionTiming(healEndMs, Date.now()),
         });
+        execRecord = appendEvent(execRecord, { type: 'learning_completed' });
         // Finalize the lifecycle: STATUS reflects HOW the run ended (completed
         // normally, cancelled by the user, or stopped by the time budget) while
         // RESULT reflects the OUTCOME (healed vs fail). Kept strictly separate.

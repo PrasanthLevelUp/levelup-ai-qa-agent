@@ -2,7 +2,7 @@
  * Tests for the Execution Timeline builder — derives an ordered lifecycle
  * timeline purely from a canonical ExecutionRecord (no new intelligence).
  */
-import { buildExecutionTimeline } from '../../src/core/execution/execution-timeline';
+import { buildExecutionTimeline, deriveStageHistory } from '../../src/core/execution/execution-timeline';
 import {
   createExecutionRecord,
   recordObservations,
@@ -10,6 +10,7 @@ import {
   recordHealingDecision,
   recordValidation,
   recordLearning,
+  setLifecycle,
 } from '../../src/core/execution/execution-record';
 
 function baseRecord() {
@@ -82,5 +83,72 @@ describe('buildExecutionTimeline', () => {
     const tl = buildExecutionTimeline(rec);
     expect(tl.find((e) => e.key === 'healing')!.status).toBe('skipped');
     expect(tl.find((e) => e.key === 'validation')!.status).toBe('failed');
+  });
+});
+
+describe('deriveStageHistory — exact per-stage spans from the events log', () => {
+  it('returns [] for a legacy record with no captured history', () => {
+    const rec = { ...baseRecord(), events: [] };
+    expect(deriveStageHistory(rec)).toEqual([]);
+  });
+
+  it('reconstructs ordered spans with start/end/duration from stage transitions', () => {
+    // Construct an events log with controlled timestamps so durations are exact
+    // (deriveStageHistory reads `events` straight through — no clock involved).
+    const base = createExecutionRecord({
+      executionId: 'exec_hist',
+      testName: 'login works',
+      status: 'running',
+      stage: 'collecting_evidence',
+      durationMs: 0,
+      startTime: '2026-06-26T09:10:00.000Z',
+      endTime: '2026-06-26T09:10:05.000Z',
+      profile: 'healing',
+    });
+    const rec = {
+      ...base,
+      events: [
+        { type: 'execution_created' as const, stage: 'collecting_evidence' as const, timestamp: '2026-06-26T09:10:00.000Z' },
+        { type: 'stage_changed' as const, stage: 'diagnosing' as const, timestamp: '2026-06-26T09:10:01.000Z' },
+        { type: 'stage_changed' as const, stage: 'healing' as const, timestamp: '2026-06-26T09:10:01.500Z' },
+        { type: 'stage_changed' as const, stage: 'learning' as const, timestamp: '2026-06-26T09:10:04.300Z' },
+      ],
+    };
+
+    const history = deriveStageHistory(rec);
+    expect(history.map((h) => h.stage)).toEqual([
+      'collecting_evidence', 'diagnosing', 'healing', 'learning',
+    ]);
+    // collecting_evidence: 09:10:00.000 -> 09:10:01.000 = 1000ms
+    expect(history[0].durationMs).toBe(1000);
+    // diagnosing: 1.0s -> 1.5s = 500ms
+    expect(history[1].durationMs).toBe(500);
+    // healing: 1.5s -> 4.3s = 2800ms (the bottleneck)
+    expect(history[2].durationMs).toBe(2800);
+    // learning: 4.3s -> record end (5.0s) = 700ms
+    expect(history[3].completedAt).toBe('2026-06-26T09:10:05.000Z');
+    expect(history[3].durationMs).toBe(700);
+
+    // Bottleneck analysis becomes a trivial reduce over the derived history.
+    const slowest = history.reduce((a, b) => ((b.durationMs ?? 0) > (a.durationMs ?? 0) ? b : a));
+    expect(slowest.stage).toBe('healing');
+  });
+
+  it('merges a born-finalized record (created + finalized, same stage) into one span', () => {
+    let rec = createExecutionRecord({
+      executionId: 'exec_pass',
+      testName: 'search works',
+      status: 'completed',
+      result: 'pass',
+      stage: 'completed',
+      durationMs: 800,
+      startTime: '2026-06-26T09:00:00.000Z',
+      endTime: '2026-06-26T09:00:00.800Z',
+      profile: 'standard',
+    });
+    rec = setLifecycle(rec, { status: 'completed', result: 'pass' });
+    const history = deriveStageHistory(rec);
+    expect(history).toHaveLength(1);
+    expect(history[0].stage).toBe('completed');
   });
 });

@@ -8,11 +8,21 @@
  *   ExecutionRecord
  *   ├── Metadata    — identity: executionId, testName, jobId, profile, schemaVersion
  *   ├── Execution   — lifecycle: status, result, stage, start/end/duration
+ *   ├── Events      — append-only log of WHAT HAPPENED, in order, with timestamps
  *   ├── Evidence    — what we SAW (screenshot/DOM/trace/console/network/locator…)
  *   ├── Diagnosis   — the classifier's verdict (what failed, why)
  *   ├── Healing     — the decision taken and the fix applied
  *   ├── Validation  — whether the fix held up on rerun
  *   └── Learning    — what was written back to the system's memory
+ *
+ * ── STATE vs HISTORY ───────────────────────────────────────────────────────
+ * `stage` is the record's CURRENT state (the latest pipeline step). `events` is
+ * its HISTORY — an append-only log of stage transitions and section milestones,
+ * each with an ISO timestamp. The two are deliberately separate: `stage`
+ * answers "where is it now?", `events` answers "how did it get here, and when?".
+ * Because the full ordered history is stored, the Timeline, Replay, bottleneck
+ * analysis, audit log and learning analytics are all TRIVIAL derivations — they
+ * never have to be reconstructed/inferred after the fact.
  *
  * ── PROJECTIONS — DERIVED ON DEMAND, NEVER STORED ──────────────────────────
  * The following are PURE FUNCTIONS of the record above. They must NOT be added
@@ -20,10 +30,12 @@
  * out of sync with its own source data:
  *
  *   Timeline · Replay · Confidence · Root-Cause Graph · Dashboard cards ·
- *   AI explanations · per-section Metrics rollups · display stage labels
+ *   AI explanations · per-section Metrics rollups · display stage labels ·
+ *   stage history (derived from `events`) · bottleneck analysis
  *
  * Keeping projections out of the record is what lets the record stay small and
- * STABLE forever: new visualizations are new derivations, not new columns.
+ * STABLE forever: new visualizations are new derivations, not new columns. The
+ * `events` log is the raw substrate those derivations read from.
  *
  * ── VERSIONING ─────────────────────────────────────────────────────────────
  * `schemaVersion` IS the record's version (currently 3). It is stamped on every
@@ -203,6 +215,44 @@ export function makeSectionTiming(startMs: number, endMs: number): SectionTiming
   };
 }
 
+// ---------------------------------------------------------------------------
+// Event log — the record's HISTORY (append-only), kept separate from `stage`
+// (its current STATE). Every meaningful transition appends a timestamped event:
+// the record is created, the stage changes, an advisor section completes, and
+// finally the execution is finalized. Storing the ordered log means Timeline,
+// Replay, bottleneck analysis and audit views are read straight off `events`
+// rather than reconstructed. New event types can be added freely — readers that
+// don't recognise a type simply ignore it (forward-compatible).
+// ---------------------------------------------------------------------------
+
+/** What kind of thing happened. Open-ended; readers ignore unknown types. */
+export type ExecutionEventType =
+  | 'execution_created'
+  | 'stage_changed'
+  | 'evidence_collected'
+  | 'diagnosis_completed'
+  | 'healing_completed'
+  | 'validation_completed'
+  | 'learning_completed'
+  | 'execution_finalized';
+
+/**
+ * A single entry in the execution's append-only history. `stage` is set for
+ * stage-related events (created / stage_changed / finalized) so the stage
+ * history can be derived directly. `note` carries an optional short detail
+ * (e.g. the terminal `status/result` on finalize).
+ */
+export interface ExecutionEvent {
+  /** What happened. */
+  type: ExecutionEventType;
+  /** ISO timestamp the event occurred. */
+  timestamp: string;
+  /** The pipeline stage in effect, for stage-related events. */
+  stage?: ExecutionStage;
+  /** Optional one-line human-readable detail. */
+  note?: string;
+}
+
 /**
  * Evidence — the OBSERVED FACTS captured for this execution (mirror of
  * core/evidence-collector EvidenceBundle). The "what we saw" section:
@@ -343,6 +393,13 @@ export interface ExecutionRecord {
   /** Files + inline metadata captured for this execution. */
   artifacts: ExecutionArtifacts;
 
+  /**
+   * Append-only history of what happened, in order, with timestamps. This is the
+   * record's HISTORY (distinct from `stage`, its current STATE). Stage history,
+   * Timeline, Replay and bottleneck analysis are all derived from this log.
+   */
+  events: ExecutionEvent[];
+
   // ---- Lifecycle sections (accumulated stage by stage) ----
   /** Evidence collected for this execution (the "what we saw" section). */
   evidence?: EvidenceRecord;
@@ -388,19 +445,24 @@ export function createExecutionRecord(init: {
   profile: ExecutionProfile;
   artifacts?: ExecutionArtifacts;
 }): ExecutionRecord {
+  const stage = init.stage ?? 'executing';
+  // Seed the history with the birth event. Its timestamp is the record's start
+  // so the stage history's first span begins exactly when the execution did.
+  const createdAt = init.startTime ?? new Date().toISOString();
   return {
     schemaVersion: EXECUTION_RECORD_SCHEMA_VERSION,
     executionId: init.executionId,
     testName: init.testName,
     status: init.status ?? 'running',
     result: init.result ?? null,
-    stage: init.stage ?? 'executing',
+    stage,
     jobId: init.jobId ?? null,
     durationMs: init.durationMs,
     startTime: init.startTime,
     endTime: init.endTime,
     profile: init.profile,
     artifacts: init.artifacts ?? {},
+    events: [{ type: 'execution_created', timestamp: createdAt, stage }],
   };
 }
 
@@ -450,9 +512,42 @@ export function recordLearning(rec: ExecutionRecord, learning: Partial<LearningR
 // Lifecycle accumulators — move the record forward through its lifecycle.
 // ---------------------------------------------------------------------------
 
-/** Advance the record to a new pipeline stage (immutable). */
+/**
+ * Append an event to the record's history (immutable). The timestamp defaults to
+ * now if not supplied. This is the single writer for the append-only `events`
+ * log — every other lifecycle helper routes through it.
+ */
+export function appendEvent(
+  rec: ExecutionRecord,
+  event: { type: ExecutionEventType; stage?: ExecutionStage; note?: string; timestamp?: string },
+): ExecutionRecord {
+  const entry: ExecutionEvent = {
+    type: event.type,
+    timestamp: event.timestamp ?? new Date().toISOString(),
+    ...(event.stage !== undefined ? { stage: event.stage } : {}),
+    ...(event.note !== undefined ? { note: event.note } : {}),
+  };
+  return { ...rec, events: [...(rec.events ?? []), entry] };
+}
+
+/** The stage carried by the most recent stage-bearing event, if any. */
+function lastEventStage(rec: ExecutionRecord): ExecutionStage | undefined {
+  const evs = rec.events ?? [];
+  for (let i = evs.length - 1; i >= 0; i--) {
+    if (evs[i].stage !== undefined) return evs[i].stage;
+  }
+  return undefined;
+}
+
+/**
+ * Advance the record to a new pipeline stage (immutable) and log the transition
+ * to the history. A no-op repeat of the current stage is NOT logged again, so
+ * the stage history stays clean even if `setStage` is called defensively.
+ */
 export function setStage(rec: ExecutionRecord, stage: ExecutionStage): ExecutionRecord {
-  return { ...rec, stage };
+  const advanced = { ...rec, stage };
+  if (lastEventStage(rec) === stage) return advanced;
+  return appendEvent(advanced, { type: 'stage_changed', stage });
 }
 
 /**
@@ -464,12 +559,22 @@ export function setLifecycle(
   rec: ExecutionRecord,
   next: { status?: ExecutionLifecycleStatus; result?: ExecutionResult | null; stage?: ExecutionStage },
 ): ExecutionRecord {
-  return {
+  const updated: ExecutionRecord = {
     ...rec,
     status: next.status ?? rec.status,
     result: next.result !== undefined ? next.result : rec.result,
     stage: next.stage ?? rec.stage,
   };
+  // Log a single finalize event when the record first reaches a terminal status.
+  const alreadyFinalized = (rec.events ?? []).some((e) => e.type === 'execution_finalized');
+  if (isTerminalStatus(updated.status) && !alreadyFinalized) {
+    return appendEvent(updated, {
+      type: 'execution_finalized',
+      stage: updated.stage,
+      note: `${updated.status}/${updated.result ?? 'null'}`,
+    });
+  }
+  return updated;
 }
 
 // ---------------------------------------------------------------------------
@@ -503,6 +608,10 @@ export function coerceLegacyRecord(rec: ExecutionRecord): ExecutionRecord {
   if (rec.evidence === undefined && legacyObservations !== undefined) {
     rec = { ...rec, evidence: legacyObservations };
   }
+  // Records persisted before the event log existed have no `events`; default to
+  // an empty history. We do NOT fabricate past events we never observed — an
+  // empty log honestly says "history wasn't captured for this older record".
+  const events = rec.events ?? [];
   const legacy = LEGACY_STATUS_MAP[rec.status as unknown as LegacyStatus];
   if (!legacy) {
     // Already a v3 lifecycle status — only fill in defaults for missing fields.
@@ -511,6 +620,7 @@ export function coerceLegacyRecord(rec: ExecutionRecord): ExecutionRecord {
       result: rec.result ?? null,
       stage: rec.stage ?? (isTerminalStatus(rec.status) ? 'completed' : 'executing'),
       jobId: rec.jobId ?? null,
+      events,
     };
   }
   return {
@@ -522,6 +632,7 @@ export function coerceLegacyRecord(rec: ExecutionRecord): ExecutionRecord {
       (rec.healing && rec.validation?.passedAfterHealing ? 'healed' : legacy.result),
     stage: rec.stage ?? 'completed',
     jobId: rec.jobId ?? null,
+    events,
   };
 }
 
