@@ -34,6 +34,7 @@ import { getProfileByUrl, listProfiles, type ApplicationProfile } from '../db/po
 import { normalizeBaseUrl } from '../utils/url-normalize';
 import { logger } from '../utils/logger';
 import type { FailureDetails } from '../core/failure-analyzer';
+import { resolveProfileForHealing } from './app-profile-healing-resolver';
 
 const MOD = 'app-profile-healing';
 
@@ -61,6 +62,8 @@ export interface AppProfileHealingInput {
   elementsScanned: number;
   /** The element description derived from the failure (for logging/trail). */
   description: string;
+  /** Human-readable reason when no candidates are found (for observability). */
+  reason?: string;
 }
 
 const EMPTY: AppProfileHealingInput = {
@@ -68,6 +71,7 @@ const EMPTY: AppProfileHealingInput = {
   profileFound: false,
   elementsScanned: 0,
   description: '',
+  reason: 'No Application Profile found',
 };
 
 /* -------------------------------------------------------------------------- */
@@ -155,7 +159,7 @@ function originOf(url: string): string {
  * page URL — so we try the normalised base, the raw origin, then fall back to a
  * tenant-scoped origin match across the company's profiles.
  */
-async function findProfileForUrl(
+export async function findProfileForUrl(
   url: string,
   companyId?: number,
   projectId?: number,
@@ -182,6 +186,32 @@ async function findProfileForUrl(
   }
 }
 
+/**
+ * Get the latest active (most-recently-crawled) Application Profile for a project.
+ * Used as a LAST RESORT fallback when no URL-based match is found (e.g., locator
+ * timeouts with no trace URL, no execution base URL configured).
+ *
+ * SAFE FOR: single-app projects (returns the only profile).
+ * EXPLICIT FOR: multi-app projects (returns the most recent; caller must log).
+ *
+ * @returns The most-recently-crawled profile for this project, or null if none exist.
+ */
+export async function getLatestActiveProjectProfile(
+  companyId?: string,
+  projectId?: string,
+): Promise<ApplicationProfile | null> {
+  if (!companyId || !projectId) return null;
+  try {
+    const { profiles } = await listProfiles(Number(companyId), {
+      projectId: Number(projectId),
+      limit: 1, // Most recent first
+    });
+    return profiles[0] ?? null;
+  } catch {
+    return null;
+  }
+}
+
 /* -------------------------------------------------------------------------- */
 /*  Main entry point                                                          */
 /* -------------------------------------------------------------------------- */
@@ -189,26 +219,68 @@ async function findProfileForUrl(
 /**
  * Consult the Application Profile crawl for grounded healing candidates.
  * Always resolves (never throws); returns {@link EMPTY} on any miss.
+ * 
+ * @param failure The failure artifact (with `url` from TraceParser, `failed_locator`, etc.).
+ * @param companyId The company owning the test project.
+ * @param projectId The test project (used to scope profile lookups).
+ * @param executionBaseUrl The execution's base URL (from playwright.config or env); used as
+ *        a fallback when the failure carries no URL (e.g., locator timeouts).
  */
 export async function buildAppProfileHealingInput(
   failure: Partial<FailureDetails>,
   companyId?: number,
   projectId?: number,
+  executionBaseUrl?: string | null,
 ): Promise<AppProfileHealingInput> {
-  if (!failure?.url) return EMPTY;
-
+  // Resolve the Application Profile using the URL cascade: failure URL → execution
+  // base URL → latest active project profile. This handles locator timeouts (which
+  // carry no URL in the error message) by consulting the trace and execution config.
   let profile: ApplicationProfile | null = null;
+  let resolutionSource: string = 'none';
+  
   try {
-    profile = await findProfileForUrl(failure.url, companyId, projectId);
+    const resolution = await resolveProfileForHealing(
+      failure?.url ?? null,
+      executionBaseUrl ?? null,
+      companyId?.toString() ?? '',
+      projectId?.toString() ?? '',
+    );
+    profile = resolution.profile;
+    resolutionSource = resolution.signal.source;
+    
+    if (!profile) {
+      const reason = 'No Application Profile found for this URL (cascade checked: failure URL → execution base URL → latest active project profile)';
+      logger.info(MOD, 'App Profile returned EMPTY: no profile resolved', {
+        failureUrl: failure?.url ?? null,
+        executionBaseUrl: executionBaseUrl ?? null,
+        resolutionSource,
+      });
+      return { ...EMPTY, reason };
+    }
   } catch (err: any) {
     logger.warn(MOD, 'Application Profile lookup failed (non-critical)', { error: err?.message });
-    return EMPTY;
+    return { ...EMPTY, reason: `Profile lookup error: ${err?.message}` };
   }
-  if (!profile || !profile.crawl_data) return EMPTY;
+
+  if (!profile.crawl_data) {
+    const reason = 'Profile exists but has no crawl data (profile not crawled yet or crawl failed)';
+    logger.info(MOD, 'App Profile returned EMPTY: no crawl data', {
+      profileId: profile.id,
+      profileUrl: profile.base_url,
+      resolutionSource,
+    });
+    return { ...EMPTY, profileFound: true, reason };
+  }
 
   const description = deriveElementDescription(failure);
   if (!description) {
-    return { ...EMPTY, profileFound: true };
+    const reason = 'Could not derive element description from failure (no locator/text/ARIA to search for)';
+    logger.info(MOD, 'App Profile returned EMPTY: no element description', {
+      profileId: profile.id,
+      failedLocator: failure?.failedLocator,
+      resolutionSource,
+    });
+    return { ...EMPTY, profileFound: true, reason };
   }
 
   // Match the failing element against the crawled DOM and build grounded
@@ -218,21 +290,43 @@ export async function buildAppProfileHealingInput(
   const elements = collectElements(profile.crawl_data);
   const elementsScanned = elements.length;
   if (!elementsScanned) {
-    return { ...EMPTY, profileFound: true, description };
+    const reason = 'Profile has crawl data but no elements were collected (empty crawl or parse error)';
+    logger.info(MOD, 'App Profile returned EMPTY: no elements', {
+      profileId: profile.id,
+      resolutionSource,
+    });
+    return { ...EMPTY, profileFound: true, description, reason };
   }
 
   const match = bestElementMatch(elements, description);
   if (!match) {
-    return { ...EMPTY, profileFound: true, description, elementsScanned };
+    const reason = `No crawled element matched the description (scanned ${elementsScanned} elements)`;
+    logger.info(MOD, 'App Profile returned EMPTY: no element match', {
+      profileId: profile.id,
+      description,
+      elementsScanned,
+      resolutionSource,
+    });
+    return { ...EMPTY, profileFound: true, description, elementsScanned, reason };
   }
 
   const candidates = buildGroundedCandidates(match.el, description);
   if (!candidates.length) {
-    return { ...EMPTY, profileFound: true, description, elementsScanned };
+    const reason = 'Element matched but no grounded locators could be built (element has no stable attributes)';
+    logger.info(MOD, 'App Profile returned EMPTY: no grounded candidates', {
+      profileId: profile.id,
+      description,
+      elementsScanned,
+      matchScore: Number(match.score.toFixed(2)),
+      resolutionSource,
+    });
+    return { ...EMPTY, profileFound: true, description, elementsScanned, reason };
   }
 
   logger.info(MOD, 'Application Profile produced grounded healing candidates', {
-    url: failure.url,
+    profileId: profile.id,
+    profileUrl: profile.base_url,
+    resolutionSource,
     description,
     elementsScanned,
     matchScore: Number(match.score.toFixed(2)),
