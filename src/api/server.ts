@@ -24,7 +24,9 @@ import { logger } from '../utils/logger';
 import { initDb, closeDb, getDatabaseHealth } from '../db/postgres';
 
 // Import healing pipeline components
-import { ExecutionEngine } from '../core/execution-engine';
+import { ExecutionEngine, type RunResult } from '../core/execution-engine';
+import { createExecutionProvider, type ExecutionMode } from '../core/execution/providers';
+import type { ExecutionContext } from '../core/execution/execution-provider';
 import { ArtifactCollector, extractTopLevelErrors, enumerateAllTests, type EnumeratedTest } from '../core/artifact-collector';
 import { FailureAnalyzer } from '../core/failure-analyzer';
 import { HealingOrchestrator, pageObjectPatchLogFields, type HealingOutcome } from '../core/healing-orchestrator';
@@ -572,82 +574,143 @@ function createHealingWorker(
       tenantPrefix,
     });
 
-    // Step 1: Clone/pull repo (MUST succeed — failing here means stale/missing code)
-    jobQueue.updateJob(job.id, { progress: 'Cloning/pulling repository...' });
-    try {
-      fs.mkdirSync(workspaceDir, { recursive: true });
-      await ExecutionEngine.cloneRepository(repoUrl, testRepoPath, branch);
-      // Verify the tests directory exists after clone
-      const testsDir = path.join(testRepoPath, 'tests');
-      const pkgFile = path.join(testRepoPath, 'package.json');
-      const testFiles = fs.existsSync(testsDir) ? fs.readdirSync(testsDir).filter(f => f.endsWith('.spec.ts') || f.endsWith('.test.ts')) : [];
-      logger.info(MOD, 'Repository ready', {
-        testRepoPath,
-        hasTestsDir: fs.existsSync(testsDir),
-        testFileCount: testFiles.length,
-        testFiles: testFiles.slice(0, 10),
-        hasPackageJson: fs.existsSync(pkgFile),
-      });
-    } catch (error) {
-      const errMsg = (error as Error).message;
-      logger.error(MOD, 'Clone/pull FAILED', { error: errMsg, repoUrl, testRepoPath });
-      // If directory exists with tests, continue with warning; otherwise fail
-      if (!fs.existsSync(path.join(testRepoPath, 'package.json'))) {
-        jobQueue.updateJob(job.id, { progress: `FAILED: Repository clone failed — ${errMsg}` });
+    // ── Steps 1–3: produce the run via the selected ExecutionProvider ──────
+    // The execution SOURCE (Local Runner vs GitHub Actions vs future providers)
+    // is an implementation detail below this point: a provider's only job is to
+    // materialize { resultsFile, repoPath, exitCode } — exactly what the heal
+    // loop below consumes. Default is 'local', which preserves the original
+    // clone → install → run behavior byte-for-byte (zero regression).
+    const executionMode: ExecutionMode = job.executionMode ?? 'local';
+    let run: RunResult;
+
+    if (executionMode === 'github_actions') {
+      // ── GitHub Actions provider (Hybrid) ──
+      // Dispatch the repo's existing workflow, wait, download + ingest the
+      // Playwright artifacts, clone locally for code-context + validation, and
+      // surface a canonical test-results.json. Diagnosis is then grounded in the
+      // REAL CI failure; healing + validation continue locally for speed.
+      jobQueue.updateJob(job.id, { progress: 'Dispatching GitHub Actions workflow...' });
+      const provider = createExecutionProvider('github_actions');
+      const ctx: ExecutionContext = {
+        repoUrl,
+        branch,
+        repoPath: testRepoPath,
+        testFile: job.testFile,
+        profile: executionProfile,
+        collectHealingArtifacts,
+        budgetMs: jobBudgetRemainingMs(),
+        companyId: job.companyId,
+        providerConfig: job.providerConfig,
+      };
+      try {
+        const outcome = await provider.execute(ctx);
+        jobQueue.updateJob(job.id, {
+          progress: `GitHub Actions run ${outcome.ref?.conclusion ?? 'completed'} — ingesting results...`,
+        });
+        run = {
+          exitCode: outcome.exitCode,
+          stdout: outcome.stdout ?? '',
+          stderr: outcome.stderr ?? '',
+          resultsFile: outcome.resultsFile,
+          startTime: outcome.startTime ?? new Date().toISOString(),
+          endTime: outcome.endTime ?? new Date().toISOString(),
+          durationMs: outcome.durationMs ?? 0,
+        };
+        logger.info(MOD, 'GitHub Actions execution complete', {
+          jobId: job.id, runId: outcome.ref?.runId, conclusion: outcome.ref?.conclusion,
+          resultsFile: run.resultsFile, exitCode: run.exitCode,
+        });
+      } catch (error) {
+        const errMsg = (error as Error).message;
+        logger.error(MOD, 'GitHub Actions execution FAILED', { error: errMsg, repoUrl, jobId: job.id });
+        jobQueue.updateJob(job.id, { progress: `FAILED: GitHub Actions execution — ${errMsg}` });
         return {
           totalTests: 0, failed: 0, healed: 0, strategy: 'none', tokensUsed: 0,
-          testResults: { exitCode: 128, durationMs: 0 },
+          testResults: { exitCode: 1, durationMs: 0 },
           healingActions: [],
-          message: `Repository clone/pull failed: ${errMsg}. Verify the repo URL is accessible and the branch exists.`,
+          message: `GitHub Actions execution failed: ${errMsg}. Verify GitHub is connected, the workflow exists, and it declares "on: workflow_dispatch".`,
           error: errMsg,
         };
       }
-      logger.warn(MOD, 'Clone failed but repo directory exists, continuing with existing code', {
-        testRepoPath,
-      });
-    }
+    } else {
+      // ── Local Runner provider (default; unchanged behavior) ──
+      // Step 1: Clone/pull repo (MUST succeed — failing here means stale/missing code)
+      jobQueue.updateJob(job.id, { progress: 'Cloning/pulling repository...' });
+      try {
+        fs.mkdirSync(workspaceDir, { recursive: true });
+        await ExecutionEngine.cloneRepository(repoUrl, testRepoPath, branch);
+        // Verify the tests directory exists after clone
+        const testsDir = path.join(testRepoPath, 'tests');
+        const pkgFile = path.join(testRepoPath, 'package.json');
+        const testFiles = fs.existsSync(testsDir) ? fs.readdirSync(testsDir).filter(f => f.endsWith('.spec.ts') || f.endsWith('.test.ts')) : [];
+        logger.info(MOD, 'Repository ready', {
+          testRepoPath,
+          hasTestsDir: fs.existsSync(testsDir),
+          testFileCount: testFiles.length,
+          testFiles: testFiles.slice(0, 10),
+          hasPackageJson: fs.existsSync(pkgFile),
+        });
+      } catch (error) {
+        const errMsg = (error as Error).message;
+        logger.error(MOD, 'Clone/pull FAILED', { error: errMsg, repoUrl, testRepoPath });
+        // If directory exists with tests, continue with warning; otherwise fail
+        if (!fs.existsSync(path.join(testRepoPath, 'package.json'))) {
+          jobQueue.updateJob(job.id, { progress: `FAILED: Repository clone failed — ${errMsg}` });
+          return {
+            totalTests: 0, failed: 0, healed: 0, strategy: 'none', tokensUsed: 0,
+            testResults: { exitCode: 128, durationMs: 0 },
+            healingActions: [],
+            message: `Repository clone/pull failed: ${errMsg}. Verify the repo URL is accessible and the branch exists.`,
+            error: errMsg,
+          };
+        }
+        logger.warn(MOD, 'Clone failed but repo directory exists, continuing with existing code', {
+          testRepoPath,
+        });
+      }
 
-    // Step 2: Install dependencies (MUST succeed before running tests)
-    jobQueue.updateJob(job.id, { progress: 'Installing dependencies...' });
-    try {
-      await ExecutionEngine.installDependencies(testRepoPath);
-    } catch (error) {
-      const errMsg = (error as Error).message;
-      logger.error(MOD, 'Dependency install FAILED — cannot proceed with test execution', {
-        error: errMsg,
-        testRepoPath,
-      });
-      jobQueue.updateJob(job.id, { progress: `FAILED: ${errMsg}` });
-      return {
-        totalTests: 0,
-        failed: 0,
-        healed: 0,
-        strategy: 'none',
-        tokensUsed: 0,
-        testResults: { exitCode: 127, durationMs: 0 },
-        healingActions: [],
-        message: `Dependency installation failed: ${errMsg}. Check that the repository has a valid package.json and npm install can succeed.`,
-        error: errMsg,
-      };
-    }
+      // Step 2: Install dependencies (MUST succeed before running tests)
+      jobQueue.updateJob(job.id, { progress: 'Installing dependencies...' });
+      try {
+        await ExecutionEngine.installDependencies(testRepoPath);
+      } catch (error) {
+        const errMsg = (error as Error).message;
+        logger.error(MOD, 'Dependency install FAILED — cannot proceed with test execution', {
+          error: errMsg,
+          testRepoPath,
+        });
+        jobQueue.updateJob(job.id, { progress: `FAILED: ${errMsg}` });
+        return {
+          totalTests: 0,
+          failed: 0,
+          healed: 0,
+          strategy: 'none',
+          tokensUsed: 0,
+          testResults: { exitCode: 127, durationMs: 0 },
+          healingActions: [],
+          message: `Dependency installation failed: ${errMsg}. Check that the repository has a valid package.json and npm install can succeed.`,
+          error: errMsg,
+        };
+      }
 
-    // Step 3: Run tests
-    // When the job specifies a single test file, scope the run to it; otherwise run the whole suite.
-    jobQueue.updateJob(job.id, {
-      progress: job.testFile ? `Running tests (${job.testFile})...` : 'Running tests...',
-    });
-    // Non-blocking full run, bounded by the overall job budget so the initial
-    // suite execution can't itself hang the job indefinitely. Initial test run
-    // uses base profile without healing artifacts (not a healing attempt yet).
-    const run = await ExecutionEngine.runAsync(
-      testRepoPath,
-      job.testFile,
-      undefined,
-      jobBudgetRemainingMs(),
-      executionProfile,
-      collectHealingArtifacts,
-      false // isHealingRun=false for initial test run
-    );
+      // Step 3: Run tests
+      // When the job specifies a single test file, scope the run to it; otherwise run the whole suite.
+      jobQueue.updateJob(job.id, {
+        progress: job.testFile ? `Running tests (${job.testFile})...` : 'Running tests...',
+      });
+      // Non-blocking full run, bounded by the overall job budget so the initial
+      // suite execution can't itself hang the job indefinitely. Initial test run
+      // uses base profile without healing artifacts (not a healing attempt yet).
+      run = await ExecutionEngine.runAsync(
+        testRepoPath,
+        job.testFile,
+        undefined,
+        jobBudgetRemainingMs(),
+        executionProfile,
+        collectHealingArtifacts,
+        false // isHealingRun=false for initial test run
+      );
+    }
 
     // Step 4: Collect artifacts
     jobQueue.updateJob(job.id, { progress: 'Collecting failure artifacts...' });

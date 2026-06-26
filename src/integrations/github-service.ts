@@ -792,6 +792,54 @@ export class GitHubService {
       return { artifacts: [], error: 'Failed to list run artifacts' };
     }
   }
+
+  /**
+   * Download a single artifact's zip bytes.
+   *
+   * GitHub's `archive_download_url` responds with a 302 redirect to a short-lived,
+   * pre-signed blob-storage URL. Per the fetch spec, the `Authorization` header is
+   * stripped on the cross-origin redirect hop — which is exactly what we want:
+   * GitHub authorizes the redirect, and the signed blob URL needs no auth. So a
+   * plain `fetch` that follows redirects (the default) returns the zip bytes.
+   *
+   * Returns the raw zip as a Buffer; the ingestion layer unzips and locates the
+   * Playwright results within it.
+   */
+  async downloadArtifactZip(
+    artifact: { id: number; archiveDownloadUrl?: string },
+    owner: string,
+    repo: string,
+    companyId?: number,
+    userId?: number,
+  ): Promise<{ ok: boolean; buffer?: Buffer; error?: string }> {
+    const token = await this.getToken(companyId, userId);
+    if (!token) return { ok: false, error: 'GitHub not connected. Connect via Tools page.' };
+
+    // Prefer the API zip endpoint (stable) over a possibly-stale archive URL.
+    const url = artifact.archiveDownloadUrl
+      || `${GITHUB_API}/repos/${owner}/${repo}/actions/artifacts/${artifact.id}/zip`;
+
+    try {
+      const res = await fetch(url, {
+        headers: {
+          Authorization: `Bearer ${token}`,
+          Accept: 'application/vnd.github.v3+json',
+          'User-Agent': 'LevelUp-AI-QA-Agent/2.0',
+        },
+        // Follow the redirect to blob storage (default); Authorization is dropped
+        // cross-origin per spec, so the signed URL serves the bytes.
+        redirect: 'follow',
+      });
+      if (!res.ok) {
+        return { ok: false, error: `Artifact download failed: GitHub API returned ${res.status}` };
+      }
+      const arrayBuf = await res.arrayBuffer();
+      return { ok: true, buffer: Buffer.from(arrayBuf) };
+    } catch (err) {
+      logger.error(MOD, 'Failed to download artifact zip', { error: (err as Error).message, artifactId: artifact.id });
+      return { ok: false, error: 'Failed to download artifact zip' };
+    }
+  }
 }
 
 /* ------------------------------------------------------------------ */

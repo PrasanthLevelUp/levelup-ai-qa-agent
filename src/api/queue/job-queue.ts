@@ -39,6 +39,19 @@ export interface HealingJob {
    * resolveCollectHealingArtifacts() in the worker.
    */
   requestedCollectHealingArtifacts?: boolean;
+  /**
+   * Where this job's tests should EXECUTE. Defaults to 'local' (the Local Runner).
+   * 'github_actions' runs the repo's existing workflow via the
+   * GitHubActionsExecutionProvider, then hands the resulting ExecutionRecord to
+   * the SAME healing pipeline (Hybrid: diagnosis from CI, heal+validate local).
+   * Carried in-memory on the job; the worker reads it immediately after creation.
+   */
+  executionMode?: import('../../core/execution/providers').ExecutionMode;
+  /**
+   * Provider-specific configuration (open bag). For 'github_actions':
+   * `{ workflowId, ref?, inputs? }`. Ignored by the Local Runner.
+   */
+  providerConfig?: Record<string, unknown>;
   status: JobStatus;
   progress: string;
   createdAt: string;
@@ -84,6 +97,8 @@ export class JobQueue {
     testFile?: string,
     requestedProfile?: import('../../core/execution/execution-profile').ExecutionProfile,
     requestedCollectHealingArtifacts?: boolean,
+    executionMode?: import('../../core/execution/providers').ExecutionMode,
+    providerConfig?: Record<string, unknown>,
   ): HealingJob {
     const job: HealingJob = {
       id: `job_${uuidv4().slice(0, 12)}`,
@@ -96,6 +111,8 @@ export class JobQueue {
       requestedProfile: requestedProfile || undefined,
       requestedCollectHealingArtifacts:
         typeof requestedCollectHealingArtifacts === 'boolean' ? requestedCollectHealingArtifacts : undefined,
+      executionMode: executionMode || undefined,
+      providerConfig: providerConfig && Object.keys(providerConfig).length ? providerConfig : undefined,
       commit,
       status: JobStatus.PENDING,
       progress: 'Queued for processing',
