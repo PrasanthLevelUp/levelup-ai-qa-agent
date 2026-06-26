@@ -304,6 +304,50 @@ export interface DiagnosisRecord {
 }
 
 /**
+ * One advisor's verdict in the healing decision waterfall — captured at heal
+ * time from the orchestrator's authoritative DecisionTrailEntry. This is the
+ * "what each advisor did" record: the BACKEND knows exactly which intelligence
+ * layers were consulted, which won, and which were skipped, so the UI never has
+ * to infer it. (Status is the user-facing collapse of the orchestrator's richer
+ * hit/miss/skipped/not_reached/error outcome.)
+ */
+export interface AdvisorDecisionEntry {
+  /** Advisor / layer name, e.g. "App Profile", "DOM Memory", "Learned Pattern", "AI". */
+  advisor: string;
+  /** Won (applied this advisor's candidate) · consulted (ran, lost) · skipped (never ran). */
+  status: 'won' | 'consulted' | 'skipped';
+  /** Confidence the advisor had in its candidate (0..1), when known. */
+  confidence?: number;
+  /** Short human-readable reason it won / lost / was skipped. */
+  reasoning?: string;
+  /** Time this advisor spent, in ms, when known (usually absent — not yet measured per-advisor). */
+  durationMs?: number;
+}
+
+/**
+ * Map the orchestrator's decision trail (structural: layer + hit/miss/skipped/
+ * not_reached/error) onto the user-facing {@link AdvisorDecisionEntry} shape that
+ * we persist on the record. Pure + structural (no import coupling to the
+ * orchestrator). `won` ⇐ hit; `skipped` ⇐ skipped/not_reached; `consulted` ⇐
+ * miss/error (it ran but didn't win).
+ */
+export function toAdvisorDecisionTrail(
+  trail: ReadonlyArray<{ layer: string; outcome: string; confidence?: number; reasoning?: string }> | undefined,
+): AdvisorDecisionEntry[] {
+  if (!trail || trail.length === 0) return [];
+  return trail.map((e) => {
+    const status: AdvisorDecisionEntry['status'] =
+      e.outcome === 'hit' ? 'won'
+        : e.outcome === 'skipped' || e.outcome === 'not_reached' ? 'skipped'
+        : 'consulted';
+    const entry: AdvisorDecisionEntry = { advisor: e.layer, status };
+    if (typeof e.confidence === 'number') entry.confidence = e.confidence;
+    if (e.reasoning) entry.reasoning = e.reasoning;
+    return entry;
+  });
+}
+
+/**
  * Healing decisions — what the engine decided to DO about the failure and the
  * outcome of applying it. The "what we changed" section.
  */
@@ -324,6 +368,12 @@ export interface HealingDecisionRecord {
   rationale?: string;
   /** Confidence (0..1) the engine had in the applied fix, when known. */
   confidence?: number;
+  /**
+   * The advisor waterfall — which intelligence layers were consulted, which won,
+   * which were skipped. Captured authoritatively from the orchestrator at heal
+   * time so the dashboard's Decision Trail renders fact, not inference.
+   */
+  decisionTrail?: AdvisorDecisionEntry[];
   /** LLM token cost attributed to producing this healing decision, when known. */
   costTokens?: number;
   /** Monetary cost (USD) attributed to this healing decision, when known. */

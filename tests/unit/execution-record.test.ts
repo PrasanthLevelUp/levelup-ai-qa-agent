@@ -18,6 +18,7 @@ import {
   setLifecycle,
   appendEvent,
   coerceLegacyRecord,
+  toAdvisorDecisionTrail,
   EXECUTION_RECORD_SCHEMA_VERSION,
   type ArtifactDescriptor,
   type ExecutionRecord,
@@ -230,5 +231,34 @@ describe('Execution Record — events log (HISTORY, separate from STATE)', () =>
     delete (legacy as Partial<ExecutionRecord>).events;
     const coerced = coerceLegacyRecord(legacy);
     expect(coerced.events).toEqual([]);
+  });
+});
+
+describe('toAdvisorDecisionTrail — orchestrator outcome → user-facing status', () => {
+  it('returns [] for undefined or empty trail', () => {
+    expect(toAdvisorDecisionTrail(undefined)).toEqual([]);
+    expect(toAdvisorDecisionTrail([])).toEqual([]);
+  });
+
+  it('maps hit→won, skipped/not_reached→skipped, miss/error→consulted', () => {
+    const out = toAdvisorDecisionTrail([
+      { layer: 'App Profile', outcome: 'hit', confidence: 0.96, reasoning: 'match' },
+      { layer: 'DOM Memory', outcome: 'miss' },
+      { layer: 'Learned Pattern', outcome: 'skipped' },
+      { layer: 'Rule Engine', outcome: 'not_reached' },
+      { layer: 'AI', outcome: 'error' },
+    ]);
+    expect(out).toEqual([
+      { advisor: 'App Profile', status: 'won', confidence: 0.96, reasoning: 'match' },
+      { advisor: 'DOM Memory', status: 'consulted' },
+      { advisor: 'Learned Pattern', status: 'skipped' },
+      { advisor: 'Rule Engine', status: 'skipped' },
+      { advisor: 'AI', status: 'consulted' },
+    ]);
+  });
+
+  it('carries confidence (0..1) and reasoning through unchanged (no rounding here)', () => {
+    const out = toAdvisorDecisionTrail([{ layer: 'AI', outcome: 'hit', confidence: 0.5 }]);
+    expect(out[0]).toEqual({ advisor: 'AI', status: 'won', confidence: 0.5 });
   });
 });

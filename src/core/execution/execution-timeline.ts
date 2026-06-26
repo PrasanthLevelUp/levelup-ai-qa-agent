@@ -13,6 +13,7 @@
  * `events` log (no invented timestamps).
  */
 import { coerceLegacyRecord, type ExecutionRecord, type ExecutionStage } from './execution-record';
+import { toDisplayStage } from './execution-lifecycle';
 
 /** Outcome marker for a timeline event (drives the icon/colour in the UI). */
 export type TimelineEventStatus = 'done' | 'failed' | 'skipped' | 'info';
@@ -229,4 +230,194 @@ export function deriveStageHistory(input: ExecutionRecord): StageHistoryEntry[] 
   const last = history[history.length - 1];
   if (last && !last.completedAt && record.endTime) closeSpan(last, record.endTime);
   return history;
+}
+
+// ---------------------------------------------------------------------------
+// Decision Trail — a DERIVED view of the advisor waterfall (never stored as a
+// projection). The record already carries the AUTHORITATIVE trail captured from
+// the orchestrator at heal time (`healing.decisionTrail`); this projection only
+// reshapes it for the dashboard: confidence as an integer %, and a stable view
+// type the UI renders verbatim. The UI NEVER infers which advisors ran — the
+// backend told it exactly. Returns `[]` for runs that never healed.
+// ---------------------------------------------------------------------------
+
+/** One advisor's verdict, ready for the dashboard's Decision Trail card. */
+export interface AdvisorDecisionView {
+  /** Advisor / layer name, e.g. "App Profile", "DOM Memory", "AI". */
+  advisor: string;
+  /** Won (applied) · consulted (ran, lost) · skipped (never ran). */
+  status: 'won' | 'consulted' | 'skipped';
+  /** Confidence as an integer percentage (0..100), when known. */
+  confidence?: number;
+  /** Short human-readable reason it won / lost / was skipped. */
+  reasoning?: string;
+  /** Time this advisor spent, in ms, when known (usually absent). */
+  durationMs?: number;
+}
+
+/**
+ * Project the record's authoritative advisor waterfall onto the dashboard view.
+ * Confidence is converted from the stored 0..1 scale to an integer percentage so
+ * the UI just renders. Returns `[]` for legacy / non-healed records.
+ */
+export function deriveDecisionTrail(input: ExecutionRecord): AdvisorDecisionView[] {
+  const record = coerceLegacyRecord(input);
+  const trail = record.healing?.decisionTrail;
+  if (!trail || trail.length === 0) return [];
+  return trail.map((e) => {
+    const view: AdvisorDecisionView = { advisor: e.advisor, status: e.status };
+    if (typeof e.confidence === 'number') view.confidence = Math.round(e.confidence * 100);
+    if (e.reasoning) view.reasoning = e.reasoning;
+    if (typeof e.durationMs === 'number') view.durationMs = e.durationMs;
+    return view;
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Friendly event feed — a DERIVED, customer-facing narration of the execution's
+// append-only `events` log. Customers don't think in backend event names
+// ("stage_changed", "diagnosis_completed"); they want a readable story:
+//   09:10:14  Execution Started
+//   09:10:17  Collected Browser Evidence
+//   09:10:18  Diagnosed Timing Failure
+//   09:10:20  Applied Wait Strategy
+//   09:10:22  Validation Passed
+//   09:10:23  Learning Stored
+// The BACKEND owns the labels + tone so the UI only renders. No new data is
+// stored — this reads the existing events log. Returns `[]` for legacy records
+// with no captured events.
+// ---------------------------------------------------------------------------
+
+/** Tone drives the colour the UI shows for a feed entry. */
+export type FriendlyEventTone = 'positive' | 'negative' | 'neutral' | 'info';
+
+/** Semantic kind drives the icon the UI shows (mirrors the lifecycle milestone). */
+export type FriendlyEventKind =
+  | 'started'
+  | 'preparing'
+  | 'running'
+  | 'evidence'
+  | 'diagnosis'
+  | 'healing'
+  | 'validation'
+  | 'learning'
+  | 'finished';
+
+/** One narrated step in the customer-facing event feed. */
+export interface FriendlyEvent {
+  /** ISO timestamp the event occurred. */
+  timestamp: string;
+  /** User-facing narrative label, e.g. "Diagnosed Timing Failure". */
+  label: string;
+  /** Semantic kind — the UI picks an icon from this. */
+  kind: FriendlyEventKind;
+  /** Tone for colour: positive (green), negative (red), neutral (grey), info (blue). */
+  tone: FriendlyEventTone;
+}
+
+/** Title-case a snake/space string: "timing_failure" → "Timing Failure". */
+function titleCase(s: string): string {
+  return s.replace(/_/g, ' ').replace(/\s+/g, ' ').trim()
+    .replace(/\b\w/g, (c) => c.toUpperCase());
+}
+
+/** Internal stages that map to user-visible PREP/RUN feed entries. */
+const PREP_RUN_STAGES: ReadonlyArray<ExecutionStage> = [
+  'queued', 'cloning', 'installing', 'building', 'executing',
+];
+
+/**
+ * Narrate the record's `events` log into a clean, customer-facing feed. Milestone
+ * events (evidence/diagnosis/healing/validation/learning/finalize) carry their own
+ * friendly labels; `stage_changed` entries are surfaced ONLY for the prep/run
+ * stages (and de-duplicated, since cloning/installing/building collapse to one
+ * "Preparing Environment" line) so later milestones aren't doubled up.
+ */
+export function deriveEventFeed(input: ExecutionRecord): FriendlyEvent[] {
+  const record = coerceLegacyRecord(input);
+  const events = record.events ?? [];
+  if (events.length === 0) return [];
+
+  const feed: FriendlyEvent[] = [];
+  const pushDeduped = (entry: FriendlyEvent) => {
+    const prev = feed[feed.length - 1];
+    if (prev && prev.label === entry.label) return; // collapse consecutive duplicates
+    feed.push(entry);
+  };
+
+  for (const ev of events) {
+    switch (ev.type) {
+      case 'execution_created':
+        pushDeduped({ timestamp: ev.timestamp, label: 'Execution Started', kind: 'started', tone: 'info' });
+        break;
+      case 'stage_changed': {
+        if (!ev.stage || !PREP_RUN_STAGES.includes(ev.stage)) break;
+        const display = toDisplayStage(ev.stage);
+        if (!display) break;
+        const kind: FriendlyEventKind =
+          ev.stage === 'executing' ? 'running' : ev.stage === 'queued' ? 'started' : 'preparing';
+        pushDeduped({ timestamp: ev.timestamp, label: display, kind, tone: 'neutral' });
+        break;
+      }
+      case 'evidence_collected':
+        pushDeduped({ timestamp: ev.timestamp, label: 'Collected Browser Evidence', kind: 'evidence', tone: 'info' });
+        break;
+      case 'diagnosis_completed': {
+        const cat = record.diagnosis?.category;
+        pushDeduped({
+          timestamp: ev.timestamp,
+          label: cat ? `Diagnosed ${titleCase(cat)}` : 'Diagnosis Completed',
+          kind: 'diagnosis',
+          tone: 'info',
+        });
+        break;
+      }
+      case 'healing_completed': {
+        const h = record.healing;
+        let label = 'No Fix Applied';
+        let tone: FriendlyEventTone = 'negative';
+        if (h?.appliedStrategy) {
+          label = `Applied ${titleCase(h.appliedStrategy)}`;
+          tone = 'positive';
+        } else if (h?.reportOnly) {
+          label = 'Flagged for Review';
+          tone = 'neutral';
+        }
+        pushDeduped({ timestamp: ev.timestamp, label, kind: 'healing', tone });
+        break;
+      }
+      case 'validation_completed': {
+        const passed = ev.note ? ev.note === 'passed' : record.validation?.passedAfterHealing === true;
+        pushDeduped({
+          timestamp: ev.timestamp,
+          label: passed ? 'Validation Passed' : 'Validation Failed',
+          kind: 'validation',
+          tone: passed ? 'positive' : 'negative',
+        });
+        break;
+      }
+      case 'learning_completed': {
+        const recorded = record.learning?.recorded === true;
+        pushDeduped({
+          timestamp: ev.timestamp,
+          label: recorded ? 'Learning Stored' : 'Nothing Stored',
+          kind: 'learning',
+          tone: recorded ? 'positive' : 'neutral',
+        });
+        break;
+      }
+      case 'execution_finalized': {
+        const result = record.result ?? null;
+        let label = 'Execution Finished';
+        let tone: FriendlyEventTone = 'info';
+        if (result === 'healed') { label = 'Passed after Healing'; tone = 'positive'; }
+        else if (result === 'pass') { label = 'Execution Passed'; tone = 'positive'; }
+        else if (result === 'fail') { label = record.status === 'timed_out' ? 'Execution Timed Out' : 'Execution Failed'; tone = 'negative'; }
+        else if (result === 'skipped') { label = 'Execution Skipped'; tone = 'neutral'; }
+        pushDeduped({ timestamp: ev.timestamp, label, kind: 'finished', tone });
+        break;
+      }
+    }
+  }
+  return feed;
 }

@@ -2,7 +2,12 @@
  * Tests for the Execution Timeline builder — derives an ordered lifecycle
  * timeline purely from a canonical ExecutionRecord (no new intelligence).
  */
-import { buildExecutionTimeline, deriveStageHistory } from '../../src/core/execution/execution-timeline';
+import {
+  buildExecutionTimeline,
+  deriveStageHistory,
+  deriveDecisionTrail,
+  deriveEventFeed,
+} from '../../src/core/execution/execution-timeline';
 import {
   createExecutionRecord,
   recordObservations,
@@ -11,6 +16,8 @@ import {
   recordValidation,
   recordLearning,
   setLifecycle,
+  appendEvent,
+  type ExecutionRecord,
 } from '../../src/core/execution/execution-record';
 
 function baseRecord() {
@@ -150,5 +157,154 @@ describe('deriveStageHistory — exact per-stage spans from the events log', () 
     const history = deriveStageHistory(rec);
     expect(history).toHaveLength(1);
     expect(history[0].stage).toBe('completed');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// deriveDecisionTrail — projects the record's authoritative advisor waterfall
+// (healing.decisionTrail) onto the dashboard view (confidence → integer %).
+// ---------------------------------------------------------------------------
+
+describe('deriveDecisionTrail', () => {
+  it('returns [] for a record that never healed', () => {
+    expect(deriveDecisionTrail(baseRecord())).toEqual([]);
+  });
+
+  it('returns [] when healing has no decisionTrail (legacy)', () => {
+    const rec = recordHealingDecision(baseRecord(), { appliedStrategy: 'rule_based' });
+    expect(deriveDecisionTrail(rec)).toEqual([]);
+  });
+
+  it('passes advisor + status through verbatim and converts confidence 0..1 → integer %', () => {
+    const rec = recordHealingDecision(baseRecord(), {
+      decisionTrail: [
+        { advisor: 'App Profile', status: 'won', confidence: 0.96, reasoning: 'profile match' },
+        { advisor: 'DOM Memory', status: 'consulted', confidence: 0.5 },
+        { advisor: 'AI', status: 'skipped' },
+      ],
+    });
+    const view = deriveDecisionTrail(rec);
+    expect(view).toEqual([
+      { advisor: 'App Profile', status: 'won', confidence: 96, reasoning: 'profile match' },
+      { advisor: 'DOM Memory', status: 'consulted', confidence: 50 },
+      { advisor: 'AI', status: 'skipped' },
+    ]);
+  });
+
+  it('omits confidence when not provided and carries durationMs when present', () => {
+    const rec = recordHealingDecision(baseRecord(), {
+      decisionTrail: [{ advisor: 'Rule Engine', status: 'won', durationMs: 42 }],
+    });
+    const view = deriveDecisionTrail(rec);
+    expect(view[0]).toEqual({ advisor: 'Rule Engine', status: 'won', durationMs: 42 });
+    expect(view[0].confidence).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// deriveEventFeed — narrates the append-only events log into a clean,
+// customer-facing story (friendly labels + tone + icon kind).
+// ---------------------------------------------------------------------------
+
+/** Build a fully-healed record whose events log mirrors what the worker stamps. */
+function healedRecordWithEvents(): ExecutionRecord {
+  let rec = createExecutionRecord({
+    executionId: 'exec_feed',
+    testName: 'checkout works',
+    status: 'completed',
+    result: 'healed',
+    durationMs: 9000,
+    startTime: '2026-06-26T09:10:00.000Z',
+    endTime: '2026-06-26T09:10:09.000Z',
+    profile: 'healing',
+  });
+  rec = recordDiagnosis(rec, { category: 'timing_failure', confidence: 0.97, recommendedStrategy: 'wait' });
+  rec = recordHealingDecision(rec, { appliedStrategy: 'wait_strategy', newLocator: '#pay' });
+  rec = recordValidation(rec, { reran: true, passedAfterHealing: true });
+  rec = recordLearning(rec, { recorded: true, domMemoryUpdated: true });
+  // Mirror the worker's event sequence (createExecutionRecord already stamped created).
+  rec = appendEvent(rec, { type: 'stage_changed', stage: 'cloning', timestamp: '2026-06-26T09:10:01.000Z' });
+  rec = appendEvent(rec, { type: 'stage_changed', stage: 'installing', timestamp: '2026-06-26T09:10:02.000Z' });
+  rec = appendEvent(rec, { type: 'stage_changed', stage: 'executing', timestamp: '2026-06-26T09:10:03.000Z' });
+  rec = appendEvent(rec, { type: 'evidence_collected', stage: 'collecting_evidence', timestamp: '2026-06-26T09:10:04.000Z' });
+  rec = appendEvent(rec, { type: 'diagnosis_completed', stage: 'diagnosing', timestamp: '2026-06-26T09:10:05.000Z' });
+  rec = appendEvent(rec, { type: 'healing_completed', stage: 'healing', timestamp: '2026-06-26T09:10:06.000Z' });
+  rec = appendEvent(rec, { type: 'validation_completed', stage: 'validating', note: 'passed', timestamp: '2026-06-26T09:10:07.000Z' });
+  rec = appendEvent(rec, { type: 'learning_completed', stage: 'learning', timestamp: '2026-06-26T09:10:08.000Z' });
+  rec = setLifecycle(rec, { status: 'completed', result: 'healed', stage: 'completed' });
+  return rec;
+}
+
+describe('deriveEventFeed', () => {
+  it('returns [] for a record with no events', () => {
+    const rec = { ...baseRecord(), events: [] };
+    expect(deriveEventFeed(rec)).toEqual([]);
+  });
+
+  it('narrates the full healed lifecycle into friendly labels', () => {
+    const feed = deriveEventFeed(healedRecordWithEvents());
+    const labels = feed.map((f) => f.label);
+    expect(labels).toEqual([
+      'Execution Started',
+      'Preparing Environment',
+      'Running Tests',
+      'Collected Browser Evidence',
+      'Diagnosed Timing Failure',
+      'Applied Wait Strategy',
+      'Validation Passed',
+      'Learning Stored',
+      'Passed after Healing',
+    ]);
+  });
+
+  it('collapses the cloning/installing/building prep stages into one "Preparing Environment" line', () => {
+    const feed = deriveEventFeed(healedRecordWithEvents());
+    expect(feed.filter((f) => f.label === 'Preparing Environment')).toHaveLength(1);
+  });
+
+  it('assigns icon kind + tone for each milestone', () => {
+    const feed = deriveEventFeed(healedRecordWithEvents());
+    const byLabel = (l: string) => feed.find((f) => f.label === l)!;
+    expect(byLabel('Collected Browser Evidence').kind).toBe('evidence');
+    expect(byLabel('Diagnosed Timing Failure').kind).toBe('diagnosis');
+    expect(byLabel('Applied Wait Strategy')).toMatchObject({ kind: 'healing', tone: 'positive' });
+    expect(byLabel('Validation Passed')).toMatchObject({ kind: 'validation', tone: 'positive' });
+    expect(byLabel('Learning Stored')).toMatchObject({ kind: 'learning', tone: 'positive' });
+    expect(byLabel('Passed after Healing')).toMatchObject({ kind: 'finished', tone: 'positive' });
+  });
+
+  it('shows "Flagged for Review" when healing is report-only', () => {
+    let rec = createExecutionRecord({
+      executionId: 'exec_ro', testName: 't', status: 'failed', result: 'fail',
+      durationMs: 1000, startTime: '2026-06-26T09:00:00.000Z', endTime: '2026-06-26T09:00:01.000Z', profile: 'healing',
+    });
+    rec = recordHealingDecision(rec, { reportOnly: true });
+    rec = appendEvent(rec, { type: 'healing_completed', stage: 'healing', timestamp: '2026-06-26T09:00:00.500Z' });
+    const feed = deriveEventFeed(rec);
+    expect(feed.find((f) => f.kind === 'healing')).toMatchObject({ label: 'Flagged for Review', tone: 'neutral' });
+  });
+
+  it('shows "Validation Failed" and "Execution Failed" for a failed run', () => {
+    let rec = createExecutionRecord({
+      executionId: 'exec_fail', testName: 't', status: 'failed', result: 'fail',
+      durationMs: 1000, startTime: '2026-06-26T09:00:00.000Z', endTime: '2026-06-26T09:00:01.000Z', profile: 'healing',
+    });
+    rec = recordValidation(rec, { reran: true, passedAfterHealing: false });
+    rec = appendEvent(rec, { type: 'validation_completed', stage: 'validating', note: 'failed', timestamp: '2026-06-26T09:00:00.500Z' });
+    rec = setLifecycle(rec, { status: 'completed', result: 'fail', stage: 'completed' });
+    const feed = deriveEventFeed(rec);
+    expect(feed.find((f) => f.kind === 'validation')).toMatchObject({ label: 'Validation Failed', tone: 'negative' });
+    expect(feed.find((f) => f.kind === 'finished')).toMatchObject({ label: 'Execution Failed', tone: 'negative' });
+  });
+
+  it('drops stage_changed entries for post-run milestone stages (no duplication)', () => {
+    let rec = createExecutionRecord({
+      executionId: 'exec_dup', testName: 't', status: 'completed', result: 'pass',
+      durationMs: 1000, startTime: '2026-06-26T09:00:00.000Z', endTime: '2026-06-26T09:00:01.000Z', profile: 'healing',
+    });
+    // A diagnosing stage_changed should NOT add a feed line (milestone covers it).
+    rec = appendEvent(rec, { type: 'stage_changed', stage: 'diagnosing', timestamp: '2026-06-26T09:00:00.300Z' });
+    const feed = deriveEventFeed(rec);
+    expect(feed.some((f) => f.kind === 'diagnosis')).toBe(false);
   });
 });
