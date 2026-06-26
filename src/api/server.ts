@@ -344,6 +344,49 @@ export async function startAPIServer(): Promise<void> {
 }
 
 /**
+ * Extract the "current browser URL" (a page.url() proxy) from a Playwright
+ * failure's error text. The artifact collector's `failure.url` only matches a
+ * couple of narrow patterns ("navigated to", "waiting for"), so a locator
+ * timeout often has `failure.url === null` even though the error body still
+ * mentions the page the browser was on. We grab the LAST http(s) URL in the
+ * text because Playwright appends the live page URL near the end of its call
+ * log. Returns null when no URL is present. Pure + defensive.
+ */
+function extractBrowserUrlFromError(errorMessage?: string | null): string | null {
+  if (!errorMessage) return null;
+  const matches = errorMessage.match(/https?:\/\/[^\s"'`)\]]+/g);
+  if (!matches || matches.length === 0) return null;
+  // Strip trailing punctuation the regex may capture (e.g. "url." / "url,").
+  return matches[matches.length - 1].replace(/[.,;:]+$/, '');
+}
+
+/**
+ * Read the suite's configured base URL (the "execution base URL") from the test
+ * repo: env BASE_URL/PLAYWRIGHT_BASE_URL first, then a `use: { baseURL: ... }`
+ * entry in playwright.config.{ts,js,mjs,cjs}. This is the right *application*
+ * even when neither the failure nor the browser URL was captured. Best-effort
+ * and defensive — returns null on any miss (never throws).
+ */
+function readExecutionBaseUrl(testRepoPath: string): string | null {
+  const envUrl = (process.env.BASE_URL || process.env.PLAYWRIGHT_BASE_URL || '').trim();
+  if (envUrl) return envUrl;
+  const candidates = ['playwright.config.ts', 'playwright.config.js', 'playwright.config.mjs', 'playwright.config.cjs'];
+  for (const name of candidates) {
+    try {
+      const p = path.join(testRepoPath, name);
+      if (!fs.existsSync(p)) continue;
+      const text = fs.readFileSync(p, 'utf-8');
+      // Match: baseURL: 'https://...'  OR  baseURL: process.env.X || 'https://...'
+      const m = text.match(/baseURL\s*:\s*[^'"`]*['"`](https?:\/\/[^'"`]+)['"`]/);
+      if (m?.[1]) return m[1].trim();
+    } catch {
+      // ignore and try next candidate
+    }
+  }
+  return null;
+}
+
+/**
  * Create the healing worker function that processes jobs.
  */
 function createHealingWorker(
@@ -819,10 +862,18 @@ function createHealingWorker(
         // Always available (no feature flag); fully defensive (never throws).
         let appProfileHealing: AppProfileHealingInput | undefined;
         try {
+          // Deterministic URL cascade for healing-grounded profile resolution:
+          //   failure.url → current browser URL → execution base URL → latest active.
+          // The browser/base URLs rescue the common case where a locator timeout
+          // carries no URL in failure.url, without blindly picking "newest crawl"
+          // in multi-app projects.
+          const browserUrl = extractBrowserUrlFromError(failure.errorMessage);
+          const executionBaseUrl = readExecutionBaseUrl(testRepoPath);
           appProfileHealing = await buildAppProfileHealingInput(
             failure,
             job.companyId,
             resolvedProjectId,
+            { browserUrl, executionBaseUrl },
           );
           if (appProfileHealing.candidates.length > 0) {
             logger.info(MOD, 'Application Profile healing candidates ready', {
