@@ -15,7 +15,7 @@
  */
 import type {
   ExecutionRecord,
-  ExecutionResult,
+  TestOutcome,
   ExecutionLifecycleStatus,
   ExecutionStage,
 } from './execution-record';
@@ -44,7 +44,7 @@ export interface EnumeratedTest {
  */
 export function deriveResult(
   status: PlaywrightTestStatus,
-): { status: ExecutionLifecycleStatus; result: ExecutionResult } {
+): { status: ExecutionLifecycleStatus; result: TestOutcome } {
   switch (status) {
     case 'passed':
       return { status: 'completed', result: 'pass' };

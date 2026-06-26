@@ -24,14 +24,14 @@ import {
   setLifecycle,
   makeSectionTiming,
   type ExecutionRecord,
-  type ExecutionResult,
+  type TestOutcome,
 } from '../../src/core/execution/execution-record';
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-function rec(testName: string, result: ExecutionResult | null): ExecutionRecord {
+function rec(testName: string, result: TestOutcome | null): ExecutionRecord {
   const r = createExecutionRecord({
     executionId: `exec_${testName}`,
     testName,

@@ -1,7 +1,7 @@
 /**
  * Execution Provider factory — resolves an {@link ExecutionProvider} for a given
  * execution mode. The healing worker calls this once per job; everything below
- * the returned provider's {@link ExecutionOutcome} is source-agnostic.
+ * the returned provider's {@link ExecutionResult} is source-agnostic.
  *
  * `local` is the default and the safe fallback for any unknown mode, so a job
  * with no execution mode behaves EXACTLY as it always has (zero regression).
@@ -13,6 +13,15 @@ import { GitHubActionsExecutionProvider } from './github-actions-execution-provi
 export { LocalExecutionProvider } from './local-execution-provider';
 export { GitHubActionsExecutionProvider } from './github-actions-execution-provider';
 export * from './artifact-ingestion';
+// Re-export the canonical execution result contract for convenient single-import.
+export {
+  assembleExecutionResult,
+  ExecutionSetupError,
+  type ExecutionResult,
+  type ProviderInfo,
+  type ExecutionRunMetadata,
+  type ExecutionSetupStage,
+} from '../execution-result';
 
 /** Supported execution modes a job may request. */
 export type ExecutionMode = 'local' | 'github_actions';

@@ -8,9 +8,12 @@
  *   2. createExecutionProvider factory — returns the right provider per mode and
  *      DEFAULTS TO LOCAL for unknown/unset modes (the zero-regression guarantee).
  *   3. GitHubActionsExecutionProvider.execute — happy path with a fully mocked
- *      GitHubService + stubbed ExecutionEngine, asserting the ExecutionOutcome
- *      shape, exitCode derivation, and provider ref.
- *   4. LocalExecutionProvider — interface parity + no-op download/collect.
+ *      GitHubService + stubbed ExecutionEngine, asserting the canonical
+ *      ExecutionResult shape (records, artifacts, repoPath, exitCode, metadata,
+ *      providerInfo) and exitCode derivation.
+ *   4. LocalExecutionProvider — execute() returns a canonical ExecutionResult
+ *      (records/artifacts split), interface parity + no-op download/collect, and
+ *      setup failures surface as ExecutionSetupError.
  *
  * Style matches the repo's plain-assertion convention (run via ts-node), so
  * there is no test-runner dependency.
@@ -58,6 +61,31 @@ function playwrightResultsJson(): string {
             title: 'logs in',
             ok: false,
             tests: [{ results: [{ status: 'failed', error: { message: 'locator not found' } }] }],
+          },
+        ],
+      },
+    ],
+  });
+}
+
+/** A Playwright document with ONE failing + ONE passing test (mixed run). */
+function mixedResultsJson(): string {
+  return JSON.stringify({
+    config: { rootDir: '/repo/tests', version: '1.40.0' },
+    stats: { expected: 1, unexpected: 1, flaky: 0, skipped: 0 },
+    suites: [
+      {
+        title: 'login.spec.ts',
+        specs: [
+          {
+            title: 'logs in',
+            ok: false,
+            tests: [{ results: [{ status: 'failed', error: { message: 'locator not found' } }] }],
+          },
+          {
+            title: 'shows home',
+            ok: true,
+            tests: [{ results: [{ status: 'passed' }] }],
           },
         ],
       },
@@ -190,27 +218,37 @@ async function main() {
         companyId: 1,
         providerConfig: { workflowId: 'ci.yml' },
       };
-      const outcome = await provider.execute(ctx);
+      const result = await provider.execute(ctx);
 
       assert('execute dispatched the workflow', calls.includes('dispatch'));
       assert('execute correlated + polled the run', calls.includes('find') && calls.includes('get'));
       assert('execute downloaded artifacts', calls.includes('download'));
-      assert('execute returned source=github_actions', outcome.source === 'github_actions');
-      assert('execute exitCode=1 for a failed run (failures to heal)', outcome.exitCode === 1);
-      assert('execute resultsFile sits in the local repo path', outcome.resultsFile === path.join(repoPath, 'test-results.json'));
-      assert('execute actually wrote the canonical results file', fs.existsSync(outcome.resultsFile));
-      assert('execute results file is the ingested Playwright JSON', JSON.parse(fs.readFileSync(outcome.resultsFile, 'utf-8')).suites?.length === 1);
-      assert('execute ref carries the CI run id', outcome.ref?.runId === 4242);
-      assert('execute ref carries the run url', !!outcome.ref?.runUrl);
-      assert('execute ref carries the conclusion', outcome.ref?.conclusion === 'failure');
-      assert('execute reports a positive durationMs', typeof outcome.durationMs === 'number' && outcome.durationMs! >= 0);
+      // ── Canonical ExecutionResult shape (the inverted contract) ──
+      assert('execute returns providerInfo.source=github_actions', result.providerInfo.source === 'github_actions');
+      assert('execute exitCode=1 for a failed run (failures to heal)', result.exitCode === 1);
+      assert('execute returns repoPath = the local clone', result.repoPath === repoPath);
+      assert('execute resultsFile sits in the local repo path', result.resultsFile === path.join(repoPath, 'test-results.json'));
+      assert('execute actually wrote the canonical results file', fs.existsSync(result.resultsFile));
+      assert('execute results file is the ingested Playwright JSON', JSON.parse(fs.readFileSync(result.resultsFile, 'utf-8')).suites?.length === 1);
+      // The provider OWNS parsing: artifacts for the 1 failing test, 0 non-failure records.
+      assert('execute parsed failure artifacts (1 failing test)', Array.isArray(result.artifacts) && result.artifacts.length === 1);
+      assert('execute built records (no non-failing tests ⇒ 0 records)', Array.isArray(result.records) && result.records.length === 0);
+      // providerInfo carries the CI deep-link references.
+      assert('execute providerInfo carries the CI run id', result.providerInfo.runId === 4242);
+      assert('execute providerInfo carries the run url', !!result.providerInfo.runUrl);
+      assert('execute providerInfo carries the conclusion', result.providerInfo.conclusion === 'failure');
+      assert('execute providerInfo carries the artifact dir', !!result.providerInfo.artifactDir);
+      // metadata carries timing/process info.
+      assert('execute metadata reports a positive durationMs', typeof result.metadata.durationMs === 'number' && result.metadata.durationMs >= 0);
+      assert('execute metadata.exitCode matches the result exitCode', result.metadata.exitCode === result.exitCode);
+      assert('execute metadata carries start/end timestamps', !!result.metadata.startTime && !!result.metadata.endTime);
 
-      // Missing workflowId must throw.
+      // Missing workflowId must throw an ExecutionSetupError.
       let threw = false;
       try {
         await provider.execute({ ...ctx, providerConfig: {} });
-      } catch { threw = true; }
-      assert('execute throws when providerConfig.workflowId is missing', threw);
+      } catch (e) { threw = (e as Error).name === 'ExecutionSetupError'; }
+      assert('execute throws ExecutionSetupError when providerConfig.workflowId is missing', threw);
     } finally {
       (ExecutionEngine as any).cloneRepository = origClone;
       (ExecutionEngine as any).installDependencies = origInstall;
@@ -237,12 +275,13 @@ async function main() {
     (ExecutionEngine as any).installDependencies = async () => {};
     try {
       const provider = new GitHubActionsExecutionProvider(fakeGithub, new LocalExecutionProvider());
-      const outcome = await provider.execute({
+      const result = await provider.execute({
         repoUrl: 'https://github.com/o/r', branch: 'main', repoPath,
         profile: 'standard' as any, collectHealingArtifacts: false, budgetMs: 60000,
         providerConfig: { workflowId: 'ci.yml' },
       });
-      assert('execute exitCode=0 for a successful run', outcome.exitCode === 0);
+      assert('execute exitCode=0 for a successful run', result.exitCode === 0);
+      assert('execute providerInfo.conclusion=success', result.providerInfo.conclusion === 'success');
     } finally {
       (ExecutionEngine as any).cloneRepository = origClone;
       (ExecutionEngine as any).installDependencies = origInstall;
@@ -281,8 +320,73 @@ async function main() {
     assert('execute throws for a non-GitHub repo URL', threw);
   }
 
-  // ─── 4. LocalExecutionProvider interface parity ──────────────────
-  console.log('\n=== LocalExecutionProvider ===');
+  // ─── 4. LocalExecutionProvider.execute returns a canonical ExecutionResult ──
+  console.log('\n=== LocalExecutionProvider.execute ===');
+  {
+    const origClone = (ExecutionEngine as any).cloneRepository;
+    const origInstall = (ExecutionEngine as any).installDependencies;
+    const origRun = (ExecutionEngine as any).runAsync;
+    const repoPath = fs.mkdtempSync(path.join(os.tmpdir(), 'levelup-local-exec-'));
+    const resultsFile = path.join(repoPath, 'test-results.json');
+    (ExecutionEngine as any).cloneRepository = async () => { fs.mkdirSync(repoPath, { recursive: true }); };
+    (ExecutionEngine as any).installDependencies = async () => {};
+    (ExecutionEngine as any).runAsync = async () => {
+      fs.writeFileSync(resultsFile, mixedResultsJson());
+      return {
+        exitCode: 1, stdout: 'ran', stderr: '', resultsFile,
+        startTime: new Date().toISOString(), endTime: new Date().toISOString(), durationMs: 12,
+      };
+    };
+    try {
+      const local = new LocalExecutionProvider();
+      const result = await local.execute({
+        repoUrl: 'https://github.com/o/r', branch: 'main', repoPath,
+        profile: 'standard' as any, collectHealingArtifacts: false, budgetMs: 60000,
+        jobId: 'job-123',
+      });
+      assert('local execute returns providerInfo.source=local', result.providerInfo.source === 'local');
+      assert('local execute passes through exitCode', result.exitCode === 1);
+      assert('local execute returns the repoPath', result.repoPath === repoPath);
+      assert('local execute returns the resultsFile', result.resultsFile === resultsFile);
+      // The provider OWNS parsing: 1 failing artifact + 1 non-failure (pass) record.
+      assert('local execute parsed the failing test into artifacts', result.artifacts.length === 1 && result.artifacts[0].test_name === 'logs in');
+      assert('local execute built a finalized record for the passing test', result.records.length === 1 && result.records[0].testName === 'shows home');
+      assert('local execute record is keyed by jobId (synthetic id)', result.records[0].executionId.startsWith('job-123:'));
+      assert('local execute metadata carries durationMs', result.metadata.durationMs === 12);
+      assert('local execute metadata.exitCode matches', result.metadata.exitCode === 1);
+    } finally {
+      (ExecutionEngine as any).cloneRepository = origClone;
+      (ExecutionEngine as any).installDependencies = origInstall;
+      (ExecutionEngine as any).runAsync = origRun;
+      fs.rmSync(repoPath, { recursive: true, force: true });
+    }
+  }
+
+  // Setup failure (clone fails AND no existing package.json) ⇒ ExecutionSetupError.
+  {
+    const origClone = (ExecutionEngine as any).cloneRepository;
+    const repoPath = fs.mkdtempSync(path.join(os.tmpdir(), 'levelup-local-fail-'));
+    (ExecutionEngine as any).cloneRepository = async () => { throw new Error('repo not found'); };
+    try {
+      const local = new LocalExecutionProvider();
+      let err: any = null;
+      try {
+        await local.execute({
+          repoUrl: 'https://github.com/o/r', branch: 'main', repoPath,
+          profile: 'standard' as any, collectHealingArtifacts: false, budgetMs: 1000,
+        });
+      } catch (e) { err = e; }
+      assert('local execute throws ExecutionSetupError when clone fails with no fallback', err?.name === 'ExecutionSetupError');
+      assert('local execute setup error carries stage=clone', err?.stage === 'clone');
+      assert('local execute setup error carries exitCode=128', err?.exitCode === 128);
+    } finally {
+      (ExecutionEngine as any).cloneRepository = origClone;
+      fs.rmSync(repoPath, { recursive: true, force: true });
+    }
+  }
+
+  // ─── 4b. LocalExecutionProvider interface parity ─────────────────
+  console.log('\n=== LocalExecutionProvider interface ===');
   {
     const local = new LocalExecutionProvider();
     assert('local exposes execute()', typeof local.execute === 'function');

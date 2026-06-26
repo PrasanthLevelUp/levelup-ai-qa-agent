@@ -1,7 +1,7 @@
 /**
  * GitHubActionsExecutionProvider — runs the customer's EXISTING GitHub Actions
- * workflow as a first-class execution source, then materializes the same local
- * workspace the healing pipeline consumes for a Local Runner execution.
+ * workflow as a first-class execution source, then materializes the same
+ * canonical {@link ExecutionResult} a Local Runner execution produces.
  *
  * ── Flow (execute) ─────────────────────────────────────────────────────────
  *   1. dispatch the chosen workflow via `workflow_dispatch`
@@ -10,10 +10,11 @@
  *   4. clone the repo locally (diagnosis reads source; Hybrid validation reruns
  *      here) and drop the CI `test-results.json` into the clone as the canonical
  *      results file
- *   5. return an ExecutionOutcome whose exitCode reflects the run's conclusion
+ *   5. assemble an ExecutionResult whose exitCode reflects the run's conclusion
+ *      and whose records/artifacts are parsed from the CI results
  *
  * From step 5 onward the rest of LevelUp AI behaves IDENTICALLY to a local run —
- * the source is an implementation detail below ExecutionOutcome.
+ * the source is an implementation detail below ExecutionResult.
  *
  * ── Hybrid validation ──────────────────────────────────────────────────────
  * `validate()` delegates to the Local Runner (via LocalExecutionProvider) so a
@@ -28,12 +29,16 @@ import { ExecutionEngine, type RunResult } from '../../execution-engine';
 import { GitHubService, parseGitHubRepoUrl } from '../../../integrations/github-service';
 import { LocalExecutionProvider } from './local-execution-provider';
 import { ingestRunArtifacts, type RemoteArtifact } from './artifact-ingestion';
+import {
+  assembleExecutionResult,
+  ExecutionSetupError,
+  type ExecutionResult,
+  type ProviderInfo,
+} from '../execution-result';
 import type {
   ExecutionProvider,
   ExecutionContext,
-  ExecutionOutcome,
   ValidationContext,
-  ExecutionProviderRef,
   ExecutionSource,
 } from '../execution-provider';
 
@@ -60,15 +65,18 @@ export class GitHubActionsExecutionProvider implements ExecutionProvider {
     this.local = local ?? new LocalExecutionProvider();
   }
 
-  async execute(ctx: ExecutionContext): Promise<ExecutionOutcome> {
+  async execute(ctx: ExecutionContext): Promise<ExecutionResult> {
     const cfg = (ctx.providerConfig ?? {}) as Partial<GitHubActionsConfig>;
     if (cfg.workflowId === undefined || cfg.workflowId === null || cfg.workflowId === '') {
-      throw new Error('GitHubActionsExecutionProvider requires providerConfig.workflowId');
+      throw new ExecutionSetupError('dispatch', 1, 'GitHubActionsExecutionProvider requires providerConfig.workflowId');
     }
 
     const parsed = parseGitHubRepoUrl(ctx.repoUrl);
     if (!parsed) {
-      throw new Error(`Could not parse a GitHub owner/repo from "${ctx.repoUrl}". GitHub Actions execution requires a GitHub repository.`);
+      throw new ExecutionSetupError(
+        'dispatch', 1,
+        `Could not parse a GitHub owner/repo from "${ctx.repoUrl}". GitHub Actions execution requires a GitHub repository.`,
+      );
     }
     const { owner, repo } = parsed;
     const ref = ctx.branch || 'main';
@@ -82,7 +90,7 @@ export class GitHubActionsExecutionProvider implements ExecutionProvider {
       owner, repo, cfg.workflowId, ref, cfg.inputs, ctx.companyId, ctx.userId,
     );
     if (!dispatch.success) {
-      throw new Error(`Failed to dispatch workflow: ${dispatch.error}`);
+      throw new ExecutionSetupError('dispatch', 1, `Failed to dispatch workflow: ${dispatch.error}`);
     }
 
     // ── 2. Correlate + wait for completion ────────────────────────────────
@@ -90,7 +98,7 @@ export class GitHubActionsExecutionProvider implements ExecutionProvider {
       owner, repo, cfg.workflowId, ref, sinceIso, ctx.companyId, ctx.userId,
     );
     if (found.error || !found.run) {
-      throw new Error(found.error || 'Dispatched workflow run could not be correlated.');
+      throw new ExecutionSetupError('execute', 1, found.error || 'Dispatched workflow run could not be correlated.');
     }
     const runId = found.run.id;
     logger.info(MOD, 'Run correlated; waiting for completion', { runId, htmlUrl: found.run.htmlUrl });
@@ -101,8 +109,6 @@ export class GitHubActionsExecutionProvider implements ExecutionProvider {
     logger.info(MOD, 'Run completed', { runId, conclusion });
 
     // ── 3. Clone the repo locally (for code context + Hybrid validation) ──
-    // Done in parallel-ish with artifact download below; clone first so the
-    // workspace exists to host the results file.
     fs.mkdirSync(path.dirname(ctx.repoPath), { recursive: true });
     await ExecutionEngine.cloneRepository(ctx.repoUrl, ctx.repoPath, ref);
     // Install deps so Hybrid validation reruns can execute immediately.
@@ -115,10 +121,8 @@ export class GitHubActionsExecutionProvider implements ExecutionProvider {
     }
 
     // ── 4. Download + ingest artifacts → canonical test-results.json ──────
-    const ref0: ExecutionProviderRef = { runId, runUrl, conclusion, artifactDir: undefined };
     const extractDir = path.join(ctx.repoPath, '.levelup', 'gha-artifacts', String(runId));
     const ingested = await this.ingest(owner, repo, runId, extractDir, ctx);
-    ref0.artifactDir = ingested.extractDir;
     for (const w of ingested.warnings) logger.warn(MOD, 'Artifact ingestion warning', { runId, warning: w });
 
     // Place the CI results file at the conventional location the collector reads.
@@ -131,24 +135,38 @@ export class GitHubActionsExecutionProvider implements ExecutionProvider {
       }
     }
 
-    // ── 5. Derive exitCode from the run conclusion ────────────────────────
+    // ── 5. Derive exitCode + assemble the canonical result ────────────────
     // 0 ⇒ success/all-passed; non-zero ⇒ there were failures to heal. When we
     // could not obtain a results file we still signal failure so the worker
     // surfaces an actionable message rather than silently "all passed".
     const haveResults = !!ingested.resultsFile && fs.existsSync(canonicalResults);
-    const exitCode = conclusion === 'success' ? 0 : (haveResults ? 1 : 1);
+    const exitCode = conclusion === 'success' ? 0 : 1;
 
-    return {
+    const providerInfo: ProviderInfo = {
+      source: this.source,
+      runId,
+      runUrl,
+      conclusion,
+      artifactDir: ingested.extractDir,
+    };
+
+    return assembleExecutionResult({
       resultsFile: canonicalResults,
       repoPath: ctx.repoPath,
       exitCode,
-      source: this.source,
-      startTime: new Date(startedAt).toISOString(),
-      endTime: new Date().toISOString(),
-      durationMs: Date.now() - startedAt,
-      ref: ref0,
-      stderr: haveResults ? '' : (ingested.warnings.join('; ') || 'No Playwright results were ingested from the GitHub Actions run.'),
-    };
+      jobId: ctx.jobId ?? String(runId),
+      profile: ctx.profile,
+      metadata: {
+        startTime: new Date(startedAt).toISOString(),
+        endTime: new Date().toISOString(),
+        durationMs: Date.now() - startedAt,
+        exitCode,
+        stderr: haveResults
+          ? ''
+          : (ingested.warnings.join('; ') || 'No Playwright results were ingested from the GitHub Actions run.'),
+      },
+      providerInfo,
+    });
   }
 
   /**
@@ -161,10 +179,10 @@ export class GitHubActionsExecutionProvider implements ExecutionProvider {
   }
 
   /** Download + extract the run's artifacts into `destDir`. */
-  async downloadArtifacts(ref: ExecutionProviderRef, destDir: string, ctx: ExecutionContext): Promise<string | null> {
+  async downloadArtifacts(info: ProviderInfo, destDir: string, ctx: ExecutionContext): Promise<string | null> {
     const parsed = parseGitHubRepoUrl(ctx.repoUrl);
-    if (!parsed || ref.runId === undefined) return null;
-    const ingested = await this.ingest(parsed.owner, parsed.repo, Number(ref.runId), destDir, ctx);
+    if (!parsed || info.runId === undefined) return null;
+    const ingested = await this.ingest(parsed.owner, parsed.repo, Number(info.runId), destDir, ctx);
     return ingested.resultsFile;
   }
 
@@ -183,7 +201,7 @@ export class GitHubActionsExecutionProvider implements ExecutionProvider {
     let htmlUrl = '';
     for (let i = 0; i < DEFAULT_RUN_POLL_ATTEMPTS; i++) {
       const { run, error } = await this.github.getWorkflowRun(owner, repo, runId, ctx.companyId, ctx.userId);
-      if (error) throw new Error(error);
+      if (error) throw new ExecutionSetupError('execute', 1, error);
       if (run) {
         htmlUrl = run.htmlUrl;
         if (run.status === 'completed') {
@@ -192,7 +210,7 @@ export class GitHubActionsExecutionProvider implements ExecutionProvider {
       }
       await new Promise((r) => setTimeout(r, DEFAULT_RUN_POLL_INTERVAL_MS));
     }
-    throw new Error(`GitHub Actions run ${runId} did not complete within the polling budget.`);
+    throw new ExecutionSetupError('execute', 1, `GitHub Actions run ${runId} did not complete within the polling budget.`);
   }
 
   /** List → download → extract artifacts for a run. */

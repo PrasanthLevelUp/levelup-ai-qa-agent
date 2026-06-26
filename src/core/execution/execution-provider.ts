@@ -1,8 +1,8 @@
 /**
  * Execution Provider — the abstraction that makes the *source* of a test
- * execution an implementation detail.
+ * execution an implementation detail, and OWNS the entire execution lifecycle.
  *
- * ── The architecture this enables ──────────────────────────────────────────
+ * ── The inverted architecture this enables ─────────────────────────────────
  *
  *                      ExecutionProvider
  *          ┌────────────────┼──────────────────┐
@@ -10,23 +10,23 @@
  *     LocalProvider   GitHubActions       Future providers
  *                      Provider           (Jenkins, GitLab, …)
  *          │                │
+ *          │  clone → execute → download artifacts → parse artifacts
+ *          │  → build ExecutionRecords → assemble ExecutionResult
  *          └───────┬────────┘
  *                  ▼
- *           ExecutionOutcome   ← test-results.json on disk + local repo + exitCode
+ *            ExecutionResult   ← records + artifacts + repoPath + exitCode
+ *                  │             + resultsFile + metadata + providerInfo
  *                  ▼
- *            ExecutionRecord
- *                  ▼
- *       Diagnosis · Healing · Learning
- *                  ▼
- *           Validation Engine   ← provider.validate()  (Hybrid: local for speed)
+ *          Healing pipeline  →  Diagnosis · Healing · Validation · Learning
  *                  ▼
  *              Pull Request
  *
- * EVERYTHING below `ExecutionOutcome` is identical regardless of where the test
- * physically ran. The healing worker consumes exactly two things from a run —
- * the Playwright `resultsFile` (test-results.json) and a local `repoPath` (for
- * code context + fast validation reruns). That pair IS the provider boundary:
- * a provider's only job is to *materialize* that pair, however it sources it.
+ * EVERYTHING below `ExecutionResult` is identical regardless of where the test
+ * physically ran. The provider does ALL the work of producing a run: it clones,
+ * executes (locally or via CI), downloads + parses artifacts, builds the
+ * finalized pass/skip ExecutionRecords, and returns one canonical
+ * {@link ExecutionResult}. The healing worker becomes provider-independent — it
+ * consumes an ExecutionResult and never learns where execution came from.
  *
  * ── Hybrid validation (deliberate) ─────────────────────────────────────────
  * `execute()` may run remotely (e.g. GitHub Actions) so DIAGNOSIS is grounded in
@@ -38,57 +38,10 @@
  */
 import type { ExecutionProfile } from './execution-profile';
 import type { RunResult } from '../execution-engine';
+import type { ExecutionResult, ProviderInfo } from './execution-result';
 
 /** Where a test execution physically ran. Open-ended for future providers. */
 export type ExecutionSource = 'local' | 'github_actions' | 'jenkins' | 'gitlab_ci' | 'azure_devops';
-
-/**
- * Provider-native references to the remote execution, when applicable. Lets the
- * dashboard deep-link to the CI run and lets debugging trace where bytes came
- * from. Absent/empty for the Local provider.
- */
-export interface ExecutionProviderRef {
-  /** CI run id (e.g. GitHub Actions workflow-run id). */
-  runId?: number | string;
-  /** Human-facing URL of the run (e.g. the Actions run page). */
-  runUrl?: string;
-  /** Local directory the provider downloaded/extracted remote artifacts into. */
-  artifactDir?: string;
-  /** Conclusion as reported by the provider (e.g. success | failure | cancelled). */
-  conclusion?: string | null;
-}
-
-/**
- * The canonical, source-agnostic outcome of running the test suite ONCE. This is
- * the contract every provider must satisfy — the single hand-off point into the
- * existing healing pipeline (`ArtifactCollector.collect(resultsFile, repoPath)`).
- */
-export interface ExecutionOutcome {
-  /** Absolute path to the Playwright `test-results.json` on the local disk. */
-  resultsFile: string;
-  /**
-   * Absolute path to a LOCAL clone of the repo under test. Required even for
-   * remote providers because diagnosis reads source (`failed_line_code`,
-   * surrounding code, Page Object resolution) and Hybrid validation reruns here.
-   */
-  repoPath: string;
-  /** Process exit semantics for the run: 0 ⇒ all tests passed. */
-  exitCode: number;
-  /** Where the execution physically ran. */
-  source: ExecutionSource;
-  /** ISO start/end + duration of the underlying run, best-effort. */
-  startTime?: string;
-  endTime?: string;
-  durationMs?: number;
-  /** Provider-native references (CI run id/url, artifact dir). */
-  ref?: ExecutionProviderRef;
-  /**
-   * Optional captured stdout/stderr (local runs populate these; remote providers
-   * may leave them blank — the authoritative signal is `resultsFile`).
-   */
-  stdout?: string;
-  stderr?: string;
-}
 
 /** Everything a provider needs to run the suite once and materialize a workspace. */
 export interface ExecutionContext {
@@ -106,6 +59,11 @@ export interface ExecutionContext {
   collectHealingArtifacts: boolean;
   /** Wall-clock budget (ms) for this execution. */
   budgetMs: number;
+  /**
+   * Owning job id — used to mint deterministic synthetic execution ids for the
+   * finalized pass/skip records the provider builds (so reruns upsert in place).
+   */
+  jobId?: string | number;
   /** Tenant identity — used by remote providers to resolve stored credentials. */
   companyId?: number;
   userId?: number;
@@ -135,22 +93,26 @@ export interface ValidationContext {
 }
 
 /**
- * The provider contract. `execute()` is the high-level orchestration; the other
- * three are the composable steps it is built from (and that tests can exercise
- * in isolation). Remote providers implement all four; the Local provider
- * implements `execute`/`validate` and treats download/collect as no-ops because
- * its results are already on disk.
+ * The provider contract. `execute()` owns the WHOLE execution lifecycle and
+ * returns a canonical {@link ExecutionResult}. `validate()` reruns one healed
+ * test (Hybrid: locally for speed). The remaining two are the composable steps a
+ * remote provider's `execute()` is built from (and that tests can exercise in
+ * isolation); the Local provider treats them as no-ops because its results are
+ * already on disk.
  */
 export interface ExecutionProvider {
   /** Stable identifier for this provider's execution source. */
   readonly source: ExecutionSource;
 
   /**
-   * Run the suite (or scoped `testFile`) ONCE and materialize a local workspace
-   * the healing pipeline can consume. MUST return an {@link ExecutionOutcome}
-   * whose `resultsFile` + `repoPath` are present on the local disk.
+   * Run the suite (or scoped `testFile`) ONCE and return a complete
+   * {@link ExecutionResult}: the provider clones, executes, downloads + parses
+   * artifacts, builds the finalized pass/skip records, and packs the container.
+   * Throws {@link ExecutionSetupError} for setup-level failures (clone/install/
+   * dispatch) so the worker can surface an actionable message without knowing the
+   * provider.
    */
-  execute(ctx: ExecutionContext): Promise<ExecutionOutcome>;
+  execute(ctx: ExecutionContext): Promise<ExecutionResult>;
 
   /**
    * Re-run a single test to confirm a fix held up. Hybrid default: run locally
@@ -164,7 +126,7 @@ export interface ExecutionProvider {
    * and return the directory the bytes were extracted to (or null if none).
    * No-op for the Local provider (its artifacts are already on disk).
    */
-  downloadArtifacts(ref: ExecutionProviderRef, destDir: string, ctx: ExecutionContext): Promise<string | null>;
+  downloadArtifacts(info: ProviderInfo, destDir: string, ctx: ExecutionContext): Promise<string | null>;
 
   /**
    * Locate the Playwright `test-results.json` produced by the run. For the Local
@@ -173,3 +135,13 @@ export interface ExecutionProvider {
    */
   collectResults(outcomeDir: string): Promise<string | null>;
 }
+
+// Re-export the canonical result types so consumers can import the whole provider
+// contract (context + result) from one module.
+export type {
+  ExecutionResult,
+  ProviderInfo,
+  ExecutionRunMetadata,
+  ExecutionSetupStage,
+} from './execution-result';
+export { ExecutionSetupError } from './execution-result';
