@@ -11,6 +11,8 @@ import { normalizeError, extractErrorPattern, type NormalizedError } from './err
 import { extractCodeContext, type CodeContext } from './code-context-extractor';
 import { resolvePageObjectLocator, type PageObjectResolution } from './page-object-resolver';
 import * as TraceParser from './playwright/trace-parser';
+import { createRepoPathResolver } from '../intelligence/repo-path-resolver';
+import { isSpecPath, looksLikePageObjectPath } from '../services/repo-intelligence-healing';
 
 const MOD = 'artifact-collector';
 
@@ -254,10 +256,22 @@ export class ArtifactCollector {
       : (candidateLocations ? [candidateLocations] : []);
     const withFile = candidates.filter((l) => !!l && !!l.file) as Array<{ file: string; line?: number }>;
 
-    const isSpec = (file: string): boolean =>
-      /(tests?[/\\].*\.spec\.ts|\.test\.ts)$/i.test(file);
-    const toAbs = (file: string): string =>
-      path.isAbsolute(file) ? file : path.join(testRepoPath, file);
+    // Classification + path mapping are owned by Repo Intelligence — the artifact
+    // collector no longer hardcodes folder names (pages/, pom/, tests/, src/, …).
+    // `isSpecPath` / `looksLikePageObjectPath` answer "is this a spec / a Page
+    // Object?", and the repo path resolver maps any foreign/CI absolute path onto
+    // the real clone via the filesystem (works for ANY layout).
+    const isSpec = (file: string): boolean => isSpecPath(file);
+
+    const resolver = createRepoPathResolver(testRepoPath);
+
+    // Map a file path (from Playwright error locations or stack frames) onto an
+    // absolute path inside the healing agent's clone. Playwright locations often
+    // carry absolute paths from the CI runner (e.g. /home/runner/work/repo/repo/pages/X.ts)
+    // which don't exist locally; the resolver re-anchors them onto the clone with
+    // no folder-convention knowledge. `toAbsolute` always returns *some* path
+    // (folder-free fallback) so this keeps its original non-null contract.
+    const toAbs = (file: string): string => resolver.toAbsolute(file) ?? path.join(testRepoPath, path.basename(file));
 
     // 1. Prefer an explicit candidate location that points at non-spec source (the PO).
     const nonSpecCandidate = withFile.find((l) => !isSpec(l.file));
@@ -296,18 +310,11 @@ export class ArtifactCollector {
       };
     }
 
-    // Known Page Object directory patterns
-    const poPatterns = [
-      /[/\\]pages[/\\]/i,
-      /[/\\]page-objects?[/\\]/i,
-      /[/\\]pom[/\\]/i,
-      /[/\\]src[/\\]pages[/\\]/i,
-      /[/\\]e2e[/\\]pom[/\\]/i,
-    ];
-
-    // Filter out test specs and prefer PO files
+    // Filter out test specs and prefer Page Object files. Whether a frame is a
+    // Page Object is decided by Repo Intelligence's `looksLikePageObjectPath`
+    // (the single source of PO-location knowledge) instead of a local folder list.
     const nonSpecFrames = frames.filter(f => !isSpec(f.file));
-    const poFrames = nonSpecFrames.filter(f => poPatterns.some(p => p.test(f.file)));
+    const poFrames = nonSpecFrames.filter(f => looksLikePageObjectPath(f.file));
 
     // Priority: PO frames > non-spec frames > first candidate location
     const best = poFrames[0] ?? nonSpecFrames[0];
