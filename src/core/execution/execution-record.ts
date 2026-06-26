@@ -304,6 +304,66 @@ export interface DiagnosisRecord {
 }
 
 /**
+ * The raw, authoritative outcome of one advisor/layer in the healing waterfall —
+ * carried THROUGH from the orchestrator's DecisionTrailEntry verbatim (no
+ * collapse, no UI-facing reinterpretation). Returning the full status + reason
+ * means the dashboard renders the entire decision and customers immediately
+ * understand WHY a layer was used or skipped.
+ *
+ *   hit         — this layer produced the candidate that was applied
+ *   miss        — this layer ran but had no viable candidate
+ *   skipped     — this layer was deliberately not run (an earlier layer won)
+ *   not_reached — the waterfall short-circuited before this layer
+ *   error       — this layer threw while running
+ */
+export type AdvisorOutcome = 'hit' | 'miss' | 'skipped' | 'not_reached' | 'error';
+
+/**
+ * One advisor's verdict in the healing decision waterfall — captured at heal
+ * time from the orchestrator's authoritative DecisionTrailEntry. This is the
+ * "what each advisor did" record: the BACKEND knows exactly which intelligence
+ * layers were consulted, which won, and which were skipped, AND WHY — so the UI
+ * never has to infer or reinterpret it.
+ */
+export interface AdvisorDecisionEntry {
+  /** Advisor / layer name, e.g. "App Profile", "DOM Memory", "Learned Pattern", "AI". */
+  advisor: string;
+  /** Raw orchestrator outcome, passed through verbatim. */
+  status: AdvisorOutcome;
+  /** Human-readable reason for this outcome — e.g. "Grounded from crawl", "Learning won". */
+  reason?: string;
+  /** Confidence the advisor had in its candidate (0..1), when known. */
+  confidence?: number;
+  /** Time this advisor spent, in ms, when known (usually absent — not yet measured per-advisor). */
+  durationMs?: number;
+}
+
+/** Type guard for the raw outcome union (defends against unexpected strings). */
+function isAdvisorOutcome(s: string): s is AdvisorOutcome {
+  return s === 'hit' || s === 'miss' || s === 'skipped' || s === 'not_reached' || s === 'error';
+}
+
+/**
+ * Capture the orchestrator's decision trail (structural: layer + outcome +
+ * reasoning + confidence) onto the record verbatim. Pure + structural (no import
+ * coupling to the orchestrator). The status is passed THROUGH unchanged — we
+ * return the entire decision, not a collapsed projection — and `reasoning` is
+ * surfaced as `reason` so the UI can show why each layer hit / missed / skipped.
+ */
+export function toAdvisorDecisionTrail(
+  trail: ReadonlyArray<{ layer: string; outcome: string; confidence?: number; reasoning?: string }> | undefined,
+): AdvisorDecisionEntry[] {
+  if (!trail || trail.length === 0) return [];
+  return trail.map((e) => {
+    const status: AdvisorOutcome = isAdvisorOutcome(e.outcome) ? e.outcome : 'miss';
+    const entry: AdvisorDecisionEntry = { advisor: e.layer, status };
+    if (e.reasoning) entry.reason = e.reasoning;
+    if (typeof e.confidence === 'number') entry.confidence = e.confidence;
+    return entry;
+  });
+}
+
+/**
  * Healing decisions — what the engine decided to DO about the failure and the
  * outcome of applying it. The "what we changed" section.
  */
@@ -324,6 +384,12 @@ export interface HealingDecisionRecord {
   rationale?: string;
   /** Confidence (0..1) the engine had in the applied fix, when known. */
   confidence?: number;
+  /**
+   * The advisor waterfall — which intelligence layers were consulted, which won,
+   * which were skipped. Captured authoritatively from the orchestrator at heal
+   * time so the dashboard's Decision Trail renders fact, not inference.
+   */
+  decisionTrail?: AdvisorDecisionEntry[];
   /** LLM token cost attributed to producing this healing decision, when known. */
   costTokens?: number;
   /** Monetary cost (USD) attributed to this healing decision, when known. */

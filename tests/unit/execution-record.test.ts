@@ -18,6 +18,7 @@ import {
   setLifecycle,
   appendEvent,
   coerceLegacyRecord,
+  toAdvisorDecisionTrail,
   EXECUTION_RECORD_SCHEMA_VERSION,
   type ArtifactDescriptor,
   type ExecutionRecord,
@@ -230,5 +231,39 @@ describe('Execution Record — events log (HISTORY, separate from STATE)', () =>
     delete (legacy as Partial<ExecutionRecord>).events;
     const coerced = coerceLegacyRecord(legacy);
     expect(coerced.events).toEqual([]);
+  });
+});
+
+describe('toAdvisorDecisionTrail — captures the orchestrator outcome VERBATIM', () => {
+  it('returns [] for undefined or empty trail', () => {
+    expect(toAdvisorDecisionTrail(undefined)).toEqual([]);
+    expect(toAdvisorDecisionTrail([])).toEqual([]);
+  });
+
+  it('passes raw status through unchanged (no collapse) and surfaces reasoning as reason', () => {
+    const out = toAdvisorDecisionTrail([
+      { layer: 'App Profile', outcome: 'hit', confidence: 0.96, reasoning: 'Grounded from crawl' },
+      { layer: 'DOM Memory', outcome: 'miss', reasoning: 'No high-confidence historical alternative' },
+      { layer: 'Learned Pattern', outcome: 'skipped', reasoning: 'App Profile won' },
+      { layer: 'Rule Engine', outcome: 'not_reached', reasoning: 'short-circuited' },
+      { layer: 'AI', outcome: 'error', reasoning: 'timeout' },
+    ]);
+    expect(out).toEqual([
+      { advisor: 'App Profile', status: 'hit', reason: 'Grounded from crawl', confidence: 0.96 },
+      { advisor: 'DOM Memory', status: 'miss', reason: 'No high-confidence historical alternative' },
+      { advisor: 'Learned Pattern', status: 'skipped', reason: 'App Profile won' },
+      { advisor: 'Rule Engine', status: 'not_reached', reason: 'short-circuited' },
+      { advisor: 'AI', status: 'error', reason: 'timeout' },
+    ]);
+  });
+
+  it('carries confidence (0..1) through unchanged (no rounding here)', () => {
+    const out = toAdvisorDecisionTrail([{ layer: 'AI', outcome: 'hit', confidence: 0.5 }]);
+    expect(out[0]).toEqual({ advisor: 'AI', status: 'hit', confidence: 0.5 });
+  });
+
+  it('defends against an unexpected outcome string (falls back to miss)', () => {
+    const out = toAdvisorDecisionTrail([{ layer: 'X', outcome: 'banana' }]);
+    expect(out[0]).toEqual({ advisor: 'X', status: 'miss' });
   });
 });

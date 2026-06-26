@@ -15,7 +15,12 @@ import {
   listExecutionRecords,
   getExecutionRecord,
 } from '../../db/postgres';
-import { buildExecutionTimeline } from '../../core/execution/execution-timeline';
+import {
+  buildExecutionTimeline,
+  deriveDecisionTrail,
+  deriveEventFeed,
+  deriveExecutionHealth,
+} from '../../core/execution/execution-timeline';
 import { toDisplayStage } from '../../core/execution/execution-lifecycle';
 import { logger } from '../../utils/logger';
 
@@ -246,7 +251,13 @@ export function createDashboardRouter(): Router {
       const record = await getExecutionRecord(id);
       if (!record) return res.status(404).json({ error: 'Execution record not found', executionId: id });
       const timeline = buildExecutionTimeline(record);
-      res.json({ record, timeline });
+      // Authoritative projections the dashboard renders verbatim (never inferred
+      // client-side): the advisor waterfall, the semantic event feed, and the
+      // per-phase health bar.
+      const decisionTrail = deriveDecisionTrail(record);
+      const eventFeed = deriveEventFeed(record);
+      const health = deriveExecutionHealth(record);
+      res.json({ record, timeline, decisionTrail, eventFeed, health });
     } catch (err) {
       logger.error(MOD, 'executions/:id failed', { error: err });
       res.status(500).json({ error: 'Failed to fetch execution record' });

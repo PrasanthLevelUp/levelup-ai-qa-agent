@@ -45,6 +45,7 @@ import {
   setLifecycle,
   makeSectionTiming,
   appendEvent,
+  toAdvisorDecisionTrail,
   type ExecutionRecord,
 } from '../core/execution/execution-record';
 import {
@@ -962,6 +963,11 @@ function createHealingWorker(
         endTime: new Date(testStartMs).toISOString(),
         profile: executionProfile,
       });
+      // The most recent advisor waterfall produced for this test. Captured each
+      // time we collect ranked candidates so the final ExecutionRecord can persist
+      // the authoritative Decision Trail (which advisors were consulted / won /
+      // skipped) — the dashboard renders it directly, never inferring.
+      let lastDecisionTrail: ReturnType<typeof toAdvisorDecisionTrail> = [];
       recordedTests.add(failure.testName);
       // Persist the RUNNING record up-front so an in-flight execution is visible
       // (and so a crash mid-heal still leaves a record rather than nothing).
@@ -1340,6 +1346,8 @@ function createHealingWorker(
             failure, domHtmlForFailure, triedLocators, resolvedProjectId,
             job.companyId, repoHealingContext, appProfileHealing,
           );
+          // Remember the authoritative advisor waterfall for the ExecutionRecord.
+          lastDecisionTrail = toAdvisorDecisionTrail(ranked.decisionTrail);
 
           if (ranked.candidates.length === 0) {
             logger.warn(MOD, 'No viable candidate for locator — skipping', {
@@ -1914,6 +1922,11 @@ function createHealingWorker(
           reportOnly: !healingForTest?.success && finalizedTrail.outcome === 'not_healed',
           rationale: finalizedTrail.summary,
         }));
+        // Persist the authoritative advisor waterfall so the Decision Trail card
+        // renders fact (which advisors won / were consulted / skipped), not inference.
+        if (lastDecisionTrail.length > 0) {
+          execRecord = recordHealingDecision(execRecord, { decisionTrail: lastDecisionTrail });
+        }
         // Stamp the healing-phase timing (validation reruns are part of this span).
         execRecord = recordHealingDecision(execRecord, {
           timing: makeSectionTiming(healStartMs, healEndMs),
