@@ -19,7 +19,53 @@
 import type { ExecutionProfile } from './execution-profile';
 
 /** Current schema version of the canonical execution record (bump on breaking shape changes). */
-export const EXECUTION_RECORD_SCHEMA_VERSION = 2;
+export const EXECUTION_RECORD_SCHEMA_VERSION = 3;
+
+// ---------------------------------------------------------------------------
+// Lifecycle vocabulary — STATUS (where the record is in its lifecycle) is kept
+// strictly separate from RESULT (the test outcome) and STAGE (the fine-grained
+// pipeline step). A record is created at test START as RUNNING, enriched with
+// stage transitions, and finalized with a terminal status + result.
+// ---------------------------------------------------------------------------
+
+/**
+ * Lifecycle status — WHERE the execution record is in its own lifecycle. This is
+ * NOT the test outcome (see `ExecutionResult`). A record begins life as `running`
+ * (or `queued`) and ends in a terminal state.
+ */
+export type ExecutionLifecycleStatus =
+  | 'queued'
+  | 'running'
+  | 'completed'
+  | 'failed'
+  | 'cancelled'
+  | 'timed_out';
+
+/**
+ * Result — the OUTCOME of the test, independent of lifecycle status. A record can
+ * be `completed` (status) with a `pass`, `fail`, or `healed` result. `result` is
+ * null until the execution reaches a terminal outcome.
+ */
+export type ExecutionResult = 'pass' | 'fail' | 'healed' | 'skipped';
+
+/**
+ * Stage — the fine-grained pipeline step the execution is currently in (or last
+ * reached). Progresses monotonically from `queued` to `completed`. Job-level
+ * stages (cloning/installing/building) apply to whole-suite runs; per-test
+ * records typically move through executing → diagnosing → healing → validating →
+ * learning → completed.
+ */
+export type ExecutionStage =
+  | 'queued'
+  | 'cloning'
+  | 'installing'
+  | 'building'
+  | 'executing'
+  | 'diagnosing'
+  | 'healing'
+  | 'validating'
+  | 'learning'
+  | 'completed';
 
 // ---------------------------------------------------------------------------
 // Artifacts — storage-agnostic descriptors (IDs, not bare paths)
@@ -155,6 +201,12 @@ export interface HealingDecisionRecord {
   /** True when the failure was surfaced to humans rather than auto-fixed. */
   reportOnly?: boolean;
   rationale?: string;
+  /** Confidence (0..1) the engine had in the applied fix, when known. */
+  confidence?: number;
+  /** LLM token cost attributed to producing this healing decision, when known. */
+  costTokens?: number;
+  /** Monetary cost (USD) attributed to this healing decision, when known. */
+  costUsd?: number;
 }
 
 /**
@@ -189,7 +241,23 @@ export interface ExecutionRecord {
   schemaVersion: number;
   executionId: string;
   testName: string;
-  status: 'passed' | 'failed' | 'timedout' | 'skipped';
+  /**
+   * Lifecycle status — WHERE this record is in its lifecycle (running → terminal).
+   * Kept strictly separate from `result` (the test outcome).
+   */
+  status: ExecutionLifecycleStatus;
+  /**
+   * Result — the test OUTCOME. Null while the execution is still in flight
+   * (status `queued`/`running`); set when a terminal status is reached.
+   */
+  result?: ExecutionResult | null;
+  /** Fine-grained pipeline stage currently reached. */
+  stage?: ExecutionStage;
+  /**
+   * The HealingJob this execution belongs to. Repository/branch/commit metadata is
+   * resolved THROUGH the job rather than duplicated onto every record.
+   */
+  jobId?: string | null;
   durationMs: number;
   startTime: string;
   endTime: string;
@@ -229,7 +297,14 @@ export type EvidenceManifest = ExecutionRecord;
 export function createExecutionRecord(init: {
   executionId: string;
   testName: string;
-  status: ExecutionRecord['status'];
+  /** Lifecycle status; defaults to `running` (a record is born at test start). */
+  status?: ExecutionLifecycleStatus;
+  /** Test outcome; null/undefined while still in flight. */
+  result?: ExecutionResult | null;
+  /** Pipeline stage; defaults to `executing`. */
+  stage?: ExecutionStage;
+  /** Owning HealingJob id (repository metadata resolved through the job). */
+  jobId?: string | null;
   durationMs: number;
   startTime: string;
   endTime: string;
@@ -240,7 +315,10 @@ export function createExecutionRecord(init: {
     schemaVersion: EXECUTION_RECORD_SCHEMA_VERSION,
     executionId: init.executionId,
     testName: init.testName,
-    status: init.status,
+    status: init.status ?? 'running',
+    result: init.result ?? null,
+    stage: init.stage ?? 'executing',
+    jobId: init.jobId ?? null,
     durationMs: init.durationMs,
     startTime: init.startTime,
     endTime: init.endTime,
@@ -283,4 +361,81 @@ export function recordValidation(rec: ExecutionRecord, validation: Partial<Valid
 /** Accumulate the learning contribution onto the record (immutable merge). */
 export function recordLearning(rec: ExecutionRecord, learning: Partial<LearningRecord>): ExecutionRecord {
   return { ...rec, learning: { ...(rec.learning ?? { recorded: false }), ...learning } };
+}
+
+// ---------------------------------------------------------------------------
+// Lifecycle accumulators — move the record forward through its lifecycle.
+// ---------------------------------------------------------------------------
+
+/** Advance the record to a new pipeline stage (immutable). */
+export function setStage(rec: ExecutionRecord, stage: ExecutionStage): ExecutionRecord {
+  return { ...rec, stage };
+}
+
+/**
+ * Set the lifecycle status and/or terminal result (immutable). Used to finalize a
+ * record (e.g. `{ status: 'completed', result: 'healed' }`) without touching the
+ * accumulated lifecycle sections.
+ */
+export function setLifecycle(
+  rec: ExecutionRecord,
+  next: { status?: ExecutionLifecycleStatus; result?: ExecutionResult | null; stage?: ExecutionStage },
+): ExecutionRecord {
+  return {
+    ...rec,
+    status: next.status ?? rec.status,
+    result: next.result !== undefined ? next.result : rec.result,
+    stage: next.stage ?? rec.stage,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Back-compat coercion — v2 records persisted `status` as the OUTCOME
+// ('passed'|'failed'|'timedout'|'skipped') with no `result`/`stage`/`jobId`.
+// On read, normalize them into the v3 split so downstream consumers (timeline,
+// dashboard) can rely on `status` (lifecycle) + `result` (outcome) uniformly.
+// ---------------------------------------------------------------------------
+
+/** Legacy v2 outcome values that used to live in `status`. */
+type LegacyStatus = 'passed' | 'failed' | 'timedout' | 'skipped';
+
+const LEGACY_STATUS_MAP: Record<LegacyStatus, { status: ExecutionLifecycleStatus; result: ExecutionResult }> = {
+  passed: { status: 'completed', result: 'pass' },
+  failed: { status: 'completed', result: 'fail' },
+  timedout: { status: 'timed_out', result: 'fail' },
+  skipped: { status: 'completed', result: 'skipped' },
+};
+
+/**
+ * Normalize a persisted record into the current v3 lifecycle shape. v3+ records
+ * pass through unchanged; legacy v2 records (where `status` held the outcome) are
+ * mapped into `{ status, result, stage }`. Safe to call on any record.
+ */
+export function coerceLegacyRecord(rec: ExecutionRecord): ExecutionRecord {
+  if (!rec) return rec;
+  const legacy = LEGACY_STATUS_MAP[rec.status as unknown as LegacyStatus];
+  if (!legacy) {
+    // Already a v3 lifecycle status — only fill in defaults for missing fields.
+    return {
+      ...rec,
+      result: rec.result ?? null,
+      stage: rec.stage ?? (isTerminalStatus(rec.status) ? 'completed' : 'executing'),
+      jobId: rec.jobId ?? null,
+    };
+  }
+  return {
+    ...rec,
+    status: legacy.status,
+    // Prefer an explicit healed result if the record already carried healing that held up.
+    result:
+      rec.result ??
+      (rec.healing && rec.validation?.passedAfterHealing ? 'healed' : legacy.result),
+    stage: rec.stage ?? 'completed',
+    jobId: rec.jobId ?? null,
+  };
+}
+
+/** True when a lifecycle status is terminal (no further transitions expected). */
+export function isTerminalStatus(status: ExecutionLifecycleStatus): boolean {
+  return status === 'completed' || status === 'failed' || status === 'cancelled' || status === 'timed_out';
 }

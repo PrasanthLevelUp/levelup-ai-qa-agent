@@ -18,6 +18,7 @@ import {
   DEFAULT_EXECUTION_SETTINGS,
 } from '../core/execution/execution-settings';
 import type { ExecutionRecord } from '../core/execution/execution-record';
+import { coerceLegacyRecord } from '../core/execution/execution-record';
 
 // Re-export execution domain models so existing `from '../db/postgres'` imports
 // keep working during/after the refactor. The models are OWNED by
@@ -42,6 +43,9 @@ export {
   type HealingDecisionRecord,
   type ValidationRecord,
   type LearningRecord,
+  type ExecutionLifecycleStatus,
+  type ExecutionResult,
+  type ExecutionStage,
   EXECUTION_RECORD_SCHEMA_VERSION,
   createExecutionRecord,
   recordArtifacts,
@@ -50,6 +54,10 @@ export {
   recordHealingDecision,
   recordValidation,
   recordLearning,
+  setStage,
+  setLifecycle,
+  coerceLegacyRecord,
+  isTerminalStatus,
 } from '../core/execution/execution-record';
 
 const MOD = 'postgres';
@@ -1872,6 +1880,23 @@ async function migrateDefaultCompany(client: PoolClient): Promise<void> {
   await safeExec(client, 'idx_execution_records_scope',
     `CREATE INDEX IF NOT EXISTS idx_execution_records_scope
        ON execution_records(COALESCE(company_id, 0), COALESCE(project_id, 0), created_at DESC)`);
+  // v3: split lifecycle STATUS from test RESULT, add fine-grained STAGE, and store
+  // the owning job_id (repository metadata is resolved THROUGH the job rather than
+  // duplicated onto every record). Additive columns — legacy rows read back via
+  // coerceLegacyRecord at the application layer.
+  await safeExec(client, 'execution_records_v3_cols', `DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='execution_records' AND column_name='result') THEN
+      ALTER TABLE execution_records ADD COLUMN result TEXT;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='execution_records' AND column_name='stage') THEN
+      ALTER TABLE execution_records ADD COLUMN stage TEXT;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='execution_records' AND column_name='job_id') THEN
+      ALTER TABLE execution_records ADD COLUMN job_id TEXT;
+    END IF;
+  END $$`);
+  await safeExec(client, 'idx_execution_records_job',
+    `CREATE INDEX IF NOT EXISTS idx_execution_records_job ON execution_records(job_id)`);
 
   // ── Crawl snapshots (proactive script maintenance: change detection) ──
   // Stores a lightweight, versioned "signature" of each crawl so we can diff
@@ -7294,17 +7319,21 @@ export async function saveExecutionRecord(
   try {
     await pool.query(
       `INSERT INTO execution_records
-         (execution_id, company_id, project_id, test_name, status, profile, schema_version, record, created_at, updated_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, NOW(), NOW())
+         (execution_id, company_id, project_id, test_name, status, result, stage, job_id, profile, schema_version, record, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, NOW(), NOW())
        ON CONFLICT (execution_id)
-       DO UPDATE SET record = $8::jsonb, status = $5, test_name = $4, profile = $6,
-                     schema_version = $7, updated_at = NOW()`,
+       DO UPDATE SET record = $11::jsonb, status = $5, result = $6, stage = $7,
+                     job_id = $8, test_name = $4, profile = $9,
+                     schema_version = $10, updated_at = NOW()`,
       [
         record.executionId,
         companyId ?? null,
         projectId ?? null,
         record.testName,
         record.status,
+        record.result ?? null,
+        record.stage ?? null,
+        record.jobId ?? null,
         record.profile,
         record.schemaVersion,
         JSON.stringify(record),
@@ -7314,6 +7343,35 @@ export async function saveExecutionRecord(
     if (err?.code === '42P01' || err?.message?.includes('does not exist')) {
       logger.warn(MOD, 'execution_records table missing — skipping persist', { executionId: record.executionId });
       return;
+    }
+    // Partially-migrated DB (v3 columns not added yet): fall back to the legacy
+    // column set. The full record (incl. result/stage/jobId) still persists in the
+    // JSONB `record` document, so no data is lost — only the denormalized columns.
+    if (err?.code === '42703') {
+      try {
+        await pool.query(
+          `INSERT INTO execution_records
+             (execution_id, company_id, project_id, test_name, status, profile, schema_version, record, created_at, updated_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, NOW(), NOW())
+           ON CONFLICT (execution_id)
+           DO UPDATE SET record = $8::jsonb, status = $5, test_name = $4, profile = $6,
+                         schema_version = $7, updated_at = NOW()`,
+          [
+            record.executionId,
+            companyId ?? null,
+            projectId ?? null,
+            record.testName,
+            record.status,
+            record.profile,
+            record.schemaVersion,
+            JSON.stringify(record),
+          ]
+        );
+        return;
+      } catch (fallbackErr: any) {
+        if (fallbackErr?.code === '42P01') return;
+        throw fallbackErr;
+      }
     }
     throw err;
   }
@@ -7327,7 +7385,8 @@ export async function getExecutionRecord(executionId: string): Promise<Execution
       `SELECT record FROM execution_records WHERE execution_id = $1 LIMIT 1`,
       [executionId]
     );
-    return (r.rows[0]?.record as ExecutionRecord) ?? null;
+    const raw = r.rows[0]?.record as ExecutionRecord | undefined;
+    return raw ? coerceLegacyRecord(raw) : null;
   } catch (err: any) {
     if (err?.code === '42P01' || err?.message?.includes('does not exist')) {
       return null;
@@ -7350,7 +7409,7 @@ export async function listExecutionRecords(
        LIMIT $3`,
       [companyId ?? null, projectId ?? null, limit]
     );
-    return r.rows.map((row) => row.record as ExecutionRecord);
+    return r.rows.map((row) => coerceLegacyRecord(row.record as ExecutionRecord));
   } catch (err: any) {
     if (err?.code === '42P01' || err?.message?.includes('does not exist')) {
       return [];

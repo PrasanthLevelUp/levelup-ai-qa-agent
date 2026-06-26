@@ -25,7 +25,7 @@ import { initDb, closeDb, getDatabaseHealth } from '../db/postgres';
 
 // Import healing pipeline components
 import { ExecutionEngine } from '../core/execution-engine';
-import { ArtifactCollector, extractTopLevelErrors } from '../core/artifact-collector';
+import { ArtifactCollector, extractTopLevelErrors, enumerateAllTests, type EnumeratedTest } from '../core/artifact-collector';
 import { FailureAnalyzer } from '../core/failure-analyzer';
 import { HealingOrchestrator, pageObjectPatchLogFields, type HealingOutcome } from '../core/healing-orchestrator';
 import { HealingStrategySelector, type StrategyConfig } from '../core/healing-strategy-selector';
@@ -41,8 +41,15 @@ import {
   recordHealingDecision,
   recordValidation,
   recordLearning,
+  setStage,
+  setLifecycle,
   type ExecutionRecord,
 } from '../core/execution/execution-record';
+import {
+  deriveResult,
+  assertOneRecordPerTest,
+  summarizeResultCounts,
+} from '../core/execution/execution-lifecycle';
 import {
   mapEvidenceToObservations,
   mapDiagnosisToRecord,
@@ -144,6 +151,82 @@ import {
 import type { HealingJob } from './queue/job-queue';
 
 const MOD = 'api-server';
+
+// ---------------------------------------------------------------------------
+// Execution Record lifecycle helpers (Phase 1: 1 test = 1 ExecutionRecord)
+// ---------------------------------------------------------------------------
+
+/** URL/id-safe slug of a test name, for synthetic execution ids of non-failing tests. */
+function slugTestName(name: string): string {
+  return String(name)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 80) || 'test';
+}
+
+/**
+ * Synthetic, deterministic execution id for a test that did NOT go through the
+ * failure pipeline (passes/skips). Keyed by job so reruns of the same job upsert
+ * in place (never duplicated). Failing tests keep their numeric logExecution id.
+ */
+function syntheticExecutionId(jobId: string | number, testName: string): string {
+  return `${jobId}:${slugTestName(testName)}`;
+}
+
+/**
+ * Build a canonical ExecutionRecord for a NON-failing test (pass/skip) enumerated
+ * from the Playwright results. These tests never enter the healing pipeline, so we
+ * create them already finalized: a terminal lifecycle status + result, stage
+ * `completed`, no diagnosis/healing sections. The owning job carries the
+ * repository metadata (we only store `jobId`).
+ */
+function buildNonFailureRecord(
+  test: EnumeratedTest,
+  jobId: string | number,
+  profile: ExecutionRecord['profile'],
+): ExecutionRecord {
+  const { status, result } = deriveResult(test.status);
+  const endMs = Date.now();
+  const durationMs = Number.isFinite(test.durationMs) ? Math.max(0, test.durationMs) : 0;
+  const startIso = new Date(endMs - durationMs).toISOString();
+  const endIso = new Date(endMs).toISOString();
+  return createExecutionRecord({
+    executionId: syntheticExecutionId(jobId, test.testName),
+    testName: test.testName,
+    status,
+    result,
+    stage: 'completed',
+    jobId: String(jobId),
+    durationMs,
+    startTime: startIso,
+    endTime: endIso,
+    profile,
+  });
+}
+
+/**
+ * Persist an ExecutionRecord without ever throwing into the worker. The canonical
+ * record is important but must never crash a healing job — failures are logged and
+ * swallowed (the same contract the worker already used for the failing-test path).
+ */
+async function persistExecutionRecordSafe(
+  record: ExecutionRecord,
+  companyId?: number,
+  projectId?: number,
+): Promise<boolean> {
+  try {
+    await saveExecutionRecord(record, companyId, projectId);
+    return true;
+  } catch (err) {
+    logger.warn(MOD, 'Failed to persist Execution Record (non-blocking)', {
+      executionId: record.executionId,
+      testName: record.testName,
+      error: (err as Error).message,
+    });
+    return false;
+  }
+}
 
 export function createServer(): express.Application {
   const app = express();
@@ -586,8 +669,38 @@ function createHealingWorker(
         }
       }
 
+      // ── Canonical Execution Records for an all-pass run ──
+      // Historically a clean run produced ZERO per-test records (records were
+      // created only inside the failure loop), so "Executions" silently dropped
+      // every passing test. Create one finalized PASS/SKIP record per enumerated
+      // test so the invariant (1 test = 1 record) holds even when nothing fails.
+      let passSkipRecorded = 0;
+      if (run.exitCode === 0) {
+        try {
+          const universe = enumerateAllTests(run.resultsFile);
+          // Resolve project scope (records are project-scoped); best-effort.
+          let projectIdForRecords: number | undefined = job.projectId;
+          if (!projectIdForRecords) {
+            const pid = await getProjectIdForRepo(repoUrl || repo?.url || job.repositoryId, job.companyId);
+            projectIdForRecords = pid ?? undefined;
+          }
+          for (const t of universe) {
+            const rec = buildNonFailureRecord(t, job.id, executionProfile);
+            const ok = await persistExecutionRecordSafe(rec, job.companyId, projectIdForRecords);
+            if (ok) passSkipRecorded++;
+          }
+          logger.info(MOD, 'All-pass run — persisted per-test Execution Records', {
+            jobId: job.id, tests: universe.length, recorded: passSkipRecorded,
+          });
+        } catch (recErr) {
+          logger.warn(MOD, 'Failed to persist all-pass Execution Records (non-blocking)', {
+            jobId: job.id, error: (recErr as Error).message,
+          });
+        }
+      }
+
       const result = {
-        totalTests: run.exitCode === 0 ? 1 : 0,
+        totalTests: run.exitCode === 0 ? Math.max(passSkipRecorded, 1) : 0,
         failed: run.exitCode !== 0 ? 1 : 0,
         healed: 0,
         strategy: 'none',
@@ -674,6 +787,10 @@ function createHealingWorker(
     const healings: ReportHealing[] = [];
     const tests: ReportTest[] = [];
     const rcaResults: RCAResult[] = [];
+    // Track which test names already produced an ExecutionRecord this job so we can
+    // backfill PASS/SKIP records for the rest after the failure loop — and assert
+    // the 1-test = 1-record invariant. (Failures + precheck-healed add to this.)
+    const recordedTests = new Set<string>();
     // Per-failure 3-layer healing trail (observability): records what each healing
     // layer tried and why it succeeded/failed — even when nothing was healable.
     const healingTrails: HealingTrail[] = [];
@@ -752,6 +869,23 @@ function createHealingWorker(
           healing_attempted: false,
           healing_succeeded: true,
         }, job.companyId);
+        // Canonical record: this test was healed by a PRIOR test's fix (shared
+        // locator). It completed with a HEALED result without its own healing
+        // pipeline — record it once so the invariant holds.
+        const precheckHealedRec = createExecutionRecord({
+          executionId: String(execId),
+          testName: failure.testName,
+          status: 'completed',
+          result: 'healed',
+          stage: 'completed',
+          jobId: String(job.id),
+          durationMs: preCheck.durationMs,
+          startTime: new Date(testStartMs).toISOString(),
+          endTime: new Date(testStartMs + preCheck.durationMs).toISOString(),
+          profile: executionProfile,
+        });
+        await persistExecutionRecordSafe(precheckHealedRec, job.companyId, resolvedProjectId);
+        recordedTests.add(failure.testName);
         continue;
       }
 
@@ -797,19 +931,28 @@ function createHealingWorker(
       // ── Canonical Execution Record ──
       // One record per failing test, threaded through the whole pipeline:
       //   Execution → Diagnosis → Healing → Validation → Learning.
-      // The dashboard reads THIS single record rather than stitching together
-      // separate diagnosis/healing/evidence/artifact tables. Lifecycle sections
-      // are accumulated immutably (each record* returns a new record) and the
-      // final record is persisted once at the end of this test's iteration.
+      // The record is born at test START as RUNNING (stage `diagnosing`) and
+      // persisted immediately, then enriched stage-by-stage and finalized with a
+      // terminal status + result. The dashboard reads THIS single record rather
+      // than stitching together separate diagnosis/healing/evidence/artifact
+      // tables. Lifecycle sections accumulate immutably (each record* returns a
+      // new record); the record is upserted in place (never duplicated).
       let execRecord: ExecutionRecord = createExecutionRecord({
         executionId: String(executionId),
         testName: failure.testName,
-        status: 'failed',
+        status: 'running',
+        result: null,
+        stage: 'diagnosing',
+        jobId: String(job.id),
         durationMs: 0,
         startTime: new Date(testStartMs).toISOString(),
         endTime: new Date(testStartMs).toISOString(),
         profile: executionProfile,
       });
+      recordedTests.add(failure.testName);
+      // Persist the RUNNING record up-front so an in-flight execution is visible
+      // (and so a crash mid-heal still leaves a record rather than nothing).
+      await persistExecutionRecordSafe(execRecord, job.companyId, resolvedProjectId);
       // Stage 1 — artifacts captured by the failing run (storage-agnostic
       // descriptors, local today). Inline metadata stays cheap/structured.
       execRecord = recordArtifacts(execRecord, {
@@ -891,6 +1034,8 @@ function createHealingWorker(
       if (failure.diagnosis && !execRecord.diagnosis) {
         execRecord = recordDiagnosis(execRecord, mapDiagnosisToRecord(failure.diagnosis));
       }
+      // Diagnosis done — advance the lifecycle stage to `healing`.
+      execRecord = setStage(execRecord, 'healing');
 
       // Observability: build a concise trail for this failure regardless of
       // whether anything is healable. Finalized after the healing branches.
@@ -1739,19 +1884,30 @@ function createHealingWorker(
           recorded: !!(healingForTest?.success),
           domMemoryUpdated: !!(healingForTest?.success),
         });
-        // Promote final status + timing, then persist the single record.
+        // Finalize the lifecycle: STATUS reflects HOW the run ended (completed
+        // normally, cancelled by the user, or stopped by the time budget) while
+        // RESULT reflects the OUTCOME (healed vs fail). Kept strictly separate.
         const testEndMs = Date.now();
+        const healed = iterationSuccess;
+        const cancelled = isCancelled();
+        const timedOut = !healed && (testBudgetExhausted() || jobBudgetExhausted());
+        execRecord = setStage(execRecord, 'learning');
+        execRecord = setLifecycle(execRecord, {
+          status: cancelled ? 'cancelled' : timedOut ? 'timed_out' : 'completed',
+          result: healed ? 'healed' : 'fail',
+          stage: 'completed',
+        });
         execRecord = {
           ...execRecord,
-          status: iterationSuccess ? 'passed' : 'failed',
           durationMs: testEndMs - testStartMs,
           endTime: new Date(testEndMs).toISOString(),
         };
-        await saveExecutionRecord(execRecord, job.companyId, resolvedProjectId);
+        await persistExecutionRecordSafe(execRecord, job.companyId, resolvedProjectId);
         logger.info(MOD, 'Execution Record persisted', {
           executionId: execRecord.executionId,
           testName: execRecord.testName,
           status: execRecord.status,
+          result: execRecord.result,
           healed: !!healingForTest?.success,
         });
       } catch (recErr) {
@@ -1849,6 +2005,46 @@ function createHealingWorker(
           });
         }
       }
+    }
+
+    // ── Backfill PASS/SKIP Execution Records for the rest of the run ──
+    // The failure loop above recorded every failing/healed test. Now create one
+    // finalized record for every OTHER test in the run (passes + skips) so the
+    // canonical store reflects the full run — exactly one record per test. Then
+    // assert the invariant and reconcile counts against the legacy job totals.
+    try {
+      const universe: EnumeratedTest[] = enumerateAllTests(run.resultsFile);
+      for (const t of universe) {
+        if (recordedTests.has(t.testName)) continue; // already recorded by the failure loop
+        const rec = buildNonFailureRecord(t, job.id, executionProfile);
+        const ok = await persistExecutionRecordSafe(rec, job.companyId, resolvedProjectId);
+        if (ok) recordedTests.add(t.testName);
+      }
+
+      // Invariant: exactly one ExecutionRecord per test in the run universe.
+      const recordedList = Array.from(recordedTests).map((testName) => ({ testName }));
+      const invariant = assertOneRecordPerTest(recordedList, universe);
+      if (!invariant.ok) {
+        logger.warn(MOD, '⚠️ ExecutionRecord invariant violated (1 test = 1 record)', {
+          jobId: job.id,
+          violations: invariant.violations.slice(0, 20),
+        });
+      }
+      // Parity: reconcile aggregated record results with the legacy job tallies.
+      const counts = summarizeResultCounts(
+        universe.map((t) => ({ result: deriveResult(t.status).result })),
+      );
+      logger.info(MOD, 'ExecutionRecord parity check', {
+        jobId: job.id,
+        universeTests: universe.length,
+        recordedTests: recordedTests.size,
+        resultCounts: counts,
+        invariantOk: invariant.ok,
+      });
+    } catch (backfillErr) {
+      logger.warn(MOD, 'Failed to backfill/verify Execution Records (non-blocking)', {
+        jobId: job.id, error: (backfillErr as Error).message,
+      });
     }
 
     // --- GitHub PR Automation ---

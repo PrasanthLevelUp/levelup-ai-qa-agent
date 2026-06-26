@@ -61,7 +61,7 @@ describe('buildExecutionTimeline', () => {
     rec = recordHealingDecision(rec, { appliedStrategy: 'rule_based', newLocator: '#login-btn' });
     rec = recordValidation(rec, { reran: true, passedAfterHealing: true });
     rec = recordLearning(rec, { recorded: true, domMemoryUpdated: true });
-    rec = { ...rec, status: 'passed' };
+    rec = { ...rec, status: 'completed', result: 'healed' };
 
     const tl = buildExecutionTimeline(rec);
     const keys = tl.map((e) => e.key);

@@ -12,7 +12,7 @@
  * not invented per-step timestamps). Capturing true per-action timing would need
  * richer execution instrumentation, which is deliberately out of scope here.
  */
-import type { ExecutionRecord } from './execution-record';
+import { coerceLegacyRecord, type ExecutionRecord } from './execution-record';
 
 /** Outcome marker for a timeline event (drives the icon/colour in the UI). */
 export type TimelineEventStatus = 'done' | 'failed' | 'skipped' | 'info';
@@ -35,7 +35,10 @@ export interface TimelineEvent {
  * the record actually has data for them, so an un-diagnosed/un-healed run yields
  * a shorter, honest timeline.
  */
-export function buildExecutionTimeline(record: ExecutionRecord): TimelineEvent[] {
+export function buildExecutionTimeline(input: ExecutionRecord): TimelineEvent[] {
+  // Normalize legacy (v2) records so we can reason about the {status, result}
+  // split uniformly. v3+ records pass through unchanged.
+  const record = coerceLegacyRecord(input);
   const events: TimelineEvent[] = [];
 
   // 1) Execution started.
@@ -47,18 +50,38 @@ export function buildExecutionTimeline(record: ExecutionRecord): TimelineEvent[]
     time: record.startTime,
   });
 
-  // 2) Outcome of the run itself.
-  const failed = record.status === 'failed' || record.status === 'timedout';
-  events.push({
-    key: 'run_result',
-    label: failed
-      ? (record.status === 'timedout' ? 'Test timed out' : 'Test failed')
-      : (record.status === 'skipped' ? 'Test skipped' : 'Test passed'),
-    status: failed ? 'failed' : (record.status === 'skipped' ? 'skipped' : 'done'),
-    detail: record.artifacts?.metadata?.locator
+  // 2) Outcome of the run itself — driven by RESULT (the test outcome), not the
+  // lifecycle status. A record still in flight (no terminal result) shows as
+  // "running" rather than a misleading pass/fail.
+  const result = record.result ?? null;
+  const timedOut = record.status === 'timed_out';
+  const runEvent: TimelineEvent = (() => {
+    const detail = record.artifacts?.metadata?.locator
       ? `at ${record.artifacts.metadata.locator}`
-      : undefined,
-  });
+      : undefined;
+    if (result === null) {
+      return { key: 'run_result', label: 'Test running', status: 'info' as const, detail };
+    }
+    if (result === 'skipped') {
+      return { key: 'run_result', label: 'Test skipped', status: 'skipped' as const, detail };
+    }
+    if (result === 'fail') {
+      return {
+        key: 'run_result',
+        label: timedOut ? 'Test timed out' : 'Test failed',
+        status: 'failed' as const,
+        detail,
+      };
+    }
+    // pass or healed
+    return {
+      key: 'run_result',
+      label: result === 'healed' ? 'Test healed' : 'Test passed',
+      status: 'done' as const,
+      detail,
+    };
+  })();
+  events.push(runEvent);
 
   // 3) Evidence collected (observations present).
   if (record.observations) {
