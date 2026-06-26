@@ -25,6 +25,7 @@ import { logger } from '../../utils/logger';
 import { recordRunAsExecutions } from '../../core/execution/record-run-executions';
 import { getProjectIdForRepo } from '../../db/postgres';
 import { isExecutionProfile } from '../../core/execution/execution-profile';
+import { runHealingEnvironmentDiagnostic } from '../../core/diagnostics/healing-environment-diagnostic';
 
 const MOD = 'github-actions-routes';
 
@@ -56,6 +57,51 @@ function resolveOwnerRepo(
 export function createGitHubActionsRouter(): Router {
   const router = Router();
   const github = new GitHubService();
+
+  /* ── Healing environment diagnostic ─────────────────────────────────
+   * GET /api/github/actions/diagnose?repoUrl=github.com/Owner/Repo.git[&branch=main][&testFile=foo.spec.ts]
+   *
+   * Runs the real healing toolchain (env probe → xvfb smoke → clone → install →
+   * playwright --list → execute one spec) INSIDE this container and returns a
+   * stage-by-stage report. Use this to see exactly WHY healing fails in prod
+   * instead of inferring it from the UI. Read-only: clones to a temp dir and
+   * cleans up. The GitHub token is used for cloning but never returned/logged.
+   */
+  router.get('/diagnose', async (req: Request, res: Response) => {
+    try {
+      const companyId = (req as any).companyId as number | undefined;
+      const userId = (req as any).userId as number | undefined;
+      const target = resolveOwnerRepo(req.query, res);
+      if (!target) return;
+
+      const branch = req.query.branch ? String(req.query.branch) : 'main';
+      const testFile = req.query.testFile ? String(req.query.testFile) : undefined;
+
+      // Best-effort token for private repos; diagnostic still runs for public.
+      let token: string | null = null;
+      try {
+        token = await github.getToken(companyId, userId);
+      } catch {
+        token = null;
+      }
+
+      logger.info(MOD, 'GET /diagnose start', { owner: target.owner, repo: target.repo, branch, hasToken: !!token });
+      const report = await runHealingEnvironmentDiagnostic({
+        owner: target.owner,
+        repo: target.repo,
+        branch,
+        token,
+        testFile,
+      });
+      logger.info(MOD, 'GET /diagnose done', { ok: report.ok, verdict: report.verdict, durationMs: report.totalDurationMs });
+
+      // 200 even when ok=false: the diagnostic SUCCEEDED at finding the problem.
+      res.json({ success: true, data: report });
+    } catch (err: any) {
+      logger.error(MOD, 'GET /diagnose error', { error: err.message });
+      res.status(500).json({ success: false, error: err?.message || 'Diagnostic failed to run' });
+    }
+  });
 
   /* ── List workflows ─────────────────────────────────────────────── */
   router.get('/workflows', async (req: Request, res: Response) => {
