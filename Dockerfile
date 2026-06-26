@@ -10,7 +10,16 @@ FROM mcr.microsoft.com/playwright:v1.59.1-jammy
 # headless container (otherwise Chromium crashes at startup with
 # "Missing X server or $DISPLAY" — a ~800ms exit 1 with no results file).
 # Install it explicitly so ExecutionEngine.hasXvfb() resolves true here.
-RUN apt-get update && apt-get install -y --no-install-recommends xvfb \
+#
+# CRITICAL: `xvfb-run` is a shell wrapper that shells out to `xauth` to create
+# the X authority cookie. If `xauth` is missing, `xvfb-run -a <cmd>` aborts with
+# `xvfb-run: error: xauth command not found` and a NON-ZERO exit BEFORE the
+# wrapped Playwright command ever runs — so no test executes and no
+# test-results.json is written. During healing this makes EVERY rerun fail to
+# confirm, and the applied fix is silently reverted ("Report only — rerun still
+# failed"). `xauth` is NOT guaranteed on the base image, so install it alongside
+# xvfb explicitly.
+RUN apt-get update && apt-get install -y --no-install-recommends xvfb xauth \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

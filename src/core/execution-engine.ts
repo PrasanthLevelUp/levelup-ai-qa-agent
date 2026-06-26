@@ -201,6 +201,7 @@ export class ExecutionEngine {
    */
   static async runTests(repoPath: string, testFile?: string): Promise<RunResult> {
     const resultsFile = path.join(repoPath, 'test-results.json');
+    ExecutionEngine.clearStaleResults(resultsFile);
     const startTime = new Date().toISOString();
     const start = Date.now();
 
@@ -255,18 +256,58 @@ export class ExecutionEngine {
   }
 
   /**
-   * Detect whether `xvfb-run` is available on the host. When present we wrap the
-   * Playwright command with it so customer configs that use `headless: false`
-   * (no `$DISPLAY` in a CI/Docker runner) still launch a browser instead of
-   * crashing at startup with "Missing X server or $DISPLAY".
+   * Detect whether we can SAFELY wrap the Playwright command in `xvfb-run`. When
+   * usable we wrap so customer configs that use `headless: false` (no `$DISPLAY`
+   * in a CI/Docker runner) still launch a browser instead of crashing at startup
+   * with "Missing X server or $DISPLAY".
+   *
+   * IMPORTANT: we require BOTH `xvfb-run` AND `xauth`. `xvfb-run` is a shell
+   * wrapper that shells out to `xauth` to mint the X authority cookie; if `xauth`
+   * is missing it aborts with `xvfb-run: error: xauth command not found` and a
+   * non-zero exit BEFORE the wrapped command runs — no test executes, no
+   * test-results.json is written, and every healing rerun fails to confirm
+   * (silent revert → "Report only"). If `xauth` is absent we deliberately return
+   * false and run Playwright directly, which still works for the common headless
+   * case — strictly better than guaranteeing a pre-test crash.
    */
   private static hasXvfb(): boolean {
     try {
       const { execSync } = require('child_process');
       execSync('command -v xvfb-run', { stdio: 'ignore' });
+      execSync('command -v xauth', { stdio: 'ignore' });
       return true;
     } catch {
       return false;
+    }
+  }
+
+  /**
+   * Delete any pre-existing test-results.json BEFORE a run so we can never read a
+   * STALE report.
+   *
+   * Why this is critical for healing: the heal loop runs the spec, applies a
+   * candidate, then RERUNS the spec and reads test-results.json to confirm the
+   * fix. If that rerun ever exits BEFORE Playwright writes its JSON report — e.g.
+   * a launcher crash like `xvfb-run: xauth command not found`, an OOM kill, or any
+   * non-zero exit before the reporter initialises — the OLD report is left on
+   * disk. The confirm step then parses the PREVIOUS result:
+   *   • stale PASS  → a still-broken locator is falsely confirmed as healed; or
+   *   • stale FAIL  → a genuinely healed locator is falsely reverted ("Report
+   *     only — rerun still failed"), which is exactly the symptom users hit.
+   * Removing the file up front turns "silently read stale data" into the honest,
+   * detectable "no results file produced", which the callers already handle via
+   * their stdout-JSON fallback and existence checks.
+   */
+  private static clearStaleResults(resultsFile: string): void {
+    try {
+      if (fs.existsSync(resultsFile)) {
+        fs.unlinkSync(resultsFile);
+      }
+    } catch (err: any) {
+      logger.warn(MOD, 'Could not remove stale test-results.json before run', {
+        resultsFile,
+        error: err?.message,
+      });
     }
   }
 
@@ -297,6 +338,7 @@ export class ExecutionEngine {
   ): RunResult {
     const { execSync } = require('child_process');
     const resultsFile = path.join(repoPath, 'test-results.json');
+    ExecutionEngine.clearStaleResults(resultsFile);
     const startTime = new Date().toISOString();
     const start = Date.now();
 
@@ -419,6 +461,7 @@ export class ExecutionEngine {
   ): Promise<RunResult> {
     const { spawn } = require('child_process');
     const resultsFile = path.join(repoPath, 'test-results.json');
+    ExecutionEngine.clearStaleResults(resultsFile);
     const startTime = new Date().toISOString();
     const start = Date.now();
 
