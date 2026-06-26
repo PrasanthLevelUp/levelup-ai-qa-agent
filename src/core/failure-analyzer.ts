@@ -5,6 +5,7 @@
 
 import { logger } from '../utils/logger';
 import type { ArtifactCollection } from './artifact-collector';
+import { classifyFailure, type FailureDiagnosis } from './failure-classifier';
 
 const MOD = 'failure-analyzer';
 
@@ -24,6 +25,12 @@ export interface FailureDetails {
   url: string | null;
   timestamp: string;
   isTimingIssue: boolean;
+  /**
+   * Diagnosis-first structured classification of WHAT failed. Populated by the
+   * Failure Classifier so downstream stages (strategy router, advisors, trail,
+   * UI) reason about a real diagnosis instead of jumping to a locator swap.
+   */
+  diagnosis?: FailureDiagnosis;
 }
 
 /**
@@ -140,11 +147,36 @@ export class FailureAnalyzer {
       isTimingIssue: isTimingIssue(artifact.error_message),
     };
 
+    // Diagnosis-first: classify WHAT failed before anything downstream decides
+    // HOW (or whether) to heal. Pass any Page-Object locator resolution so a
+    // field-reference failure is diagnosed against its real selector.
+    const po = artifact.page_object_resolution;
+    details.diagnosis = classifyFailure({
+      failure: details,
+      pageObject: po
+        ? {
+            resolvedLocator: po.resolvedLocator,
+            fieldName: po.fieldName,
+            action: po.action,
+            builder: po.builder,
+          }
+        : null,
+    });
+
+    // If the inline locator was empty but we resolved one from the Page Object,
+    // surface it as the failed locator so grounded healing layers aren't starved.
+    if (!details.failedLocator && details.diagnosis.locator) {
+      details.failedLocator = details.diagnosis.locator;
+    }
+
     logger.info(MOD, 'Failure analyzed', {
       testName: details.testName,
       failureType: details.failureType,
       failedLocator: details.failedLocator,
       isTimingIssue: details.isTimingIssue,
+      diagnosisCategory: details.diagnosis.category,
+      diagnosisConfidence: details.diagnosis.confidence,
+      healableByLocatorSwap: details.diagnosis.healableByLocatorSwap,
     });
 
     return details;

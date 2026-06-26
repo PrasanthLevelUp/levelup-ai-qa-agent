@@ -78,6 +78,25 @@ function detectElementContext(locator: string, errorMessage: string): ElementCon
   return 'generic';
 }
 
+/**
+ * Build a structured LocatorInfo from a known raw locator string. Used when the
+ * locator was recovered from a Page Object field reference (not parsed out of the
+ * error message), so the diagnosis/healing layers receive the same shape they
+ * would from `extractLocator`.
+ */
+export function buildLocatorInfo(rawLocator: string, errorMessage = ''): LocatorInfo | null {
+  const raw = (rawLocator || '').trim();
+  if (!raw) return null;
+  const locatorType = detectLocatorType(raw);
+  return {
+    rawLocator: raw,
+    locatorType,
+    elementContext: detectElementContext(raw, errorMessage),
+    selectorValue: raw,
+    isSemanticLocator: ['role', 'text', 'label', 'placeholder', 'testid'].includes(locatorType),
+  };
+}
+
 export function extractLocator(errorMessage: string): LocatorInfo | null {
   for (const entry of LOCATOR_PATTERNS) {
     const { pattern, group } = entry;

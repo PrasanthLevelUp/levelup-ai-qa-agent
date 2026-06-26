@@ -29,6 +29,7 @@ import { ArtifactCollector, extractTopLevelErrors } from '../core/artifact-colle
 import { FailureAnalyzer } from '../core/failure-analyzer';
 import { HealingOrchestrator, pageObjectPatchLogFields, type HealingOutcome } from '../core/healing-orchestrator';
 import { HealingStrategySelector, type StrategyConfig } from '../core/healing-strategy-selector';
+import { routeHealingStrategy } from '../core/healing-strategy-router';
 import { RuleEngine } from '../engines/rule-engine';
 import { PatternEngine } from '../engines/pattern-engine';
 import { AIEngine } from '../engines/ai-engine';
@@ -720,7 +721,24 @@ function createHealingWorker(
 
       // Observability: build a concise 3-layer trail for this failure regardless
       // of whether anything is healable. Finalized after the healing branches.
-      const trail = new HealingTrailBuilder(failure.testName, failure.failureType);
+      const trail = new HealingTrailBuilder(failure.testName, failure.failureType, failure.diagnosis);
+
+      // ── Diagnosis-first strategy routing ──
+      // Map the structured diagnosis ("WHAT failed") to a remedy ("HOW / whether
+      // to heal"). This is the gate that stops the engine from prescribing a
+      // locator swap before it has confidently diagnosed a locator problem. The
+      // existing failureType branches below remain for navigation/assertion/
+      // timing handling; this plan adds the crucial guard for locator-typed
+      // failures that have NO resolvable locator (and for unclassified ones).
+      const strategyPlan = failure.diagnosis ? routeHealingStrategy(failure.diagnosis) : null;
+      if (strategyPlan) {
+        logger.info(MOD, 'Diagnosis-first strategy routed', {
+          testName: failure.testName,
+          category: strategyPlan.category,
+          remedy: strategyPlan.remedy,
+          shouldAttemptLocatorHealing: strategyPlan.shouldAttemptLocatorHealing,
+        });
+      }
 
       try {
         // Decide healing strategy based on failure type:
@@ -809,6 +827,24 @@ function createHealingWorker(
             restoreFile(failure.filePath);
           }
 
+          // Continue to RCA analysis below (skip the locator healing loop)
+        } else if (strategyPlan && !strategyPlan.shouldAttemptLocatorHealing) {
+          // ── Diagnosis-first gate ──
+          // The failure reached the locator branch by failureType, but the
+          // diagnosis says this is NOT a locator-swap candidate — e.g. a
+          // locator-typed failure whose selector could not be resolved, or an
+          // unclassified failure. Historically the engine would have entered the
+          // loop, starved every grounded advisor, let the AI hallucinate a
+          // selector, and then mislabel a valid locator as "broken". Instead we
+          // report an honest diagnosis and leave the test untouched.
+          logger.info(MOD, 'Diagnosis-first: not a locator-swap candidate — reporting instead of healing', {
+            testName: failure.testName,
+            category: strategyPlan.category,
+            remedy: strategyPlan.remedy,
+            failedLocator: failure.failedLocator,
+          });
+          trail.skip(strategyPlan.rationale);
+          restoreFile(failure.filePath);
           // Continue to RCA analysis below (skip the locator healing loop)
         } else {
 
