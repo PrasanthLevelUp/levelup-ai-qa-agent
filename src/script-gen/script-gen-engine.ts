@@ -35,6 +35,8 @@ import { analyzeRepoStructure, buildPageObjectFileName, buildSpecFileName } from
 import type { RepoStructureAnalysis } from './repo-analyzer';
 import {
   buildConventionProfile,
+  buildReuseCatalogue,
+  findReusablePageObject,
   resolveTestDataModulePath,
   resolveFixturePath,
   resolveHelperPath,
@@ -2010,7 +2012,11 @@ ${gotoB}${sessionLogin('pageB')}
     profile?: import('../context/types').RepositoryProfile,
     testDir = 'tests',
   ): Array<{ name: string; varName: string; filePath: string; methods: string[]; importPath: string; kind: string }> {
-    if (!profile?.pageObjects?.length) return [];
+    // ── Ask Repo Intelligence (Reuse Catalogue) for the reusable page objects ──
+    // Script Generation does not inspect the raw profile directly; it consumes the
+    // catalogue Repo Intelligence derived from the same scan (identical data).
+    const reusablePOs = buildReuseCatalogue(profile).pageObjects;
+    if (!reusablePOs.length) return [];
 
     const text = `${tc.title || ''} ${steps.join(' ')} ${tc.expected_result || ''}`.toLowerCase();
     // Map a semantic kind → keyword test + PO-name matcher.
@@ -2025,15 +2031,15 @@ ${gotoB}${sessionLogin('pageB')}
     const seen = new Set<string>();
     for (const k of kinds) {
       if (!k.inText.test(text)) continue;
-      const po = profile.pageObjects.find((p) => k.poName.test(p.name));
+      const po = reusablePOs.find((p) => k.poName.test(p.name));
       if (!po || seen.has(po.name)) continue;
       seen.add(po.name);
       out.push({
         name: po.name,
         varName: po.name.charAt(0).toLowerCase() + po.name.slice(1),
-        filePath: po.filePath,
-        methods: (po.methods || []).map((m) => m.name),
-        importPath: this.buildPageObjectImportPath(po.filePath, testDir),
+        filePath: po.path,
+        methods: po.methods || [],
+        importPath: this.buildPageObjectImportPath(po.path, testDir),
         kind: k.kind,
       });
     }
@@ -3742,20 +3748,16 @@ ${actionMethods}
    * Returns null when there is no connected repo or no confident match.
    */
   private findExistingPageObject(po: PageObjectSpec, config: GenerationConfig): ClassInfo | null {
-    const pageObjects = config.repoProfile?.pageObjects;
-    if (!Array.isArray(pageObjects) || pageObjects.length === 0) return null;
-
     try {
-      const wanted = this.normalizePageObjectName(po.name);
-      // 1) Exact normalized name match.
-      let hit = pageObjects.find(c => this.normalizePageObjectName(c.name) === wanted);
-      // 2) Containment match (LoginPage vs Login / SignInPage).
-      if (!hit) {
-        hit = pageObjects.find(c => {
-          const n = this.normalizePageObjectName(c.name);
-          return n.length > 2 && wanted.length > 2 && (n.includes(wanted) || wanted.includes(n));
-        });
-      }
+      // ── Ask Repo Intelligence (Reuse Catalogue), not the raw profile ──
+      // The convention profile owns "what already exists". We consult its reuse
+      // catalogue rather than inspecting config.repoProfile.pageObjects directly,
+      // so Script Generation stays a pure consumer. The catalogue mirrors the same
+      // scanned data, so reuse decisions are identical to before.
+      const conv = this.resolveConventions(config);
+      const reusable = findReusablePageObject(conv, po.name);
+      if (!reusable) return null;
+      const hit = reusable.raw;
       // Only reuse if the matched class actually exposes selectors we can use.
       if (hit && hit.properties.some(p => p.selector)) return hit;
       return null;
