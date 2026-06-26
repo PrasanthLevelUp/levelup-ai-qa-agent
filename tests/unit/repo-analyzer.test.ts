@@ -21,6 +21,8 @@ const flatProfile: RepositoryProfile = {
     pageObjectFolder: null,
     fixtureFolder: null,
     utilsFolder: null,
+    testDataFolder: null,
+    apiFolder: null,
     configFiles: ['playwright.config.ts'],
     supportFiles: [],
   },

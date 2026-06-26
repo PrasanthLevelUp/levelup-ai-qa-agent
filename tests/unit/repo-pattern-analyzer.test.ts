@@ -28,6 +28,8 @@ const baseProfile: RepositoryProfile = {
     pageObjectFolder: 'pages',
     fixtureFolder: 'fixtures',
     utilsFolder: 'utils',
+    testDataFolder: 'data',
+    apiFolder: null,
     configFiles: ['playwright.config.ts'],
     supportFiles: [],
   },

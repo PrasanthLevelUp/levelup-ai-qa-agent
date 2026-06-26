@@ -116,6 +116,8 @@ export interface FolderStructure {
   pageObjectFolder: string | null; // e.g. /pages, /page-objects, /pom
   fixtureFolder: string | null;    // e.g. /fixtures, /support
   utilsFolder: string | null;      // e.g. /utils, /helpers, /lib
+  testDataFolder: string | null;   // e.g. /data, /test-data, /tests/data, /fixtures/data
+  apiFolder: string | null;        // e.g. /api, /apis, /services, /endpoints
   configFiles: string[];           // playwright.config.ts, cypress.config.ts, etc.
   supportFiles: string[];          // setup/teardown files
 }
