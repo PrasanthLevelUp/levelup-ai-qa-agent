@@ -832,6 +832,30 @@ function createHealingWorker(
               candidateCount: appProfileHealing.candidates.length,
               topLocator: appProfileHealing.candidates[0]?.locator,
             });
+          } else {
+            // Critical observability: tell the user WHY App Profile returned empty.
+            // Without a crawl, we miss the strongest grounded selectors (data-test*, etc.).
+            if (!appProfileHealing.profileFound) {
+              logger.warn(MOD, 'Application Profile NOT found — crawl the app to get grounded data-test* selectors', {
+                testName: failure.testName,
+                url: failure.url,
+                hint: 'Create an Application Profile for this URL to unlock grounded healing from real DOM attributes',
+              });
+            } else if (appProfileHealing.elementsScanned === 0) {
+              logger.warn(MOD, 'Application Profile found but contains NO crawled elements', {
+                testName: failure.testName,
+                url: failure.url,
+                profileFound: true,
+              });
+            } else {
+              logger.info(MOD, 'Application Profile found but no element matched the failure', {
+                testName: failure.testName,
+                url: failure.url,
+                description: appProfileHealing.description,
+                elementsScanned: appProfileHealing.elementsScanned,
+                hint: 'The crawl exists but the failing element description did not match any crawled element',
+              });
+            }
           }
         } catch (err: any) {
           logger.warn(MOD, 'Application Profile healing build failed (non-critical)', { error: err?.message });
