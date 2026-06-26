@@ -5,12 +5,11 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
-import { execSync } from 'child_process';
 import { logger } from '../utils/logger';
 import { extractLocator, type LocatorInfo } from './locator-extractor';
 import { normalizeError, extractErrorPattern, type NormalizedError } from './error-normalizer';
 import { extractCodeContext, type CodeContext } from './code-context-extractor';
+import * as TraceParser from './playwright/trace-parser';
 
 const MOD = 'artifact-collector';
 
@@ -41,59 +40,6 @@ function extractUrl(errorMessage: string): string | null {
   const waitingMatch = /waiting for\"\s*(https?:\/\/[^\"\s]+)\"/.exec(errorMessage);
   if (waitingMatch?.[1]) return waitingMatch[1];
   return null;
-}
-
-/**
- * Extract the REAL page URL (a page.url() equivalent) from a Playwright trace.zip.
- *
- * WHY THE TRACE (and not a fixture)?
- * Playwright NATIVELY records the rendered frame URL inside the trace as
- * `frame-snapshot` events — no fixture injection, config rewrite, or test-code
- * change is needed. We force `--trace=retain-on-failure` (a CLI flag only) so a
- * trace exists on failure, then read the last non-blank frame URL here. This is
- * the cleanest non-invasive source: empirically the JSON reporter and
- * error-context.md do NOT contain page.url(), and the execution subprocess has
- * no access to the `page` object. See PR description for the full evidence table.
- *
- * Returns null on any failure (missing unzip, malformed trace, no URL) so the
- * URL cascade falls back to the execution base URL / latest active profile.
- */
-export function extractUrlFromTrace(traceZipPath: string): string | null {
-  if (!traceZipPath || !fs.existsSync(traceZipPath)) return null;
-  let tmpDir: string | null = null;
-  try {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'levelup-trace-'));
-    // `unzip` is present on the Playwright Docker image and standard Linux runners.
-    execSync(`unzip -o "${traceZipPath}" -d "${tmpDir}"`, { stdio: 'ignore' });
-
-    const traceFiles = fs.readdirSync(tmpDir).filter((f) => f.endsWith('.trace'));
-    let lastPageUrl: string | null = null;
-    let gotoUrl: string | null = null;
-
-    for (const tf of traceFiles) {
-      const lines = fs.readFileSync(path.join(tmpDir, tf), 'utf-8').split('\n');
-      for (const line of lines) {
-        const s = line.trim();
-        if (!s) continue;
-        let evt: any;
-        try { evt = JSON.parse(s); } catch { continue; }
-        // The rendered document URL at each snapshot — last non-blank wins (page at failure).
-        if (evt.type === 'frame-snapshot') {
-          const url = evt.snapshot?.frameUrl;
-          if (url && url !== 'about:blank') lastPageUrl = url;
-        }
-        // Fallback: the navigation target if no snapshot URL is present.
-        if (evt.type === 'before' && evt.params?.url) gotoUrl = evt.params.url;
-      }
-    }
-    return lastPageUrl ?? gotoUrl;
-  } catch (err) {
-    return null;
-  } finally {
-    if (tmpDir) {
-      try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* noop */ }
-    }
-  }
 }
 
 export class ArtifactCollector {
@@ -171,14 +117,15 @@ export class ArtifactCollector {
                 a.name === 'screenshot' || a.contentType?.startsWith('image/')
               )?.path ?? null;
 
-              // Resolve the REAL page URL from this result's trace.zip (Playwright
-              // records the rendered frame URL natively). No fixture / config edit.
-              // Fall back to the legacy regex extraction if no trace/URL is found.
+              // Resolve the REAL page URL from this result's trace.zip via the
+              // TraceParser (Playwright records the rendered frame URL natively in
+              // frame-snapshot events). No fixture injection or config edits needed.
+              // Falls back to legacy regex extraction if no trace/URL is found.
               const tracePath = (result.attachments ?? []).find((a: any) =>
                 a.name === 'trace' || (typeof a.path === 'string' && a.path.endsWith('trace.zip'))
               )?.path ?? null;
-              const tracedUrl = tracePath ? extractUrlFromTrace(tracePath) : null;
-              const finalUrl = tracedUrl ?? extractUrl(errorMessage);
+              const executionContext = tracePath ? TraceParser.parse(tracePath) : null;
+              const finalUrl = executionContext?.pageUrl ?? extractUrl(errorMessage);
 
               const artifact: ArtifactCollection = {
                 test_name: testName,
