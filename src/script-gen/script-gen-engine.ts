@@ -33,6 +33,14 @@ import type { RepositoryProfile, ClassInfo } from '../context/types';
 import { extractSelectorInfo } from '../context/ast-analyzer';
 import { analyzeRepoStructure, buildPageObjectFileName, buildSpecFileName } from './repo-analyzer';
 import type { RepoStructureAnalysis } from './repo-analyzer';
+import {
+  buildConventionProfile,
+  resolveTestDataModulePath,
+  resolveFixturePath,
+  resolveHelperPath,
+  resolveImportSpecifier,
+  type ProjectConventionProfile,
+} from '../intelligence/project-convention-profile';
 import { analyzeRepoPatterns } from './repo-pattern-analyzer';
 import { adaptiveGenerateFiles } from './adaptive-codegen';
 import { getRAGService } from '../services/rag-service';
@@ -657,6 +665,19 @@ export class ScriptGenEngine {
     return result;
   }
 
+  /**
+   * Resolve the canonical Project Convention Profile for this generation.
+   *
+   * This is the ONLY place Script Generation learns *where* files belong and
+   * *which* conventions to follow — it asks Repo Intelligence rather than
+   * inspecting folders or hardcoding names. With no connected repo profile the
+   * profile falls back to the historical defaults (tests/, pages/, tests/data,
+   * fixtures/, utils/), so greenfield output is unchanged.
+   */
+  private resolveConventions(config: GenerationConfig): ProjectConventionProfile {
+    return buildConventionProfile(config.repoProfile ?? null);
+  }
+
   /* ──────────────────────────────────────────────────────────────────────── */
   /*  DETERMINISTIC TEST-CASE GENERATION                                      */
   /*  Translates a structured Test Case (steps + test data + expected result) */
@@ -750,15 +771,28 @@ export class ScriptGenEngine {
     const matchedPOs = this.matchPageObjects(tc, steps, config.repoProfile);
     const usedPOVars = new Set<string>();
 
+    // ── Repo Intelligence owns conventions ──
+    // Where the spec + shared test-data module land, and how the spec imports
+    // that module, are all answered by the Project Convention Profile — never
+    // hardcoded here. Defaults reproduce the historical tests/ + tests/data
+    // layout for greenfield runs.
+    const conv = this.resolveConventions(config);
+    const testDataModulePath = resolveTestDataModulePath(conv); // e.g. tests/data/test-data.ts
+    const testDataImport = resolveImportSpecifier(
+      conv,
+      conv.testFolder,
+      testDataModulePath,
+    ); // e.g. ./data/test-data
+
     // ── Non-automatable detection (review priority #5) ──
     // Concurrent / multi-browser cases (and anything flagged Automation Ready =
     // No) need multiple browser contexts and human judgement. Emit a test.fixme
     // with a correct multi-context skeleton instead of a broken single-page run.
     if (this.isNonAutomatable(tc, steps)) {
-      const content = this.buildNonAutomatableSpec(tc, steps, baseUrl, sel, dataRef, { title, idMarker, stepComments, creds }, matchedPOs);
+      const content = this.buildNonAutomatableSpec(tc, steps, baseUrl, sel, dataRef, { title, idMarker, stepComments, creds }, matchedPOs, testDataImport);
       const fileName = `${toKebab(title).slice(0, 60) || `test-case-${tc.id ?? 'x'}`}.spec.ts`;
-      const generatedFiles: GeneratedFile[] = [{ path: `tests/${fileName}`, content, type: 'test' }];
-      const moduleFile = this.buildTestDataModule(dataIndex);
+      const generatedFiles: GeneratedFile[] = [{ path: `${conv.testFolder}/${fileName}`, content, type: 'test' }];
+      const moduleFile = this.buildTestDataModule(dataIndex, conv);
       if (moduleFile) generatedFiles.push(moduleFile);
       const grounding = this.buildLocatorGroundingReport(tracked, content);
       return this.buildTcResult(tc, title, baseUrl, crawl, tags, generatedFiles, 0, startTime, grounding, matchedPOs);
@@ -870,7 +904,7 @@ export class ScriptGenEngine {
     // Reference the generated test-data module whenever the body binds a dataset.
     const usesModule = combined.some(l => /\bgetRecord\s*\(/.test(l));
     let importLine = usesModule
-      ? `import { test, expect } from '@playwright/test';\nimport { getRecord } from './data/test-data';`
+      ? `import { test, expect } from '@playwright/test';\nimport { getRecord } from '${testDataImport}';`
       : `import { test, expect } from '@playwright/test';`;
 
     // Add Page Object imports for the POs we actually reuse (repo-derived paths).
@@ -904,13 +938,13 @@ ${combined.map(l => (l ? `    ${l}` : '')).join('\n')}
 
     const fileName = `${toKebab(title).slice(0, 60) || `test-case-${tc.id ?? 'x'}`}.spec.ts`;
     const generatedFiles: GeneratedFile[] = [{
-      path: `tests/${fileName}`,
+      path: `${conv.testFolder}/${fileName}`,
       content,
       type: 'test',
     }];
 
     // Emit the shared test-data module alongside the spec when records were used.
-    const moduleFile = this.buildTestDataModule(dataIndex);
+    const moduleFile = this.buildTestDataModule(dataIndex, conv);
     if (moduleFile && usesModule) generatedFiles.push(moduleFile);
 
     const totalAssertions = combined.filter(a => /\bexpect\s*\(/.test(a)).length;
@@ -1036,6 +1070,11 @@ ${combined.map(l => (l ? `    ${l}` : '')).join('\n')}
     const groundingReports: LocatorGroundingReport[] = [];
     const repoIntelReports: RepositoryIntelligenceReport[] = [];
 
+    // The shared test-data module path is a repository convention (Repo
+    // Intelligence), not a literal — resolve it once so the de-dupe check below
+    // matches whatever folder the connected repo uses (defaults to tests/data).
+    const sharedDataModulePath = resolveTestDataModulePath(this.resolveConventions(config));
+
     for (const tc of cases) {
       try {
         // Reuse the single-case translator by scoping config to this case.
@@ -1048,8 +1087,8 @@ ${combined.map(l => (l ? `    ${l}` : '')).join('\n')}
         if (single.repositoryIntelligence) repoIntelReports.push(single.repositoryIntelligence);
         for (const f of single.generatedFiles) {
           // The shared test-data module is identical across cases — emit it
-          // once, never rename it (specs import a fixed './data/test-data' path).
-          if (f.path === 'tests/data/test-data.ts') {
+          // once, never rename it (specs import a fixed relative path to it).
+          if (f.path === sharedDataModulePath) {
             if (!usedNames.has(f.path)) {
               usedNames.add(f.path);
               generatedFiles.push(f);
@@ -1466,7 +1505,10 @@ ${combined.map(l => (l ? `    ${l}` : '')).join('\n')}
    *   - `testData` exposes the flat object view (e.g. `testData.valid_users[0]`)
    * Generated specs reference datasets by NAME + SCHEMA, never a hardcoded value.
    */
-  private buildTestDataModule(index: Map<string, Map<string, any>>): GeneratedFile | null {
+  private buildTestDataModule(
+    index: Map<string, Map<string, any>>,
+    conv?: ProjectConventionProfile,
+  ): GeneratedFile | null {
     if (!this.hasResolvedData(index)) return null;
     // Normalize each record into an object that always carries its `key`, with
     // any object-shaped value fields (username/password/…) spread alongside.
@@ -1557,7 +1599,10 @@ export const testData = datasets;
 
 export default datasets;
 `;
-    return { path: 'tests/data/test-data.ts', content, type: 'test' };
+    // Repo Intelligence decides where the shared data module lives. Defaults to
+    // the historical `tests/data/test-data.ts` when no profile is connected.
+    const dataModulePath = resolveTestDataModulePath(conv ?? buildConventionProfile(null));
+    return { path: dataModulePath, content, type: 'test' };
   }
 
   /** Tags for the deterministic test-case flow, derived from case metadata. */
@@ -1815,6 +1860,7 @@ export default datasets;
     dataRef: { varName: string; ref: string; hasUsername: boolean; hasPassword: boolean } | undefined,
     meta: { title: string; idMarker: string; stepComments: string; creds: { username: string; password: string } },
     matchedPOs: Array<{ name: string; varName: string; methods: string[]; importPath: string; kind: string }> = [],
+    testDataImport = './data/test-data',
   ): string {
     const { title, idMarker, stepComments } = meta;
     const usesModule = !!dataRef;
@@ -1831,7 +1877,7 @@ export default datasets;
     const usePO = !!(loginPO && loginMethod);
 
     let importLine = `import { test, expect, chromium } from '@playwright/test';`;
-    if (usesModule) importLine += `\nimport { getRecord } from './data/test-data';`;
+    if (usesModule) importLine += `\nimport { getRecord } from '${testDataImport}';`;
     if (usePO) importLine += `\nimport { ${loginPO!.name} } from '${loginPO!.importPath}';`;
 
     const userDecl = dataRef ? `    const ${dataRef.varName} = ${dataRef.ref};\n` : '';
@@ -3384,6 +3430,10 @@ ${config.testCase
     // style paths. Falls back to sensible defaults for greenfield generation.
     const pageDir = analysis ? analysis.pageObjectDir : 'pages';
     const testDir = analysis ? analysis.testDir : 'tests';
+    // Fixture / helper folders are repository conventions owned by Repo
+    // Intelligence — resolved from the profile rather than hardcoded. Defaults
+    // reproduce the historical `fixtures/` and `utils/` layout for greenfield.
+    const conv = analysis?.conventions ?? this.resolveConventions(config);
 
     // 1. Page Objects — core artifact. Generated for new pages, but REUSED
     //    (not duplicated) when the connected repo already defines them (Fix #2).
@@ -3405,7 +3455,7 @@ ${config.testCase
         : po.fileName;
       files.push({
         path: `${pageDir}/${fileName}`,
-        content: this.maybeAddAuthImport(this.generatePageObject(po, config), config),
+        content: this.maybeAddAuthImport(this.generatePageObject(po, config), config, conv),
         type: 'page-object',
       });
     }
@@ -3419,7 +3469,7 @@ ${config.testCase
       if (analysis?.naming.usesNumberPrefix) specNum++;
       files.push({
         path: `${testDir}/${fileName}`,
-        content: this.maybeAddAuthImport(this.generateTestSpec(flow, testPlan, config), config),
+        content: this.maybeAddAuthImport(this.generateTestSpec(flow, testPlan, config), config, conv),
         type: 'test',
       });
     }
@@ -3427,18 +3477,19 @@ ${config.testCase
     // 3. Fixtures — a functional artifact (test data the generated specs rely
     //    on), NOT a scaffold file. Generated only if the plan needs them and the
     //    repo lacks them. Always logged.
+    const fixturesPath = resolveFixturePath(conv, 'test-fixtures.ts');
     if (testPlan.fixtures.length > 0) {
       if (!analysis?.hasFixtures) {
         files.push({
-          path: 'fixtures/test-fixtures.ts',
-          content: this.maybeAddAuthImport(this.generateFixtures(testPlan.fixtures, config), config),
+          path: fixturesPath,
+          content: this.maybeAddAuthImport(this.generateFixtures(testPlan.fixtures, config), config, conv),
           type: 'fixture',
         });
-        logger.debug(MOD, 'Scaffold decision: fixtures/test-fixtures.ts → GENERATE', {
+        logger.debug(MOD, `Scaffold decision: ${fixturesPath} → GENERATE`, {
           reason: 'test plan declares fixtures and repo has none',
         });
       } else {
-        skipped.push('fixtures/test-fixtures.ts (repo already has fixtures)');
+        skipped.push(`${fixturesPath} (repo already has fixtures)`);
       }
     }
 
@@ -3448,18 +3499,19 @@ ${config.testCase
     //     relying on un-provisioned environment variables. Skipped silently for
     //     greenfield runs where no credentials are available.
     if (this.credsAvailable(config)) {
-      const alreadyEmitted = files.some(f => f.path === 'fixtures/auth.ts');
+      const authFixturePath = resolveFixturePath(conv, 'auth.ts');
+      const alreadyEmitted = files.some(f => f.path === authFixturePath);
       if (!alreadyEmitted) {
         files.push({
-          path: 'fixtures/auth.ts',
+          path: authFixturePath,
           content: this.generateAuthFixture(config),
           type: 'fixture',
         });
-        logger.info(MOD, '🔐 Emitting fixtures/auth.ts with injected credentials/baseUrl', {
+        logger.info(MOD, `🔐 Emitting ${authFixturePath} with injected credentials/baseUrl`, {
           hasUsername: !!config.credentials?.username,
           hasBaseUrl: !!config.url,
         });
-        console.log('[ScriptGenEngine] 🔐 Generated fixtures/auth.ts (credentials + baseUrl injected from repo profile)');
+        console.log(`[ScriptGenEngine] 🔐 Generated ${authFixturePath} (credentials + baseUrl injected from repo profile)`);
       }
     }
 
@@ -3495,9 +3547,9 @@ ${config.testCase
       },
       {
         key: 'utils',
-        path: 'utils/test-helpers.ts',
+        path: resolveHelperPath(conv, 'test-helpers.ts'),
         repoHas: !!analysis?.hasUtils,
-        build: () => ({ path: 'utils/test-helpers.ts', content: this.generateTestHelpers(), type: 'util' }),
+        build: () => ({ path: resolveHelperPath(conv, 'test-helpers.ts'), content: this.generateTestHelpers(), type: 'util' }),
       },
       {
         key: 'env',
@@ -3854,13 +3906,18 @@ export const baseUrl = process.env.BASE_URL || '${baseUrl}';
    * generated file when (a) the profile supplied credentials and (b) the file
    * actually references those symbols. Avoids unused imports.
    */
-  private maybeAddAuthImport(content: string, config?: GenerationConfig): string {
+  private maybeAddAuthImport(content: string, config?: GenerationConfig, conv?: ProjectConventionProfile): string {
     if (!this.credsAvailable(config)) return content;
     const needs = /\btestCredentials\b/.test(content) || /\bbaseUrl\b/.test(content);
     if (!needs) return content;
-    if (/from '[^']*fixtures\/auth'/.test(content)) return content; // already imported
+    // The fixture folder is a repository convention (Repo Intelligence). Use its
+    // last path segment for the one-level-up relative import, defaulting to the
+    // historical `../fixtures/auth` when no profile is connected.
+    const fixtureSeg = (conv?.fixtureFolder ?? 'fixtures').split('/').filter(Boolean).pop() || 'fixtures';
+    const authImportPath = `../${fixtureSeg}/auth`;
+    if (new RegExp(`from '[^']*${fixtureSeg}\\/auth'`).test(content)) return content; // already imported
 
-    const importLine = `import { testCredentials, baseUrl } from '../fixtures/auth';`;
+    const importLine = `import { testCredentials, baseUrl } from '${authImportPath}';`;
     const lines = content.split('\n');
     const idx = lines.findIndex(l => /^import\s/.test(l));
     if (idx >= 0) {

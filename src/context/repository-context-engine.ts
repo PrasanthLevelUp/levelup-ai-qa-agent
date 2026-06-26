@@ -252,6 +252,12 @@ function detectFolderStructure(repoRoot: string, analyses: FileAnalysis[]): Fold
   const poFolders = ['pages', 'page-objects', 'pom', 'screens', 'page_objects'];
   const fixtureFolders = ['fixtures', 'support', 'data', 'test-data'];
   const utilFolders = ['utils', 'helpers', 'lib', 'common', 'shared'];
+  // Test-data folder is detected independently of fixtures: a repo may keep
+  // datasets in a dedicated `data/` (or `tests/data`) directory even when it
+  // also has a `fixtures/` directory. Ordering matters — prefer the most
+  // specific / conventional locations first.
+  const testDataFolders = ['data', 'test-data', 'testdata', 'tests/data', 'test/data', 'fixtures/data', 'cypress/fixtures'];
+  const apiFolders = ['api', 'apis', 'services', 'endpoints', 'clients', 'src/api'];
 
   const findFolder = (candidates: string[]): string | null => {
     for (const c of candidates) {
@@ -303,6 +309,8 @@ function detectFolderStructure(repoRoot: string, analyses: FileAnalysis[]): Fold
     pageObjectFolder: findFolder(poFolders),
     fixtureFolder: findFolder(fixtureFolders),
     utilsFolder: findFolder(utilFolders),
+    testDataFolder: findFolder(testDataFolders),
+    apiFolder: findFolder(apiFolders),
     configFiles,
     supportFiles,
   };

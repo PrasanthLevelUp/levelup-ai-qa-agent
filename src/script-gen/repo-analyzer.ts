@@ -16,6 +16,10 @@ import type {
   CodingStyle,
   TestSuiteInfo,
 } from '../context/types';
+import {
+  buildConventionProfile,
+  type ProjectConventionProfile,
+} from '../intelligence/project-convention-profile';
 
 /* ------------------------------------------------------------------ */
 /*  Public Types                                                        */
@@ -79,6 +83,15 @@ export interface RepoStructureAnalysis {
 
   /** How the repo supplies credentials (inline, env, fixture, unknown) */
   credentialStyle: 'inline' | 'env' | 'fixture' | 'unknown';
+
+  /**
+   * The canonical Project Convention Profile (owned by Repo Intelligence).
+   * Script Generation reads folder/import/naming conventions from here instead
+   * of hardcoding them. Folders are always resolved (never null) and default to
+   * the historical hardcoded values, so connected-repo behaviour only changes
+   * when the repo genuinely uses a different convention.
+   */
+  conventions: ProjectConventionProfile;
 }
 
 /* ------------------------------------------------------------------ */
@@ -121,6 +134,8 @@ export function analyzeRepoStructure(profile: RepositoryProfile): RepoStructureA
     indentStyle: profile.codingStyle.indentStyle ?? 'spaces-2',
 
     credentialStyle: detectCredentialStyle(profile),
+
+    conventions: buildConventionProfile(profile),
   };
 }
 
