@@ -23,6 +23,7 @@
  */
 
 import type { FailureDetails, FailureType } from './failure-analyzer';
+import type { EvidenceBundle } from './evidence-collector';
 
 /**
  * Diagnostic failure categories from the Healing Classifier spec. These map onto
@@ -37,6 +38,19 @@ export type FailureCategory =
   | 'environment'
   | 'framework'
   | 'unknown';
+
+/**
+ * The concrete remedy the diagnosis recommends. This is the single field that
+ * downstream RCA, the Learning Engine, the dashboard and analytics all key off.
+ */
+export type RecommendedStrategy =
+  | 'locator_swap'
+  | 'wait_for_overlay'
+  | 'wait_for_visible'
+  | 'wait_for_enabled'
+  | 'inject_wait'
+  | 'report_only'
+  | 'none';
 
 export interface DiagnosisEvidence {
   /** Short machine label, e.g. `failed_line`, `resolved_locator`, `error_signal`. */
@@ -70,6 +84,10 @@ export interface FailureDiagnosis {
   rootCause: string;
   /** Plain-language recommended action (diagnosis-level, not a patch). */
   recommendedAction: string;
+  /** Machine-readable strategy that downstream RCA/learning/dashboard key off. */
+  recommendedStrategy: RecommendedStrategy;
+  /** True once the diagnosis was corroborated by observed evidence (not just regex). */
+  evidenceBased: boolean;
   /**
    * Whether this failure is even a candidate for locator-swap healing. This is
    * the single most important field for fixing the false-positive bug: a valid
@@ -289,9 +307,134 @@ export function classifyFailure(input: ClassifierInput): FailureDiagnosis {
     actual,
     rootCause,
     recommendedAction,
+    recommendedStrategy: strategyForCategory(category, healableByLocatorSwap),
+    evidenceBased: false,
     healableByLocatorSwap,
     evidence,
   };
+}
+
+/** Default recommended strategy from category alone (parser-based first pass). */
+function strategyForCategory(
+  category: FailureCategory,
+  healableByLocatorSwap: boolean,
+): RecommendedStrategy {
+  switch (category) {
+    case 'locator':
+      return healableByLocatorSwap ? 'locator_swap' : 'report_only';
+    case 'timing':
+      return 'inject_wait';
+    default:
+      return 'report_only';
+  }
+}
+
+/**
+ * Upgrade a parser-based diagnosis with OBSERVED evidence. This is what makes
+ * the diagnosis evidence-based rather than inference-based. The canonical case:
+ *
+ *   exists ✔ visible ✔ enabled ✔ clickable ✖ (overlay)
+ *     → category = timing, rootCause "overlay intercepts click",
+ *       recommendedStrategy = wait_for_overlay, confidence ↑
+ *
+ * Pure & deterministic. Returns a NEW diagnosis (does not mutate the input).
+ */
+export function refineDiagnosisWithEvidence(
+  diagnosis: FailureDiagnosis,
+  evidence: EvidenceBundle,
+): FailureDiagnosis {
+  const next: FailureDiagnosis = {
+    ...diagnosis,
+    evidence: [...diagnosis.evidence],
+  };
+  const ls = evidence.locatorState;
+
+  // Fold observed evidence summaries into the evidence list for the UI.
+  for (const line of evidence.summary) {
+    next.evidence.push({ kind: 'observed', detail: line });
+  }
+
+  // ── Network/console signals can re-categorise an ambiguous diagnosis ──
+  if (evidence.networkErrors.length > 0 && (next.category === 'unknown' || next.category === 'navigation' || next.category === 'timing')) {
+    next.category = 'api';
+    next.recommendedStrategy = 'report_only';
+    next.healableByLocatorSwap = false;
+    next.evidenceBased = true;
+    next.confidence = Math.max(next.confidence, 0.8);
+    next.rootCause = `API/network failure observed (${evidence.networkErrors
+      .map((n) => n.detail)
+      .join(', ')}).`;
+    next.recommendedAction = 'Inspect the failing request/response and backend availability. Out of scope for locator healing.';
+    return next;
+  }
+
+  // ── Locator-state facts are the strongest evidence we have ──
+  if (ls && ls.source !== 'unknown') {
+    next.evidenceBased = true;
+
+    if (!ls.exists) {
+      // The element genuinely isn't in the DOM → a real locator problem.
+      next.category = 'locator';
+      next.healableByLocatorSwap = !!next.locator;
+      next.recommendedStrategy = next.locator ? 'locator_swap' : 'report_only';
+      next.confidence = Math.max(next.confidence, 0.9);
+      next.rootCause = next.locator
+        ? `Observed: no element matching ${next.locator} exists in the DOM — the locator is genuinely broken/changed.`
+        : 'Observed: the target element does not exist in the DOM, and no concrete locator could be resolved.';
+      next.recommendedAction = next.locator
+        ? 'Propose a grounded replacement locator from the DOM evidence and validate by rerun.'
+        : 'Resolve the element from the DOM/Page Object before attempting any locator change.';
+      return next;
+    }
+
+    // Element EXISTS — so it is NOT a broken locator, regardless of what the
+    // error string looked like. Now explain WHY the interaction failed.
+    if (ls.exists && ls.visible && ls.enabled && ls.receivesPointerEvents === false) {
+      next.category = 'timing';
+      next.healableByLocatorSwap = false;
+      next.recommendedStrategy = 'wait_for_overlay';
+      next.confidence = 0.95;
+      next.rootCause = `Element exists, is visible and enabled, but does not receive pointer events${
+        ls.interceptedBy ? ` — intercepted by ${ls.interceptedBy}` : ''
+      }. The locator is correct; the click is being blocked.`;
+      next.recommendedAction = 'Wait for the intercepting overlay/loader to disappear, then retry the click. Do NOT change the locator.';
+      return next;
+    }
+
+    if (ls.exists && !ls.visible) {
+      next.category = 'timing';
+      next.healableByLocatorSwap = false;
+      next.recommendedStrategy = 'wait_for_visible';
+      next.confidence = 0.9;
+      next.rootCause = 'Element exists in the DOM but is not yet visible — likely a rendering/timing race. The locator is correct.';
+      next.recommendedAction = 'Wait for the element to become visible (expect(...).toBeVisible) before interacting. Do NOT change the locator.';
+      return next;
+    }
+
+    if (ls.exists && ls.visible && !ls.enabled) {
+      next.category = 'timing';
+      next.healableByLocatorSwap = false;
+      next.recommendedStrategy = 'wait_for_enabled';
+      next.confidence = 0.88;
+      next.rootCause = 'Element exists and is visible but is disabled — the app has not enabled it yet. The locator is correct.';
+      next.recommendedAction = 'Wait for the element to become enabled before interacting. Do NOT change the locator.';
+      return next;
+    }
+
+    // Element exists and is fully interactable, yet the test still failed → the
+    // problem is functional/data (assertion), not a locator.
+    if (ls.exists && ls.clickable && next.category === 'locator') {
+      next.category = 'assertion';
+      next.healableByLocatorSwap = false;
+      next.recommendedStrategy = 'report_only';
+      next.confidence = Math.max(next.confidence, 0.8);
+      next.rootCause = 'Observed: the element exists and is fully interactable, so this is not a broken locator — the failure is functional/assertion-level.';
+      next.recommendedAction = 'Report as a functional finding for human review. Do NOT swap the locator.';
+      return next;
+    }
+  }
+
+  return next;
 }
 
 /** Best-effort action extraction from the failing source line. */

@@ -17,6 +17,8 @@ function diag(overrides: Partial<FailureDiagnosis> = {}): FailureDiagnosis {
     recommendedAction: 'y',
     healableByLocatorSwap: true,
     evidence: [],
+    recommendedStrategy: 'locator_swap',
+    evidenceBased: false,
     ...overrides,
   };
 }
@@ -44,6 +46,29 @@ describe('routeHealingStrategy', () => {
     );
     expect(plan.remedy).toBe('inject_wait');
     expect(plan.shouldAttemptLocatorHealing).toBe(false);
+  });
+
+  it('honors an evidence-driven wait_for_overlay strategy on a timing failure', () => {
+    const plan = routeHealingStrategy(
+      diag({
+        category: 'timing',
+        healableByLocatorSwap: false,
+        confidence: 0.95,
+        recommendedStrategy: 'wait_for_overlay',
+        evidenceBased: true,
+      }),
+    );
+    expect(plan.remedy).toBe('inject_wait');
+    expect(plan.recommendedStrategy).toBe('wait_for_overlay');
+    expect(plan.shouldAttemptLocatorHealing).toBe(false);
+  });
+
+  it('never swaps a locator on a timing failure even if the strategy says locator_swap', () => {
+    const plan = routeHealingStrategy(
+      diag({ category: 'timing', confidence: 0.9, recommendedStrategy: 'locator_swap' }),
+    );
+    expect(plan.shouldAttemptLocatorHealing).toBe(false);
+    expect(plan.remedy).toBe('inject_wait');
   });
 
   it.each<FailureCategory>(['assertion', 'navigation', 'api', 'environment', 'framework', 'unknown'])(

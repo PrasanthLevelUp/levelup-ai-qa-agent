@@ -22,6 +22,10 @@ export interface ArtifactCollection {
   line_number: number;
   failed_line_code: string | null;
   screenshot_path: string | null;
+  /** Path to the Playwright trace.zip attachment, when captured (Failure Replay). */
+  trace_path: string | null;
+  /** Path to the failure video attachment, when captured (Failure Replay). */
+  video_path: string | null;
   url: string | null;
   timestamp: string;
   test_results_json: string;
@@ -133,8 +137,18 @@ export class ArtifactCollector {
                 }
               }
 
-              const screenshotPath = (result.attachments ?? []).find((a: any) =>
+              const attachments = (result.attachments ?? []) as any[];
+              const screenshotPath = attachments.find((a: any) =>
                 a.name === 'screenshot' || a.contentType?.startsWith('image/')
+              )?.path ?? null;
+              const tracePath = attachments.find((a: any) =>
+                a.name === 'trace' ||
+                a.contentType === 'application/zip' ||
+                (typeof a.path === 'string' && /trace.*\.zip$/i.test(a.path)) ||
+                (typeof a.path === 'string' && /\.zip$/i.test(a.path) && /trace/i.test(a.path))
+              )?.path ?? null;
+              const videoPath = attachments.find((a: any) =>
+                a.name === 'video' || a.contentType?.startsWith('video/')
               )?.path ?? null;
 
               const artifact: ArtifactCollection = {
@@ -146,6 +160,8 @@ export class ArtifactCollector {
                 line_number: lineNumber,
                 failed_line_code: codeContext.failedLineCode,
                 screenshot_path: screenshotPath,
+                trace_path: tracePath,
+                video_path: videoPath,
                 url: extractUrl(errorMessage),
                 timestamp: result.startTime ?? new Date().toISOString(),
                 test_results_json: rawText,
