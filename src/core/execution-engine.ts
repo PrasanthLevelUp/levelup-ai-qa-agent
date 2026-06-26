@@ -7,6 +7,7 @@ import { spawn } from 'child_process';
 import * as path from 'path';
 import * as fs from 'fs';
 import { logger } from '../utils/logger';
+import type { ExecutionProfile } from '../db/postgres';
 
 const MOD = 'execution-engine';
 
@@ -30,6 +31,33 @@ export interface RunResult {
   startTime: string;
   endTime: string;
   durationMs: number;
+}
+
+/**
+ * Translate an ExecutionProfile into Playwright CLI flags for trace/video/screenshot.
+ * Follows the tiered capture model: Fast < Standard < Healing < Debug.
+ */
+function playwrightArtifactFlags(profile: ExecutionProfile): string {
+  switch (profile) {
+    case 'fast':
+      // Metadata only — no screenshots, trace, or video. Fastest for CI.
+      return '--screenshot=off --video=off --trace=off';
+    case 'standard':
+      // Default: screenshot + DOM on failure (Playwright's default on-first-retry
+      // captures on first failure). No trace/video to keep storage lean.
+      return '--screenshot=only-on-failure --video=off --trace=off';
+    case 'healing':
+      // Healing mode: capture trace + video ONLY when healing is attempted. The
+      // worker will use 'standard' initially, then upgrade to 'healing' when
+      // actually healing a failure. Trace = on-first-retry (same as screenshot).
+      return '--screenshot=only-on-failure --video=on-first-retry --trace=on-first-retry';
+    case 'debug':
+      // Maximum diagnostics — always capture everything regardless of outcome.
+      return '--screenshot=on --video=on --trace=on';
+    default:
+      // Fallback to standard for safety.
+      return '--screenshot=only-on-failure --video=off --trace=off';
+  }
 }
 
 export class ExecutionEngine {
@@ -232,8 +260,16 @@ export class ExecutionEngine {
    *   2. Wrap the command in `xvfb-run -a` when available, so configs that set
    *      `headless: false` still run under a virtual X server instead of failing
    *      to launch the browser in a headless runner.
+   *   3. Configure artifact capture (screenshot/trace/video) based on the execution
+   *      profile to balance storage costs vs. diagnostic richness.
    */
-  static run(repoPath: string, testFile?: string, grepFilter?: string, timeoutMs: number = DEFAULT_RERUN_TIMEOUT_MS): RunResult {
+  static run(
+    repoPath: string,
+    testFile?: string,
+    grepFilter?: string,
+    timeoutMs: number = DEFAULT_RERUN_TIMEOUT_MS,
+    profile: ExecutionProfile = 'standard',
+  ): RunResult {
     const { execSync } = require('child_process');
     const resultsFile = path.join(repoPath, 'test-results.json');
     const startTime = new Date().toISOString();
@@ -242,9 +278,10 @@ export class ExecutionEngine {
     // Force the JSON reporter to a known file regardless of the repo's config.
     // PLAYWRIGHT_JSON_OUTPUT_NAME makes the json reporter write to a file (it
     // would otherwise stream JSON to stdout when invoked via --reporter=json).
+    const artifactFlags = playwrightArtifactFlags(profile);
     let cmd = testFile
-      ? `npx playwright test "${testFile}" --reporter=json`
-      : `npx playwright test --reporter=json`;
+      ? `npx playwright test "${testFile}" --reporter=json ${artifactFlags}`
+      : `npx playwright test --reporter=json ${artifactFlags}`;
 
     // --grep isolates a single test by name for efficient per-test reruns
     if (grepFilter) {
@@ -328,8 +365,9 @@ export class ExecutionEngine {
 
   /**
    * Non-blocking async variant of {@link run}. Behaves identically (forced JSON
-   * reporter, optional --grep isolation, xvfb wrapping, stdout-JSON fallback) but
-   * uses `spawn` instead of `execSync` so it NEVER blocks the Node event loop.
+   * reporter, optional --grep isolation, xvfb wrapping, stdout-JSON fallback,
+   * artifact capture based on profile) but uses `spawn` instead of `execSync` so
+   * it NEVER blocks the Node event loop.
    *
    * Why this matters: the healing worker reruns a single test many times inside
    * nested retry loops. With the old blocking execSync, the entire server (status
@@ -346,15 +384,17 @@ export class ExecutionEngine {
     testFile?: string,
     grepFilter?: string,
     timeoutMs: number = DEFAULT_RERUN_TIMEOUT_MS,
+    profile: ExecutionProfile = 'standard',
   ): Promise<RunResult> {
     const { spawn } = require('child_process');
     const resultsFile = path.join(repoPath, 'test-results.json');
     const startTime = new Date().toISOString();
     const start = Date.now();
 
+    const artifactFlags = playwrightArtifactFlags(profile);
     let cmd = testFile
-      ? `npx playwright test "${testFile}" --reporter=json`
-      : `npx playwright test --reporter=json`;
+      ? `npx playwright test "${testFile}" --reporter=json ${artifactFlags}`
+      : `npx playwright test --reporter=json ${artifactFlags}`;
     if (grepFilter) {
       cmd += ` --grep "${grepFilter.replace(/"/g, '\\"')}"`;
     }

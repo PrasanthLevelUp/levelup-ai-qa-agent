@@ -7163,6 +7163,16 @@ export async function setRequirementGenerationState(
 
 // ---- Healing settings (admin-tunable confidence thresholds + cost caps) ----
 
+/**
+ * Execution Profile — controls what artifacts are captured during test execution.
+ * Tiered to balance storage costs vs. diagnostic richness:
+ * - fast: CI pipelines — metadata only
+ * - standard: default — metadata + failure screenshots + DOM
+ * - healing: auto-healing — standard + trace + video for healed failures
+ * - debug: investigation — everything (trace/video/HAR always on)
+ */
+export type ExecutionProfile = 'fast' | 'standard' | 'healing' | 'debug';
+
 export interface HealingSettings {
   ruleThreshold: number;
   patternThreshold: number;
@@ -7170,6 +7180,11 @@ export interface HealingSettings {
   aiFallbackEnabled: boolean;
   maxCostPerHealing: number;
   maxDailyTokenBudget: number;
+  /**
+   * Execution profile — defaults to 'standard'. Set per project or derive from
+   * subscription plan (e.g., Free='fast', Pro/Enterprise='standard').
+   */
+  executionProfile: ExecutionProfile;
 }
 
 export const DEFAULT_HEALING_SETTINGS: HealingSettings = {
@@ -7179,6 +7194,7 @@ export const DEFAULT_HEALING_SETTINGS: HealingSettings = {
   aiFallbackEnabled: true,
   maxCostPerHealing: parseFloat(process.env.MAX_COST_PER_HEALING || '0.10'),
   maxDailyTokenBudget: parseInt(process.env.MAX_DAILY_TOKEN_BUDGET || '100000', 10),
+  executionProfile: 'standard', // Safe default: screenshots + DOM on failure
 };
 
 /** Read healing settings for a scope, merged over defaults (never throws on missing table). */
