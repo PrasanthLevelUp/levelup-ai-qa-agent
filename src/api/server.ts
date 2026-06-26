@@ -1698,14 +1698,37 @@ function createHealingWorker(
                 }
               }
 
-              // Still can't determine — revert and try next suggestion
-              logger.warn(MOD, 'Cannot confirm fix, reverting', { iteration, retry });
+              // Still can't determine — revert and try next suggestion.
+              //
+              // OBSERVABILITY: the generic "no parseable failure artifact" message
+              // hid the REAL reason a rerun could not be confirmed (e.g. the
+              // process exited BEFORE any test ran: `xvfb-run: xauth command not
+              // found`, an unknown CLI flag, OOM, or a timeout). Surface the
+              // confirmation rerun's exit code, whether a results file was
+              // produced, and a tail of stderr so the decision trail is
+              // self-diagnosing instead of a guessing game.
+              const noResultsFile = !confirmRerun.resultsFile || !fs.existsSync(confirmRerun.resultsFile);
+              const stderrTail = (confirmRerun.stderr || '').trim().split('\n').slice(-3).join(' ').slice(-300);
+              const rerunCrashedBeforeTests = noResultsFile && confirmRerun.exitCode !== 0;
+              const diagnostic =
+                `rerun exit=${confirmRerun.exitCode}, resultsFile=${noResultsFile ? 'MISSING' : 'present'}` +
+                (stderrTail ? `, stderr: ${stderrTail}` : '');
+              const revertReason = rerunCrashedBeforeTests
+                ? `Candidate applied, but the confirmation rerun CRASHED BEFORE ANY TEST RAN — no results file was produced, so the heal could not be confirmed (reverted). This is an environment/runner failure, not a bad candidate. Diagnostic: ${diagnostic}`
+                : `Candidate applied, but the rerun produced no passing result and no parseable failure artifact, so the heal could not be confirmed (reverted). Diagnostic: ${diagnostic}`;
+              logger.warn(MOD, 'Cannot confirm fix, reverting', {
+                iteration, retry,
+                rerunExitCode: confirmRerun.exitCode,
+                resultsFileMissing: noResultsFile,
+                rerunCrashedBeforeTests,
+                stderrTail,
+              });
               trail.record({
                 layer: outcome.suggestion.strategy,
                 candidate: outcome.suggestion.newLocator,
                 confidence: outcome.suggestion.confidence,
                 decision: 'rerun_failed',
-                reason: 'Candidate applied, but the rerun produced no passing result and no parseable failure artifact, so the heal could not be confirmed (reverted).',
+                reason: revertReason,
               });
               fs.writeFileSync(failure.filePath, fileContentBeforeFix, 'utf-8');
               continue;
