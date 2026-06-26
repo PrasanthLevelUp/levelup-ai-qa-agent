@@ -199,6 +199,93 @@ export class ArtifactCollector {
   }
 }
 
+/**
+ * A single enumerated test from a Playwright run — EVERY spec/test that ran or was
+ * skipped, regardless of outcome. Unlike `ArtifactCollector.collect` (which only
+ * returns failures), this is the complete "universe" of the run so the worker can
+ * create exactly one ExecutionRecord per test (passes included) and prove the
+ * 1-test = 1-record invariant.
+ */
+export interface EnumeratedTest {
+  testName: string;
+  file: string | null;
+  /** Concrete Playwright result status, normalized to lowercase. */
+  status: 'passed' | 'failed' | 'timedout' | 'skipped' | 'interrupted';
+  durationMs: number;
+}
+
+/** Reduce several raw result statuses for one spec into a single outcome. */
+function reduceSpecStatus(
+  statuses: string[],
+): 'passed' | 'failed' | 'timedout' | 'skipped' | 'interrupted' {
+  const norm = statuses.map((s) => String(s).toLowerCase());
+  if (norm.some((s) => s === 'timedout')) return 'timedout';
+  if (norm.some((s) => s === 'interrupted')) return 'interrupted';
+  if (norm.some((s) => s === 'failed')) return 'failed';
+  if (norm.some((s) => s === 'passed')) return 'passed';
+  if (norm.length > 0 && norm.every((s) => s === 'skipped')) return 'skipped';
+  return 'failed';
+}
+
+/**
+ * Enumerate EVERY test in a Playwright results file (passes, failures, skips),
+ * deduplicated by test name. This is the run universe the ExecutionRecord store is
+ * reconciled against — each test here must map to exactly one record.
+ *
+ * Pure read of the results JSON; safe to call alongside `collect`.
+ */
+export function enumerateAllTests(resultsFilePath: string): EnumeratedTest[] {
+  if (!fs.existsSync(resultsFilePath)) return [];
+  let raw: { suites?: any[] };
+  try {
+    raw = JSON.parse(fs.readFileSync(resultsFilePath, 'utf-8')) as { suites?: any[] };
+  } catch {
+    return [];
+  }
+
+  // Aggregate per test name: a spec can produce multiple `tests` (projects) and
+  // multiple `results` (retries). We take the final result status per test and a
+  // single reduced status per spec title.
+  type SpecAgg = { file: string | null; statuses: string[]; durationMs: number };
+  const byName = new Map<string, SpecAgg>();
+
+  const walk = (suites: any[], parentFile?: string): void => {
+    for (const suite of suites ?? []) {
+      const suiteFile = suite.file ?? parentFile;
+      for (const spec of suite.specs ?? []) {
+        const testName = spec.title ?? 'unknown test';
+        const entry: SpecAgg = byName.get(testName) ?? { file: spec.file ?? suiteFile ?? null, statuses: [], durationMs: 0 };
+        for (const test of spec.tests ?? []) {
+          const results = test.results ?? [];
+          // Final result (retries are appended in order); fall back to last.
+          const finalResult = results[results.length - 1];
+          if (finalResult?.status) {
+            entry.statuses.push(String(finalResult.status));
+            entry.durationMs += Number(finalResult.duration ?? 0) || 0;
+          } else if (typeof test.status === 'string') {
+            entry.statuses.push(test.status);
+          }
+        }
+        byName.set(testName, entry);
+      }
+      if (suite.suites?.length > 0) walk(suite.suites, suiteFile);
+    }
+  };
+
+  walk(raw.suites ?? []);
+
+  const out: EnumeratedTest[] = [];
+  for (const [testName, entry] of byName) {
+    out.push({
+      testName,
+      file: entry.file,
+      status: reduceSpecStatus(entry.statuses),
+      durationMs: entry.durationMs,
+    });
+  }
+  return out;
+}
+
 /** Strip ANSI colour codes Playwright embeds in error text. */
 function stripAnsi(s: string): string {
   // eslint-disable-next-line no-control-regex

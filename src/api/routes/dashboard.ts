@@ -12,7 +12,11 @@ import {
   getAiCostTrend,
   getDailyBudgetStatus,
   getHealingIntelligenceMetrics,
+  listExecutionRecords,
+  getExecutionRecord,
 } from '../../db/postgres';
+import { buildExecutionTimeline } from '../../core/execution/execution-timeline';
+import { toDisplayStage } from '../../core/execution/execution-lifecycle';
 import { logger } from '../../utils/logger';
 
 const MOD = 'dashboard-api';
@@ -189,6 +193,63 @@ export function createDashboardRouter(): Router {
     } catch (err) {
       logger.error(MOD, 'healings/:id failed', { error: err });
       res.status(500).json({ error: 'Failed to fetch healing detail' });
+    }
+  });
+
+  // ─── Execution Records (canonical lifecycle record) ─────────
+  // These power the Execution Details page: ONE record per test execution
+  // (artifacts → observations → diagnosis → healing → validation → learning),
+  // plus a derived lifecycle timeline. No new intelligence — pure presentation
+  // of the record the healing worker already persists.
+
+  /** GET /api/dashboard/executions?limit=50&projectId= — recent records. */
+  router.get('/executions', async (req: Request, res: Response) => {
+    try {
+      const limit = Math.min(parseInt(req.query.limit as string) || 50, 200);
+      const cid = (req as any).companyId;
+      const pid = req.query.projectId ? parseInt(req.query.projectId as string, 10) : undefined;
+      const records = await listExecutionRecords(cid, Number.isNaN(pid as number) ? undefined : pid, limit);
+      // Return a compact list shape for the table (full record fetched per-row on click).
+      const result = records.map((r) => ({
+        executionId: r.executionId,
+        testName: r.testName,
+        // Lifecycle status (queued|running|completed|failed|cancelled|timed_out)
+        // is kept separate from the test outcome (`result`).
+        status: r.status,
+        result: r.result ?? null,
+        // Internal pipeline stage + its clean user-facing label (derived, never
+        // stored) so the UI can show "Preparing Environment" instead of leaking
+        // cloning/installing/building.
+        stage: r.stage ?? null,
+        displayStage: toDisplayStage(r.stage) ?? null,
+        jobId: r.jobId ?? null,
+        profile: r.profile,
+        durationMs: r.durationMs,
+        startTime: r.startTime,
+        endTime: r.endTime,
+        diagnosisCategory: r.diagnosis?.category ?? null,
+        confidence: r.diagnosis?.confidence ?? null,
+        healed: r.result === 'healed' || r.validation?.passedAfterHealing === true,
+        appliedStrategy: r.healing?.appliedStrategy ?? null,
+      }));
+      res.json({ executions: result, count: result.length });
+    } catch (err) {
+      logger.error(MOD, 'executions list failed', { error: err });
+      res.json({ executions: [], count: 0 });
+    }
+  });
+
+  /** GET /api/dashboard/executions/:id — the complete record + derived timeline. */
+  router.get('/executions/:id', async (req: Request, res: Response) => {
+    try {
+      const id = String(req.params.id);
+      const record = await getExecutionRecord(id);
+      if (!record) return res.status(404).json({ error: 'Execution record not found', executionId: id });
+      const timeline = buildExecutionTimeline(record);
+      res.json({ record, timeline });
+    } catch (err) {
+      logger.error(MOD, 'executions/:id failed', { error: err });
+      res.status(500).json({ error: 'Failed to fetch execution record' });
     }
   });
 
