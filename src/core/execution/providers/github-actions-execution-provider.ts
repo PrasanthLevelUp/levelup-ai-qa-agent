@@ -53,6 +53,13 @@ interface GitHubActionsConfig {
   workflowId: string | number;
   /** Optional dispatch inputs forwarded to the workflow. */
   inputs?: Record<string, string>;
+  /**
+   * Reuse an EXISTING workflow run instead of dispatching a fresh one. When set,
+   * the provider skips dispatch + correlation and ingests this run's artifacts
+   * directly. This is the path "Heal Failures" takes from a run the user already
+   * triggered — they never have to re-run their suite.
+   */
+  runId?: number | string;
 }
 
 export class GitHubActionsExecutionProvider implements ExecutionProvider {
@@ -81,28 +88,45 @@ export class GitHubActionsExecutionProvider implements ExecutionProvider {
     const { owner, repo } = parsed;
     const ref = ctx.branch || 'main';
     const startedAt = Date.now();
-    // Mark the dispatch window a few seconds in the past to tolerate clock skew.
-    const sinceIso = new Date(startedAt - 5000).toISOString();
 
-    // ── 1. Dispatch ──────────────────────────────────────────────────────
-    logger.info(MOD, 'Dispatching workflow', { owner, repo, workflowId: cfg.workflowId, ref });
-    const dispatch = await this.github.dispatchWorkflow(
-      owner, repo, cfg.workflowId, ref, cfg.inputs, ctx.companyId, ctx.userId,
-    );
-    if (!dispatch.success) {
-      throw new ExecutionSetupError('dispatch', 1, `Failed to dispatch workflow: ${dispatch.error}`);
+    // ── 1+2. Obtain the run to heal ───────────────────────────────────────
+    // Two paths converge on a single `runId`:
+    //   (a) REUSE  — cfg.runId set ⇒ heal the user's EXISTING run. No dispatch;
+    //       they never have to re-run their suite. This is the "Heal Failures"
+    //       button path from a run that already completed in GitHub Actions.
+    //   (b) DISPATCH — no runId ⇒ trigger a fresh workflow_dispatch and correlate
+    //       it to its run (the original, self-contained execution path).
+    let runId: number;
+    if (cfg.runId !== undefined && cfg.runId !== null && cfg.runId !== '') {
+      runId = Number(cfg.runId);
+      if (!Number.isFinite(runId)) {
+        throw new ExecutionSetupError('execute', 1, `Invalid providerConfig.runId: "${cfg.runId}"`);
+      }
+      logger.info(MOD, 'Reusing existing workflow run (no dispatch)', { owner, repo, runId, ref });
+    } else {
+      // Mark the dispatch window a few seconds in the past to tolerate clock skew.
+      const sinceIso = new Date(startedAt - 5000).toISOString();
+
+      logger.info(MOD, 'Dispatching workflow', { owner, repo, workflowId: cfg.workflowId, ref });
+      const dispatch = await this.github.dispatchWorkflow(
+        owner, repo, cfg.workflowId, ref, cfg.inputs, ctx.companyId, ctx.userId,
+      );
+      if (!dispatch.success) {
+        throw new ExecutionSetupError('dispatch', 1, `Failed to dispatch workflow: ${dispatch.error}`);
+      }
+
+      const found = await this.github.findRunForDispatch(
+        owner, repo, cfg.workflowId, ref, sinceIso, ctx.companyId, ctx.userId,
+      );
+      if (found.error || !found.run) {
+        throw new ExecutionSetupError('execute', 1, found.error || 'Dispatched workflow run could not be correlated.');
+      }
+      runId = found.run.id;
+      logger.info(MOD, 'Run correlated; waiting for completion', { runId, htmlUrl: found.run.htmlUrl });
     }
 
-    // ── 2. Correlate + wait for completion ────────────────────────────────
-    const found = await this.github.findRunForDispatch(
-      owner, repo, cfg.workflowId, ref, sinceIso, ctx.companyId, ctx.userId,
-    );
-    if (found.error || !found.run) {
-      throw new ExecutionSetupError('execute', 1, found.error || 'Dispatched workflow run could not be correlated.');
-    }
-    const runId = found.run.id;
-    logger.info(MOD, 'Run correlated; waiting for completion', { runId, htmlUrl: found.run.htmlUrl });
-
+    // Wait for completion. For a reused run that already finished this returns
+    // immediately on the first poll; for a fresh dispatch it polls until done.
     const completed = await this.waitForRun(owner, repo, runId, ctx);
     const conclusion = completed.conclusion; // success | failure | cancelled | timed_out | null
     const runUrl = completed.htmlUrl;

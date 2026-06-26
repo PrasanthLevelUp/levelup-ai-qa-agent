@@ -289,6 +289,60 @@ async function main() {
     }
   }
 
+  // ─── runId reuse: heal an EXISTING run WITHOUT dispatching ──────
+  // This is the "Heal Failures" path — the user already ran their suite; we must
+  // NOT trigger a new run, just ingest the given run's artifacts.
+  {
+    const inner = new JSZip();
+    inner.file('test-results.json', playwrightResultsJson());
+    const zipBuffer = await inner.generateAsync({ type: 'nodebuffer' });
+    const calls: string[] = [];
+    const fakeGithub: any = {
+      async dispatchWorkflow() { calls.push('dispatch'); return { success: true }; },
+      async findRunForDispatch() { calls.push('find'); return { run: { id: 999, htmlUrl: 'u' } }; },
+      async getWorkflowRun() {
+        calls.push('get');
+        return { run: { id: 7777, status: 'completed', conclusion: 'failure', htmlUrl: 'https://github.com/o/r/actions/runs/7777' } };
+      },
+      async listRunArtifacts() { calls.push('listArtifacts'); return { artifacts: [{ id: 3, name: 'r', archiveDownloadUrl: 'x', expired: false }] }; },
+      async downloadArtifactZip() { calls.push('download'); return { ok: true, buffer: zipBuffer }; },
+    };
+    const origClone = (ExecutionEngine as any).cloneRepository;
+    const origInstall = (ExecutionEngine as any).installDependencies;
+    const repoPath = fs.mkdtempSync(path.join(os.tmpdir(), 'levelup-gha-reuse-'));
+    (ExecutionEngine as any).cloneRepository = async () => { fs.mkdirSync(repoPath, { recursive: true }); };
+    (ExecutionEngine as any).installDependencies = async () => {};
+    try {
+      const provider = new GitHubActionsExecutionProvider(fakeGithub, new LocalExecutionProvider());
+      const result = await provider.execute({
+        repoUrl: 'https://github.com/o/r', branch: 'main', repoPath,
+        profile: 'standard' as any, collectHealingArtifacts: false, budgetMs: 60000,
+        providerConfig: { workflowId: 'ci.yml', runId: 7777 },
+      });
+      assert('reuse path does NOT dispatch a new workflow', !calls.includes('dispatch'));
+      assert('reuse path does NOT correlate a dispatch', !calls.includes('find'));
+      assert('reuse path polls the GIVEN run', calls.includes('get'));
+      assert('reuse path ingests the given run artifacts', calls.includes('download'));
+      assert('reuse path keeps the given runId in providerInfo', result.providerInfo.runId === 7777);
+      assert('reuse path exitCode=1 for a failed run', result.exitCode === 1);
+
+      // An invalid runId must throw before any GitHub call.
+      let threw = false;
+      try {
+        await provider.execute({
+          repoUrl: 'https://github.com/o/r', branch: 'main', repoPath,
+          profile: 'standard' as any, collectHealingArtifacts: false, budgetMs: 1000,
+          providerConfig: { workflowId: 'ci.yml', runId: 'not-a-number' as any },
+        });
+      } catch (e) { threw = (e as Error).name === 'ExecutionSetupError'; }
+      assert('reuse path throws ExecutionSetupError for a non-numeric runId', threw);
+    } finally {
+      (ExecutionEngine as any).cloneRepository = origClone;
+      (ExecutionEngine as any).installDependencies = origInstall;
+      fs.rmSync(repoPath, { recursive: true, force: true });
+    }
+  }
+
   // Dispatch failure must surface as a thrown error.
   {
     const fakeGithub: any = {

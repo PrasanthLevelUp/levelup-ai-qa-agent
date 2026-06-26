@@ -8,6 +8,9 @@
  *   POST /api/github/actions/dispatch                  — trigger via workflow_dispatch
  *   GET  /api/github/actions/runs/:runId               — poll a run's status
  *   GET  /api/github/actions/runs/:runId/artifacts     — list a run's artifacts
+ *   POST /api/github/actions/runs/:runId/record        — record a finished run's
+ *                                                        tests (pass+fail) as
+ *                                                        execution records
  *
  * Repo can be supplied either as `owner` + `repo` OR a single `repoUrl`
  * (e.g. github.com/Owner/Repo.git) which is parsed server-side.
@@ -19,6 +22,9 @@
 import { Router, type Request, type Response } from 'express';
 import { GitHubService, parseGitHubRepoUrl } from '../../integrations/github-service';
 import { logger } from '../../utils/logger';
+import { recordRunAsExecutions } from '../../core/execution/record-run-executions';
+import { getProjectIdForRepo } from '../../db/postgres';
+import { isExecutionProfile } from '../../core/execution/execution-profile';
 
 const MOD = 'github-actions-routes';
 
@@ -175,6 +181,47 @@ export function createGitHubActionsRouter(): Router {
     } catch (err: any) {
       logger.error(MOD, 'GET /runs/:runId/artifacts error', { error: err.message });
       res.status(500).json({ success: false, error: 'Failed to list run artifacts' });
+    }
+  });
+
+  /* ── Record a finished run as execution records (pass + fail) ────────
+     Ingests THIS run's artifacts and persists one execution record per test so
+     the run shows up on the Execution / Healing / Jobs screens — without healing
+     and without re-running anything. Idempotent per run (upserts in place). */
+  router.post('/runs/:runId/record', async (req: Request, res: Response) => {
+    try {
+      const companyId = (req as any).companyId as number | undefined;
+      const userId = (req as any).userId as number | undefined;
+      const target = resolveOwnerRepo(req.body, res);
+      if (!target) return;
+
+      const runId = parseInt(String(req.params.runId), 10);
+      if (isNaN(runId)) {
+        res.status(400).json({ success: false, error: 'Invalid runId.' });
+        return;
+      }
+
+      // Scope the records to the right project so they land under the active
+      // project filter. Resolve from the supplied repoUrl when available.
+      const repoUrl = req.body?.repoUrl ? String(req.body.repoUrl) : undefined;
+      const projectIdRaw = req.body?.projectId;
+      let projectId: number | undefined =
+        projectIdRaw != null && Number.isFinite(Number(projectIdRaw)) ? Number(projectIdRaw) : undefined;
+      if (projectId == null) {
+        const resolved = await getProjectIdForRepo(repoUrl, companyId);
+        if (resolved != null) projectId = resolved;
+      }
+
+      const profile = isExecutionProfile(req.body?.profile) ? req.body.profile : undefined;
+
+      const summary = await recordRunAsExecutions(github, target.owner, target.repo, runId, {
+        companyId, userId, projectId, profile,
+      });
+
+      res.json({ success: true, data: summary });
+    } catch (err: any) {
+      logger.error(MOD, 'POST /runs/:runId/record error', { error: err.message });
+      res.status(500).json({ success: false, error: err?.message || 'Failed to record workflow run' });
     }
   });
 
