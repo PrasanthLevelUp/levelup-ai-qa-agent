@@ -234,31 +234,36 @@ describe('Execution Record — events log (HISTORY, separate from STATE)', () =>
   });
 });
 
-describe('toAdvisorDecisionTrail — orchestrator outcome → user-facing status', () => {
+describe('toAdvisorDecisionTrail — captures the orchestrator outcome VERBATIM', () => {
   it('returns [] for undefined or empty trail', () => {
     expect(toAdvisorDecisionTrail(undefined)).toEqual([]);
     expect(toAdvisorDecisionTrail([])).toEqual([]);
   });
 
-  it('maps hit→won, skipped/not_reached→skipped, miss/error→consulted', () => {
+  it('passes raw status through unchanged (no collapse) and surfaces reasoning as reason', () => {
     const out = toAdvisorDecisionTrail([
-      { layer: 'App Profile', outcome: 'hit', confidence: 0.96, reasoning: 'match' },
-      { layer: 'DOM Memory', outcome: 'miss' },
-      { layer: 'Learned Pattern', outcome: 'skipped' },
-      { layer: 'Rule Engine', outcome: 'not_reached' },
-      { layer: 'AI', outcome: 'error' },
+      { layer: 'App Profile', outcome: 'hit', confidence: 0.96, reasoning: 'Grounded from crawl' },
+      { layer: 'DOM Memory', outcome: 'miss', reasoning: 'No high-confidence historical alternative' },
+      { layer: 'Learned Pattern', outcome: 'skipped', reasoning: 'App Profile won' },
+      { layer: 'Rule Engine', outcome: 'not_reached', reasoning: 'short-circuited' },
+      { layer: 'AI', outcome: 'error', reasoning: 'timeout' },
     ]);
     expect(out).toEqual([
-      { advisor: 'App Profile', status: 'won', confidence: 0.96, reasoning: 'match' },
-      { advisor: 'DOM Memory', status: 'consulted' },
-      { advisor: 'Learned Pattern', status: 'skipped' },
-      { advisor: 'Rule Engine', status: 'skipped' },
-      { advisor: 'AI', status: 'consulted' },
+      { advisor: 'App Profile', status: 'hit', reason: 'Grounded from crawl', confidence: 0.96 },
+      { advisor: 'DOM Memory', status: 'miss', reason: 'No high-confidence historical alternative' },
+      { advisor: 'Learned Pattern', status: 'skipped', reason: 'App Profile won' },
+      { advisor: 'Rule Engine', status: 'not_reached', reason: 'short-circuited' },
+      { advisor: 'AI', status: 'error', reason: 'timeout' },
     ]);
   });
 
-  it('carries confidence (0..1) and reasoning through unchanged (no rounding here)', () => {
+  it('carries confidence (0..1) through unchanged (no rounding here)', () => {
     const out = toAdvisorDecisionTrail([{ layer: 'AI', outcome: 'hit', confidence: 0.5 }]);
-    expect(out[0]).toEqual({ advisor: 'AI', status: 'won', confidence: 0.5 });
+    expect(out[0]).toEqual({ advisor: 'AI', status: 'hit', confidence: 0.5 });
+  });
+
+  it('defends against an unexpected outcome string (falls back to miss)', () => {
+    const out = toAdvisorDecisionTrail([{ layer: 'X', outcome: 'banana' }]);
+    expect(out[0]).toEqual({ advisor: 'X', status: 'miss' });
   });
 });

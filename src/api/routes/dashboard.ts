@@ -19,6 +19,7 @@ import {
   buildExecutionTimeline,
   deriveDecisionTrail,
   deriveEventFeed,
+  deriveExecutionHealth,
 } from '../../core/execution/execution-timeline';
 import { toDisplayStage } from '../../core/execution/execution-lifecycle';
 import { logger } from '../../utils/logger';
@@ -251,10 +252,12 @@ export function createDashboardRouter(): Router {
       if (!record) return res.status(404).json({ error: 'Execution record not found', executionId: id });
       const timeline = buildExecutionTimeline(record);
       // Authoritative projections the dashboard renders verbatim (never inferred
-      // client-side): the advisor waterfall and the customer-facing event feed.
+      // client-side): the advisor waterfall, the semantic event feed, and the
+      // per-phase health bar.
       const decisionTrail = deriveDecisionTrail(record);
       const eventFeed = deriveEventFeed(record);
-      res.json({ record, timeline, decisionTrail, eventFeed });
+      const health = deriveExecutionHealth(record);
+      res.json({ record, timeline, decisionTrail, eventFeed, health });
     } catch (err) {
       logger.error(MOD, 'executions/:id failed', { error: err });
       res.status(500).json({ error: 'Failed to fetch execution record' });
