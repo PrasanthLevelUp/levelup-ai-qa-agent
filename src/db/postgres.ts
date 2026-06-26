@@ -6003,10 +6003,19 @@ export interface NotificationConfig {
  * fall back to company-only scoping for backwards compatibility.
  */
 export async function getNotificationConfigs(companyId?: number, userId?: number): Promise<NotificationConfig[]> {
+  // Use COALESCE to match the unique constraint behavior
   const where: string[] = [];
   const params: any[] = [];
-  if (companyId != null) { params.push(companyId); where.push(`company_id = $${params.length}`); }
-  if (userId != null) { params.push(userId); where.push(`user_id = $${params.length}`); }
+  if (companyId != null) { 
+    const cidCoalesced = companyId ?? 0;
+    params.push(cidCoalesced); 
+    where.push(`COALESCE(company_id, 0) = $${params.length}`); 
+  }
+  if (userId != null) { 
+    const uidCoalesced = userId ?? 0;
+    params.push(uidCoalesced); 
+    where.push(`COALESCE(user_id, 0) = $${params.length}`); 
+  }
   const clause = where.length ? `WHERE ${where.join(' AND ')}` : '';
   const result = await getPool().query(
     `SELECT * FROM notification_configs ${clause} ORDER BY created_at ASC`,
@@ -6020,13 +6029,17 @@ export async function getNotificationConfigByType(
   companyId?: number,
   userId?: number,
 ): Promise<NotificationConfig | null> {
-  const params: any[] = [toolType];
-  const where: string[] = [`tool_type = $1`];
-  if (companyId != null) { params.push(companyId); where.push(`company_id = $${params.length}`); }
-  if (userId != null) { params.push(userId); where.push(`user_id = $${params.length}`); }
+  // Use COALESCE to match the unique constraint behavior
+  // This ensures we find rows even when company_id or user_id are NULL
+  const cidCoalesced = companyId ?? 0;
+  const uidCoalesced = userId ?? 0;
   const result = await getPool().query(
-    `SELECT * FROM notification_configs WHERE ${where.join(' AND ')} ORDER BY updated_at DESC LIMIT 1`,
-    params,
+    `SELECT * FROM notification_configs 
+     WHERE tool_type = $1 
+       AND COALESCE(company_id, 0) = $2 
+       AND COALESCE(user_id, 0) = $3 
+     ORDER BY updated_at DESC LIMIT 1`,
+    [toolType, cidCoalesced, uidCoalesced],
   );
   return result.rows[0] || null;
 }
