@@ -142,7 +142,7 @@ export class ExecutionEngine {
     const start = Date.now();
 
     const args = testFile
-      ? ['playwright', 'test', testFile, '--reporter=json', '--output=test-results']
+      ? ['playwright', 'test', testFile, '--reporter=json', '--trace=retain-on-failure', '--output=test-results']
       : ['test'];
 
     const cmd = testFile ? 'npx' : 'npm';
@@ -208,46 +208,6 @@ export class ExecutionEngine {
   }
 
   /**
-   * Generate a temporary Playwright config that extends the user's config (if
-   * present) and injects a global fixture to capture page.url() at test failure.
-   * This gives us the REAL browser URL without regex-guessing from error text.
-   */
-  private static generateHealingConfig(repoPath: string): string {
-    const userConfigs = ['playwright.config.ts', 'playwright.config.js', 'playwright.config.mjs', 'playwright.config.cjs'];
-    let userConfigPath: string | null = null;
-    for (const name of userConfigs) {
-      const p = path.join(repoPath, name);
-      if (fs.existsSync(p)) { userConfigPath = `./${name}`; break; }
-    }
-
-    const fixtureRelPath = path.relative(repoPath, path.join(__dirname, 'page-url-capture-fixture.js'));
-    const configContent = userConfigPath
-      ? `// Healing-injected config override (extends user config + captures page.url())
-const { defineConfig } = require('@playwright/test');
-const userConfig = require('${userConfigPath}');
-const { test } = require('./${fixtureRelPath}');
-
-module.exports = defineConfig({
-  ...userConfig.default ?? userConfig,
-  // Export the instrumented test object so the fixture runs for every test
-  _fixtures: test,
-});
-`
-      : `// Healing-injected config (no user config found; captures page.url())
-const { defineConfig } = require('@playwright/test');
-const { test } = require('./${fixtureRelPath}');
-
-module.exports = defineConfig({
-  _fixtures: test,
-});
-`;
-
-    const configPath = path.join(repoPath, 'playwright.config.healing.js');
-    fs.writeFileSync(configPath, configContent);
-    return configPath;
-  }
-
-  /**
    * Synchronous run method (backward compatible for orchestrator).
    * Always uses `npx playwright test` to resolve both local and global playwright.
    *
@@ -260,8 +220,13 @@ module.exports = defineConfig({
    *   2. Wrap the command in `xvfb-run -a` when available, so configs that set
    *      `headless: false` still run under a virtual X server instead of failing
    *      to launch the browser in a headless runner.
-   *   3. Inject a global fixture (via generated config) to capture page.url() at
-   *      failure, giving us the real browser URL for healing profile resolution.
+   *   3. Force `--trace=retain-on-failure` so a trace.zip is produced on failure.
+   *      Playwright natively records the rendered frame URL in the trace; the
+   *      ArtifactCollector reads the REAL page.url() from it for healing-grounded
+   *      profile resolution. This is a CLI flag ONLY — identical in spirit to the
+   *      `--reporter=json` override above. It does NOT edit the user's config,
+   *      inject fixtures, or modify test code, so "we run your suite unchanged"
+   *      still holds. If the user already enables tracing, this is a no-op.
    */
   static run(repoPath: string, testFile?: string, grepFilter?: string): RunResult {
     const { execSync } = require('child_process');
@@ -269,16 +234,14 @@ module.exports = defineConfig({
     const startTime = new Date().toISOString();
     const start = Date.now();
 
-    // Inject a temporary config that captures page.url() at failure via auto-fixture.
-    const healingConfigPath = ExecutionEngine.generateHealingConfig(repoPath);
-    const configRelPath = path.relative(repoPath, healingConfigPath);
-
     // Force the JSON reporter to a known file regardless of the repo's config.
     // PLAYWRIGHT_JSON_OUTPUT_NAME makes the json reporter write to a file (it
     // would otherwise stream JSON to stdout when invoked via --reporter=json).
+    // Also force --trace=retain-on-failure so a trace.zip exists on failure; the
+    // ArtifactCollector reads the REAL page.url() from it (no fixture, no config edit).
     let cmd = testFile
-      ? `npx playwright test "${testFile}" --config="${configRelPath}" --reporter=json`
-      : `npx playwright test --config="${configRelPath}" --reporter=json`;
+      ? `npx playwright test "${testFile}" --reporter=json --trace=retain-on-failure`
+      : `npx playwright test --reporter=json --trace=retain-on-failure`;
 
     // --grep isolates a single test by name for efficient per-test reruns
     if (grepFilter) {

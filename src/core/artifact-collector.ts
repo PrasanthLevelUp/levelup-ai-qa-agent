@@ -5,6 +5,8 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
+import * as os from 'os';
+import { execSync } from 'child_process';
 import { logger } from '../utils/logger';
 import { extractLocator, type LocatorInfo } from './locator-extractor';
 import { normalizeError, extractErrorPattern, type NormalizedError } from './error-normalizer';
@@ -42,26 +44,56 @@ function extractUrl(errorMessage: string): string | null {
 }
 
 /**
- * Load the captured page.url() values from the fixture-generated file.
- * Returns a Map keyed by (file + testName) for fast lookup.
+ * Extract the REAL page URL (a page.url() equivalent) from a Playwright trace.zip.
+ *
+ * WHY THE TRACE (and not a fixture)?
+ * Playwright NATIVELY records the rendered frame URL inside the trace as
+ * `frame-snapshot` events — no fixture injection, config rewrite, or test-code
+ * change is needed. We force `--trace=retain-on-failure` (a CLI flag only) so a
+ * trace exists on failure, then read the last non-blank frame URL here. This is
+ * the cleanest non-invasive source: empirically the JSON reporter and
+ * error-context.md do NOT contain page.url(), and the execution subprocess has
+ * no access to the `page` object. See PR description for the full evidence table.
+ *
+ * Returns null on any failure (missing unzip, malformed trace, no URL) so the
+ * URL cascade falls back to the execution base URL / latest active profile.
  */
-function loadCapturedPageUrls(testRepoPath: string): Map<string, string> {
-  const urlsFile = path.join(testRepoPath, 'test-results-page-urls.json');
-  const map = new Map<string, string>();
-  if (!fs.existsSync(urlsFile)) return map;
+export function extractUrlFromTrace(traceZipPath: string): string | null {
+  if (!traceZipPath || !fs.existsSync(traceZipPath)) return null;
+  let tmpDir: string | null = null;
   try {
-    const raw = fs.readFileSync(urlsFile, 'utf-8');
-    const entries = JSON.parse(raw) as Array<{ testName: string; file: string; url: string }>;
-    for (const e of entries) {
-      if (e.testName && e.file && e.url) {
-        const key = `${e.file}|${e.testName}`;
-        map.set(key, e.url);
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'levelup-trace-'));
+    // `unzip` is present on the Playwright Docker image and standard Linux runners.
+    execSync(`unzip -o "${traceZipPath}" -d "${tmpDir}"`, { stdio: 'ignore' });
+
+    const traceFiles = fs.readdirSync(tmpDir).filter((f) => f.endsWith('.trace'));
+    let lastPageUrl: string | null = null;
+    let gotoUrl: string | null = null;
+
+    for (const tf of traceFiles) {
+      const lines = fs.readFileSync(path.join(tmpDir, tf), 'utf-8').split('\n');
+      for (const line of lines) {
+        const s = line.trim();
+        if (!s) continue;
+        let evt: any;
+        try { evt = JSON.parse(s); } catch { continue; }
+        // The rendered document URL at each snapshot — last non-blank wins (page at failure).
+        if (evt.type === 'frame-snapshot') {
+          const url = evt.snapshot?.frameUrl;
+          if (url && url !== 'about:blank') lastPageUrl = url;
+        }
+        // Fallback: the navigation target if no snapshot URL is present.
+        if (evt.type === 'before' && evt.params?.url) gotoUrl = evt.params.url;
       }
     }
+    return lastPageUrl ?? gotoUrl;
   } catch (err) {
-    // Defensive: if the file is malformed or unreadable, skip it.
+    return null;
+  } finally {
+    if (tmpDir) {
+      try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* noop */ }
+    }
   }
-  return map;
 }
 
 export class ArtifactCollector {
@@ -75,9 +107,6 @@ export class ArtifactCollector {
       suites?: any[];
       errors?: any[];
     };
-
-    // Load the real page.url() captures from the auto-fixture, keyed by file + testName.
-    const capturedUrls = loadCapturedPageUrls(testRepoPath);
 
     const artifacts: ArtifactCollection[] = [];
 
@@ -142,12 +171,14 @@ export class ArtifactCollector {
                 a.name === 'screenshot' || a.contentType?.startsWith('image/')
               )?.path ?? null;
 
-              // Prefer the REAL captured page.url() from the fixture over regex-guessing.
-              // The fixture writes a file keyed by (file + testName). Fallback to the legacy
-              // regex extraction for backward compat if the fixture didn't run.
-              const urlKey = `${suiteFile}|${testName}`;
-              const capturedUrl = capturedUrls.get(urlKey);
-              const finalUrl = capturedUrl ?? extractUrl(errorMessage);
+              // Resolve the REAL page URL from this result's trace.zip (Playwright
+              // records the rendered frame URL natively). No fixture / config edit.
+              // Fall back to the legacy regex extraction if no trace/URL is found.
+              const tracePath = (result.attachments ?? []).find((a: any) =>
+                a.name === 'trace' || (typeof a.path === 'string' && a.path.endsWith('trace.zip'))
+              )?.path ?? null;
+              const tracedUrl = tracePath ? extractUrlFromTrace(tracePath) : null;
+              const finalUrl = tracedUrl ?? extractUrl(errorMessage);
 
               const artifact: ArtifactCollection = {
                 test_name: testName,

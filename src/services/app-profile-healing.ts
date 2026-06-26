@@ -192,13 +192,14 @@ export interface HealingProfileResolverInput {
   projectId?: number;
   /**
    * URL from the failure artifact (most specific).
-   * Now populated with the REAL page.url() from the auto-fixture on test failure,
-   * no longer regex-guessed from error text.
+   * Now populated with the REAL page URL read from the Playwright trace.zip
+   * (frame-snapshot events) by the ArtifactCollector — no longer regex-guessed
+   * from error text, and no fixture injection.
    */
   failureUrl?: string | null;
   /**
-   * DEPRECATED: browserUrl tier is no longer used; the auto-fixture writes the
-   * real page.url() directly into failure.url via the artifact collector.
+   * DEPRECATED: browserUrl tier is no longer used; the ArtifactCollector writes
+   * the real page URL (from the trace) directly into failure.url.
    * Kept for signature stability; always pass null.
    */
   browserUrl?: string | null;
@@ -225,12 +226,11 @@ export interface HealingProfileResolution {
  * must heal the page that actually failed):
  *
  *   1. Failure URL (failureUrl)
- *        Now populated with the REAL page.url() captured by an auto-fixture at
- *        test failure — no regex-guessing. This is the most specific signal.
+ *        Now populated with the REAL page URL read from the Playwright trace.zip
+ *        (frame-snapshot events) — no regex-guessing, no fixture. Most specific.
  *   2. Execution Base URL (executionBaseUrl)
  *        The suite's baseURL config (playwright.config / BASE_URL env). Right app,
- *        but maybe not the exact page. Used when the fixture didn't run or the
- *        browser was already closed.
+ *        but maybe not the exact page. Used when no trace/URL is available.
  *   3. Latest Active Project Profile
  *        Last resort. Avoids the multi-app pitfall: a project with QA / Prod /
  *        Admin / Customer portals crawled together would otherwise heal against

@@ -345,8 +345,9 @@ export async function startAPIServer(): Promise<void> {
 
 /**
  * REMOVED: extractBrowserUrlFromError (regex-based guessing).
- * Now replaced with REAL page.url() capture via auto-fixture.
- * The artifact collector merges the captured URL into failure.url directly.
+ * Now replaced with the REAL page URL read from the Playwright trace.zip
+ * (frame-snapshot events) by the ArtifactCollector, which merges it into
+ * failure.url directly. No fixture injection or config rewrite required.
  */
 
 /**
@@ -852,11 +853,11 @@ function createHealingWorker(
         let appProfileHealing: AppProfileHealingInput | undefined;
         try {
           // Deterministic URL cascade for healing-grounded profile resolution:
-          //   failure.url (now REAL page.url() from fixture) → execution base URL → latest active.
-          // The auto-fixture captures page.url() at failure and the artifact collector
-          // merges it into failure.url. The execution base URL rescues cases where the
-          // fixture didn't run or the browser was already closed. This avoids blindly
-          // picking "newest crawl" in multi-app projects.
+          //   failure.url (REAL page URL from the trace) → execution base URL → latest active.
+          // The ArtifactCollector reads the rendered page URL from the Playwright
+          // trace.zip and merges it into failure.url. The execution base URL rescues
+          // cases where no trace/URL is available. This avoids blindly picking the
+          // "newest crawl" in multi-app projects.
           const executionBaseUrl = readExecutionBaseUrl(testRepoPath);
           appProfileHealing = await buildAppProfileHealingInput(
             failure,
