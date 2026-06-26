@@ -13,6 +13,44 @@ import {
   applyEnvSprintSchema,
 } from './environment-sprint-schema';
 import { FEATURE_FLAGS } from '../config/features';
+import {
+  type ExecutionSettings,
+  DEFAULT_EXECUTION_SETTINGS,
+} from '../core/execution/execution-settings';
+import type { ExecutionRecord } from '../core/execution/execution-record';
+
+// Re-export execution domain models so existing `from '../db/postgres'` imports
+// keep working during/after the refactor. The models are OWNED by
+// src/core/execution/* — postgres.ts only persists them.
+export type { ExecutionProfile } from '../core/execution/execution-profile';
+export {
+  type ExecutionSettings,
+  DEFAULT_EXECUTION_SETTINGS,
+  resolveExecutionProfile,
+  resolveCollectHealingArtifacts,
+} from '../core/execution/execution-settings';
+export {
+  type ExecutionRecord,
+  type EvidenceManifest,
+  type ArtifactDescriptor,
+  type ArtifactStorage,
+  type ArtifactType,
+  type ExecutionArtifacts,
+  type ExecutionMetadata,
+  type ObservationRecord,
+  type DiagnosisRecord,
+  type HealingDecisionRecord,
+  type ValidationRecord,
+  type LearningRecord,
+  EXECUTION_RECORD_SCHEMA_VERSION,
+  createExecutionRecord,
+  recordArtifacts,
+  recordObservations,
+  recordDiagnosis,
+  recordHealingDecision,
+  recordValidation,
+  recordLearning,
+} from '../core/execution/execution-record';
 
 const MOD = 'postgres';
 
@@ -1812,6 +1850,28 @@ async function migrateDefaultCompany(client: PoolClient): Promise<void> {
   await safeExec(client, 'idx_execution_settings_scope',
     `CREATE UNIQUE INDEX IF NOT EXISTS idx_execution_settings_scope
        ON execution_settings(COALESCE(company_id, 0), COALESCE(project_id, 0))`);
+
+  // ── Execution records (the canonical per-execution record) ──
+  // One JSONB document per execution that accumulates artifacts → observations →
+  // diagnosis → healing → validation → learning. The dashboard/analytics read
+  // THIS table instead of separate diagnosis/healing/evidence/artifact tables.
+  // Fully additive — absence of rows simply means no executions recorded yet.
+  console.log('🔧 [DB] Migration: execution_records table...');
+  await safeExec(client, 'execution_records', `CREATE TABLE IF NOT EXISTS execution_records (
+    execution_id TEXT PRIMARY KEY,
+    company_id INTEGER REFERENCES companies(id),
+    project_id INTEGER REFERENCES projects(id) ON DELETE CASCADE,
+    test_name TEXT,
+    status TEXT,
+    profile TEXT,
+    schema_version INTEGER NOT NULL DEFAULT 1,
+    record JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+  )`);
+  await safeExec(client, 'idx_execution_records_scope',
+    `CREATE INDEX IF NOT EXISTS idx_execution_records_scope
+       ON execution_records(COALESCE(company_id, 0), COALESCE(project_id, 0), created_at DESC)`);
 
   // ── Crawl snapshots (proactive script maintenance: change detection) ──
   // Stores a lightweight, versioned "signature" of each crawl so we can diff
@@ -7178,266 +7238,6 @@ export async function setRequirementGenerationState(
   }
 }
 
-// ---- Execution settings (project-level configuration for test execution) ----
-
-/**
- * Execution Profile — controls what artifacts are captured during test execution.
- * Tiered to balance storage costs vs. diagnostic richness:
- * - fast: CI pipelines — metadata only
- * - standard: default — metadata + failure screenshots + DOM
- * - healing: healing mode — standard + trace + video (used explicitly, not auto-upgraded)
- * - debug: investigation — everything (trace/video/HAR always on)
- */
-export type ExecutionProfile = 'fast' | 'standard' | 'healing' | 'debug';
-
-/**
- * Execution Settings — project-level DEFAULTS for test execution.
- * Separate from healing settings because execution is used by multiple consumers:
- * script validation, healing, regression, smoke, nightly, GitHub Actions, etc.
- *
- * IMPORTANT: these are *defaults only*. The same project frequently runs under
- * different profiles (CI smoke wants `fast`, an investigation wants `debug`),
- * so every execution request MAY override these values. Use
- * `resolveExecutionProfile()` / `resolveCollectHealingArtifacts()` to compute
- * the effective values for a given request rather than reading these directly.
- */
-export interface ExecutionSettings {
-  /**
-   * Default execution profile — controls baseline artifact collection when a
-   * request does not specify its own. Authorization layer should enforce which
-   * profiles are available per plan.
-   */
-  executionProfile: ExecutionProfile;
-  /**
-   * Explicit opt-in for additional artifacts during healing attempts.
-   * When true, healing runs will collect trace/video/HAR (regardless of profile).
-   * When false, only the base profile artifacts are collected.
-   * Makes artifact collection behavior explicit and visible to users.
-   */
-  collectHealingArtifacts: boolean;
-}
-
-export const DEFAULT_EXECUTION_SETTINGS: ExecutionSettings = {
-  executionProfile: 'standard', // Safe default: screenshots + DOM on failure
-  collectHealingArtifacts: true, // Default: collect additional diagnostics during healing
-};
-
-/** Current schema version of the canonical execution record (bump on breaking shape changes). */
-export const EXECUTION_RECORD_SCHEMA_VERSION = 1;
-
-/**
- * Observations — the OBSERVED FACTS gathered before any diagnosis is attempted
- * (mirror of core/evidence-collector EvidenceBundle, kept structural here to
- * avoid a core→db import cycle). This is the "what we saw" section.
- */
-export interface ObservationRecord {
-  locatorState?: {
-    exists: boolean;
-    visible: boolean;
-    enabled: boolean;
-    receivesPointerEvents: boolean | null;
-    clickable: boolean;
-    interceptedBy: string | null;
-    source: 'dom_snapshot' | 'live_probe' | 'unknown';
-  } | null;
-  consoleErrors?: string[];
-  networkErrors?: Array<{ url?: string; status?: number; detail: string }>;
-  /** Compact, human-readable evidence lines. */
-  summary?: string[];
-}
-
-/**
- * Diagnosis — the classifier's verdict (mirror of core FailureDiagnosis, kept
- * structural). This is the "what failed and why" section.
- */
-export interface DiagnosisRecord {
-  category: string;
-  confidence: number;
-  recommendedStrategy: string;
-  rootCause?: string;
-  recommendedAction?: string;
-  locator?: string | null;
-  locatorResolvedFromPageObject?: boolean;
-  healableByLocatorSwap?: boolean;
-  evidenceBased?: boolean;
-}
-
-/**
- * Healing decisions — what the engine decided to DO about the failure and the
- * outcome of applying it. This is the "what we changed" section.
- */
-export interface HealingDecisionRecord {
-  /** Coarse remedy class chosen (locator_swap | inject_wait | report_only). */
-  remedy?: string;
-  /** Fine-grained strategies attempted in order. */
-  attemptedStrategies?: string[];
-  /** The strategy that was actually applied, if any. */
-  appliedStrategy?: string | null;
-  /** Which advisor/source produced the applied fix (rule | pattern | ai | wait | ...). */
-  source?: string | null;
-  brokenLocator?: string | null;
-  newLocator?: string | null;
-  candidatesConsidered?: number;
-  /** True when the failure was surfaced to humans rather than auto-fixed. */
-  reportOnly?: boolean;
-  rationale?: string;
-}
-
-/**
- * Validation — did the fix actually hold up on rerun? This is the "did it work"
- * section that gates whether a healing is trustworthy.
- */
-export interface ValidationRecord {
-  reran: boolean;
-  passedAfterHealing?: boolean | null;
-  confirmationRuns?: number;
-  durationMs?: number;
-  notes?: string[];
-}
-
-/**
- * Learning — what this execution contributed back to the system's memory.
- * This is the "what we remembered" section that closes the loop.
- */
-export interface LearningRecord {
-  recorded: boolean;
-  patternId?: string | null;
-  domMemoryUpdated?: boolean;
-  notes?: string[];
-}
-
-/**
- * Evidence Manifest / Execution Record — the CANONICAL execution record.
- *
- * This started as an artifact container and has evolved into the single source
- * of truth for a test execution. It accumulates, across the lifecycle:
- *   1. artifacts    — files captured (screenshot/DOM/trace/video/HAR/...)
- *   2. observations — the observed facts before diagnosis
- *   3. diagnosis    — the classifier's verdict (what failed, why)
- *   4. healing      — the decision taken and the fix applied
- *   5. validation   — whether the fix held up on rerun
- *   6. learning     — what was written back to the system's memory
- *
- * Consumed by Timeline, Replay, Healing, Diagnosis, Analytics, and Learning.
- * Use `createExecutionRecord()` + the `record*()` accumulators to build it up
- * stage by stage rather than passing dozens of values around separately.
- */
-export interface EvidenceManifest {
-  /** Schema version for forward/backward compatibility of persisted records. */
-  schemaVersion?: number;
-  executionId: string;
-  testName: string;
-  status: 'passed' | 'failed' | 'timedout' | 'skipped';
-  durationMs: number;
-  startTime: string;
-  endTime: string;
-  artifacts: {
-    // Always collected (Tier 1)
-    metadata?: {
-      url?: string;
-      locator?: string;
-      failedLine?: number;
-      stackTrace?: string;
-      browserInfo?: string;
-    };
-    // Tier 2 - On failure
-    screenshot?: string; // Path or URL to screenshot
-    dom?: string; // Path to DOM snapshot
-    html?: string; // Full page HTML
-    consoleErrors?: string[]; // Console error messages
-    locatorState?: {
-      exists: boolean;
-      visible: boolean;
-      enabled: boolean;
-      boundingBox?: { x: number; y: number; width: number; height: number };
-    };
-    // Tier 3 - On healing (when collectHealingArtifacts=true)
-    trace?: string; // Path to Playwright trace
-    video?: string; // Path to video recording
-    har?: string; // Path to HAR (HTTP Archive) file
-    network?: string[]; // Network errors
-    performance?: Record<string, any>; // Performance metrics
-  };
-  profile: ExecutionProfile; // Which profile was used for this execution
-
-  // ---- Lifecycle sections (accumulated stage by stage) ----
-  /** Observed facts gathered before diagnosis. */
-  observations?: ObservationRecord;
-  /** The classifier's verdict for this execution. */
-  diagnosis?: DiagnosisRecord;
-  /** The healing decision taken and the fix applied. */
-  healing?: HealingDecisionRecord;
-  /** Whether the applied fix held up on rerun. */
-  validation?: ValidationRecord;
-  /** What this execution contributed back to system memory. */
-  learning?: LearningRecord;
-}
-
-/**
- * Canonical alias for the evolved manifest. Prefer `ExecutionRecord` in new code
- * to reflect that this object is the single source of truth for an execution,
- * not merely an artifact container. `EvidenceManifest` is retained for back-compat.
- */
-export type ExecutionRecord = EvidenceManifest;
-
-/**
- * Create a fresh canonical execution record. Lifecycle sections start empty and
- * are filled in by the `record*()` accumulators as the execution progresses.
- */
-export function createExecutionRecord(init: {
-  executionId: string;
-  testName: string;
-  status: EvidenceManifest['status'];
-  durationMs: number;
-  startTime: string;
-  endTime: string;
-  profile: ExecutionProfile;
-  artifacts?: EvidenceManifest['artifacts'];
-}): ExecutionRecord {
-  return {
-    schemaVersion: EXECUTION_RECORD_SCHEMA_VERSION,
-    executionId: init.executionId,
-    testName: init.testName,
-    status: init.status,
-    durationMs: init.durationMs,
-    startTime: init.startTime,
-    endTime: init.endTime,
-    profile: init.profile,
-    artifacts: init.artifacts ?? {},
-  };
-}
-
-/**
- * Accumulators take Partial section data because a record is built up across the
- * lifecycle — a later stage may set only the fields it just learned. Each returns
- * a new record (immutable merge) so callers can thread the record through stages.
- */
-
-/** Accumulate observed facts onto the record (immutable merge). */
-export function recordObservations(rec: ExecutionRecord, observations: Partial<ObservationRecord>): ExecutionRecord {
-  return { ...rec, observations: { ...(rec.observations ?? {}), ...observations } };
-}
-
-/** Accumulate the diagnosis verdict onto the record (immutable merge). */
-export function recordDiagnosis(rec: ExecutionRecord, diagnosis: Partial<DiagnosisRecord>): ExecutionRecord {
-  return { ...rec, diagnosis: { ...(rec.diagnosis ?? {} as DiagnosisRecord), ...diagnosis } };
-}
-
-/** Accumulate the healing decision/outcome onto the record (immutable merge). */
-export function recordHealingDecision(rec: ExecutionRecord, healing: Partial<HealingDecisionRecord>): ExecutionRecord {
-  return { ...rec, healing: { ...(rec.healing ?? {}), ...healing } };
-}
-
-/** Accumulate the validation outcome onto the record (immutable merge). */
-export function recordValidation(rec: ExecutionRecord, validation: Partial<ValidationRecord>): ExecutionRecord {
-  return { ...rec, validation: { ...(rec.validation ?? { reran: false }), ...validation } };
-}
-
-/** Accumulate the learning contribution onto the record (immutable merge). */
-export function recordLearning(rec: ExecutionRecord, learning: Partial<LearningRecord>): ExecutionRecord {
-  return { ...rec, learning: { ...(rec.learning ?? { recorded: false }), ...learning } };
-}
-
 /** Read execution settings for a scope, merged over defaults (never throws on missing table). */
 export async function getExecutionSettings(companyId?: number, projectId?: number): Promise<ExecutionSettings> {
   const pool = getPool();
@@ -7476,39 +7276,87 @@ export async function upsertExecutionSettings(
   return merged;
 }
 
-/**
- * Resolve the effective execution profile for a single execution request.
- *
- * Execution profiles are PROJECT-LEVEL DEFAULTS that can be overridden PER
- * EXECUTION REQUEST. The same project routinely runs under different profiles:
- * a CI smoke job wants `fast`, an investigation rerun wants `debug`, a nightly
- * regression may force `standard`. The project default is just the fallback
- * when a request does not specify one.
- *
- * Precedence (highest wins):
- *   1. requested  — the profile attached to this specific execution request
- *   2. projectDefault — the project-level ExecutionSettings default
- *   3. system default ('standard')
- */
-export function resolveExecutionProfile(
-  requested?: ExecutionProfile | null,
-  projectDefault?: ExecutionProfile | null
-): ExecutionProfile {
-  return requested || projectDefault || DEFAULT_EXECUTION_SETTINGS.executionProfile;
-}
+// ---- Execution records (the canonical per-execution record) ----
+//
+// The ExecutionRecord business model lives in src/core/execution/execution-record.ts.
+// postgres.ts only persists and reads it. The dashboard/analytics read THIS row
+// (one record per execution) rather than separate diagnosis/healing/evidence tables.
 
 /**
- * Resolve the effective "collect healing artifacts" flag for a single request.
- * Same precedence model as the profile: an explicit per-request value wins over
- * the project default, which wins over the system default.
+ * Persist (insert or update) a canonical execution record. Stored as a single
+ * JSONB document keyed by executionId, scoped by company/project. Safe no-op
+ * fallback if the table does not exist yet (never throws on missing table).
  */
-export function resolveCollectHealingArtifacts(
-  requested?: boolean | null,
-  projectDefault?: boolean | null
-): boolean {
-  if (typeof requested === 'boolean') return requested;
-  if (typeof projectDefault === 'boolean') return projectDefault;
-  return DEFAULT_EXECUTION_SETTINGS.collectHealingArtifacts;
+export async function saveExecutionRecord(
+  record: ExecutionRecord, companyId?: number, projectId?: number
+): Promise<void> {
+  const pool = getPool();
+  try {
+    await pool.query(
+      `INSERT INTO execution_records
+         (execution_id, company_id, project_id, test_name, status, profile, schema_version, record, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, NOW(), NOW())
+       ON CONFLICT (execution_id)
+       DO UPDATE SET record = $8::jsonb, status = $5, test_name = $4, profile = $6,
+                     schema_version = $7, updated_at = NOW()`,
+      [
+        record.executionId,
+        companyId ?? null,
+        projectId ?? null,
+        record.testName,
+        record.status,
+        record.profile,
+        record.schemaVersion,
+        JSON.stringify(record),
+      ]
+    );
+  } catch (err: any) {
+    if (err?.code === '42P01' || err?.message?.includes('does not exist')) {
+      logger.warn(MOD, 'execution_records table missing — skipping persist', { executionId: record.executionId });
+      return;
+    }
+    throw err;
+  }
+}
+
+/** Read a single canonical execution record by its executionId (null if absent). */
+export async function getExecutionRecord(executionId: string): Promise<ExecutionRecord | null> {
+  const pool = getPool();
+  try {
+    const r = await pool.query(
+      `SELECT record FROM execution_records WHERE execution_id = $1 LIMIT 1`,
+      [executionId]
+    );
+    return (r.rows[0]?.record as ExecutionRecord) ?? null;
+  } catch (err: any) {
+    if (err?.code === '42P01' || err?.message?.includes('does not exist')) {
+      return null;
+    }
+    throw err;
+  }
+}
+
+/** List recent execution records for a project scope (most recent first). */
+export async function listExecutionRecords(
+  companyId?: number, projectId?: number, limit = 50
+): Promise<ExecutionRecord[]> {
+  const pool = getPool();
+  try {
+    const r = await pool.query(
+      `SELECT record FROM execution_records
+       WHERE COALESCE(company_id, 0) = COALESCE($1, 0)
+         AND COALESCE(project_id, 0) = COALESCE($2, 0)
+       ORDER BY created_at DESC
+       LIMIT $3`,
+      [companyId ?? null, projectId ?? null, limit]
+    );
+    return r.rows.map((row) => row.record as ExecutionRecord);
+  } catch (err: any) {
+    if (err?.code === '42P01' || err?.message?.includes('does not exist')) {
+      return [];
+    }
+    throw err;
+  }
 }
 
 // ---- Healing settings (admin-tunable confidence thresholds + cost caps) ----

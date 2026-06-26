@@ -7,7 +7,8 @@ import { spawn } from 'child_process';
 import * as path from 'path';
 import * as fs from 'fs';
 import { logger } from '../utils/logger';
-import type { ExecutionProfile, EvidenceManifest } from '../db/postgres';
+import type { ExecutionProfile } from './execution/execution-profile';
+import type { EvidenceManifest } from './execution/execution-record';
 
 const MOD = 'execution-engine';
 

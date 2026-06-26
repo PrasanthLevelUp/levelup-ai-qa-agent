@@ -5,15 +5,19 @@
 import {
   resolveExecutionProfile,
   resolveCollectHealingArtifacts,
+} from '../../src/core/execution/execution-settings';
+import {
   createExecutionRecord,
+  recordArtifacts,
   recordObservations,
   recordDiagnosis,
   recordHealingDecision,
   recordValidation,
   recordLearning,
   EXECUTION_RECORD_SCHEMA_VERSION,
+  type ArtifactDescriptor,
   type ExecutionRecord,
-} from '../../src/db/postgres';
+} from '../../src/core/execution/execution-record';
 
 describe('resolveExecutionProfile — defaults overridden per request', () => {
   it('uses the per-request override when provided', () => {
@@ -120,5 +124,34 @@ describe('Execution Record — canonical lifecycle accumulation', () => {
     rec = recordValidation(rec, { reran: true });
     rec = recordValidation(rec, { passedAfterHealing: false });
     expect(rec.validation).toEqual({ reran: true, passedAfterHealing: false });
+  });
+
+  it('stores artifacts as storage-agnostic descriptors (id + storage, not bare paths)', () => {
+    const trace: ArtifactDescriptor = {
+      id: 'art_trace_1',
+      type: 'trace',
+      storage: 's3',
+      path: 'tenants/42/exec_1/trace.zip',
+      size: 240939,
+      contentType: 'application/zip',
+    };
+    const rec = recordArtifacts(base(), { trace });
+    expect(rec.artifacts.trace?.id).toBe('art_trace_1');
+    expect(rec.artifacts.trace?.storage).toBe('s3');
+    expect(rec.artifacts.trace?.size).toBe(240939);
+    // The same schema supports swapping the backend without shape changes.
+    const moved = recordArtifacts(rec, {
+      trace: { ...trace, storage: 'browserstack', path: 'sessions/abc/trace.zip' },
+    });
+    expect(moved.artifacts.trace?.storage).toBe('browserstack');
+  });
+
+  it('keeps Tier-1 metadata inline while file artifacts are descriptors', () => {
+    const rec = recordArtifacts(base(), {
+      metadata: { url: 'https://app/login', locator: '#login', failedLine: 42 },
+      screenshot: { id: 'art_s1', type: 'screenshot', storage: 'local', path: '/tmp/s.png' },
+    });
+    expect(rec.artifacts.metadata?.failedLine).toBe(42);
+    expect(rec.artifacts.screenshot?.storage).toBe('local');
   });
 });

@@ -32,7 +32,7 @@ export interface HealingJob {
    * project-level ExecutionSettings default (CI smoke → 'fast', investigation →
    * 'debug', etc.). Resolved via resolveExecutionProfile() in the worker.
    */
-  requestedProfile?: import('../../db/postgres').ExecutionProfile;
+  requestedProfile?: import('../../core/execution/execution-profile').ExecutionProfile;
   /**
    * Per-request override for collecting extra healing artifacts (trace/video/HAR).
    * When set, wins over the project default. Resolved via
@@ -82,7 +82,7 @@ export class JobQueue {
     companyId?: number,
     projectId?: number,
     testFile?: string,
-    requestedProfile?: import('../../db/postgres').ExecutionProfile,
+    requestedProfile?: import('../../core/execution/execution-profile').ExecutionProfile,
     requestedCollectHealingArtifacts?: boolean,
   ): HealingJob {
     const job: HealingJob = {

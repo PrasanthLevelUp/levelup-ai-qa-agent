@@ -5,19 +5,16 @@
 import { Router, type Request, type Response } from 'express';
 import { JobQueue } from '../queue/job-queue';
 import { RepoManager } from '../services/repo-manager';
-import { listAllRepositories, type ExecutionProfile } from '../../db/postgres';
+import { listAllRepositories } from '../../db/postgres';
+import { type ExecutionProfile, isExecutionProfile } from '../../core/execution/execution-profile';
 import { logger } from '../../utils/logger';
 
 const MOD = 'heal-route';
 const router = Router();
 
-const VALID_PROFILES: ReadonlyArray<ExecutionProfile> = ['fast', 'standard', 'healing', 'debug'];
-
 /** Validate a client-supplied execution profile; returns undefined if absent/invalid. */
 function parseRequestedProfile(value: unknown): ExecutionProfile | undefined {
-  return typeof value === 'string' && (VALID_PROFILES as readonly string[]).includes(value)
-    ? (value as ExecutionProfile)
-    : undefined;
+  return isExecutionProfile(value) ? value : undefined;
 }
 
 /** Normalize a git URL for comparison: drop protocol, trailing .git, lowercase. */
