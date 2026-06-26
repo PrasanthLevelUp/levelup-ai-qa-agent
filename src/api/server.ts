@@ -24,7 +24,14 @@ import { logger } from '../utils/logger';
 import { initDb, closeDb, getDatabaseHealth } from '../db/postgres';
 
 // Import healing pipeline components
-import { ExecutionEngine } from '../core/execution-engine';
+import { ExecutionEngine, type RunResult } from '../core/execution-engine';
+import {
+  createExecutionProvider,
+  ExecutionSetupError,
+  type ExecutionMode,
+  type ExecutionResult as ProviderExecutionResult,
+} from '../core/execution/providers';
+import type { ExecutionContext } from '../core/execution/execution-provider';
 import { ArtifactCollector, extractTopLevelErrors, enumerateAllTests, type EnumeratedTest } from '../core/artifact-collector';
 import { FailureAnalyzer } from '../core/failure-analyzer';
 import { HealingOrchestrator, pageObjectPatchLogFields, type HealingOutcome } from '../core/healing-orchestrator';
@@ -114,6 +121,7 @@ import { createCIWebhookRouter } from './routes/ci-webhooks';
 import { createUsersRouter } from './routes/users';
 import { createHealingPRRouter } from './routes/healing-pr';
 import { createGitHubRouter } from './routes/github';
+import { createGitHubActionsRouter } from './routes/github-actions';
 import { createIntelligenceRouter } from './routes/intelligence';
 import { createIntelligenceLearningRouter } from './routes/intelligence-learning';
 import { createMetricsRouter } from './routes/metrics';
@@ -158,64 +166,6 @@ const MOD = 'api-server';
 // ---------------------------------------------------------------------------
 // Execution Record lifecycle helpers (Phase 1: 1 test = 1 ExecutionRecord)
 // ---------------------------------------------------------------------------
-
-/** URL/id-safe slug of a test name, for synthetic execution ids of non-failing tests. */
-function slugTestName(name: string): string {
-  return String(name)
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '')
-    .slice(0, 80) || 'test';
-}
-
-/**
- * Synthetic, deterministic execution id for a test that did NOT go through the
- * failure pipeline (passes/skips). Keyed by job so reruns of the same job upsert
- * in place (never duplicated). Failing tests keep their numeric logExecution id.
- */
-function syntheticExecutionId(jobId: string | number, testName: string): string {
-  return `${jobId}:${slugTestName(testName)}`;
-}
-
-/**
- * Build a canonical ExecutionRecord for a NON-failing test (pass/skip) enumerated
- * from the Playwright results. These tests never enter the healing pipeline, so we
- * create them already finalized: a terminal lifecycle status + result, stage
- * `completed`, no diagnosis/healing sections. The owning job carries the
- * repository metadata (we only store `jobId`).
- */
-function buildNonFailureRecord(
-  test: EnumeratedTest,
-  jobId: string | number,
-  profile: ExecutionRecord['profile'],
-): ExecutionRecord {
-  const { status, result } = deriveResult(test.status);
-  const endMs = Date.now();
-  const durationMs = Number.isFinite(test.durationMs) ? Math.max(0, test.durationMs) : 0;
-  const startIso = new Date(endMs - durationMs).toISOString();
-  const endIso = new Date(endMs).toISOString();
-  const rec = createExecutionRecord({
-    executionId: syntheticExecutionId(jobId, test.testName),
-    testName: test.testName,
-    status,
-    result,
-    stage: 'completed',
-    jobId: String(jobId),
-    durationMs,
-    startTime: startIso,
-    endTime: endIso,
-    profile,
-  });
-  // Pass/skip records are born already terminal — close the history with a
-  // finalize event (timestamped at end) so derived views see a created→finalized
-  // pair just like a healed record's history.
-  return appendEvent(rec, {
-    type: 'execution_finalized',
-    stage: 'completed',
-    note: `${status}/${result ?? 'null'}`,
-    timestamp: endIso,
-  });
-}
 
 /**
  * Persist an ExecutionRecord without ever throwing into the worker. The canonical
@@ -389,6 +339,7 @@ export function createServer(): express.Application {
   app.use('/api/projects', authMiddleware, companyMiddleware, sessionMiddleware, projectContextMiddleware, contextMiddleware, createProjectsRouter());
   app.use('/api/healings', authMiddleware, companyMiddleware, sessionMiddleware, createHealingPRRouter());
   app.use('/api/users', authMiddleware, companyMiddleware, sessionMiddleware, createUsersRouter());
+  app.use('/api/github/actions', authMiddleware, companyMiddleware, sessionMiddleware, createGitHubActionsRouter());
   app.use('/api/github', authMiddleware, companyMiddleware, sessionMiddleware, createGitHubRouter());
   app.use('/api/intelligence', authMiddleware, companyMiddleware, sessionMiddleware, projectContextMiddleware, contextMiddleware, createIntelligenceRouter());
   app.use('/api/intelligence-learning', authMiddleware, companyMiddleware, sessionMiddleware, projectContextMiddleware, contextMiddleware, createIntelligenceLearningRouter());
@@ -570,94 +521,105 @@ function createHealingWorker(
       tenantPrefix,
     });
 
-    // Step 1: Clone/pull repo (MUST succeed — failing here means stale/missing code)
-    jobQueue.updateJob(job.id, { progress: 'Cloning/pulling repository...' });
+    // ── Steps 1–4: produce the run via the selected ExecutionProvider ──────
+    // The execution SOURCE (Local Runner vs GitHub Actions vs future providers)
+    // has DISAPPEARED from the worker. A provider now owns the ENTIRE execution
+    // lifecycle — clone, execute, download + parse artifacts, and build the
+    // finalized pass/skip ExecutionRecords — and returns ONE canonical
+    // ExecutionResult { records, artifacts, repoPath, exitCode, resultsFile,
+    // metadata, providerInfo }. Everything below this point is source-agnostic:
+    // the worker feeds the result through Diagnosis → Healing → Validation →
+    // Learning without ever learning where execution physically ran. Default is
+    // 'local', preserving the original clone → install → run behavior.
+    const executionMode: ExecutionMode = job.executionMode ?? 'local';
+    jobQueue.updateJob(job.id, {
+      progress: executionMode === 'github_actions'
+        ? 'Dispatching GitHub Actions workflow...'
+        : 'Cloning/pulling repository...',
+    });
+
+    const provider = createExecutionProvider(executionMode);
+    const executionContext: ExecutionContext = {
+      repoUrl,
+      branch,
+      repoPath: testRepoPath,
+      testFile: job.testFile,
+      profile: executionProfile,
+      collectHealingArtifacts,
+      budgetMs: jobBudgetRemainingMs(),
+      jobId: job.id,
+      companyId: job.companyId,
+      providerConfig: job.providerConfig,
+    };
+
+    let execResult: ProviderExecutionResult;
     try {
-      fs.mkdirSync(workspaceDir, { recursive: true });
-      await ExecutionEngine.cloneRepository(repoUrl, testRepoPath, branch);
-      // Verify the tests directory exists after clone
-      const testsDir = path.join(testRepoPath, 'tests');
-      const pkgFile = path.join(testRepoPath, 'package.json');
-      const testFiles = fs.existsSync(testsDir) ? fs.readdirSync(testsDir).filter(f => f.endsWith('.spec.ts') || f.endsWith('.test.ts')) : [];
-      logger.info(MOD, 'Repository ready', {
-        testRepoPath,
-        hasTestsDir: fs.existsSync(testsDir),
-        testFileCount: testFiles.length,
-        testFiles: testFiles.slice(0, 10),
-        hasPackageJson: fs.existsSync(pkgFile),
-      });
+      execResult = await provider.execute(executionContext);
     } catch (error) {
-      const errMsg = (error as Error).message;
-      logger.error(MOD, 'Clone/pull FAILED', { error: errMsg, repoUrl, testRepoPath });
-      // If directory exists with tests, continue with warning; otherwise fail
-      if (!fs.existsSync(path.join(testRepoPath, 'package.json'))) {
-        jobQueue.updateJob(job.id, { progress: `FAILED: Repository clone failed — ${errMsg}` });
+      // Setup-level failures (clone/install/dispatch/...) carry the SAME exit
+      // codes + actionable messages the worker surfaced inline before this
+      // inversion, so the operator-facing behavior is identical regardless of
+      // which provider raised them.
+      if (error instanceof ExecutionSetupError) {
+        logger.error(MOD, 'Execution setup FAILED', {
+          stage: error.stage, exitCode: error.exitCode, error: error.message, repoUrl, jobId: job.id,
+        });
+        jobQueue.updateJob(job.id, { progress: `FAILED: ${error.message}` });
+        const suffix = executionMode === 'github_actions'
+          ? ' Verify GitHub is connected, the workflow exists, and it declares "on: workflow_dispatch".'
+          : '';
         return {
           totalTests: 0, failed: 0, healed: 0, strategy: 'none', tokensUsed: 0,
-          testResults: { exitCode: 128, durationMs: 0 },
+          testResults: { exitCode: error.exitCode, durationMs: 0 },
           healingActions: [],
-          message: `Repository clone/pull failed: ${errMsg}. Verify the repo URL is accessible and the branch exists.`,
-          error: errMsg,
+          message: `${error.message}${suffix}`,
+          error: error.message,
         };
       }
-      logger.warn(MOD, 'Clone failed but repo directory exists, continuing with existing code', {
-        testRepoPath,
-      });
-    }
-
-    // Step 2: Install dependencies (MUST succeed before running tests)
-    jobQueue.updateJob(job.id, { progress: 'Installing dependencies...' });
-    try {
-      await ExecutionEngine.installDependencies(testRepoPath);
-    } catch (error) {
       const errMsg = (error as Error).message;
-      logger.error(MOD, 'Dependency install FAILED — cannot proceed with test execution', {
-        error: errMsg,
-        testRepoPath,
-      });
+      logger.error(MOD, 'Execution FAILED', { error: errMsg, repoUrl, jobId: job.id });
       jobQueue.updateJob(job.id, { progress: `FAILED: ${errMsg}` });
       return {
-        totalTests: 0,
-        failed: 0,
-        healed: 0,
-        strategy: 'none',
-        tokensUsed: 0,
-        testResults: { exitCode: 127, durationMs: 0 },
+        totalTests: 0, failed: 0, healed: 0, strategy: 'none', tokensUsed: 0,
+        testResults: { exitCode: 1, durationMs: 0 },
         healingActions: [],
-        message: `Dependency installation failed: ${errMsg}. Check that the repository has a valid package.json and npm install can succeed.`,
+        message: `Execution failed: ${errMsg}.`,
         error: errMsg,
       };
     }
 
-    // Step 3: Run tests
-    // When the job specifies a single test file, scope the run to it; otherwise run the whole suite.
     jobQueue.updateJob(job.id, {
-      progress: job.testFile ? `Running tests (${job.testFile})...` : 'Running tests...',
+      progress: `Execution complete (${execResult.providerInfo.source}) — analyzing results...`,
     });
-    // Non-blocking full run, bounded by the overall job budget so the initial
-    // suite execution can't itself hang the job indefinitely. Initial test run
-    // uses base profile without healing artifacts (not a healing attempt yet).
-    const run = await ExecutionEngine.runAsync(
-      testRepoPath,
-      job.testFile,
-      undefined,
-      jobBudgetRemainingMs(),
-      executionProfile,
-      collectHealingArtifacts,
-      false // isHealingRun=false for initial test run
-    );
+    logger.info(MOD, 'Execution complete', {
+      jobId: job.id,
+      source: execResult.providerInfo.source,
+      runId: execResult.providerInfo.runId,
+      conclusion: execResult.providerInfo.conclusion,
+      resultsFile: execResult.resultsFile,
+      exitCode: execResult.exitCode,
+      records: execResult.records.length,
+      artifacts: execResult.artifacts.length,
+    });
 
-    // Step 4: Collect artifacts
-    jobQueue.updateJob(job.id, { progress: 'Collecting failure artifacts...' });
+    // Minimal `run` view for the downstream legacy paths (all-pass messaging +
+    // result tallies). The heal loop consumes `artifacts` directly; `run` only
+    // carries the exit/stderr/duration + resultsFile those legacy branches read.
+    const run: RunResult = {
+      exitCode: execResult.exitCode,
+      stdout: execResult.metadata.stdout ?? '',
+      stderr: execResult.metadata.stderr ?? '',
+      resultsFile: execResult.resultsFile,
+      startTime: execResult.metadata.startTime,
+      endTime: execResult.metadata.endTime,
+      durationMs: execResult.metadata.durationMs,
+    };
+    // The provider already parsed failure artifacts AND built the finalized
+    // pass/skip records — the worker no longer collects anything itself.
+    const artifacts: any[] = execResult.artifacts;
+    // The Hybrid validation reruns inside the heal loop re-collect artifacts from
+    // their (local) rerun results file; keep a collector instance for those.
     const collector = new ArtifactCollector();
-    let artifacts: any[] = [];
-    try {
-      artifacts = collector.collect(run.resultsFile, testRepoPath);
-    } catch (error) {
-      logger.warn(MOD, 'Artifact collection failed', {
-        error: (error as Error).message,
-      });
-    }
 
     if (artifacts.length === 0) {
       let message = 'All tests passed — no healing needed';
@@ -684,25 +646,24 @@ function createHealingWorker(
       // ── Canonical Execution Records for an all-pass run ──
       // Historically a clean run produced ZERO per-test records (records were
       // created only inside the failure loop), so "Executions" silently dropped
-      // every passing test. Create one finalized PASS/SKIP record per enumerated
-      // test so the invariant (1 test = 1 record) holds even when nothing fails.
+      // every passing test. The PROVIDER now builds one finalized PASS/SKIP record
+      // per enumerated test (pure execution facts) — the worker just persists
+      // them, so the invariant (1 test = 1 record) holds even when nothing fails.
       let passSkipRecorded = 0;
       if (run.exitCode === 0) {
         try {
-          const universe = enumerateAllTests(run.resultsFile);
           // Resolve project scope (records are project-scoped); best-effort.
           let projectIdForRecords: number | undefined = job.projectId;
           if (!projectIdForRecords) {
             const pid = await getProjectIdForRepo(repoUrl || repo?.url || job.repositoryId, job.companyId);
             projectIdForRecords = pid ?? undefined;
           }
-          for (const t of universe) {
-            const rec = buildNonFailureRecord(t, job.id, executionProfile);
+          for (const rec of execResult.records) {
             const ok = await persistExecutionRecordSafe(rec, job.companyId, projectIdForRecords);
             if (ok) passSkipRecorded++;
           }
           logger.info(MOD, 'All-pass run — persisted per-test Execution Records', {
-            jobId: job.id, tests: universe.length, recorded: passSkipRecorded,
+            jobId: job.id, tests: execResult.records.length, recorded: passSkipRecorded,
           });
         } catch (recErr) {
           logger.warn(MOD, 'Failed to persist all-pass Execution Records (non-blocking)', {
@@ -2078,17 +2039,18 @@ function createHealingWorker(
     }
 
     // ── Backfill PASS/SKIP Execution Records for the rest of the run ──
-    // The failure loop above recorded every failing/healed test. Now create one
-    // finalized record for every OTHER test in the run (passes + skips) so the
-    // canonical store reflects the full run — exactly one record per test. Then
-    // assert the invariant and reconcile counts against the legacy job totals.
+    // The failure loop above recorded every failing/healed test. The PROVIDER
+    // already built one finalized record for every NON-failing test (passes +
+    // skips) in `execResult.records` — persist those the failure loop didn't, so
+    // the canonical store reflects the full run (exactly one record per test).
+    // Then assert the invariant and reconcile counts against the legacy totals
+    // (the universe is re-read from the local results file for verification).
     try {
       const universe: EnumeratedTest[] = enumerateAllTests(run.resultsFile);
-      for (const t of universe) {
-        if (recordedTests.has(t.testName)) continue; // already recorded by the failure loop
-        const rec = buildNonFailureRecord(t, job.id, executionProfile);
+      for (const rec of execResult.records) {
+        if (recordedTests.has(rec.testName)) continue; // already recorded by the failure loop
         const ok = await persistExecutionRecordSafe(rec, job.companyId, resolvedProjectId);
-        if (ok) recordedTests.add(t.testName);
+        if (ok) recordedTests.add(rec.testName);
       }
 
       // Invariant: exactly one ExecutionRecord per test in the run universe.

@@ -67,7 +67,7 @@ export const EXECUTION_RECORD_SCHEMA_VERSION = 3;
 
 /**
  * Lifecycle status — WHERE the execution record is in its own lifecycle. This is
- * NOT the test outcome (see `ExecutionResult`). A record begins life as `running`
+ * NOT the test outcome (see `TestOutcome`). A record begins life as `running`
  * (or `queued`) and ends in a terminal state.
  */
 export type ExecutionLifecycleStatus =
@@ -83,7 +83,7 @@ export type ExecutionLifecycleStatus =
  * be `completed` (status) with a `pass`, `fail`, or `healed` result. `result` is
  * null until the execution reaches a terminal outcome.
  */
-export type ExecutionResult = 'pass' | 'fail' | 'healed' | 'skipped';
+export type TestOutcome = 'pass' | 'fail' | 'healed' | 'skipped';
 
 /**
  * Stage — the fine-grained pipeline step the execution is currently in (or last
@@ -443,7 +443,7 @@ export interface ExecutionRecord {
    * Result — the test OUTCOME. Null while the execution is still in flight
    * (status `queued`/`running`); set when a terminal status is reached.
    */
-  result?: ExecutionResult | null;
+  result?: TestOutcome | null;
   /** Fine-grained pipeline stage currently reached. */
   stage?: ExecutionStage;
   /**
@@ -500,7 +500,7 @@ export function createExecutionRecord(init: {
   /** Lifecycle status; defaults to `running` (a record is born at test start). */
   status?: ExecutionLifecycleStatus;
   /** Test outcome; null/undefined while still in flight. */
-  result?: ExecutionResult | null;
+  result?: TestOutcome | null;
   /** Pipeline stage; defaults to `executing`. */
   stage?: ExecutionStage;
   /** Owning HealingJob id (repository metadata resolved through the job). */
@@ -623,7 +623,7 @@ export function setStage(rec: ExecutionRecord, stage: ExecutionStage): Execution
  */
 export function setLifecycle(
   rec: ExecutionRecord,
-  next: { status?: ExecutionLifecycleStatus; result?: ExecutionResult | null; stage?: ExecutionStage },
+  next: { status?: ExecutionLifecycleStatus; result?: TestOutcome | null; stage?: ExecutionStage },
 ): ExecutionRecord {
   const updated: ExecutionRecord = {
     ...rec,
@@ -653,7 +653,7 @@ export function setLifecycle(
 /** Legacy v2 outcome values that used to live in `status`. */
 type LegacyStatus = 'passed' | 'failed' | 'timedout' | 'skipped';
 
-const LEGACY_STATUS_MAP: Record<LegacyStatus, { status: ExecutionLifecycleStatus; result: ExecutionResult }> = {
+const LEGACY_STATUS_MAP: Record<LegacyStatus, { status: ExecutionLifecycleStatus; result: TestOutcome }> = {
   passed: { status: 'completed', result: 'pass' },
   failed: { status: 'completed', result: 'fail' },
   timedout: { status: 'timed_out', result: 'fail' },

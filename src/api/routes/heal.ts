@@ -24,7 +24,10 @@ function normalizeRepoUrl(url: string): string {
 
 export function createHealRouter(jobQueue: JobQueue, repoManager: RepoManager): Router {
   router.post('/', async (req: Request, res: Response) => {
-    const { repository, branch, commit, projectId, testFile, profile, collectHealingArtifacts } = req.body as {
+    const {
+      repository, branch, commit, projectId, testFile, profile, collectHealingArtifacts,
+      executionMode, providerConfig,
+    } = req.body as {
       repository?: string;
       branch?: string;
       commit?: string;
@@ -34,6 +37,15 @@ export function createHealRouter(jobQueue: JobQueue, repoManager: RepoManager): 
       profile?: string;
       /** Per-request override for collecting extra healing artifacts (trace/video/HAR). */
       collectHealingArtifacts?: boolean;
+      /**
+       * Where this job's tests should EXECUTE. 'local' (default) uses the Local
+       * Runner; 'github_actions' runs the repo's existing workflow via the
+       * GitHubActionsExecutionProvider, then feeds the resulting ExecutionRecord
+       * into the SAME healing pipeline (Hybrid: diagnosis from CI, heal+validate local).
+       */
+      executionMode?: 'local' | 'github_actions';
+      /** Provider-specific config. For 'github_actions': { workflowId, ref?, inputs? }. */
+      providerConfig?: Record<string, unknown>;
     };
 
     // Per-request overrides — win over the project-level ExecutionSettings default.
@@ -109,9 +121,18 @@ export function createHealRouter(jobQueue: JobQueue, repoManager: RepoManager): 
       }
     }
 
+    // Validate execution mode; anything unknown falls back to local (zero regression).
+    const requestedExecutionMode: 'local' | 'github_actions' =
+      executionMode === 'github_actions' ? 'github_actions' : 'local';
+    const requestedProviderConfig =
+      requestedExecutionMode === 'github_actions' && providerConfig && typeof providerConfig === 'object'
+        ? providerConfig
+        : undefined;
+
     const job = jobQueue.createJob(
       repoId, branch ?? 'main', commit, repoUrl, cid, pid, testFile,
       requestedProfile, requestedCollectHealingArtifacts,
+      requestedExecutionMode, requestedProviderConfig,
     );
 
     res.status(202).json({

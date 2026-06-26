@@ -44,7 +44,7 @@ export {
   type ValidationRecord,
   type LearningRecord,
   type ExecutionLifecycleStatus,
-  type ExecutionResult,
+  type TestOutcome,
   type ExecutionStage,
   EXECUTION_RECORD_SCHEMA_VERSION,
   createExecutionRecord,
