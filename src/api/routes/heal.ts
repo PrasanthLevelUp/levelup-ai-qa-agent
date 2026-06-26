@@ -5,11 +5,20 @@
 import { Router, type Request, type Response } from 'express';
 import { JobQueue } from '../queue/job-queue';
 import { RepoManager } from '../services/repo-manager';
-import { listAllRepositories } from '../../db/postgres';
+import { listAllRepositories, type ExecutionProfile } from '../../db/postgres';
 import { logger } from '../../utils/logger';
 
 const MOD = 'heal-route';
 const router = Router();
+
+const VALID_PROFILES: ReadonlyArray<ExecutionProfile> = ['fast', 'standard', 'healing', 'debug'];
+
+/** Validate a client-supplied execution profile; returns undefined if absent/invalid. */
+function parseRequestedProfile(value: unknown): ExecutionProfile | undefined {
+  return typeof value === 'string' && (VALID_PROFILES as readonly string[]).includes(value)
+    ? (value as ExecutionProfile)
+    : undefined;
+}
 
 /** Normalize a git URL for comparison: drop protocol, trailing .git, lowercase. */
 function normalizeRepoUrl(url: string): string {
@@ -18,13 +27,22 @@ function normalizeRepoUrl(url: string): string {
 
 export function createHealRouter(jobQueue: JobQueue, repoManager: RepoManager): Router {
   router.post('/', async (req: Request, res: Response) => {
-    const { repository, branch, commit, projectId, testFile } = req.body as {
+    const { repository, branch, commit, projectId, testFile, profile, collectHealingArtifacts } = req.body as {
       repository?: string;
       branch?: string;
       commit?: string;
       projectId?: number;
       testFile?: string;
+      /** Per-request execution profile override (CI smoke → 'fast', investigation → 'debug', ...). */
+      profile?: string;
+      /** Per-request override for collecting extra healing artifacts (trace/video/HAR). */
+      collectHealingArtifacts?: boolean;
     };
+
+    // Per-request overrides — win over the project-level ExecutionSettings default.
+    const requestedProfile = parseRequestedProfile(profile);
+    const requestedCollectHealingArtifacts =
+      typeof collectHealingArtifacts === 'boolean' ? collectHealingArtifacts : undefined;
 
     if (!repository) {
       res.status(400).json({
@@ -94,7 +112,10 @@ export function createHealRouter(jobQueue: JobQueue, repoManager: RepoManager): 
       }
     }
 
-    const job = jobQueue.createJob(repoId, branch ?? 'main', commit, repoUrl, cid, pid, testFile);
+    const job = jobQueue.createJob(
+      repoId, branch ?? 'main', commit, repoUrl, cid, pid, testFile,
+      requestedProfile, requestedCollectHealingArtifacts,
+    );
 
     res.status(202).json({
       jobId: job.id,

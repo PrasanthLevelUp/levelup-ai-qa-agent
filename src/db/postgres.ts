@@ -7191,14 +7191,21 @@ export async function setRequirementGenerationState(
 export type ExecutionProfile = 'fast' | 'standard' | 'healing' | 'debug';
 
 /**
- * Execution Settings — project-level configuration for test execution.
+ * Execution Settings — project-level DEFAULTS for test execution.
  * Separate from healing settings because execution is used by multiple consumers:
  * script validation, healing, regression, smoke, nightly, GitHub Actions, etc.
+ *
+ * IMPORTANT: these are *defaults only*. The same project frequently runs under
+ * different profiles (CI smoke wants `fast`, an investigation wants `debug`),
+ * so every execution request MAY override these values. Use
+ * `resolveExecutionProfile()` / `resolveCollectHealingArtifacts()` to compute
+ * the effective values for a given request rather than reading these directly.
  */
 export interface ExecutionSettings {
   /**
-   * Base execution profile — controls baseline artifact collection.
-   * Authorization layer should enforce which profiles are available per plan.
+   * Default execution profile — controls baseline artifact collection when a
+   * request does not specify its own. Authorization layer should enforce which
+   * profiles are available per plan.
    */
   executionProfile: ExecutionProfile;
   /**
@@ -7215,13 +7222,109 @@ export const DEFAULT_EXECUTION_SETTINGS: ExecutionSettings = {
   collectHealingArtifacts: true, // Default: collect additional diagnostics during healing
 };
 
+/** Current schema version of the canonical execution record (bump on breaking shape changes). */
+export const EXECUTION_RECORD_SCHEMA_VERSION = 1;
+
 /**
- * Evidence Manifest — single object recording all artifacts collected during execution.
- * This is the canonical output of every test run, consumed by Timeline, Replay,
- * Healing, Diagnosis, and Learning modules. Prevents passing dozens of artifact
- * paths around separately.
+ * Observations — the OBSERVED FACTS gathered before any diagnosis is attempted
+ * (mirror of core/evidence-collector EvidenceBundle, kept structural here to
+ * avoid a core→db import cycle). This is the "what we saw" section.
+ */
+export interface ObservationRecord {
+  locatorState?: {
+    exists: boolean;
+    visible: boolean;
+    enabled: boolean;
+    receivesPointerEvents: boolean | null;
+    clickable: boolean;
+    interceptedBy: string | null;
+    source: 'dom_snapshot' | 'live_probe' | 'unknown';
+  } | null;
+  consoleErrors?: string[];
+  networkErrors?: Array<{ url?: string; status?: number; detail: string }>;
+  /** Compact, human-readable evidence lines. */
+  summary?: string[];
+}
+
+/**
+ * Diagnosis — the classifier's verdict (mirror of core FailureDiagnosis, kept
+ * structural). This is the "what failed and why" section.
+ */
+export interface DiagnosisRecord {
+  category: string;
+  confidence: number;
+  recommendedStrategy: string;
+  rootCause?: string;
+  recommendedAction?: string;
+  locator?: string | null;
+  locatorResolvedFromPageObject?: boolean;
+  healableByLocatorSwap?: boolean;
+  evidenceBased?: boolean;
+}
+
+/**
+ * Healing decisions — what the engine decided to DO about the failure and the
+ * outcome of applying it. This is the "what we changed" section.
+ */
+export interface HealingDecisionRecord {
+  /** Coarse remedy class chosen (locator_swap | inject_wait | report_only). */
+  remedy?: string;
+  /** Fine-grained strategies attempted in order. */
+  attemptedStrategies?: string[];
+  /** The strategy that was actually applied, if any. */
+  appliedStrategy?: string | null;
+  /** Which advisor/source produced the applied fix (rule | pattern | ai | wait | ...). */
+  source?: string | null;
+  brokenLocator?: string | null;
+  newLocator?: string | null;
+  candidatesConsidered?: number;
+  /** True when the failure was surfaced to humans rather than auto-fixed. */
+  reportOnly?: boolean;
+  rationale?: string;
+}
+
+/**
+ * Validation — did the fix actually hold up on rerun? This is the "did it work"
+ * section that gates whether a healing is trustworthy.
+ */
+export interface ValidationRecord {
+  reran: boolean;
+  passedAfterHealing?: boolean | null;
+  confirmationRuns?: number;
+  durationMs?: number;
+  notes?: string[];
+}
+
+/**
+ * Learning — what this execution contributed back to the system's memory.
+ * This is the "what we remembered" section that closes the loop.
+ */
+export interface LearningRecord {
+  recorded: boolean;
+  patternId?: string | null;
+  domMemoryUpdated?: boolean;
+  notes?: string[];
+}
+
+/**
+ * Evidence Manifest / Execution Record — the CANONICAL execution record.
+ *
+ * This started as an artifact container and has evolved into the single source
+ * of truth for a test execution. It accumulates, across the lifecycle:
+ *   1. artifacts    — files captured (screenshot/DOM/trace/video/HAR/...)
+ *   2. observations — the observed facts before diagnosis
+ *   3. diagnosis    — the classifier's verdict (what failed, why)
+ *   4. healing      — the decision taken and the fix applied
+ *   5. validation   — whether the fix held up on rerun
+ *   6. learning     — what was written back to the system's memory
+ *
+ * Consumed by Timeline, Replay, Healing, Diagnosis, Analytics, and Learning.
+ * Use `createExecutionRecord()` + the `record*()` accumulators to build it up
+ * stage by stage rather than passing dozens of values around separately.
  */
 export interface EvidenceManifest {
+  /** Schema version for forward/backward compatibility of persisted records. */
+  schemaVersion?: number;
   executionId: string;
   testName: string;
   status: 'passed' | 'failed' | 'timedout' | 'skipped';
@@ -7256,6 +7359,83 @@ export interface EvidenceManifest {
     performance?: Record<string, any>; // Performance metrics
   };
   profile: ExecutionProfile; // Which profile was used for this execution
+
+  // ---- Lifecycle sections (accumulated stage by stage) ----
+  /** Observed facts gathered before diagnosis. */
+  observations?: ObservationRecord;
+  /** The classifier's verdict for this execution. */
+  diagnosis?: DiagnosisRecord;
+  /** The healing decision taken and the fix applied. */
+  healing?: HealingDecisionRecord;
+  /** Whether the applied fix held up on rerun. */
+  validation?: ValidationRecord;
+  /** What this execution contributed back to system memory. */
+  learning?: LearningRecord;
+}
+
+/**
+ * Canonical alias for the evolved manifest. Prefer `ExecutionRecord` in new code
+ * to reflect that this object is the single source of truth for an execution,
+ * not merely an artifact container. `EvidenceManifest` is retained for back-compat.
+ */
+export type ExecutionRecord = EvidenceManifest;
+
+/**
+ * Create a fresh canonical execution record. Lifecycle sections start empty and
+ * are filled in by the `record*()` accumulators as the execution progresses.
+ */
+export function createExecutionRecord(init: {
+  executionId: string;
+  testName: string;
+  status: EvidenceManifest['status'];
+  durationMs: number;
+  startTime: string;
+  endTime: string;
+  profile: ExecutionProfile;
+  artifacts?: EvidenceManifest['artifacts'];
+}): ExecutionRecord {
+  return {
+    schemaVersion: EXECUTION_RECORD_SCHEMA_VERSION,
+    executionId: init.executionId,
+    testName: init.testName,
+    status: init.status,
+    durationMs: init.durationMs,
+    startTime: init.startTime,
+    endTime: init.endTime,
+    profile: init.profile,
+    artifacts: init.artifacts ?? {},
+  };
+}
+
+/**
+ * Accumulators take Partial section data because a record is built up across the
+ * lifecycle — a later stage may set only the fields it just learned. Each returns
+ * a new record (immutable merge) so callers can thread the record through stages.
+ */
+
+/** Accumulate observed facts onto the record (immutable merge). */
+export function recordObservations(rec: ExecutionRecord, observations: Partial<ObservationRecord>): ExecutionRecord {
+  return { ...rec, observations: { ...(rec.observations ?? {}), ...observations } };
+}
+
+/** Accumulate the diagnosis verdict onto the record (immutable merge). */
+export function recordDiagnosis(rec: ExecutionRecord, diagnosis: Partial<DiagnosisRecord>): ExecutionRecord {
+  return { ...rec, diagnosis: { ...(rec.diagnosis ?? {} as DiagnosisRecord), ...diagnosis } };
+}
+
+/** Accumulate the healing decision/outcome onto the record (immutable merge). */
+export function recordHealingDecision(rec: ExecutionRecord, healing: Partial<HealingDecisionRecord>): ExecutionRecord {
+  return { ...rec, healing: { ...(rec.healing ?? {}), ...healing } };
+}
+
+/** Accumulate the validation outcome onto the record (immutable merge). */
+export function recordValidation(rec: ExecutionRecord, validation: Partial<ValidationRecord>): ExecutionRecord {
+  return { ...rec, validation: { ...(rec.validation ?? { reran: false }), ...validation } };
+}
+
+/** Accumulate the learning contribution onto the record (immutable merge). */
+export function recordLearning(rec: ExecutionRecord, learning: Partial<LearningRecord>): ExecutionRecord {
+  return { ...rec, learning: { ...(rec.learning ?? { recorded: false }), ...learning } };
 }
 
 /** Read execution settings for a scope, merged over defaults (never throws on missing table). */
@@ -7294,6 +7474,41 @@ export async function upsertExecutionSettings(
     [companyId ?? null, projectId ?? null, JSON.stringify(merged)]
   );
   return merged;
+}
+
+/**
+ * Resolve the effective execution profile for a single execution request.
+ *
+ * Execution profiles are PROJECT-LEVEL DEFAULTS that can be overridden PER
+ * EXECUTION REQUEST. The same project routinely runs under different profiles:
+ * a CI smoke job wants `fast`, an investigation rerun wants `debug`, a nightly
+ * regression may force `standard`. The project default is just the fallback
+ * when a request does not specify one.
+ *
+ * Precedence (highest wins):
+ *   1. requested  — the profile attached to this specific execution request
+ *   2. projectDefault — the project-level ExecutionSettings default
+ *   3. system default ('standard')
+ */
+export function resolveExecutionProfile(
+  requested?: ExecutionProfile | null,
+  projectDefault?: ExecutionProfile | null
+): ExecutionProfile {
+  return requested || projectDefault || DEFAULT_EXECUTION_SETTINGS.executionProfile;
+}
+
+/**
+ * Resolve the effective "collect healing artifacts" flag for a single request.
+ * Same precedence model as the profile: an explicit per-request value wins over
+ * the project default, which wins over the system default.
+ */
+export function resolveCollectHealingArtifacts(
+  requested?: boolean | null,
+  projectDefault?: boolean | null
+): boolean {
+  if (typeof requested === 'boolean') return requested;
+  if (typeof projectDefault === 'boolean') return projectDefault;
+  return DEFAULT_EXECUTION_SETTINGS.collectHealingArtifacts;
 }
 
 // ---- Healing settings (admin-tunable confidence thresholds + cost caps) ----

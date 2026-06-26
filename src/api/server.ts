@@ -107,6 +107,8 @@ import {
   getProjectIdForRepo,
   getHealingSettings,
   getExecutionSettings,
+  resolveExecutionProfile,
+  resolveCollectHealingArtifacts,
   getLatestDomHtmlForUrl,
   type HealingSettings,
   type ExecutionSettings,
@@ -383,17 +385,32 @@ function createHealingWorker(
 
     // Execution settings — load early so they're available for initial test run
     // Use job.projectId if available (will be refined later with resolvedProjectId for healing)
-    let executionProfile: import('../db/postgres').ExecutionProfile = 'standard';
-    let collectHealingArtifacts = true;
+    // Profiles are project-level DEFAULTS overridden per execution request:
+    //   request override (job.requestedProfile) > project default > system default.
+    let executionProfile: import('../db/postgres').ExecutionProfile = resolveExecutionProfile(
+      job.requestedProfile,
+      undefined,
+    );
+    let collectHealingArtifacts = resolveCollectHealingArtifacts(
+      job.requestedCollectHealingArtifacts,
+      undefined,
+    );
     try {
       const es: ExecutionSettings = await getExecutionSettings(job.companyId, job.projectId);
-      executionProfile = es.executionProfile || 'standard';
-      collectHealingArtifacts = es.collectHealingArtifacts ?? true;
-      logger.info(MOD, '⚙️ Execution settings loaded (early)', {
+      // Per-request override wins over the project default; project default wins over system default.
+      executionProfile = resolveExecutionProfile(job.requestedProfile, es.executionProfile);
+      collectHealingArtifacts = resolveCollectHealingArtifacts(
+        job.requestedCollectHealingArtifacts,
+        es.collectHealingArtifacts,
+      );
+      logger.info(MOD, '⚙️ Execution settings resolved (early)', {
         companyId: job.companyId ?? null,
         projectId: job.projectId ?? null,
-        executionProfile,
-        collectHealingArtifacts,
+        projectDefaultProfile: es.executionProfile,
+        requestedProfile: job.requestedProfile ?? null,
+        effectiveProfile: executionProfile,
+        requestedCollectHealingArtifacts: job.requestedCollectHealingArtifacts ?? null,
+        effectiveCollectHealingArtifacts: collectHealingArtifacts,
       });
     } catch (settingsErr: any) {
       logger.warn(MOD, 'Could not load execution settings — using defaults', { error: settingsErr.message });
