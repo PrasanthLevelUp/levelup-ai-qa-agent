@@ -35,7 +35,13 @@
  *   output for connected repos that genuinely use a different convention.
  */
 
-import type { RepositoryProfile, TestFramework, FolderStructure } from '../context/types';
+import type {
+  RepositoryProfile,
+  TestFramework,
+  FolderStructure,
+  ClassInfo,
+  FunctionSignature,
+} from '../context/types';
 
 /* -------------------------------------------------------------------------- */
 /*  Types                                                                     */
@@ -71,9 +77,87 @@ export interface ProjectConventionProfile {
   namingConvention: NamingConvention;
   testDataPattern: TestDataPattern;
 
+  /**
+   * Reuse Intelligence — the catalogue of reusable assets the repository
+   * already provides. Empty for greenfield. Owned by Repo Intelligence; Script
+   * Generation (and Healing / Migration / PR Generation / …) consume it to
+   * REUSE before generating rather than duplicating existing assets.
+   */
+  reuse: ReuseCatalogue;
+
   /** false ⇒ values are safe greenfield defaults, not derived from a real repo. */
   fromProfile: boolean;
 }
+
+/* -------------------------------------------------------------------------- */
+/*  Reuse Intelligence — catalogue types                                      */
+/* -------------------------------------------------------------------------- */
+
+/** A reusable Page Object the repo already defines. */
+export interface ReusablePageObject {
+  name: string;
+  path: string;
+  /** Exported method names (e.g. login, logout). */
+  methods: string[];
+  /** Property names that carry a resolved selector (the locators it exposes). */
+  locators: string[];
+  baseClass: string | null;
+  framework: TestFramework;
+  /** Full scanned detail — used by the selector-level reuse matcher. */
+  raw: ClassInfo;
+}
+
+/** A reusable helper module (functions grouped by their source file). */
+export interface ReusableHelper {
+  name: string;            // module name derived from the file (e.g. AuthHelper)
+  path: string;
+  functions: string[];     // exported function names in that module
+}
+
+/** A reusable fixture the repo already defines. */
+export interface ReusableFixture {
+  name: string;
+  path: string;
+}
+
+/** A reusable API client (UserApi, OrderApi, …). */
+export interface ReusableApi {
+  name: string;
+  path: string;
+}
+
+/** A reusable UI component (HeaderComponent, MenuComponent, …). */
+export interface ReusableComponent {
+  name: string;
+  path: string;
+}
+
+/** A reusable test-data asset (users.json, test-data.ts, builders/factories). */
+export interface ReusableTestData {
+  name: string;
+  path: string;
+  type: 'json' | 'ts' | 'js' | 'csv';
+  recordCount?: number;
+}
+
+export interface ReuseCatalogue {
+  pageObjects: ReusablePageObject[];
+  helpers: ReusableHelper[];
+  fixtures: ReusableFixture[];
+  apis: ReusableApi[];
+  components: ReusableComponent[];
+  testData: ReusableTestData[];
+}
+
+/** An empty catalogue (greenfield / no connected repo). */
+export const EMPTY_REUSE_CATALOGUE: ReuseCatalogue = {
+  pageObjects: [],
+  helpers: [],
+  fixtures: [],
+  apis: [],
+  components: [],
+  testData: [],
+};
 
 /* -------------------------------------------------------------------------- */
 /*  Zero-regression defaults                                                  */
@@ -124,6 +208,7 @@ export function buildConventionProfile(
       importAlias: DEFAULT_CONVENTIONS.importAlias,
       namingConvention: DEFAULT_CONVENTIONS.namingConvention,
       testDataPattern: DEFAULT_CONVENTIONS.testDataPattern,
+      reuse: EMPTY_REUSE_CATALOGUE,
       fromProfile: false,
     };
   }
@@ -146,8 +231,221 @@ export function buildConventionProfile(
     namingConvention: detectNamingConvention(profile),
     testDataPattern: detectTestDataPattern(profile),
 
+    reuse: buildReuseCatalogue(profile),
+
     fromProfile: true,
   };
+}
+
+/* -------------------------------------------------------------------------- */
+/*  Reuse Intelligence — catalogue builder + "Ask Repo Intelligence" queries  */
+/* -------------------------------------------------------------------------- */
+
+const API_NAME_RE = /(api|client|service|endpoint)$/i;
+const COMPONENT_NAME_RE = /component$/i;
+
+/**
+ * Derive the reuse catalogue from an already-scanned `RepositoryProfile`. Pure
+ * function — a faithful, summarised view of the cached profile. Never scans the
+ * filesystem and adds no new intelligence; it only re-shapes what the scan
+ * already extracted so consumers can ask "what already exists?".
+ */
+export function buildReuseCatalogue(profile?: RepositoryProfile | null): ReuseCatalogue {
+  if (!profile) return EMPTY_REUSE_CATALOGUE;
+
+  const framework = profile.framework ?? DEFAULT_CONVENTIONS.framework;
+
+  /* ── Page Objects ── */
+  const pageObjects: ReusablePageObject[] = (profile.pageObjects ?? []).map((c) => ({
+    name: c.name,
+    path: normalize(c.filePath || ''),
+    methods: (c.methods ?? []).map((m) => m.name),
+    locators: (c.properties ?? []).filter((p) => !!p.selector).map((p) => p.name),
+    baseClass: c.baseClass ?? null,
+    framework,
+    raw: c,
+  }));
+
+  /* ── Helpers (functions grouped into modules by source file) ── */
+  const helpers = groupFunctionsByModule(profile.helperFunctions ?? []);
+
+  /* ── Fixtures ── */
+  const fixtures: ReusableFixture[] = dedupeByNamePath(
+    (profile.fixtures ?? []).map((f) => ({ name: f.name, path: normalize(f.filePath || '') })),
+  );
+
+  /* ── Test data ── */
+  const testData: ReusableTestData[] = (profile.dataFiles ?? []).map((d) => ({
+    name: d.name,
+    path: normalize(d.path || ''),
+    type: d.type,
+    recordCount: d.recordCount,
+  }));
+
+  /* ── APIs / Components — derived HONESTLY from names already catalogued ──
+     The scan does not retain a dedicated API/component list, so we surface the
+     ones whose class/module name clearly signals the role. Empty when none. */
+  const namedAssets: Array<{ name: string; path: string }> = [
+    ...pageObjects.map((p) => ({ name: p.name, path: p.path })),
+    ...helpers.map((h) => ({ name: h.name, path: h.path })),
+  ];
+  const apis: ReusableApi[] = dedupeByNamePath(
+    namedAssets.filter((a) => API_NAME_RE.test(a.name)),
+  );
+  const components: ReusableComponent[] = dedupeByNamePath(
+    namedAssets.filter((a) => COMPONENT_NAME_RE.test(a.name)),
+  );
+
+  return { pageObjects, helpers, fixtures, apis, components, testData };
+}
+
+/** Group exported helper functions into per-file modules (e.g. AuthHelper). */
+function groupFunctionsByModule(fns: FunctionSignature[]): ReusableHelper[] {
+  const byFile = new Map<string, { name: string; functions: string[] }>();
+  for (const fn of fns) {
+    const path = normalize(fn.filePath || '');
+    if (!path) continue;
+    let entry = byFile.get(path);
+    if (!entry) {
+      entry = { name: moduleNameFromPath(path), functions: [] };
+      byFile.set(path, entry);
+    }
+    if (fn.name && !entry.functions.includes(fn.name)) entry.functions.push(fn.name);
+  }
+  return [...byFile.entries()].map(([path, e]) => ({ name: e.name, path, functions: e.functions }));
+}
+
+/** Derive a module name from a file path: utils/AuthHelper.ts → AuthHelper. */
+function moduleNameFromPath(path: string): string {
+  const base = path.split('/').filter(Boolean).pop() || path;
+  return base.replace(/\.[a-z0-9]+$/i, '');
+}
+
+function dedupeByNamePath<T extends { name: string; path: string }>(items: T[]): T[] {
+  const seen = new Set<string>();
+  const out: T[] = [];
+  for (const it of items) {
+    const key = `${it.name}::${it.path}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(it);
+  }
+  return out;
+}
+
+/** Normalize a name to a comparable token (case/separator-insensitive). */
+function reuseNameToken(name: string): string {
+  return (name || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+/**
+ * Normalize a page-object/class name down to its semantic intent so
+ * `LoginPage` ≈ `Login` ≈ `LoginPageObject`. Mirrors the historical
+ * Script-Generation matcher so reuse decisions are identical.
+ */
+function pageObjectIntent(name: string): string {
+  return reuseNameToken(name).replace(/(pageobject|page|pom|screen|view|component|cmp)$/, '');
+}
+
+/**
+ * "Does LoginPage already exist?" — find a reusable Page Object by name intent.
+ * Returns the catalogued entry (carrying full `raw` detail) or null.
+ */
+export function findReusablePageObject(
+  conv: ProjectConventionProfile,
+  name: string,
+): ReusablePageObject | null {
+  const pos = conv.reuse?.pageObjects ?? [];
+  if (!pos.length || !name) return null;
+  const wanted = pageObjectIntent(name);
+  // 1) exact intent match
+  let hit = pos.find((p) => pageObjectIntent(p.name) === wanted);
+  // 2) containment (LoginPage vs Login / SignInPage)
+  if (!hit) {
+    hit = pos.find((p) => {
+      const n = pageObjectIntent(p.name);
+      return n.length > 2 && wanted.length > 2 && (n.includes(wanted) || wanted.includes(n));
+    });
+  }
+  return hit ?? null;
+}
+
+/** "Does AuthHelper exist?" — find a reusable helper module by name. */
+export function findReusableHelper(
+  conv: ProjectConventionProfile,
+  name: string,
+): ReusableHelper | null {
+  const helpers = conv.reuse?.helpers ?? [];
+  if (!helpers.length || !name) return null;
+  const wanted = reuseNameToken(name);
+  return (
+    helpers.find((h) => reuseNameToken(h.name) === wanted) ??
+    helpers.find((h) => h.functions.some((f) => reuseNameToken(f) === wanted)) ??
+    null
+  );
+}
+
+/** "Does baseFixture exist?" — find a reusable fixture by name. */
+export function findReusableFixture(
+  conv: ProjectConventionProfile,
+  name: string,
+): ReusableFixture | null {
+  const fixtures = conv.reuse?.fixtures ?? [];
+  if (!fixtures.length || !name) return null;
+  const wanted = reuseNameToken(name);
+  return fixtures.find((f) => reuseNameToken(f.name) === wanted) ?? null;
+}
+
+/** "Does checkout_data.json already exist?" — find a reusable test-data asset. */
+export function findReusableTestData(
+  conv: ProjectConventionProfile,
+  nameOrFile: string,
+): ReusableTestData | null {
+  const data = conv.reuse?.testData ?? [];
+  if (!data.length || !nameOrFile) return null;
+  const wanted = reuseNameToken(nameOrFile);
+  return (
+    data.find((d) => reuseNameToken(d.name) === wanted) ??
+    data.find((d) => reuseNameToken(d.path) === wanted) ??
+    data.find((d) => reuseNameToken(stripExt(d.name)) === reuseNameToken(stripExt(nameOrFile))) ??
+    null
+  );
+}
+
+/** Find a reusable API client by name. */
+export function findReusableApi(
+  conv: ProjectConventionProfile,
+  name: string,
+): ReusableApi | null {
+  const apis = conv.reuse?.apis ?? [];
+  if (!apis.length || !name) return null;
+  const wanted = reuseNameToken(name);
+  return apis.find((a) => reuseNameToken(a.name) === wanted) ?? null;
+}
+
+/** Find a reusable component by name. */
+export function findReusableComponent(
+  conv: ProjectConventionProfile,
+  name: string,
+): ReusableComponent | null {
+  const components = conv.reuse?.components ?? [];
+  if (!components.length || !name) return null;
+  const wanted = reuseNameToken(name);
+  return components.find((c) => reuseNameToken(c.name) === wanted) ?? null;
+}
+
+/** True when the repository provides ANY reusable asset. */
+export function hasReusableAssets(conv: ProjectConventionProfile): boolean {
+  const r = conv.reuse;
+  if (!r) return false;
+  return (
+    r.pageObjects.length > 0 ||
+    r.helpers.length > 0 ||
+    r.fixtures.length > 0 ||
+    r.apis.length > 0 ||
+    r.components.length > 0 ||
+    r.testData.length > 0
+  );
 }
 
 /* -------------------------------------------------------------------------- */
