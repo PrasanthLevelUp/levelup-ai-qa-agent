@@ -344,21 +344,10 @@ export async function startAPIServer(): Promise<void> {
 }
 
 /**
- * Extract the "current browser URL" (a page.url() proxy) from a Playwright
- * failure's error text. The artifact collector's `failure.url` only matches a
- * couple of narrow patterns ("navigated to", "waiting for"), so a locator
- * timeout often has `failure.url === null` even though the error body still
- * mentions the page the browser was on. We grab the LAST http(s) URL in the
- * text because Playwright appends the live page URL near the end of its call
- * log. Returns null when no URL is present. Pure + defensive.
+ * REMOVED: extractBrowserUrlFromError (regex-based guessing).
+ * Now replaced with REAL page.url() capture via auto-fixture.
+ * The artifact collector merges the captured URL into failure.url directly.
  */
-function extractBrowserUrlFromError(errorMessage?: string | null): string | null {
-  if (!errorMessage) return null;
-  const matches = errorMessage.match(/https?:\/\/[^\s"'`)\]]+/g);
-  if (!matches || matches.length === 0) return null;
-  // Strip trailing punctuation the regex may capture (e.g. "url." / "url,").
-  return matches[matches.length - 1].replace(/[.,;:]+$/, '');
-}
 
 /**
  * Read the suite's configured base URL (the "execution base URL") from the test
@@ -863,17 +852,17 @@ function createHealingWorker(
         let appProfileHealing: AppProfileHealingInput | undefined;
         try {
           // Deterministic URL cascade for healing-grounded profile resolution:
-          //   failure.url → current browser URL → execution base URL → latest active.
-          // The browser/base URLs rescue the common case where a locator timeout
-          // carries no URL in failure.url, without blindly picking "newest crawl"
-          // in multi-app projects.
-          const browserUrl = extractBrowserUrlFromError(failure.errorMessage);
+          //   failure.url (now REAL page.url() from fixture) → execution base URL → latest active.
+          // The auto-fixture captures page.url() at failure and the artifact collector
+          // merges it into failure.url. The execution base URL rescues cases where the
+          // fixture didn't run or the browser was already closed. This avoids blindly
+          // picking "newest crawl" in multi-app projects.
           const executionBaseUrl = readExecutionBaseUrl(testRepoPath);
           appProfileHealing = await buildAppProfileHealingInput(
             failure,
             job.companyId,
             resolvedProjectId,
-            { browserUrl, executionBaseUrl },
+            { browserUrl: null, executionBaseUrl },
           );
           if (appProfileHealing.candidates.length > 0) {
             logger.info(MOD, 'Application Profile healing candidates ready', {

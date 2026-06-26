@@ -41,6 +41,29 @@ function extractUrl(errorMessage: string): string | null {
   return null;
 }
 
+/**
+ * Load the captured page.url() values from the fixture-generated file.
+ * Returns a Map keyed by (file + testName) for fast lookup.
+ */
+function loadCapturedPageUrls(testRepoPath: string): Map<string, string> {
+  const urlsFile = path.join(testRepoPath, 'test-results-page-urls.json');
+  const map = new Map<string, string>();
+  if (!fs.existsSync(urlsFile)) return map;
+  try {
+    const raw = fs.readFileSync(urlsFile, 'utf-8');
+    const entries = JSON.parse(raw) as Array<{ testName: string; file: string; url: string }>;
+    for (const e of entries) {
+      if (e.testName && e.file && e.url) {
+        const key = `${e.file}|${e.testName}`;
+        map.set(key, e.url);
+      }
+    }
+  } catch (err) {
+    // Defensive: if the file is malformed or unreadable, skip it.
+  }
+  return map;
+}
+
 export class ArtifactCollector {
   collect(resultsFilePath: string, testRepoPath: string): ArtifactCollection[] {
     if (!fs.existsSync(resultsFilePath)) {
@@ -52,6 +75,9 @@ export class ArtifactCollector {
       suites?: any[];
       errors?: any[];
     };
+
+    // Load the real page.url() captures from the auto-fixture, keyed by file + testName.
+    const capturedUrls = loadCapturedPageUrls(testRepoPath);
 
     const artifacts: ArtifactCollection[] = [];
 
@@ -116,6 +142,13 @@ export class ArtifactCollector {
                 a.name === 'screenshot' || a.contentType?.startsWith('image/')
               )?.path ?? null;
 
+              // Prefer the REAL captured page.url() from the fixture over regex-guessing.
+              // The fixture writes a file keyed by (file + testName). Fallback to the legacy
+              // regex extraction for backward compat if the fixture didn't run.
+              const urlKey = `${suiteFile}|${testName}`;
+              const capturedUrl = capturedUrls.get(urlKey);
+              const finalUrl = capturedUrl ?? extractUrl(errorMessage);
+
               const artifact: ArtifactCollection = {
                 test_name: testName,
                 error_message: errorMessage,
@@ -125,7 +158,7 @@ export class ArtifactCollector {
                 line_number: lineNumber,
                 failed_line_code: codeContext.failedLineCode,
                 screenshot_path: screenshotPath,
-                url: extractUrl(errorMessage),
+                url: finalUrl,
                 timestamp: result.startTime ?? new Date().toISOString(),
                 test_results_json: rawText,
                 test_results_json_path: resultsFilePath,

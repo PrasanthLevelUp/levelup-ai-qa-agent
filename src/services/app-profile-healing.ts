@@ -190,9 +190,17 @@ async function findProfileForUrl(
 export interface HealingProfileResolverInput {
   companyId?: number;
   projectId?: number;
-  /** URL parsed from the Playwright failure error (most specific). */
+  /**
+   * URL from the failure artifact (most specific).
+   * Now populated with the REAL page.url() from the auto-fixture on test failure,
+   * no longer regex-guessed from error text.
+   */
   failureUrl?: string | null;
-  /** The page the browser was actually on at failure (page.url() proxy). */
+  /**
+   * DEPRECATED: browserUrl tier is no longer used; the auto-fixture writes the
+   * real page.url() directly into failure.url via the artifact collector.
+   * Kept for signature stability; always pass null.
+   */
   browserUrl?: string | null;
   /** The suite's configured base URL (playwright.config baseURL / BASE_URL). */
   executionBaseUrl?: string | null;
@@ -216,12 +224,17 @@ export interface HealingProfileResolution {
  * cascade — NOT the Script-Generation helper (healing is its own domain and
  * must heal the page that actually failed):
  *
- *   1. Failure URL          (parsed from the Playwright error — most specific)
- *   2. Current Browser URL  (page.url() at failure — more accurate than "latest")
- *   3. Execution Base URL   (suite baseURL / BASE_URL — right app, maybe not page)
- *   4. Latest Active Project Profile  (last resort; avoids the multi-app pitfall
- *      of blindly picking "the newest crawl" when a project has QA / Prod /
- *      Admin / Customer portals all crawled together)
+ *   1. Failure URL (failureUrl)
+ *        Now populated with the REAL page.url() captured by an auto-fixture at
+ *        test failure — no regex-guessing. This is the most specific signal.
+ *   2. Execution Base URL (executionBaseUrl)
+ *        The suite's baseURL config (playwright.config / BASE_URL env). Right app,
+ *        but maybe not the exact page. Used when the fixture didn't run or the
+ *        browser was already closed.
+ *   3. Latest Active Project Profile
+ *        Last resort. Avoids the multi-app pitfall: a project with QA / Prod /
+ *        Admin / Customer portals crawled together would otherwise heal against
+ *        the wrong "newest crawl."
  *
  * Always resolves (never throws); returns `{ profile: null, source: 'none' }`
  * when nothing matches.

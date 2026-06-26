@@ -208,6 +208,46 @@ export class ExecutionEngine {
   }
 
   /**
+   * Generate a temporary Playwright config that extends the user's config (if
+   * present) and injects a global fixture to capture page.url() at test failure.
+   * This gives us the REAL browser URL without regex-guessing from error text.
+   */
+  private static generateHealingConfig(repoPath: string): string {
+    const userConfigs = ['playwright.config.ts', 'playwright.config.js', 'playwright.config.mjs', 'playwright.config.cjs'];
+    let userConfigPath: string | null = null;
+    for (const name of userConfigs) {
+      const p = path.join(repoPath, name);
+      if (fs.existsSync(p)) { userConfigPath = `./${name}`; break; }
+    }
+
+    const fixtureRelPath = path.relative(repoPath, path.join(__dirname, 'page-url-capture-fixture.js'));
+    const configContent = userConfigPath
+      ? `// Healing-injected config override (extends user config + captures page.url())
+const { defineConfig } = require('@playwright/test');
+const userConfig = require('${userConfigPath}');
+const { test } = require('./${fixtureRelPath}');
+
+module.exports = defineConfig({
+  ...userConfig.default ?? userConfig,
+  // Export the instrumented test object so the fixture runs for every test
+  _fixtures: test,
+});
+`
+      : `// Healing-injected config (no user config found; captures page.url())
+const { defineConfig } = require('@playwright/test');
+const { test } = require('./${fixtureRelPath}');
+
+module.exports = defineConfig({
+  _fixtures: test,
+});
+`;
+
+    const configPath = path.join(repoPath, 'playwright.config.healing.js');
+    fs.writeFileSync(configPath, configContent);
+    return configPath;
+  }
+
+  /**
    * Synchronous run method (backward compatible for orchestrator).
    * Always uses `npx playwright test` to resolve both local and global playwright.
    *
@@ -220,6 +260,8 @@ export class ExecutionEngine {
    *   2. Wrap the command in `xvfb-run -a` when available, so configs that set
    *      `headless: false` still run under a virtual X server instead of failing
    *      to launch the browser in a headless runner.
+   *   3. Inject a global fixture (via generated config) to capture page.url() at
+   *      failure, giving us the real browser URL for healing profile resolution.
    */
   static run(repoPath: string, testFile?: string, grepFilter?: string): RunResult {
     const { execSync } = require('child_process');
@@ -227,12 +269,16 @@ export class ExecutionEngine {
     const startTime = new Date().toISOString();
     const start = Date.now();
 
+    // Inject a temporary config that captures page.url() at failure via auto-fixture.
+    const healingConfigPath = ExecutionEngine.generateHealingConfig(repoPath);
+    const configRelPath = path.relative(repoPath, healingConfigPath);
+
     // Force the JSON reporter to a known file regardless of the repo's config.
     // PLAYWRIGHT_JSON_OUTPUT_NAME makes the json reporter write to a file (it
     // would otherwise stream JSON to stdout when invoked via --reporter=json).
     let cmd = testFile
-      ? `npx playwright test "${testFile}" --reporter=json`
-      : `npx playwright test --reporter=json`;
+      ? `npx playwright test "${testFile}" --config="${configRelPath}" --reporter=json`
+      : `npx playwright test --config="${configRelPath}" --reporter=json`;
 
     // --grep isolates a single test by name for efficient per-test reruns
     if (grepFilter) {
