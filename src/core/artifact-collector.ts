@@ -90,22 +90,35 @@ export class ArtifactCollector {
                 ...(result.errors ?? []).map((e: any) => e.message || ''),
               ].filter(Boolean).join('\n\n');
 
-              const location = result.errorLocation
-                ?? result.error?.location
-                ?? result.errors?.[0]?.location;
-
-              // Parse the full error stack to find the ACTUAL source file where the
-              // broken code lives. When a Page Object method fails (e.g. LoginPage.login()),
-              // Playwright's top-of-stack location points to the TEST FILE that CALLED
-              // the method, not the PO file where the broken locator is. Healing then
-              // searches the test spec for the locator string, finds nothing, and rejects
-              // every fix with "Original locator not found in file."
+              // A broken locator almost always manifests as a TEST TIMEOUT (the
+              // action — e.g. fill('#username') — waits the full timeout then fails).
+              // In that case Playwright emits TWO errors on the result:
+              //   errors[0] = "Test timeout of Nms exceeded."  (NO location, NO stack)
+              //   errors[1] = the real action error            (location → Page Object)
+              // The generic timeout error is also surfaced as `result.error`. Reading
+              // only `result.error`/`errors[0]` therefore yields an undefined location,
+              // the stack parse finds zero frames, and filePath falls back to the test
+              // spec — so validation searches the spec for the locator, finds nothing,
+              // and rejects every candidate with "Original locator not found in file."
               //
-              // Solution: walk the stack frames and prefer files in known PO directories
-              // (pages/, page-objects/, pom/, src/pages/) over test specs. If no PO is
-              // found, fall back to the top frame (original behavior for inline tests).
-              const stack = result.error?.stack ?? result.errors?.[0]?.stack;
-              const resolvedLocation = this.findActualSourceLocation(stack, location, testRepoPath);
+              // Fix: gather EVERY candidate location Playwright provides and prefer the
+              // one that points at the actual source (Page Object) over the generic
+              // timeout error (which has none) and over the test spec. Playwright hands
+              // us the precise PO location in errors[1] — we just have to read it.
+              const candidateLocations: Array<{ file?: string; line?: number }> = [
+                result.errorLocation,
+                result.error?.location,
+                ...((result.errors ?? []).map((e: any) => e?.location)),
+              ].filter((l: any): l is { file?: string; line?: number } => !!l && !!l.file);
+
+              // Stack frames are still useful for inline failures where errors carry a
+              // real stack (no precise location). Concatenate every available stack.
+              const stack = [
+                result.error?.stack,
+                ...((result.errors ?? []).map((e: any) => e?.stack)),
+              ].filter(Boolean).join('\n') || undefined;
+
+              const resolvedLocation = this.findActualSourceLocation(stack, candidateLocations, testRepoPath);
 
               const filePath = resolvedLocation.file
                 ?? path.join(testRepoPath, 'tests', spec.file ?? suiteFile ?? '');
@@ -220,26 +233,45 @@ export class ArtifactCollector {
   }
 
   /**
-   * Parse a Playwright error stack to find the ACTUAL source file where the broken
-   * code lives. When a Page Object method fails, the top-of-stack location points
-   * to the test file that called it, not the PO where the locator is.
+   * Resolve the ACTUAL source file where the broken code lives. When a Page Object
+   * method fails, the generic/top-of-stack location points to the test file that
+   * called it (or to nothing at all for timeouts), not the PO where the locator is.
    *
-   * Strategy:
-   * 1. Parse all stack frames from the error
-   * 2. Skip test specs (tests/*.spec.ts)
-   * 3. Prefer frames in known Page Object directories (pages/, page-objects/, pom/, src/pages/)
-   * 4. Fall back to the original location if no PO frame is found
+   * Strategy (in priority order):
+   * 1. Among the explicit candidate locations Playwright provides, prefer one that is
+   *    NOT a test spec — that is the Page Object source (e.g. errors[1].location).
+   * 2. Otherwise parse the error stack, skipping test specs, preferring known PO
+   *    directories (pages/, page-objects/, pom/, src/pages/).
+   * 3. Otherwise fall back to the first available candidate location.
    */
   private findActualSourceLocation(
     stack: string | undefined,
-    originalLocation: { file?: string; line?: number } | null | undefined,
+    candidateLocations: Array<{ file?: string; line?: number }> | { file?: string; line?: number } | null | undefined,
     testRepoPath: string,
   ): { file: string | null; line: number } {
-    // Default: use the original location if present
+    const candidates = Array.isArray(candidateLocations)
+      ? candidateLocations
+      : (candidateLocations ? [candidateLocations] : []);
+    const withFile = candidates.filter((l) => !!l && !!l.file) as Array<{ file: string; line?: number }>;
+
+    const isSpec = (file: string): boolean =>
+      /(tests?[/\\].*\.spec\.ts|\.test\.ts)$/i.test(file);
+    const toAbs = (file: string): string =>
+      path.isAbsolute(file) ? file : path.join(testRepoPath, file);
+
+    // 1. Prefer an explicit candidate location that points at non-spec source (the PO).
+    const nonSpecCandidate = withFile.find((l) => !isSpec(l.file));
+    if (nonSpecCandidate) {
+      return { file: toAbs(nonSpecCandidate.file), line: nonSpecCandidate.line ?? 0 };
+    }
+
+    const firstCandidate = withFile[0];
+
+    // No stack to parse → fall back to the first available candidate (may be a spec).
     if (!stack) {
       return {
-        file: originalLocation?.file ?? null,
-        line: originalLocation?.line ?? 0,
+        file: firstCandidate ? toAbs(firstCandidate.file) : null,
+        line: firstCandidate?.line ?? 0,
       };
     }
 
@@ -259,8 +291,8 @@ export class ArtifactCollector {
 
     if (frames.length === 0) {
       return {
-        file: originalLocation?.file ?? null,
-        line: originalLocation?.line ?? 0,
+        file: firstCandidate ? toAbs(firstCandidate.file) : null,
+        line: firstCandidate?.line ?? 0,
       };
     }
 
@@ -274,22 +306,18 @@ export class ArtifactCollector {
     ];
 
     // Filter out test specs and prefer PO files
-    const nonSpecFrames = frames.filter(f => !/(tests?[/\\].*\.spec\.ts|\.test\.ts)$/i.test(f.file));
+    const nonSpecFrames = frames.filter(f => !isSpec(f.file));
     const poFrames = nonSpecFrames.filter(f => poPatterns.some(p => p.test(f.file)));
 
-    // Priority: PO frames > non-spec frames > original location
+    // Priority: PO frames > non-spec frames > first candidate location
     const best = poFrames[0] ?? nonSpecFrames[0];
     if (best) {
-      // Normalize to absolute path if relative
-      const absFile = path.isAbsolute(best.file)
-        ? best.file
-        : path.join(testRepoPath, best.file);
-      return { file: absFile, line: best.line };
+      return { file: toAbs(best.file), line: best.line };
     }
 
     return {
-      file: originalLocation?.file ?? null,
-      line: originalLocation?.line ?? 0,
+      file: firstCandidate ? toAbs(firstCandidate.file) : null,
+      line: firstCandidate?.line ?? 0,
     };
   }
 }
