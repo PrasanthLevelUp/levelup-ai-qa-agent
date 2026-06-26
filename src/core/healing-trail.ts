@@ -18,6 +18,8 @@
  * with NO side effects.
  */
 
+import type { FailureDiagnosis, FailureCategory } from './failure-classifier';
+
 /** The three healing layers (matches HealingStrategy in healing-orchestrator). */
 export type HealingLayerName =
   | 'rule_based'
@@ -57,6 +59,25 @@ export interface HealingTrail {
   attempts: HealingLayerAttempt[];
   outcome: 'healed' | 'not_healed';
   summary: string;            // one-line human summary for this failure
+  /** Structured diagnosis-first classification, when available. */
+  diagnosis?: FailureDiagnosis;
+}
+
+/** Map a diagnosis-first category onto the trail's healing classification. */
+export function classificationFromDiagnosis(category: FailureCategory): FailureClass {
+  switch (category) {
+    case 'locator':
+      return 'healable_locator';
+    case 'assertion':
+      return 'assertion';
+    case 'timing':
+      return 'timeout';
+    case 'navigation':
+      return 'navigation';
+    default:
+      // api / environment / framework / unknown have no dedicated bucket yet.
+      return 'unknown';
+  }
 }
 
 /** Map the analyzer's raw failureType to a healing classification + healability. */
@@ -99,14 +120,26 @@ export class HealingTrailBuilder {
   private readonly attempts: HealingLayerAttempt[] = [];
   private readonly classification: FailureClass;
   private readonly healable: boolean;
+  private readonly diagnosis?: FailureDiagnosis;
 
   constructor(
     private readonly testName: string,
     private readonly failureType: string,
+    diagnosis?: FailureDiagnosis,
   ) {
-    const c = classifyFailure(failureType);
-    this.classification = c.classification;
-    this.healable = c.healable;
+    // Prefer the diagnosis-first classification when available — it is richer and
+    // correctly marks non-locator failures (and locator failures with no
+    // resolvable selector) as NOT healable, instead of the old failureType-only
+    // default that treated 'unknown' as healable.
+    if (diagnosis) {
+      this.diagnosis = diagnosis;
+      this.classification = classificationFromDiagnosis(diagnosis.category);
+      this.healable = diagnosis.healableByLocatorSwap;
+    } else {
+      const c = classifyFailure(failureType);
+      this.classification = c.classification;
+      this.healable = c.healable;
+    }
   }
 
   get isHealable(): boolean {
@@ -148,6 +181,7 @@ export class HealingTrailBuilder {
       attempts: [...this.attempts],
       outcome,
       summary: summaryOverride ?? this.defaultSummary(outcome),
+      diagnosis: this.diagnosis,
     };
   }
 
@@ -159,6 +193,12 @@ export class HealingTrailBuilder {
       return `Healed${via} — test passed on rerun.`;
     }
     if (!this.healable) {
+      // When we have a structured diagnosis, its root cause is the most honest,
+      // specific one-liner — especially for api/environment/framework/unknown
+      // categories that share the 'unknown' trail bucket.
+      if (this.diagnosis) {
+        return `${capitalize(this.diagnosis.category)} failure — ${this.diagnosis.rootCause} ${this.diagnosis.recommendedAction}`.trim();
+      }
       if (this.classification === 'assertion') {
         return 'Assertion/functional failure — element was found but the assertion did not match. Not a locator issue, so nothing to heal (real product/data defect).';
       }
@@ -183,6 +223,10 @@ export class HealingTrailBuilder {
     if (rerunFailed) bits.push(`${rerunFailed} applied but rerun still failed`);
     return `Broken-locator failure — tried ${tried} candidate(s) across the 3 layers (${bits.join(', ') || 'no viable fix'}).`;
   }
+}
+
+function capitalize(s: string): string {
+  return s ? s.charAt(0).toUpperCase() + s.slice(1) : s;
 }
 
 /** Friendly label for a healing layer. */

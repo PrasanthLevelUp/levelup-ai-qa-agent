@@ -6,9 +6,10 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { logger } from '../utils/logger';
-import { extractLocator, type LocatorInfo } from './locator-extractor';
+import { extractLocator, buildLocatorInfo, type LocatorInfo } from './locator-extractor';
 import { normalizeError, extractErrorPattern, type NormalizedError } from './error-normalizer';
 import { extractCodeContext, type CodeContext } from './code-context-extractor';
+import { resolvePageObjectLocator, type PageObjectResolution } from './page-object-resolver';
 
 const MOD = 'artifact-collector';
 
@@ -31,6 +32,12 @@ export interface ArtifactCollection {
   locator_info: LocatorInfo | null;
   normalized_error: NormalizedError | null;
   code_context: CodeContext | null;
+  /**
+   * When the failing line referenced a Page Object field (e.g. `this.loginBtn`)
+   * rather than an inline locator, this holds the field→selector resolution so
+   * the diagnosis/healing layers are not starved of a `failed_locator`.
+   */
+  page_object_resolution: PageObjectResolution | null;
 }
 
 function extractUrl(errorMessage: string): string | null {
@@ -96,8 +103,35 @@ export class ArtifactCollector {
               // contains the locator, e.g. `await page.getByRole(...).click()`).
               // Without this fallback, failed_locator ends up empty and ALL
               // healing layers (rule / pattern / validation / DOM) are starved.
-              const locatorInfo =
+              let locatorInfo =
                 extractLocator(errorMessage) || extractLocator(codeContext.failedLineCode || '');
+
+              // Page Object fallback: when the failing line is a field reference
+              // (e.g. `await this.loginBtn.click()`) there is no inline selector,
+              // so the extractors above return null. Resolve the field back to
+              // its concrete locator using the failing file's full source (which
+              // contains both the field declaration and the method that used it).
+              // Without this the healer is starved of a `failed_locator` and
+              // misdiagnoses a perfectly valid selector as a "broken locator".
+              let pageObjectResolution: PageObjectResolution | null = null;
+              if (!locatorInfo && codeContext.failedLineCode) {
+                pageObjectResolution = resolvePageObjectLocator(
+                  codeContext.failedLineCode,
+                  codeContext.fullContent || '',
+                );
+                if (pageObjectResolution) {
+                  locatorInfo = buildLocatorInfo(
+                    pageObjectResolution.resolvedLocator,
+                    errorMessage,
+                  );
+                  logger.info(MOD, 'Resolved locator from Page Object field', {
+                    testName,
+                    fieldName: pageObjectResolution.fieldName,
+                    resolvedLocator: pageObjectResolution.resolvedLocator,
+                    builder: pageObjectResolution.builder,
+                  });
+                }
+              }
 
               const screenshotPath = (result.attachments ?? []).find((a: any) =>
                 a.name === 'screenshot' || a.contentType?.startsWith('image/')
@@ -122,6 +156,7 @@ export class ArtifactCollector {
                 locator_info: locatorInfo,
                 normalized_error: normalizedError,
                 code_context: codeContext,
+                page_object_resolution: pageObjectResolution,
               };
 
               artifacts.push(artifact);
