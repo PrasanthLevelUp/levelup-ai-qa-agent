@@ -16,6 +16,7 @@ import {
   getExecutionRecord,
 } from '../../db/postgres';
 import { buildExecutionTimeline } from '../../core/execution/execution-timeline';
+import { toDisplayStage } from '../../core/execution/execution-lifecycle';
 import { logger } from '../../utils/logger';
 
 const MOD = 'dashboard-api';
@@ -216,7 +217,11 @@ export function createDashboardRouter(): Router {
         // is kept separate from the test outcome (`result`).
         status: r.status,
         result: r.result ?? null,
+        // Internal pipeline stage + its clean user-facing label (derived, never
+        // stored) so the UI can show "Preparing Environment" instead of leaking
+        // cloning/installing/building.
         stage: r.stage ?? null,
+        displayStage: toDisplayStage(r.stage) ?? null,
         jobId: r.jobId ?? null,
         profile: r.profile,
         durationMs: r.durationMs,

@@ -16,11 +16,13 @@ import {
   assertOneRecordPerTest,
   stageIndex,
   STAGE_ORDER,
+  toDisplayStage,
   type EnumeratedTest,
 } from '../../src/core/execution/execution-lifecycle';
 import {
   createExecutionRecord,
   setLifecycle,
+  makeSectionTiming,
   type ExecutionRecord,
   type ExecutionResult,
 } from '../../src/core/execution/execution-record';
@@ -229,5 +231,59 @@ describe('stage ordering', () => {
 
   it('returns -1 for an unknown/undefined stage', () => {
     expect(stageIndex(undefined)).toBe(-1);
+  });
+
+  it('places collecting_evidence between executing and diagnosing', () => {
+    expect(stageIndex('executing')).toBeLessThan(stageIndex('collecting_evidence'));
+    expect(stageIndex('collecting_evidence')).toBeLessThan(stageIndex('diagnosing'));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// toDisplayStage — DERIVED user-facing labels (infra stages are never leaked)
+// ---------------------------------------------------------------------------
+
+describe('toDisplayStage', () => {
+  it('collapses all environment-prep infra stages to a single user label', () => {
+    expect(toDisplayStage('cloning')).toBe('Preparing Environment');
+    expect(toDisplayStage('installing')).toBe('Preparing Environment');
+    expect(toDisplayStage('building')).toBe('Preparing Environment');
+  });
+
+  it('maps the test/evidence/diagnosis/heal stages to friendly labels', () => {
+    expect(toDisplayStage('queued')).toBe('Queued');
+    expect(toDisplayStage('executing')).toBe('Running Tests');
+    expect(toDisplayStage('collecting_evidence')).toBe('Collecting Evidence');
+    expect(toDisplayStage('diagnosing')).toBe('Diagnosing');
+    expect(toDisplayStage('healing')).toBe('Healing');
+    expect(toDisplayStage('validating')).toBe('Validating');
+    expect(toDisplayStage('learning')).toBe('Learning');
+    expect(toDisplayStage('completed')).toBe('Completed');
+  });
+
+  it('returns undefined for an unknown/undefined stage (no guessing)', () => {
+    expect(toDisplayStage(undefined)).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// makeSectionTiming — per-section timing helper (durationMs is derived)
+// ---------------------------------------------------------------------------
+
+describe('makeSectionTiming', () => {
+  it('computes durationMs as end - start and stamps ISO boundaries', () => {
+    const start = Date.parse('2026-06-26T09:00:00.000Z');
+    const end = Date.parse('2026-06-26T09:00:12.500Z');
+    const timing = makeSectionTiming(start, end);
+    expect(timing.startedAt).toBe('2026-06-26T09:00:00.000Z');
+    expect(timing.completedAt).toBe('2026-06-26T09:00:12.500Z');
+    expect(timing.durationMs).toBe(12500);
+  });
+
+  it('clamps a negative duration to 0 (never reports negative time)', () => {
+    const start = Date.parse('2026-06-26T09:00:05.000Z');
+    const end = Date.parse('2026-06-26T09:00:00.000Z');
+    const timing = makeSectionTiming(start, end);
+    expect(timing.durationMs).toBe(0);
   });
 });

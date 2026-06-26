@@ -83,13 +83,13 @@ export function buildExecutionTimeline(input: ExecutionRecord): TimelineEvent[] 
   })();
   events.push(runEvent);
 
-  // 3) Evidence collected (observations present).
-  if (record.observations) {
-    const ls = record.observations.locatorState;
+  // 3) Evidence collected (evidence present).
+  if (record.evidence) {
+    const ls = record.evidence.locatorState;
     const detail = ls
       ? `locator ${ls.exists ? 'exists' : 'missing'}` +
         (ls.interceptedBy ? `, intercepted by ${ls.interceptedBy}` : '')
-      : (record.observations.summary?.[0] ?? undefined);
+      : (record.evidence.summary?.[0] ?? undefined);
     events.push({
       key: 'evidence',
       label: 'Evidence collected',

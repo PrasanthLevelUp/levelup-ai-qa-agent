@@ -36,13 +36,14 @@ import { refineDiagnosisWithEvidence } from '../core/failure-classifier';
 import {
   createExecutionRecord,
   recordArtifacts,
-  recordObservations,
+  recordEvidence,
   recordDiagnosis,
   recordHealingDecision,
   recordValidation,
   recordLearning,
   setStage,
   setLifecycle,
+  makeSectionTiming,
   type ExecutionRecord,
 } from '../core/execution/execution-record';
 import {
@@ -931,18 +932,20 @@ function createHealingWorker(
       // ── Canonical Execution Record ──
       // One record per failing test, threaded through the whole pipeline:
       //   Execution → Diagnosis → Healing → Validation → Learning.
-      // The record is born at test START as RUNNING (stage `diagnosing`) and
-      // persisted immediately, then enriched stage-by-stage and finalized with a
-      // terminal status + result. The dashboard reads THIS single record rather
-      // than stitching together separate diagnosis/healing/evidence/artifact
-      // tables. Lifecycle sections accumulate immutably (each record* returns a
-      // new record); the record is upserted in place (never duplicated).
+      // The record is born at test START as RUNNING (stage `collecting_evidence`,
+      // since we capture the failing run's artifacts/evidence first) and persisted
+      // immediately, then enriched stage-by-stage (collecting_evidence →
+      // diagnosing → healing → learning) and finalized with a terminal status +
+      // result. The dashboard reads THIS single record rather than stitching
+      // together separate diagnosis/healing/evidence/artifact tables. Lifecycle
+      // sections accumulate immutably (each record* returns a new record); the
+      // record is upserted in place (never duplicated).
       let execRecord: ExecutionRecord = createExecutionRecord({
         executionId: String(executionId),
         testName: failure.testName,
         status: 'running',
         result: null,
-        stage: 'diagnosing',
+        stage: 'collecting_evidence',
         jobId: String(job.id),
         durationMs: 0,
         startTime: new Date(testStartMs).toISOString(),
@@ -975,6 +978,12 @@ function createHealingWorker(
       let iterFixCount = 0;
       const healedBeforeTest = healedCount;
 
+      // Per-section wall-clock markers (epoch ms) for the timing breakdown the
+      // dashboard shows (Evidence / Diagnosis / Healing / Learning durations).
+      // Best-effort: phases that don't run leave their timing unset.
+      let evidenceStartMs = 0;
+      let evidenceEndMs = 0;
+
       // ── Evidence-Based Diagnosis (runs BEFORE classification is consumed) ──
       // The parser-based classifier produced `failure.diagnosis` from the error
       // text. Before anyone acts on it, aggregate the OBSERVED facts Playwright
@@ -986,6 +995,7 @@ function createHealingWorker(
       // the parser-based diagnosis.
       if (failure.diagnosis) {
         try {
+          evidenceStartMs = Date.now();
           let domSnapshot: string | null = null;
           if (failure.url) {
             domSnapshot = await getLatestDomHtmlForUrl(
@@ -1001,10 +1011,17 @@ function createHealingWorker(
             videoPath: evidenceArtifact.video_path,
             consoleLog: failure.errorMessage,
           });
+          evidenceEndMs = Date.now();
           const refined = refineDiagnosisWithEvidence(failure.diagnosis, evidence);
           failure.diagnosis = refined;
-          // Stage 2 + 3 — record the OBSERVED facts and the classifier's verdict.
-          execRecord = recordObservations(execRecord, mapEvidenceToObservations(evidence));
+          // Stage 2 + 3 — record the collected EVIDENCE and the classifier's
+          // verdict, each stamped with its wall-clock timing.
+          execRecord = recordEvidence(execRecord, {
+            ...mapEvidenceToObservations(evidence),
+            timing: makeSectionTiming(evidenceStartMs, evidenceEndMs),
+          });
+          // Evidence captured — advance the stage before diagnosis is recorded.
+          execRecord = setStage(execRecord, 'diagnosing');
           execRecord = recordDiagnosis(execRecord, mapDiagnosisToRecord(refined));
           logger.info(MOD, 'Evidence-based diagnosis', {
             testName: failure.testName,
@@ -1032,9 +1049,19 @@ function createHealingWorker(
       // Ensure the record carries a diagnosis even when evidence collection
       // failed/was skipped (falls back to the parser-based verdict).
       if (failure.diagnosis && !execRecord.diagnosis) {
+        execRecord = setStage(execRecord, 'diagnosing');
         execRecord = recordDiagnosis(execRecord, mapDiagnosisToRecord(failure.diagnosis));
       }
-      // Diagnosis done — advance the lifecycle stage to `healing`.
+      // Diagnosis done — stamp its timing and advance the stage to `healing`.
+      // Diagnosis spans from the end of evidence collection (or the test start,
+      // when no evidence ran) to now. Healing timing starts here.
+      const healStartMs = Date.now();
+      const diagStartMs = evidenceEndMs || testStartMs;
+      if (execRecord.diagnosis) {
+        execRecord = recordDiagnosis(execRecord, {
+          timing: makeSectionTiming(diagStartMs, healStartMs),
+        });
+      }
       execRecord = setStage(execRecord, 'healing');
 
       // Observability: build a concise trail for this failure regardless of
@@ -1860,6 +1887,9 @@ function createHealingWorker(
         const attemptedStrategies = Array.from(
           new Set(finalizedTrail.attempts.map((a) => a.layer)),
         );
+        // The healing phase (incl. validation reruns interleaved with it) ran from
+        // `healStartMs` until now; the learning write-back happens after this.
+        const healEndMs = Date.now();
         // Stage 4 — what we decided to do and the fix we applied.
         execRecord = recordHealingDecision(execRecord, buildHealingDecision({
           remedy: strategyPlan?.recommendedStrategy ?? failure.diagnosis?.recommendedStrategy,
@@ -1872,17 +1902,25 @@ function createHealingWorker(
           reportOnly: !healingForTest?.success && finalizedTrail.outcome === 'not_healed',
           rationale: finalizedTrail.summary,
         }));
-        // Stage 5 — did the applied fix hold up on rerun?
+        // Stamp the healing-phase timing (validation reruns are part of this span).
+        execRecord = recordHealingDecision(execRecord, {
+          timing: makeSectionTiming(healStartMs, healEndMs),
+        });
+        // Stage 5 — did the applied fix hold up on rerun? (Validation reruns are
+        // interleaved with healing, so its wall-clock span is the healing window.)
         execRecord = recordValidation(execRecord, {
           reran: !!healingForTest,
           passedAfterHealing: healingForTest ? healingForTest.success : null,
           notes: healingForTest?.validationReason ? [healingForTest.validationReason] : [],
+          timing: healingForTest ? makeSectionTiming(healStartMs, healEndMs) : undefined,
         });
         // Stage 6 — what we wrote back to memory (a successful heal closes the
         // learning loop + updates DOM Memory in the locator branches above).
+        execRecord = setStage(execRecord, 'learning');
         execRecord = recordLearning(execRecord, {
           recorded: !!(healingForTest?.success),
           domMemoryUpdated: !!(healingForTest?.success),
+          timing: makeSectionTiming(healEndMs, Date.now()),
         });
         // Finalize the lifecycle: STATUS reflects HOW the run ended (completed
         // normally, cancelled by the user, or stopped by the time budget) while
@@ -1891,7 +1929,6 @@ function createHealingWorker(
         const healed = iterationSuccess;
         const cancelled = isCancelled();
         const timedOut = !healed && (testBudgetExhausted() || jobBudgetExhausted());
-        execRecord = setStage(execRecord, 'learning');
         execRecord = setLifecycle(execRecord, {
           status: cancelled ? 'cancelled' : timedOut ? 'timed_out' : 'completed',
           result: healed ? 'healed' : 'fail',

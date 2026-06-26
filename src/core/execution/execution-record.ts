@@ -2,13 +2,34 @@
  * Execution Record — the CANONICAL record of a single test execution.
  *
  * This is the single source of truth for an execution. It is NOT just an
- * artifact container: it accumulates, across the lifecycle —
- *   1. artifacts    — files captured (screenshot/DOM/trace/video/HAR/...)
- *   2. observations — observed facts gathered before diagnosis
- *   3. diagnosis    — the classifier's verdict (what failed, why)
- *   4. healing      — the decision taken and the fix applied
- *   5. validation   — whether the fix held up on rerun
- *   6. learning     — what was written back to the system's memory
+ * artifact container: it accumulates, across the lifecycle, a fixed set of
+ * SECTIONS that are persisted as-is:
+ *
+ *   ExecutionRecord
+ *   ├── Metadata    — identity: executionId, testName, jobId, profile, schemaVersion
+ *   ├── Execution   — lifecycle: status, result, stage, start/end/duration
+ *   ├── Evidence    — what we SAW (screenshot/DOM/trace/console/network/locator…)
+ *   ├── Diagnosis   — the classifier's verdict (what failed, why)
+ *   ├── Healing     — the decision taken and the fix applied
+ *   ├── Validation  — whether the fix held up on rerun
+ *   └── Learning    — what was written back to the system's memory
+ *
+ * ── PROJECTIONS — DERIVED ON DEMAND, NEVER STORED ──────────────────────────
+ * The following are PURE FUNCTIONS of the record above. They must NOT be added
+ * as persisted fields — storing them would bloat the record and let it drift
+ * out of sync with its own source data:
+ *
+ *   Timeline · Replay · Confidence · Root-Cause Graph · Dashboard cards ·
+ *   AI explanations · per-section Metrics rollups · display stage labels
+ *
+ * Keeping projections out of the record is what lets the record stay small and
+ * STABLE forever: new visualizations are new derivations, not new columns.
+ *
+ * ── VERSIONING ─────────────────────────────────────────────────────────────
+ * `schemaVersion` IS the record's version (currently 3). It is stamped on every
+ * record so the UI/readers can render older records correctly and migrations
+ * can coerce legacy shapes forward (see `coerceLegacyRecord`). Bump it on any
+ * breaking shape change.
  *
  * The dashboard and analytics read ONLY this record (not separate diagnosis /
  * healing / evidence / artifact tables).
@@ -18,7 +39,11 @@
  */
 import type { ExecutionProfile } from './execution-profile';
 
-/** Current schema version of the canonical execution record (bump on breaking shape changes). */
+/**
+ * Current schema version of the canonical execution record. This IS the
+ * record's `version` — stamped on every record so older records can still be
+ * rendered/migrated. Bump on breaking shape changes.
+ */
 export const EXECUTION_RECORD_SCHEMA_VERSION = 3;
 
 // ---------------------------------------------------------------------------
@@ -61,6 +86,7 @@ export type ExecutionStage =
   | 'installing'
   | 'building'
   | 'executing'
+  | 'collecting_evidence'
   | 'diagnosing'
   | 'healing'
   | 'validating'
@@ -144,13 +170,47 @@ export interface ExecutionArtifacts {
 
 // ---------------------------------------------------------------------------
 // Lifecycle sections
+//
+// Every major section carries an optional `timing` (startedAt / completedAt /
+// durationMs) so the dashboard can show a per-phase breakdown — e.g.
+//   Evidence 0.4s · Diagnosis 1.2s · Healing 2.8s · Learning 140ms —
+// without inventing a separate analytics store. (Per-phase Metrics rollups are
+// a PROJECTION derived from these timings, never persisted separately.)
 // ---------------------------------------------------------------------------
 
 /**
- * Observations — the OBSERVED FACTS gathered before any diagnosis is attempted
- * (mirror of core/evidence-collector EvidenceBundle). The "what we saw" section.
+ * Wall-clock timing for a single lifecycle section. All fields optional because
+ * a section may be recorded without precise timing; populate best-effort.
  */
-export interface ObservationRecord {
+export interface SectionTiming {
+  /** ISO timestamp the section began. */
+  startedAt?: string;
+  /** ISO timestamp the section completed. */
+  completedAt?: string;
+  /** Duration in milliseconds (completedAt − startedAt). */
+  durationMs?: number;
+}
+
+/**
+ * Build a SectionTiming from two epoch-millis markers. Clamps negative spans to
+ * zero so clock skew can never produce a nonsensical negative duration.
+ */
+export function makeSectionTiming(startMs: number, endMs: number): SectionTiming {
+  return {
+    startedAt: new Date(startMs).toISOString(),
+    completedAt: new Date(endMs).toISOString(),
+    durationMs: Math.max(0, endMs - startMs),
+  };
+}
+
+/**
+ * Evidence — the OBSERVED FACTS captured for this execution (mirror of
+ * core/evidence-collector EvidenceBundle). The "what we saw" section:
+ * screenshot/DOM/trace/console/network signals + locator state. (File-backed
+ * evidence such as the screenshot/trace/video itself lives in `artifacts`; this
+ * section holds the structured, queryable facts derived from them.)
+ */
+export interface EvidenceRecord {
   locatorState?: {
     exists: boolean;
     visible: boolean;
@@ -164,7 +224,16 @@ export interface ObservationRecord {
   networkErrors?: Array<{ url?: string; status?: number; detail: string }>;
   /** Compact, human-readable evidence lines. */
   summary?: string[];
+  /** When this evidence was collected. */
+  timing?: SectionTiming;
 }
+
+/**
+ * Back-compat alias. The section was originally named "Observation"; it reads
+ * better to users as "Evidence".
+ * @deprecated Prefer `EvidenceRecord`.
+ */
+export type ObservationRecord = EvidenceRecord;
 
 /**
  * Diagnosis — the classifier's verdict (mirror of core FailureDiagnosis).
@@ -180,6 +249,8 @@ export interface DiagnosisRecord {
   locatorResolvedFromPageObject?: boolean;
   healableByLocatorSwap?: boolean;
   evidenceBased?: boolean;
+  /** When diagnosis ran. */
+  timing?: SectionTiming;
 }
 
 /**
@@ -207,6 +278,8 @@ export interface HealingDecisionRecord {
   costTokens?: number;
   /** Monetary cost (USD) attributed to this healing decision, when known. */
   costUsd?: number;
+  /** When the healing phase ran (includes validation reruns interleaved with it). */
+  timing?: SectionTiming;
 }
 
 /**
@@ -219,6 +292,8 @@ export interface ValidationRecord {
   confirmationRuns?: number;
   durationMs?: number;
   notes?: string[];
+  /** When validation ran. */
+  timing?: SectionTiming;
 }
 
 /**
@@ -230,6 +305,8 @@ export interface LearningRecord {
   patternId?: string | null;
   domMemoryUpdated?: boolean;
   notes?: string[];
+  /** When the learning write-back ran. */
+  timing?: SectionTiming;
 }
 
 // ---------------------------------------------------------------------------
@@ -267,8 +344,8 @@ export interface ExecutionRecord {
   artifacts: ExecutionArtifacts;
 
   // ---- Lifecycle sections (accumulated stage by stage) ----
-  /** Observed facts gathered before diagnosis. */
-  observations?: ObservationRecord;
+  /** Evidence collected for this execution (the "what we saw" section). */
+  evidence?: EvidenceRecord;
   /** The classifier's verdict for this execution. */
   diagnosis?: DiagnosisRecord;
   /** The healing decision taken and the fix applied. */
@@ -338,10 +415,16 @@ export function recordArtifacts(rec: ExecutionRecord, artifacts: Partial<Executi
   return { ...rec, artifacts: { ...(rec.artifacts ?? {}), ...artifacts } };
 }
 
-/** Accumulate observed facts onto the record (immutable merge). */
-export function recordObservations(rec: ExecutionRecord, observations: Partial<ObservationRecord>): ExecutionRecord {
-  return { ...rec, observations: { ...(rec.observations ?? {}), ...observations } };
+/** Accumulate collected evidence onto the record (immutable merge). */
+export function recordEvidence(rec: ExecutionRecord, evidence: Partial<EvidenceRecord>): ExecutionRecord {
+  return { ...rec, evidence: { ...(rec.evidence ?? {}), ...evidence } };
 }
+
+/**
+ * Back-compat alias for {@link recordEvidence}.
+ * @deprecated The "Observation" section was renamed to "Evidence".
+ */
+export const recordObservations = recordEvidence;
 
 /** Accumulate the diagnosis verdict onto the record (immutable merge). */
 export function recordDiagnosis(rec: ExecutionRecord, diagnosis: Partial<DiagnosisRecord>): ExecutionRecord {
@@ -413,6 +496,13 @@ const LEGACY_STATUS_MAP: Record<LegacyStatus, { status: ExecutionLifecycleStatus
  */
 export function coerceLegacyRecord(rec: ExecutionRecord): ExecutionRecord {
   if (!rec) return rec;
+  // Migrate the legacy `observations` section to its new name `evidence`. Older
+  // persisted records (and their JSONB) used `observations`; surface them as
+  // `evidence` without losing the original data.
+  const legacyObservations = (rec as unknown as { observations?: EvidenceRecord }).observations;
+  if (rec.evidence === undefined && legacyObservations !== undefined) {
+    rec = { ...rec, evidence: legacyObservations };
+  }
   const legacy = LEGACY_STATUS_MAP[rec.status as unknown as LegacyStatus];
   if (!legacy) {
     // Already a v3 lifecycle status — only fill in defaults for missing fields.

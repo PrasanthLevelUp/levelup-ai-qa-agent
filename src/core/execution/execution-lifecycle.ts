@@ -169,6 +169,7 @@ export const STAGE_ORDER: ExecutionStage[] = [
   'installing',
   'building',
   'executing',
+  'collecting_evidence',
   'diagnosing',
   'healing',
   'validating',
@@ -179,4 +180,63 @@ export const STAGE_ORDER: ExecutionStage[] = [
 /** Numeric index of a stage in the canonical order (−1 if unknown). */
 export function stageIndex(stage: ExecutionStage | undefined): number {
   return stage ? STAGE_ORDER.indexOf(stage) : -1;
+}
+
+// ---------------------------------------------------------------------------
+// Display stages — a USER-FACING PROJECTION of the internal stage.
+//
+// The internal `ExecutionStage` is intentionally granular for orchestration
+// (cloning/installing/building are distinct operations). The UI should NOT leak
+// that infrastructure detail. `toDisplayStage` collapses the internal stages
+// into the clean, product-level labels users actually care about (à la
+// BrowserStack). This is a DERIVED view — it is never persisted on the record.
+// ---------------------------------------------------------------------------
+
+/** Clean, user-facing stage label shown in the dashboard. */
+export type DisplayStage =
+  | 'Queued'
+  | 'Preparing Environment'
+  | 'Running Tests'
+  | 'Collecting Evidence'
+  | 'Diagnosing'
+  | 'Healing'
+  | 'Validating'
+  | 'Learning'
+  | 'Completed';
+
+/** The user-facing display stages in order (for progress bars / steppers). */
+export const DISPLAY_STAGE_ORDER: DisplayStage[] = [
+  'Queued',
+  'Preparing Environment',
+  'Running Tests',
+  'Collecting Evidence',
+  'Diagnosing',
+  'Healing',
+  'Validating',
+  'Learning',
+  'Completed',
+];
+
+/** Map each internal stage to its user-facing display label. */
+const STAGE_DISPLAY: Record<ExecutionStage, DisplayStage> = {
+  queued: 'Queued',
+  // Infrastructure prep is collapsed into one user-facing step.
+  cloning: 'Preparing Environment',
+  installing: 'Preparing Environment',
+  building: 'Preparing Environment',
+  executing: 'Running Tests',
+  collecting_evidence: 'Collecting Evidence',
+  diagnosing: 'Diagnosing',
+  healing: 'Healing',
+  validating: 'Validating',
+  learning: 'Learning',
+  completed: 'Completed',
+};
+
+/**
+ * Project an internal stage onto its clean, user-facing label. Returns
+ * `undefined` for an unknown/undefined stage so the UI can omit the chip.
+ */
+export function toDisplayStage(stage: ExecutionStage | undefined): DisplayStage | undefined {
+  return stage ? STAGE_DISPLAY[stage] : undefined;
 }

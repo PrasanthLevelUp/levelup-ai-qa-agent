@@ -9,7 +9,7 @@ import {
 import {
   createExecutionRecord,
   recordArtifacts,
-  recordObservations,
+  recordEvidence,
   recordDiagnosis,
   recordHealingDecision,
   recordValidation,
@@ -71,10 +71,10 @@ describe('Execution Record — canonical lifecycle accumulation', () => {
     expect(rec.diagnosis).toBeUndefined();
   });
 
-  it('accumulates observations → diagnosis → healing → validation → learning immutably', () => {
+  it('accumulates evidence → diagnosis → healing → validation → learning immutably', () => {
     const rec = base();
 
-    const withObs = recordObservations(rec, {
+    const withObs = recordEvidence(rec, {
       locatorState: {
         exists: true, visible: true, enabled: true,
         receivesPointerEvents: false, clickable: false,
@@ -83,8 +83,8 @@ describe('Execution Record — canonical lifecycle accumulation', () => {
       summary: ['element covered by overlay'],
     });
     // original is untouched (immutable merge)
-    expect(rec.observations).toBeUndefined();
-    expect(withObs.observations?.locatorState?.interceptedBy).toBe('.overlay');
+    expect(rec.evidence).toBeUndefined();
+    expect(withObs.evidence?.locatorState?.interceptedBy).toBe('.overlay');
 
     const withDiag = recordDiagnosis(withObs, {
       category: 'timing',
@@ -95,7 +95,7 @@ describe('Execution Record — canonical lifecycle accumulation', () => {
     expect(withDiag.diagnosis?.category).toBe('timing');
     expect(withDiag.diagnosis?.confidence).toBe(0.95);
     // earlier section preserved
-    expect(withDiag.observations?.summary).toContain('element covered by overlay');
+    expect(withDiag.evidence?.summary).toContain('element covered by overlay');
 
     const withHeal = recordHealingDecision(withDiag, {
       remedy: 'inject_wait',
@@ -112,7 +112,7 @@ describe('Execution Record — canonical lifecycle accumulation', () => {
     expect(withLearn.learning?.recorded).toBe(true);
 
     // full lifecycle present on the final record
-    expect(withLearn.observations).toBeDefined();
+    expect(withLearn.evidence).toBeDefined();
     expect(withLearn.diagnosis).toBeDefined();
     expect(withLearn.healing).toBeDefined();
     expect(withLearn.validation).toBeDefined();
