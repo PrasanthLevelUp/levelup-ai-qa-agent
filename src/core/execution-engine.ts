@@ -43,7 +43,7 @@ export interface RunResult {
  * @param collectHealingArtifacts When true, collect trace/video regardless of profile (except 'fast')
  * @param isHealingRun Whether this is a healing attempt (used with collectHealingArtifacts)
  */
-function playwrightArtifactFlags(
+export function playwrightArtifactFlags(
   profile: ExecutionProfile,
   collectHealingArtifacts: boolean,
   isHealingRun: boolean
@@ -54,24 +54,32 @@ function playwrightArtifactFlags(
     ? 'healing'
     : profile;
 
+  // IMPORTANT: Playwright Test exposes ONLY `--trace` as an artifact CLI flag.
+  // `--screenshot` and `--video` are NOT CLI options — they are `use:` config
+  // options (playwright.config `use: { screenshot, video }`). Passing them on the
+  // CLI makes Playwright exit immediately with `error: unknown option
+  // '--screenshot=...'` BEFORE any test runs, so the run (and every healing
+  // rerun) fails with no results JSON — the heal can then never be confirmed and
+  // is silently reverted ("Report only"). Verified against Playwright 1.59–1.60.
+  // Screenshots/video are therefore governed by the repo's own playwright.config;
+  // here we only set the trace mode, which the caller may further override with
+  // an always-appended `--trace=retain-on-failure` for TraceParser DOM/URL.
   switch (effectiveProfile) {
     case 'fast':
-      // Metadata only — no screenshots, trace, or video. Fastest for CI.
-      return '--screenshot=off --video=off --trace=off';
+      // Metadata only — fastest for CI.
+      return '--trace=off';
     case 'standard':
-      // Default: screenshot + DOM on failure (Playwright's default on-first-retry
-      // captures on first failure). No trace/video to keep storage lean.
-      return '--screenshot=only-on-failure --video=off --trace=off';
+      // Default: keep storage lean (trace is force-appended on failure by caller).
+      return '--trace=off';
     case 'healing':
-      // Healing mode: capture trace + video when healing is attempted.
-      // Trace = on-first-retry (captures on first failure).
-      return '--screenshot=only-on-failure --video=on-first-retry --trace=on-first-retry';
+      // Healing mode: capture trace when healing is attempted.
+      return '--trace=on-first-retry';
     case 'debug':
-      // Maximum diagnostics — always capture everything regardless of outcome.
-      return '--screenshot=on --video=on --trace=on';
+      // Maximum diagnostics — always capture a trace regardless of outcome.
+      return '--trace=on';
     default:
       // Fallback to standard for safety.
-      return '--screenshot=only-on-failure --video=off --trace=off';
+      return '--trace=off';
   }
 }
 

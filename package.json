@@ -12,7 +12,8 @@
     "dev": "ts-node src/index.ts",
     "dev:api": "MODE=api ts-node src/index.ts",
     "run-tests": "ts-node src/core/execution-engine.ts",
-    "report": "ts-node src/reports/html-report.ts"
+    "report": "ts-node src/reports/html-report.ts",
+    "benchmark:saucedemo": "node benchmarks/heal-saucedemo-login.js"
   },
   "repository": {
     "type": "git",
