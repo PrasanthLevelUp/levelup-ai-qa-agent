@@ -7,7 +7,7 @@ import { spawn } from 'child_process';
 import * as path from 'path';
 import * as fs from 'fs';
 import { logger } from '../utils/logger';
-import type { ExecutionProfile } from '../db/postgres';
+import type { ExecutionProfile, EvidenceManifest } from '../db/postgres';
 
 const MOD = 'execution-engine';
 
@@ -31,14 +31,29 @@ export interface RunResult {
   startTime: string;
   endTime: string;
   durationMs: number;
+  evidence?: EvidenceManifest; // Evidence manifest with all collected artifacts
 }
 
 /**
  * Translate an ExecutionProfile into Playwright CLI flags for trace/video/screenshot.
  * Follows the tiered capture model: Fast < Standard < Healing < Debug.
+ * 
+ * @param profile Base execution profile
+ * @param collectHealingArtifacts When true, collect trace/video regardless of profile (except 'fast')
+ * @param isHealingRun Whether this is a healing attempt (used with collectHealingArtifacts)
  */
-function playwrightArtifactFlags(profile: ExecutionProfile): string {
-  switch (profile) {
+function playwrightArtifactFlags(
+  profile: ExecutionProfile,
+  collectHealingArtifacts: boolean,
+  isHealingRun: boolean
+): string {
+  // If collectHealingArtifacts is enabled and this is a healing run, upgrade artifact collection
+  // (unless profile is 'fast', which explicitly disables all artifacts)
+  const effectiveProfile = collectHealingArtifacts && isHealingRun && profile !== 'fast'
+    ? 'healing'
+    : profile;
+
+  switch (effectiveProfile) {
     case 'fast':
       // Metadata only — no screenshots, trace, or video. Fastest for CI.
       return '--screenshot=off --video=off --trace=off';
@@ -47,9 +62,8 @@ function playwrightArtifactFlags(profile: ExecutionProfile): string {
       // captures on first failure). No trace/video to keep storage lean.
       return '--screenshot=only-on-failure --video=off --trace=off';
     case 'healing':
-      // Healing mode: capture trace + video ONLY when healing is attempted. The
-      // worker will use 'standard' initially, then upgrade to 'healing' when
-      // actually healing a failure. Trace = on-first-retry (same as screenshot).
+      // Healing mode: capture trace + video when healing is attempted.
+      // Trace = on-first-retry (captures on first failure).
       return '--screenshot=only-on-failure --video=on-first-retry --trace=on-first-retry';
     case 'debug':
       // Maximum diagnostics — always capture everything regardless of outcome.
@@ -269,6 +283,8 @@ export class ExecutionEngine {
     grepFilter?: string,
     timeoutMs: number = DEFAULT_RERUN_TIMEOUT_MS,
     profile: ExecutionProfile = 'standard',
+    collectHealingArtifacts: boolean = true,
+    isHealingRun: boolean = false,
   ): RunResult {
     const { execSync } = require('child_process');
     const resultsFile = path.join(repoPath, 'test-results.json');
@@ -278,7 +294,7 @@ export class ExecutionEngine {
     // Force the JSON reporter to a known file regardless of the repo's config.
     // PLAYWRIGHT_JSON_OUTPUT_NAME makes the json reporter write to a file (it
     // would otherwise stream JSON to stdout when invoked via --reporter=json).
-    const artifactFlags = playwrightArtifactFlags(profile);
+    const artifactFlags = playwrightArtifactFlags(profile, collectHealingArtifacts, isHealingRun);
     let cmd = testFile
       ? `npx playwright test "${testFile}" --reporter=json ${artifactFlags}`
       : `npx playwright test --reporter=json ${artifactFlags}`;
@@ -385,13 +401,15 @@ export class ExecutionEngine {
     grepFilter?: string,
     timeoutMs: number = DEFAULT_RERUN_TIMEOUT_MS,
     profile: ExecutionProfile = 'standard',
+    collectHealingArtifacts: boolean = true,
+    isHealingRun: boolean = false,
   ): Promise<RunResult> {
     const { spawn } = require('child_process');
     const resultsFile = path.join(repoPath, 'test-results.json');
     const startTime = new Date().toISOString();
     const start = Date.now();
 
-    const artifactFlags = playwrightArtifactFlags(profile);
+    const artifactFlags = playwrightArtifactFlags(profile, collectHealingArtifacts, isHealingRun);
     let cmd = testFile
       ? `npx playwright test "${testFile}" --reporter=json ${artifactFlags}`
       : `npx playwright test --reporter=json ${artifactFlags}`;

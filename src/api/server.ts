@@ -106,8 +106,10 @@ import {
   logPR,
   getProjectIdForRepo,
   getHealingSettings,
+  getExecutionSettings,
   getLatestDomHtmlForUrl,
   type HealingSettings,
+  type ExecutionSettings,
 } from '../db/postgres';
 import {
   HealingIntelligenceContext,
@@ -379,6 +381,24 @@ function createHealingWorker(
     // reruns per broken locator (the old code ran one rerun PER candidate).
     const MAX_BROWSER_TRIES_PER_LOCATOR = envInt('HEALING_MAX_BROWSER_TRIES_PER_LOCATOR', 2);
 
+    // Execution settings — load early so they're available for initial test run
+    // Use job.projectId if available (will be refined later with resolvedProjectId for healing)
+    let executionProfile: import('../db/postgres').ExecutionProfile = 'standard';
+    let collectHealingArtifacts = true;
+    try {
+      const es: ExecutionSettings = await getExecutionSettings(job.companyId, job.projectId);
+      executionProfile = es.executionProfile || 'standard';
+      collectHealingArtifacts = es.collectHealingArtifacts ?? true;
+      logger.info(MOD, '⚙️ Execution settings loaded (early)', {
+        companyId: job.companyId ?? null,
+        projectId: job.projectId ?? null,
+        executionProfile,
+        collectHealingArtifacts,
+      });
+    } catch (settingsErr: any) {
+      logger.warn(MOD, 'Could not load execution settings — using defaults', { error: settingsErr.message });
+    }
+
     /** True once the user has cancelled this job (Cancel sets status=FAILED). */
     const isCancelled = (): boolean => jobQueue.getJob(job.id)?.status === JobStatus.FAILED;
     /** Remaining job wall-clock budget in ms (never negative). */
@@ -482,8 +502,17 @@ function createHealingWorker(
       progress: job.testFile ? `Running tests (${job.testFile})...` : 'Running tests...',
     });
     // Non-blocking full run, bounded by the overall job budget so the initial
-    // suite execution can't itself hang the job indefinitely.
-    const run = await ExecutionEngine.runAsync(testRepoPath, job.testFile, undefined, jobBudgetRemainingMs());
+    // suite execution can't itself hang the job indefinitely. Initial test run
+    // uses base profile without healing artifacts (not a healing attempt yet).
+    const run = await ExecutionEngine.runAsync(
+      testRepoPath,
+      job.testFile,
+      undefined,
+      jobBudgetRemainingMs(),
+      executionProfile,
+      collectHealingArtifacts,
+      false // isHealingRun=false for initial test run
+    );
 
     // Step 4: Collect artifacts
     jobQueue.updateJob(job.id, { progress: 'Collecting failure artifacts...' });
@@ -562,16 +591,14 @@ function createHealingWorker(
       logger.warn(MOD, '⚠️ OPENAI_API_KEY not set — AI healing strategy disabled (rule + pattern still active)');
     }
 
-    // ── Issue #3: apply admin-configured healing strategy settings ──
+    // ── Load healing strategy settings (thresholds + cost caps) ──
     // Load per-company/project thresholds + cost caps and build a configured
     // strategy selector. When no settings are stored, getHealingSettings returns
     // the engine defaults, preserving prior behaviour. AI fallback off is modelled
     // by setting the daily token budget to 0 so the AI budget check always fails.
     let strategySelector: HealingStrategySelector | undefined;
-    let executionProfile: import('../db/postgres').ExecutionProfile = 'standard';
     try {
       const hs: HealingSettings = await getHealingSettings(job.companyId, resolvedProjectId);
-      executionProfile = hs.executionProfile || 'standard';
       const strategyConfig: StrategyConfig = {
         confidenceThresholds: {
           rule: hs.ruleThreshold,
@@ -590,7 +617,6 @@ function createHealingWorker(
         thresholds: strategyConfig.confidenceThresholds,
         aiFallbackEnabled: hs.aiFallbackEnabled,
         maxCostPerHealing: hs.maxCostPerHealing,
-        executionProfile,
       });
     } catch (settingsErr: any) {
       logger.warn(MOD, 'Could not load healing settings — using engine defaults', { error: settingsErr.message });
@@ -658,9 +684,17 @@ function createHealingWorker(
 
       // PRE-CHECK: Re-run this specific test to see if it still fails.
       // A previous test's healing may have already fixed shared locators in the same file.
-      // Use the base execution profile (no trace/video unless profile is 'debug').
+      // Use the base execution profile (not a healing attempt yet).
       const preCheckRelFile = path.relative(path.join(testRepoPath, 'tests'), failure.filePath);
-      const preCheck = await ExecutionEngine.runAsync(testRepoPath, preCheckRelFile, failure.testName, rerunTimeoutMs(), executionProfile);
+      const preCheck = await ExecutionEngine.runAsync(
+        testRepoPath,
+        preCheckRelFile,
+        failure.testName,
+        rerunTimeoutMs(),
+        executionProfile,
+        collectHealingArtifacts,
+        false // isHealingRun=false for precheck
+      );
       if (preCheck.exitCode === 0) {
         logger.info(MOD, 'Test already passes (fixed by prior healing) — skipping', {
           testName: failure.testName,
@@ -802,19 +836,12 @@ function createHealingWorker(
         });
       }
 
-      // Adaptive execution profile: start with the configured profile, then upgrade
-      // to 'healing' when we actually attempt healing (captures trace/video only
-      // for healed failures, not passing tests or report-only diagnoses). Never
-      // downgrade 'debug' (user explicitly requested full diagnostics).
-      let activeProfile = executionProfile;
-      const upgradeToHealingProfile = () => {
-        if (activeProfile !== 'debug') {
-          activeProfile = 'healing';
-          logger.info(MOD, 'Upgraded execution profile to "healing" (trace+video capture enabled)', {
-            testName: failure.testName,
-          });
-        }
-      };
+      // Explicit artifact collection control: collectHealingArtifacts flag is set at
+      // project level by the user (explicit, visible, never auto-upgraded). When true,
+      // healing runs will collect trace/video/HAR regardless of base profile (unless
+      // profile is 'fast', which explicitly disables all artifacts). When false, only
+      // the base profile artifacts are collected. This makes artifact costs predictable
+      // and prevents hidden storage surprises.
 
       try {
         // Decide healing strategy based on failure type:
@@ -839,7 +866,6 @@ function createHealingWorker(
           // For assertion failures, try adding explicit wait only
           if (failure.isTimingIssue || failure.errorMessage.includes('Received ""') || failure.errorMessage.includes('Received: ""')) {
             logger.info(MOD, 'Assertion failure may be timing-related — attempting wait injection');
-            upgradeToHealingProfile(); // Capture trace/video for the healing attempt
             const originalContent = fs.readFileSync(failure.filePath, 'utf-8');
             // Add networkidle wait after goto
             if (!originalContent.includes("waitForLoadState('networkidle')")) {
@@ -850,7 +876,15 @@ function createHealingWorker(
               if (updatedContent !== originalContent) {
                 fs.writeFileSync(failure.filePath, updatedContent, 'utf-8');
                 const relativeTestFile = path.relative(path.join(testRepoPath, 'tests'), failure.filePath);
-                const rerun = await ExecutionEngine.runAsync(testRepoPath, relativeTestFile, failure.testName, rerunTimeoutMs(), activeProfile);
+                const rerun = await ExecutionEngine.runAsync(
+                  testRepoPath,
+                  relativeTestFile,
+                  failure.testName,
+                  rerunTimeoutMs(),
+                  executionProfile,
+                  collectHealingArtifacts,
+                  true // isHealingRun=true (wait injection is a healing attempt)
+                );
                 if (rerun.exitCode === 0) {
                   iterationSuccess = true;
                   healedCount++;
@@ -1018,11 +1052,6 @@ function createHealingWorker(
             break;
           }
           
-          // Upgrade to 'healing' profile on first iteration (capture trace+video for healing).
-          if (iteration === 0) {
-            upgradeToHealingProfile();
-          }
-          
           jobQueue.updateJob(job.id, {
             progress: `Healing: ${failure.testName} (locator ${iteration + 1})...`,
           });
@@ -1173,7 +1202,15 @@ function createHealingWorker(
             );
             const currentTestName = failure.testName;
             browserTries++; // count this candidate against the per-locator browser budget
-            const rerun = await ExecutionEngine.runAsync(testRepoPath, relativeTestFile, currentTestName, rerunTimeoutMs(), activeProfile);
+            const rerun = await ExecutionEngine.runAsync(
+              testRepoPath,
+              relativeTestFile,
+              currentTestName,
+              rerunTimeoutMs(),
+              executionProfile,
+              collectHealingArtifacts,
+              true // isHealingRun=true (locator healing attempt)
+            );
 
             logger.info(MOD, 'Rerun result', {
               exitCode: rerun.exitCode, iteration, retry,
@@ -1280,7 +1317,15 @@ function createHealingWorker(
                 testName: failure.testName, iteration, retry,
                 exitCode: rerun.exitCode,
               });
-              const confirmRerun = await ExecutionEngine.runAsync(testRepoPath, relativeTestFile, currentTestName, rerunTimeoutMs(), activeProfile);
+              const confirmRerun = await ExecutionEngine.runAsync(
+                testRepoPath,
+                relativeTestFile,
+                currentTestName,
+                rerunTimeoutMs(),
+                executionProfile,
+                collectHealingArtifacts,
+                true // isHealingRun=true (confirmation rerun)
+              );
               if (confirmRerun.exitCode === 0) {
                 // Confirmed healed!
                 locatorFixed = true;

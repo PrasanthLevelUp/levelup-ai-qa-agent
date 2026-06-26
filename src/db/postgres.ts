@@ -1796,6 +1796,23 @@ async function migrateDefaultCompany(client: PoolClient): Promise<void> {
     `CREATE UNIQUE INDEX IF NOT EXISTS idx_healing_settings_scope
        ON healing_settings(COALESCE(company_id, 0), COALESCE(project_id, 0))`);
 
+  // ── Execution settings (project-level execution configuration) ──
+  // Separate from healing_settings because execution is used by multiple consumers:
+  // script validation, healing, regression, smoke, nightly, GitHub Actions, etc.
+  // Authorization layer enforces which profiles are available per subscription plan.
+  console.log('🔧 [DB] Migration: execution_settings table...');
+  await safeExec(client, 'execution_settings', `CREATE TABLE IF NOT EXISTS execution_settings (
+    id SERIAL PRIMARY KEY,
+    company_id INTEGER REFERENCES companies(id),
+    project_id INTEGER REFERENCES projects(id) ON DELETE CASCADE,
+    settings JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+  )`);
+  await safeExec(client, 'idx_execution_settings_scope',
+    `CREATE UNIQUE INDEX IF NOT EXISTS idx_execution_settings_scope
+       ON execution_settings(COALESCE(company_id, 0), COALESCE(project_id, 0))`);
+
   // ── Crawl snapshots (proactive script maintenance: change detection) ──
   // Stores a lightweight, versioned "signature" of each crawl so we can diff
   // successive crawls of the same app and detect UI/locator changes that may
@@ -7161,17 +7178,125 @@ export async function setRequirementGenerationState(
   }
 }
 
-// ---- Healing settings (admin-tunable confidence thresholds + cost caps) ----
+// ---- Execution settings (project-level configuration for test execution) ----
 
 /**
  * Execution Profile — controls what artifacts are captured during test execution.
  * Tiered to balance storage costs vs. diagnostic richness:
  * - fast: CI pipelines — metadata only
  * - standard: default — metadata + failure screenshots + DOM
- * - healing: auto-healing — standard + trace + video for healed failures
+ * - healing: healing mode — standard + trace + video (used explicitly, not auto-upgraded)
  * - debug: investigation — everything (trace/video/HAR always on)
  */
 export type ExecutionProfile = 'fast' | 'standard' | 'healing' | 'debug';
+
+/**
+ * Execution Settings — project-level configuration for test execution.
+ * Separate from healing settings because execution is used by multiple consumers:
+ * script validation, healing, regression, smoke, nightly, GitHub Actions, etc.
+ */
+export interface ExecutionSettings {
+  /**
+   * Base execution profile — controls baseline artifact collection.
+   * Authorization layer should enforce which profiles are available per plan.
+   */
+  executionProfile: ExecutionProfile;
+  /**
+   * Explicit opt-in for additional artifacts during healing attempts.
+   * When true, healing runs will collect trace/video/HAR (regardless of profile).
+   * When false, only the base profile artifacts are collected.
+   * Makes artifact collection behavior explicit and visible to users.
+   */
+  collectHealingArtifacts: boolean;
+}
+
+export const DEFAULT_EXECUTION_SETTINGS: ExecutionSettings = {
+  executionProfile: 'standard', // Safe default: screenshots + DOM on failure
+  collectHealingArtifacts: true, // Default: collect additional diagnostics during healing
+};
+
+/**
+ * Evidence Manifest — single object recording all artifacts collected during execution.
+ * This is the canonical output of every test run, consumed by Timeline, Replay,
+ * Healing, Diagnosis, and Learning modules. Prevents passing dozens of artifact
+ * paths around separately.
+ */
+export interface EvidenceManifest {
+  executionId: string;
+  testName: string;
+  status: 'passed' | 'failed' | 'timedout' | 'skipped';
+  durationMs: number;
+  startTime: string;
+  endTime: string;
+  artifacts: {
+    // Always collected (Tier 1)
+    metadata?: {
+      url?: string;
+      locator?: string;
+      failedLine?: number;
+      stackTrace?: string;
+      browserInfo?: string;
+    };
+    // Tier 2 - On failure
+    screenshot?: string; // Path or URL to screenshot
+    dom?: string; // Path to DOM snapshot
+    html?: string; // Full page HTML
+    consoleErrors?: string[]; // Console error messages
+    locatorState?: {
+      exists: boolean;
+      visible: boolean;
+      enabled: boolean;
+      boundingBox?: { x: number; y: number; width: number; height: number };
+    };
+    // Tier 3 - On healing (when collectHealingArtifacts=true)
+    trace?: string; // Path to Playwright trace
+    video?: string; // Path to video recording
+    har?: string; // Path to HAR (HTTP Archive) file
+    network?: string[]; // Network errors
+    performance?: Record<string, any>; // Performance metrics
+  };
+  profile: ExecutionProfile; // Which profile was used for this execution
+}
+
+/** Read execution settings for a scope, merged over defaults (never throws on missing table). */
+export async function getExecutionSettings(companyId?: number, projectId?: number): Promise<ExecutionSettings> {
+  const pool = getPool();
+  try {
+    const r = await pool.query(
+      `SELECT settings FROM execution_settings
+       WHERE COALESCE(company_id, 0) = COALESCE($1, 0)
+         AND COALESCE(project_id, 0) = COALESCE($2, 0)
+       LIMIT 1`,
+      [companyId ?? null, projectId ?? null]
+    );
+    const stored = r.rows[0]?.settings || {};
+    return { ...DEFAULT_EXECUTION_SETTINGS, ...stored };
+  } catch (err: any) {
+    if (err?.code === '42P01' || err?.message?.includes('does not exist')) {
+      return { ...DEFAULT_EXECUTION_SETTINGS };
+    }
+    throw err;
+  }
+}
+
+/** Upsert execution settings for a scope. Returns the merged effective settings. */
+export async function upsertExecutionSettings(
+  settings: Partial<ExecutionSettings>, companyId?: number, projectId?: number
+): Promise<ExecutionSettings> {
+  const pool = getPool();
+  const current = await getExecutionSettings(companyId, projectId);
+  const merged: ExecutionSettings = { ...current, ...settings };
+  await pool.query(
+    `INSERT INTO execution_settings (company_id, project_id, settings, created_at, updated_at)
+     VALUES ($1, $2, $3::jsonb, NOW(), NOW())
+     ON CONFLICT (COALESCE(company_id, 0), COALESCE(project_id, 0))
+     DO UPDATE SET settings = $3::jsonb, updated_at = NOW()`,
+    [companyId ?? null, projectId ?? null, JSON.stringify(merged)]
+  );
+  return merged;
+}
+
+// ---- Healing settings (admin-tunable confidence thresholds + cost caps) ----
 
 export interface HealingSettings {
   ruleThreshold: number;
@@ -7180,11 +7305,6 @@ export interface HealingSettings {
   aiFallbackEnabled: boolean;
   maxCostPerHealing: number;
   maxDailyTokenBudget: number;
-  /**
-   * Execution profile — defaults to 'standard'. Set per project or derive from
-   * subscription plan (e.g., Free='fast', Pro/Enterprise='standard').
-   */
-  executionProfile: ExecutionProfile;
 }
 
 export const DEFAULT_HEALING_SETTINGS: HealingSettings = {
@@ -7194,7 +7314,6 @@ export const DEFAULT_HEALING_SETTINGS: HealingSettings = {
   aiFallbackEnabled: true,
   maxCostPerHealing: parseFloat(process.env.MAX_COST_PER_HEALING || '0.10'),
   maxDailyTokenBudget: parseInt(process.env.MAX_DAILY_TOKEN_BUDGET || '100000', 10),
-  executionProfile: 'standard', // Safe default: screenshots + DOM on failure
 };
 
 /** Read healing settings for a scope, merged over defaults (never throws on missing table). */
