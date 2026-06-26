@@ -18,6 +18,14 @@ export interface FailureDetails {
   errorMessage: string;
   errorPattern: string;
   filePath: string;
+  /**
+   * Absolute path to the runnable SPEC file that defines this test. Distinct
+   * from `filePath` (the source of the broken locator, often a Page Object).
+   * The healing rerun targets this so the test is actually found and executed;
+   * rerunning a Page Object path yields "No tests found" and the heal can never
+   * be confirmed. Falls back to `filePath` when not available.
+   */
+  specFilePath?: string;
   lineNumber: number;
   failedLineCode: string;
   surroundingCode: string;
@@ -138,6 +146,7 @@ export class FailureAnalyzer {
       errorMessage: artifact.error_message,
       errorPattern: artifact.error_pattern,
       filePath: artifact.file_path,
+      specFilePath: artifact.spec_file ?? undefined,
       lineNumber: artifact.line_number,
       failedLineCode: artifact.failed_line_code ?? '',
       surroundingCode: artifact.surrounding_code,

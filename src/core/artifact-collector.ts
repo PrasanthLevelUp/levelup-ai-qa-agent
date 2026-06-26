@@ -24,6 +24,14 @@ export interface ArtifactCollection {
   file_path: string;
   line_number: number;
   failed_line_code: string | null;
+  /**
+   * Absolute path to the SPEC file that defines the failing test (the `.spec.ts`
+   * Playwright actually runs). Distinct from `file_path`, which points at the
+   * source of the broken locator — often a Page Object, NOT a runnable spec.
+   * The healing rerun MUST target this spec file; rerunning `file_path` when it
+   * is a Page Object yields "No tests found" and the heal can never be confirmed.
+   */
+  spec_file: string | null;
   screenshot_path: string | null;
   /** Path to the Playwright trace.zip attachment, when captured (Failure Replay). */
   trace_path: string | null;
@@ -125,6 +133,15 @@ export class ArtifactCollector {
               const filePath = resolvedLocation.file
                 ?? path.join(testRepoPath, 'tests', spec.file ?? suiteFile ?? '');
 
+              // The runnable spec file (where the test is DEFINED), independent of
+              // where the broken locator lives. Playwright reports `spec.file`
+              // relative to the test rootDir (tests/). The healing rerun targets
+              // this — NOT `filePath` (which may be a Page Object → "No tests found").
+              const specRel = spec.file ?? suiteFile;
+              const specFilePath = specRel
+                ? path.join(testRepoPath, 'tests', specRel)
+                : null;
+
               const lineNumber = resolvedLocation.line ?? 0;
 
               // Use modular extractors
@@ -193,6 +210,7 @@ export class ArtifactCollector {
                 error_pattern: extractErrorPattern(errorMessage),
                 failed_locator: locatorInfo?.rawLocator ?? null,
                 file_path: filePath,
+                spec_file: specFilePath,
                 line_number: lineNumber,
                 failed_line_code: codeContext.failedLineCode,
                 screenshot_path: screenshotPath,

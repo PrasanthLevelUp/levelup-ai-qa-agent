@@ -1471,9 +1471,15 @@ function createHealingWorker(
               newLocator: outcome.suggestion.newLocator,
             });
 
-            // Rerun ONLY the current test for isolation
+            // Rerun ONLY the current test for isolation. Target the SPEC file
+            // (where the test is defined) — NOT failure.filePath, which for a
+            // Page Object heal points at the PO source and yields "No tests
+            // found" on rerun, so the heal could never be confirmed (the fix was
+            // applied correctly but silently reverted). Fall back to filePath
+            // when the spec file is unknown (inline-locator failures).
+            const rerunTarget = failure.specFilePath ?? failure.filePath;
             const relativeTestFile = path.relative(
-              path.join(testRepoPath, 'tests'), failure.filePath,
+              path.join(testRepoPath, 'tests'), rerunTarget,
             );
             const currentTestName = failure.testName;
             browserTries++; // count this candidate against the per-locator browser budget
@@ -1694,6 +1700,13 @@ function createHealingWorker(
 
               // Still can't determine — revert and try next suggestion
               logger.warn(MOD, 'Cannot confirm fix, reverting', { iteration, retry });
+              trail.record({
+                layer: outcome.suggestion.strategy,
+                candidate: outcome.suggestion.newLocator,
+                confidence: outcome.suggestion.confidence,
+                decision: 'rerun_failed',
+                reason: 'Candidate applied, but the rerun produced no passing result and no parseable failure artifact, so the heal could not be confirmed (reverted).',
+              });
               fs.writeFileSync(failure.filePath, fileContentBeforeFix, 'utf-8');
               continue;
             }
@@ -1794,6 +1807,13 @@ function createHealingWorker(
             logger.info(MOD, 'Fix did not work, reverting file', {
               testName: failure.testName, failedLocator: failure.failedLocator,
               triedLocator: outcome.suggestion.newLocator, iteration, retry,
+            });
+            trail.record({
+              layer: outcome.suggestion.strategy,
+              candidate: outcome.suggestion.newLocator,
+              confidence: outcome.suggestion.confidence,
+              decision: 'rerun_failed',
+              reason: 'Candidate applied, but the same locator still failed on rerun (reverted).',
             });
             fs.writeFileSync(failure.filePath, fileContentBeforeFix, 'utf-8');
 
