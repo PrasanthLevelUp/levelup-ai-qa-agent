@@ -30,7 +30,7 @@
  *  • Tenant-safe — every profile read is scoped by companyId / projectId.
  */
 
-import { getProfileByUrl, listProfiles, type ApplicationProfile } from '../db/postgres';
+import { getProfileByUrl, listProfiles, getLatestActiveApplicationProfileForHealing, type ApplicationProfile } from '../db/postgres';
 import { normalizeBaseUrl } from '../utils/url-normalize';
 import { logger } from '../utils/logger';
 import type { FailureDetails } from '../core/failure-analyzer';
@@ -183,23 +183,137 @@ async function findProfileForUrl(
 }
 
 /* -------------------------------------------------------------------------- */
+/*  Healing-specific profile resolver (URL cascade → latest active fallback)  */
+/* -------------------------------------------------------------------------- */
+
+/** Extra, healing-only URL signals that help locate the right crawl. */
+export interface HealingProfileResolverInput {
+  companyId?: number;
+  projectId?: number;
+  /** URL parsed from the Playwright failure error (most specific). */
+  failureUrl?: string | null;
+  /** The page the browser was actually on at failure (page.url() proxy). */
+  browserUrl?: string | null;
+  /** The suite's configured base URL (playwright.config baseURL / BASE_URL). */
+  executionBaseUrl?: string | null;
+}
+
+/** How a healing profile was resolved — surfaced for the decision trail. */
+export type HealingProfileSource =
+  | 'failure_url'
+  | 'browser_url'
+  | 'execution_base_url'
+  | 'latest_active_project'
+  | 'none';
+
+export interface HealingProfileResolution {
+  profile: ApplicationProfile | null;
+  source: HealingProfileSource;
+}
+
+/**
+ * Resolve the Application Profile to ground healing on, using a deterministic
+ * cascade — NOT the Script-Generation helper (healing is its own domain and
+ * must heal the page that actually failed):
+ *
+ *   1. Failure URL          (parsed from the Playwright error — most specific)
+ *   2. Current Browser URL  (page.url() at failure — more accurate than "latest")
+ *   3. Execution Base URL   (suite baseURL / BASE_URL — right app, maybe not page)
+ *   4. Latest Active Project Profile  (last resort; avoids the multi-app pitfall
+ *      of blindly picking "the newest crawl" when a project has QA / Prod /
+ *      Admin / Customer portals all crawled together)
+ *
+ * Always resolves (never throws); returns `{ profile: null, source: 'none' }`
+ * when nothing matches.
+ */
+export async function getApplicationProfileForHealing(
+  input: HealingProfileResolverInput,
+): Promise<HealingProfileResolution> {
+  const { companyId, projectId } = input;
+
+  // Ordered URL signals, most-specific first. Filtered + de-duped so we never
+  // do a redundant DB lookup for the same URL.
+  const urlSignals: Array<{ url: string; source: HealingProfileSource }> = [];
+  const pushUrl = (url: string | null | undefined, source: HealingProfileSource) => {
+    const u = (url || '').trim();
+    if (u && !urlSignals.some((s) => s.url === u)) urlSignals.push({ url: u, source });
+  };
+  pushUrl(input.failureUrl, 'failure_url');
+  pushUrl(input.browserUrl, 'browser_url');
+  pushUrl(input.executionBaseUrl, 'execution_base_url');
+
+  for (const signal of urlSignals) {
+    try {
+      const profile = await findProfileForUrl(signal.url, companyId, projectId);
+      if (profile) {
+        logger.info(MOD, 'Healing profile resolved by URL', {
+          source: signal.source,
+          url: signal.url,
+          profileBaseUrl: profile.base_url,
+          companyId,
+          projectId,
+        });
+        return { profile, source: signal.source };
+      }
+    } catch (err: any) {
+      logger.warn(MOD, 'Healing profile URL lookup failed (continuing cascade)', {
+        source: signal.source,
+        url: signal.url,
+        error: err?.message,
+      });
+    }
+  }
+
+  // Last resort: latest ACTIVE profile for this project. Logged loudly because
+  // in a multi-app project this may not be the page that failed — it's a
+  // best-effort fallback, not a guarantee.
+  try {
+    const profile = await getLatestActiveApplicationProfileForHealing(companyId, projectId);
+    if (profile) {
+      logger.warn(MOD, 'Healing profile resolved via latest-active fallback (no URL matched)', {
+        profileBaseUrl: profile.base_url,
+        triedUrlSignals: urlSignals.map((s) => s.source),
+        companyId,
+        projectId,
+        note: 'In multi-app projects this may not be the failing page; provide a failure/browser URL for precision.',
+      });
+      return { profile, source: 'latest_active_project' };
+    }
+  } catch (err: any) {
+    logger.warn(MOD, 'Healing latest-active profile fallback failed', { error: err?.message });
+  }
+
+  return { profile: null, source: 'none' };
+}
+
+/* -------------------------------------------------------------------------- */
 /*  Main entry point                                                          */
 /* -------------------------------------------------------------------------- */
 
 /**
  * Consult the Application Profile crawl for grounded healing candidates.
  * Always resolves (never throws); returns {@link EMPTY} on any miss.
+ *
+ * `urls` carries the extra healing-only URL signals (current browser URL,
+ * execution base URL) that make profile resolution deterministic even when the
+ * failure error itself carries no URL (the common locator-timeout case).
  */
 export async function buildAppProfileHealingInput(
   failure: Partial<FailureDetails>,
   companyId?: number,
   projectId?: number,
+  urls?: { browserUrl?: string | null; executionBaseUrl?: string | null },
 ): Promise<AppProfileHealingInput> {
-  if (!failure?.url) return EMPTY;
-
   let profile: ApplicationProfile | null = null;
   try {
-    profile = await findProfileForUrl(failure.url, companyId, projectId);
+    const resolution = await getApplicationProfileForHealing({
+      companyId,
+      projectId,
+      failureUrl: failure?.url ?? null,
+      browserUrl: urls?.browserUrl ?? null,
+      executionBaseUrl: urls?.executionBaseUrl ?? null,
+    });
+    profile = resolution.profile;
   } catch (err: any) {
     logger.warn(MOD, 'Application Profile lookup failed (non-critical)', { error: err?.message });
     return EMPTY;

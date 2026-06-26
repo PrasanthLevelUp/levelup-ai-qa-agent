@@ -8011,6 +8011,33 @@ export async function getApplicationProfileForGeneration(
   }
 }
 
+/**
+ * Healing-specific fallback profile resolver — DO NOT reuse the Script
+ * Generation helper here. Healing is a distinct domain with different
+ * correctness requirements: it must heal the page that *actually failed*, so
+ * the URL-based cascade (failure URL → browser URL → execution base URL) runs
+ * first in {@link getApplicationProfileForHealing}. This function is only the
+ * LAST resort when no URL signal resolves a profile.
+ *
+ * Prefers an ACTIVE ('fresh') profile for the project so we never ground
+ * healing on a stale/expired crawl when a fresh one exists; falls back to the
+ * most recently crawled profile only if nothing is fresh. Keeping this separate
+ * from generation means the two domains can evolve independently.
+ */
+export async function getLatestActiveApplicationProfileForHealing(
+  companyId?: number, projectId?: number
+): Promise<ApplicationProfile | null> {
+  try {
+    const fresh = await listProfiles(companyId, { projectId, status: 'fresh', limit: 1 });
+    if (fresh.profiles[0]) return fresh.profiles[0];
+    // No active/fresh profile — fall back to the most recently crawled one.
+    const any = await listProfiles(companyId, { projectId, limit: 1 });
+    return any.profiles[0] || null;
+  } catch {
+    return null;
+  }
+}
+
 // ---- Generated Test Scenarios ----
 export async function insertTestScenarios(requirementId: number, scenarios: Array<{
   scenario: string; coverageType: string; priority: string; riskArea: string;
