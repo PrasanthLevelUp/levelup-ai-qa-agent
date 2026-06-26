@@ -30,6 +30,8 @@ import { FailureAnalyzer } from '../core/failure-analyzer';
 import { HealingOrchestrator, pageObjectPatchLogFields, type HealingOutcome } from '../core/healing-orchestrator';
 import { HealingStrategySelector, type StrategyConfig } from '../core/healing-strategy-selector';
 import { routeHealingStrategy } from '../core/healing-strategy-router';
+import { EvidenceCollector } from '../core/evidence-collector';
+import { refineDiagnosisWithEvidence } from '../core/failure-classifier';
 import { RuleEngine } from '../engines/rule-engine';
 import { PatternEngine } from '../engines/pattern-engine';
 import { AIEngine } from '../engines/ai-engine';
@@ -643,6 +645,9 @@ function createHealingWorker(
       }
 
       let failure = analyzer.analyze(artifact);
+      // Track which artifact `failure` was derived from, so the Evidence
+      // Collector can read its trace/video/screenshot paths (Failure Replay).
+      let evidenceArtifact = artifact;
       const testStartMs = Date.now();
       // Per-test deadline = min(per-test budget, remaining job budget).
       const testDeadlineMs = testStartMs + Math.min(PER_TEST_BUDGET_MS, jobBudgetRemainingMs());
@@ -683,6 +688,7 @@ function createHealingWorker(
         });
         if (freshForTest) {
           failure = analyzer.analyze(freshForTest);
+          evidenceArtifact = freshForTest;
           logger.info(MOD, 'Using fresh artifacts for test', {
             testName: failure.testName,
             failedLocator: failure.failedLocator,
@@ -719,8 +725,60 @@ function createHealingWorker(
       let iterFixCount = 0;
       const healedBeforeTest = healedCount;
 
-      // Observability: build a concise 3-layer trail for this failure regardless
-      // of whether anything is healable. Finalized after the healing branches.
+      // ── Evidence-Based Diagnosis (runs BEFORE classification is consumed) ──
+      // The parser-based classifier produced `failure.diagnosis` from the error
+      // text. Before anyone acts on it, aggregate the OBSERVED facts Playwright
+      // already captured (DOM snapshot → locator state, console/network signals,
+      // trace/video/screenshot artifacts) and upgrade the diagnosis with them.
+      // This is what turns inference ("looks like a broken locator") into
+      // evidence ("element exists/visible/enabled but is covered by an overlay →
+      // wait_for_overlay"). Best-effort: any failure here degrades gracefully to
+      // the parser-based diagnosis.
+      if (failure.diagnosis) {
+        try {
+          let domSnapshot: string | null = null;
+          if (failure.url) {
+            domSnapshot = await getLatestDomHtmlForUrl(
+              failure.url,
+              job.companyId,
+              resolvedProjectId,
+            );
+          }
+          const evidence = await new EvidenceCollector().collect({
+            failure,
+            domSnapshot,
+            tracePath: evidenceArtifact.trace_path,
+            videoPath: evidenceArtifact.video_path,
+            consoleLog: failure.errorMessage,
+          });
+          const refined = refineDiagnosisWithEvidence(failure.diagnosis, evidence);
+          failure.diagnosis = refined;
+          logger.info(MOD, 'Evidence-based diagnosis', {
+            testName: failure.testName,
+            category: refined.category,
+            recommendedStrategy: refined.recommendedStrategy,
+            confidence: refined.confidence,
+            evidenceBased: refined.evidenceBased,
+            locatorState: evidence.locatorState
+              ? {
+                  exists: evidence.locatorState.exists,
+                  visible: evidence.locatorState.visible,
+                  enabled: evidence.locatorState.enabled,
+                  clickable: evidence.locatorState.clickable,
+                  interceptedBy: evidence.locatorState.interceptedBy,
+                }
+              : null,
+          });
+        } catch (e) {
+          logger.warn(MOD, 'Evidence collection failed — using parser-based diagnosis', {
+            testName: failure.testName,
+            error: (e as Error).message,
+          });
+        }
+      }
+
+      // Observability: build a concise trail for this failure regardless of
+      // whether anything is healable. Finalized after the healing branches.
       const trail = new HealingTrailBuilder(failure.testName, failure.failureType, failure.diagnosis);
 
       // ── Diagnosis-first strategy routing ──
