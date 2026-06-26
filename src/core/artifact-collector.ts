@@ -10,6 +10,7 @@ import { extractLocator, buildLocatorInfo, type LocatorInfo } from './locator-ex
 import { normalizeError, extractErrorPattern, type NormalizedError } from './error-normalizer';
 import { extractCodeContext, type CodeContext } from './code-context-extractor';
 import { resolvePageObjectLocator, type PageObjectResolution } from './page-object-resolver';
+import * as TraceParser from './playwright/trace-parser';
 
 const MOD = 'artifact-collector';
 
@@ -164,6 +165,13 @@ export class ArtifactCollector {
                 a.name === 'video' || a.contentType?.startsWith('video/')
               )?.path ?? null;
 
+              // Resolve the REAL page URL from this result's trace.zip via the
+              // TraceParser (Playwright records the rendered frame URL natively in
+              // frame-snapshot events). No fixture injection or config edits needed.
+              // Falls back to legacy regex extraction if no trace/URL is found.
+              const executionContext = tracePath ? TraceParser.parse(tracePath) : null;
+              const finalUrl = executionContext?.pageUrl ?? extractUrl(errorMessage);
+
               const artifact: ArtifactCollection = {
                 test_name: testName,
                 error_message: errorMessage,
@@ -175,7 +183,7 @@ export class ArtifactCollector {
                 screenshot_path: screenshotPath,
                 trace_path: tracePath,
                 video_path: videoPath,
-                url: extractUrl(errorMessage),
+                url: finalUrl,
                 timestamp: result.startTime ?? new Date().toISOString(),
                 test_results_json: rawText,
                 test_results_json_path: resultsFilePath,

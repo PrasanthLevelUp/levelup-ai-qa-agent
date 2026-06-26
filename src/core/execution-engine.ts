@@ -296,9 +296,13 @@ export class ExecutionEngine {
     // PLAYWRIGHT_JSON_OUTPUT_NAME makes the json reporter write to a file (it
     // would otherwise stream JSON to stdout when invoked via --reporter=json).
     const artifactFlags = playwrightArtifactFlags(profile, collectHealingArtifacts, isHealingRun);
+    // ALWAYS force --trace=retain-on-failure so the TraceParser can extract the real
+    // page URL for healing profile resolution (no fixture/config changes needed). This
+    // is a CLI flag only, same category as --reporter=json. If the user's profile already
+    // enables tracing, this is a no-op.
     let cmd = testFile
-      ? `npx playwright test "${testFile}" --reporter=json ${artifactFlags}`
-      : `npx playwright test --reporter=json ${artifactFlags}`;
+      ? `npx playwright test "${testFile}" --reporter=json ${artifactFlags} --trace=retain-on-failure`
+      : `npx playwright test --reporter=json ${artifactFlags} --trace=retain-on-failure`;
 
     // --grep isolates a single test by name for efficient per-test reruns
     if (grepFilter) {
@@ -411,9 +415,10 @@ export class ExecutionEngine {
     const start = Date.now();
 
     const artifactFlags = playwrightArtifactFlags(profile, collectHealingArtifacts, isHealingRun);
+    // ALWAYS force --trace=retain-on-failure for TraceParser URL extraction (CLI flag only).
     let cmd = testFile
-      ? `npx playwright test "${testFile}" --reporter=json ${artifactFlags}`
-      : `npx playwright test --reporter=json ${artifactFlags}`;
+      ? `npx playwright test "${testFile}" --reporter=json ${artifactFlags} --trace=retain-on-failure`
+      : `npx playwright test --reporter=json ${artifactFlags} --trace=retain-on-failure`;
     if (grepFilter) {
       cmd += ` --grep "${grepFilter.replace(/"/g, '\\"')}"`;
     }
