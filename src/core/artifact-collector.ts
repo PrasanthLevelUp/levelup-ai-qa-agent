@@ -256,8 +256,40 @@ export class ArtifactCollector {
 
     const isSpec = (file: string): boolean =>
       /(tests?[/\\].*\.spec\.ts|\.test\.ts)$/i.test(file);
-    const toAbs = (file: string): string =>
-      path.isAbsolute(file) ? file : path.join(testRepoPath, file);
+
+    // Normalize a file path (from Playwright error locations or stack frames) to an
+    // absolute path in the healing agent's environment. Playwright locations often
+    // carry absolute paths from the CI runner (e.g. /home/runner/work/repo/repo/pages/X.ts)
+    // which don't exist in the healing agent's clone. Extract the repo-relative part
+    // (e.g. pages/X.ts) and join it with the agent's testRepoPath.
+    const toAbs = (file: string): string => {
+      if (!path.isAbsolute(file)) {
+        // Already relative (e.g. "pages/LoginPage.ts") → join with testRepoPath
+        return path.join(testRepoPath, file);
+      }
+      // Absolute path from a different environment (CI runner, local dev, etc.).
+      // Try using it as-is first (works when healing agent and test runner share the same FS).
+      if (fs.existsSync(file)) {
+        return file;
+      }
+      // Path doesn't exist locally → extract the repo-relative part.
+      // Common CI patterns: /home/runner/work/{repo}/{repo}/pages/X.ts (GitHub Actions),
+      //                     /builds/{org}/{repo}/pages/X.ts (GitLab CI),
+      //                     /home/ubuntu/github_repos/{repo}/pages/X.ts (local).
+      // Strategy: look for known repo-relative directories (pages/, tests/, src/, e2e/, pom/)
+      // and take everything from that point onward.
+      const repoRelativeDirs = ['pages/', 'page-objects/', 'pom/', 'tests/', 'test/', 'src/', 'e2e/', 'specs/'];
+      for (const dir of repoRelativeDirs) {
+        const idx = file.indexOf(dir);
+        if (idx !== -1) {
+          const relative = file.slice(idx); // e.g. "pages/LoginPage.ts"
+          return path.join(testRepoPath, relative);
+        }
+      }
+      // Fallback: use the file basename in testRepoPath (may not work if there are duplicates)
+      logger.warn(MOD, 'Could not extract repo-relative path from absolute location; using basename fallback', { file });
+      return path.join(testRepoPath, path.basename(file));
+    };
 
     // 1. Prefer an explicit candidate location that points at non-spec source (the PO).
     const nonSpecCandidate = withFile.find((l) => !isSpec(l.file));
