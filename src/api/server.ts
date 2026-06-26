@@ -114,6 +114,7 @@ import { createCIWebhookRouter } from './routes/ci-webhooks';
 import { createUsersRouter } from './routes/users';
 import { createHealingPRRouter } from './routes/healing-pr';
 import { createGitHubRouter } from './routes/github';
+import { createGitHubActionsRouter } from './routes/github-actions';
 import { createIntelligenceRouter } from './routes/intelligence';
 import { createIntelligenceLearningRouter } from './routes/intelligence-learning';
 import { createMetricsRouter } from './routes/metrics';
@@ -389,6 +390,7 @@ export function createServer(): express.Application {
   app.use('/api/projects', authMiddleware, companyMiddleware, sessionMiddleware, projectContextMiddleware, contextMiddleware, createProjectsRouter());
   app.use('/api/healings', authMiddleware, companyMiddleware, sessionMiddleware, createHealingPRRouter());
   app.use('/api/users', authMiddleware, companyMiddleware, sessionMiddleware, createUsersRouter());
+  app.use('/api/github/actions', authMiddleware, companyMiddleware, sessionMiddleware, createGitHubActionsRouter());
   app.use('/api/github', authMiddleware, companyMiddleware, sessionMiddleware, createGitHubRouter());
   app.use('/api/intelligence', authMiddleware, companyMiddleware, sessionMiddleware, projectContextMiddleware, contextMiddleware, createIntelligenceRouter());
   app.use('/api/intelligence-learning', authMiddleware, companyMiddleware, sessionMiddleware, projectContextMiddleware, contextMiddleware, createIntelligenceLearningRouter());

@@ -85,6 +85,51 @@ export interface GitHubConnectionStatus {
   error?: string;
 }
 
+/* ── GitHub Actions types (Execution Mode: GitHub Actions) ───────────── */
+
+export interface GitHubWorkflow {
+  /** Numeric workflow id (stable across renames). */
+  id: number;
+  /** Display name from the YAML `name:` field. */
+  name: string;
+  /** Repo-relative path, e.g. `.github/workflows/playwright.yml`. */
+  path: string;
+  /** `active` | `disabled_manually` | `disabled_inactivity` … */
+  state: string;
+  htmlUrl: string;
+}
+
+export interface GitHubWorkflowRun {
+  id: number;
+  name: string | null;
+  /** The commit/dispatch title shown in the Actions UI. */
+  displayTitle: string;
+  /** `queued` | `in_progress` | `completed` */
+  status: string;
+  /** `success` | `failure` | `cancelled` | `timed_out` | null (while running) */
+  conclusion: string | null;
+  /** Trigger event, e.g. `workflow_dispatch`, `push`, `pull_request`. */
+  event: string;
+  headBranch: string;
+  headSha: string;
+  htmlUrl: string;
+  runNumber: number;
+  workflowId: number;
+  createdAt: string;
+  updatedAt: string;
+  runStartedAt: string | null;
+}
+
+export interface GitHubArtifact {
+  id: number;
+  name: string;
+  sizeInBytes: number;
+  expired: boolean;
+  /** Authenticated zip download URL (requires the same PAT to fetch). */
+  archiveDownloadUrl: string;
+  createdAt: string;
+}
+
 /* ------------------------------------------------------------------ */
 /*  Helpers                                                            */
 /* ------------------------------------------------------------------ */
@@ -491,4 +536,286 @@ export class GitHubService {
       filesCommitted: files.length,
     };
   }
+
+  /* ================================================================== */
+  /*  GitHub Actions — Execution Mode 2                                  */
+  /*                                                                     */
+  /*  These let LevelUp AI plug into a customer's EXISTING CI: list the  */
+  /*  workflows already in `.github/workflows`, trigger one via the      */
+  /*  workflow_dispatch API, track the resulting run, and surface its    */
+  /*  artifacts — WITHOUT recreating any CI logic.                       */
+  /* ================================================================== */
+
+  /** Map a raw GitHub Actions run object to our typed shape. */
+  private mapRun(r: any): GitHubWorkflowRun {
+    return {
+      id: r.id,
+      name: r.name ?? null,
+      displayTitle: r.display_title ?? r.name ?? '',
+      status: r.status,
+      conclusion: r.conclusion ?? null,
+      event: r.event,
+      headBranch: r.head_branch,
+      headSha: r.head_sha,
+      htmlUrl: r.html_url,
+      runNumber: r.run_number,
+      workflowId: r.workflow_id,
+      createdAt: r.created_at,
+      updatedAt: r.updated_at,
+      runStartedAt: r.run_started_at ?? null,
+    };
+  }
+
+  /**
+   * List the workflows defined in `.github/workflows` for a repository.
+   * Returns only the fields the dashboard needs to render a picker.
+   */
+  async listWorkflows(
+    owner: string,
+    repo: string,
+    companyId?: number,
+    userId?: number,
+  ): Promise<{ workflows: GitHubWorkflow[]; error?: string }> {
+    const token = await this.getToken(companyId, userId);
+    if (!token) return { workflows: [], error: 'GitHub not connected. Connect via Tools page.' };
+
+    try {
+      const { ok, status, data } = await ghFetch(
+        `/repos/${owner}/${repo}/actions/workflows?per_page=100`,
+        token,
+      );
+      if (!ok) {
+        if (status === 404) {
+          return { workflows: [], error: `Repository ${owner}/${repo} not found or no Actions access.` };
+        }
+        return { workflows: [], error: data?.message || `GitHub API returned ${status}` };
+      }
+      const workflows: GitHubWorkflow[] = (data.workflows || []).map((w: any) => ({
+        id: w.id,
+        name: w.name,
+        path: w.path,
+        state: w.state,
+        htmlUrl: w.html_url,
+      }));
+      return { workflows };
+    } catch (err) {
+      logger.error(MOD, 'Failed to list workflows', { error: (err as Error).message });
+      return { workflows: [], error: 'Failed to list workflows' };
+    }
+  }
+
+  /**
+   * Trigger a workflow via the `workflow_dispatch` API.
+   *
+   * `workflowId` may be the numeric id OR the workflow file name
+   * (e.g. `playwright.yml`). The workflow MUST declare an `on: workflow_dispatch`
+   * trigger, otherwise GitHub returns 422 ("Workflow does not have
+   * 'workflow_dispatch' trigger").
+   *
+   * The dispatch endpoint returns 204 with NO body and does NOT return the run
+   * it created. Callers that need the run should follow up with
+   * `findRunForDispatch()`.
+   */
+  async dispatchWorkflow(
+    owner: string,
+    repo: string,
+    workflowId: string | number,
+    ref: string,
+    inputs?: Record<string, string>,
+    companyId?: number,
+    userId?: number,
+  ): Promise<{ success: boolean; error?: string }> {
+    const token = await this.getToken(companyId, userId);
+    if (!token) return { success: false, error: 'GitHub not connected. Connect via Tools page.' };
+
+    if (!ref || !ref.trim()) return { success: false, error: 'A git ref (branch/tag) is required to dispatch a workflow.' };
+
+    try {
+      const { ok, status, data } = await ghFetch(
+        `/repos/${owner}/${repo}/actions/workflows/${encodeURIComponent(String(workflowId))}/dispatches`,
+        token,
+        {
+          method: 'POST',
+          body: JSON.stringify({ ref, ...(inputs && Object.keys(inputs).length ? { inputs } : {}) }),
+        },
+      );
+      if (!ok) {
+        if (status === 422) {
+          return {
+            success: false,
+            error:
+              data?.message ||
+              `Workflow cannot be dispatched. Ensure it declares "on: workflow_dispatch" and that "${ref}" is a valid branch/tag.`,
+          };
+        }
+        if (status === 403) {
+          return { success: false, error: describeGitHubWriteError('dispatch workflow', status, data?.message) };
+        }
+        return { success: false, error: data?.message || `GitHub API returned ${status}` };
+      }
+      return { success: true };
+    } catch (err) {
+      logger.error(MOD, 'Failed to dispatch workflow', { error: (err as Error).message });
+      return { success: false, error: 'Failed to dispatch workflow' };
+    }
+  }
+
+  /**
+   * List recent runs for a repository, optionally scoped to a single workflow.
+   * Supports the filters needed to correlate a dispatch back to its run.
+   */
+  async listWorkflowRuns(
+    owner: string,
+    repo: string,
+    opts?: {
+      workflowId?: string | number;
+      branch?: string;
+      event?: string;
+      perPage?: number;
+      created?: string; // e.g. ">=2026-06-26T12:00:00Z"
+    },
+    companyId?: number,
+    userId?: number,
+  ): Promise<{ runs: GitHubWorkflowRun[]; error?: string }> {
+    const token = await this.getToken(companyId, userId);
+    if (!token) return { runs: [], error: 'GitHub not connected. Connect via Tools page.' };
+
+    const params = new URLSearchParams();
+    params.set('per_page', String(Math.min(opts?.perPage ?? 20, 100)));
+    if (opts?.branch) params.set('branch', opts.branch);
+    if (opts?.event) params.set('event', opts.event);
+    if (opts?.created) params.set('created', opts.created);
+
+    const base = opts?.workflowId
+      ? `/repos/${owner}/${repo}/actions/workflows/${encodeURIComponent(String(opts.workflowId))}/runs`
+      : `/repos/${owner}/${repo}/actions/runs`;
+
+    try {
+      const { ok, status, data } = await ghFetch(`${base}?${params.toString()}`, token);
+      if (!ok) return { runs: [], error: data?.message || `GitHub API returned ${status}` };
+      const runs: GitHubWorkflowRun[] = (data.workflow_runs || []).map((r: any) => this.mapRun(r));
+      return { runs };
+    } catch (err) {
+      logger.error(MOD, 'Failed to list workflow runs', { error: (err as Error).message });
+      return { runs: [], error: 'Failed to list workflow runs' };
+    }
+  }
+
+  /**
+   * Correlate a just-issued `workflow_dispatch` to the run it created.
+   *
+   * GitHub does not return the run id from the dispatch call, so we poll the
+   * runs list (scoped to the workflow, branch, dispatch event, and created
+   * since just before we dispatched) until the run appears.
+   */
+  async findRunForDispatch(
+    owner: string,
+    repo: string,
+    workflowId: string | number,
+    ref: string,
+    sinceIso: string,
+    companyId?: number,
+    userId?: number,
+    opts?: { attempts?: number; intervalMs?: number },
+  ): Promise<{ run?: GitHubWorkflowRun; error?: string }> {
+    const attempts = opts?.attempts ?? 8;
+    const intervalMs = opts?.intervalMs ?? 2000;
+
+    for (let i = 0; i < attempts; i++) {
+      const { runs, error } = await this.listWorkflowRuns(
+        owner, repo,
+        { workflowId, branch: ref, event: 'workflow_dispatch', created: `>=${sinceIso}`, perPage: 10 },
+        companyId, userId,
+      );
+      if (error) return { error };
+      if (runs.length > 0) {
+        // Most recent first (GitHub returns newest first); pick the newest.
+        return { run: runs[0] };
+      }
+      if (i < attempts - 1) await new Promise((r) => setTimeout(r, intervalMs));
+    }
+    return { error: 'Workflow was dispatched but the run did not appear in time. Check the repository Actions tab.' };
+  }
+
+  /** Fetch a single workflow run by id (used for status polling). */
+  async getWorkflowRun(
+    owner: string,
+    repo: string,
+    runId: number,
+    companyId?: number,
+    userId?: number,
+  ): Promise<{ run?: GitHubWorkflowRun; error?: string }> {
+    const token = await this.getToken(companyId, userId);
+    if (!token) return { error: 'GitHub not connected. Connect via Tools page.' };
+
+    try {
+      const { ok, status, data } = await ghFetch(`/repos/${owner}/${repo}/actions/runs/${runId}`, token);
+      if (!ok) {
+        if (status === 404) return { error: `Run ${runId} not found.` };
+        return { error: data?.message || `GitHub API returned ${status}` };
+      }
+      return { run: this.mapRun(data) };
+    } catch (err) {
+      logger.error(MOD, 'Failed to get workflow run', { error: (err as Error).message });
+      return { error: 'Failed to get workflow run' };
+    }
+  }
+
+  /** List the artifacts produced by a workflow run (e.g. the Playwright report). */
+  async listRunArtifacts(
+    owner: string,
+    repo: string,
+    runId: number,
+    companyId?: number,
+    userId?: number,
+  ): Promise<{ artifacts: GitHubArtifact[]; error?: string }> {
+    const token = await this.getToken(companyId, userId);
+    if (!token) return { artifacts: [], error: 'GitHub not connected. Connect via Tools page.' };
+
+    try {
+      const { ok, status, data } = await ghFetch(
+        `/repos/${owner}/${repo}/actions/runs/${runId}/artifacts?per_page=100`,
+        token,
+      );
+      if (!ok) return { artifacts: [], error: data?.message || `GitHub API returned ${status}` };
+      const artifacts: GitHubArtifact[] = (data.artifacts || []).map((a: any) => ({
+        id: a.id,
+        name: a.name,
+        sizeInBytes: a.size_in_bytes,
+        expired: a.expired,
+        archiveDownloadUrl: a.archive_download_url,
+        createdAt: a.created_at,
+      }));
+      return { artifacts };
+    } catch (err) {
+      logger.error(MOD, 'Failed to list run artifacts', { error: (err as Error).message });
+      return { artifacts: [], error: 'Failed to list run artifacts' };
+    }
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/*  URL helpers                                                        */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Parse a GitHub repository URL into { owner, repo }.
+ * Accepts forms like:
+ *   - https://github.com/Owner/Repo.git
+ *   - github.com/Owner/Repo
+ *   - git@github.com:Owner/Repo.git
+ * Returns null if it cannot be parsed as a GitHub repo.
+ */
+export function parseGitHubRepoUrl(url: string): { owner: string; repo: string } | null {
+  if (!url) return null;
+  const cleaned = url.trim();
+  // SSH form: git@github.com:Owner/Repo.git
+  const sshMatch = cleaned.match(/^git@github\.com:([^/]+)\/(.+?)(?:\.git)?$/i);
+  if (sshMatch) return { owner: sshMatch[1], repo: sshMatch[2] };
+  // HTTP(S) or bare host form
+  const httpMatch = cleaned
+    .replace(/^https?:\/\//i, '')
+    .match(/^(?:www\.)?github\.com\/([^/]+)\/([^/]+?)(?:\.git)?\/?$/i);
+  if (httpMatch) return { owner: httpMatch[1], repo: httpMatch[2] };
+  return null;
 }
