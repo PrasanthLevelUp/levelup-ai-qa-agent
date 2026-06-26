@@ -92,7 +92,7 @@ export function looksLikePageObjectPath(filePath: string): boolean {
   if (!filePath || isSpecPath(filePath)) return false;
   const f = filePath.replace(/\\/g, '/').toLowerCase();
   const base = f.split('/').pop() || '';
-  const dirSignal = /(^|\/)(pages?|page-?objects?|pageobjects?|po|fixtures?|helpers?|support|components?)\//.test(f);
+  const dirSignal = /(^|\/)(pages?|page-?objects?|pageobjects?|pom?|fixtures?|helpers?|support|components?)\//.test(f);
   const nameSignal =
     /\.page\.[cm]?[jt]sx?$/.test(base) ||
     /\.po\.[cm]?[jt]sx?$/.test(base) ||

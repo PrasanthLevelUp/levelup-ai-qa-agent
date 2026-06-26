@@ -10,6 +10,7 @@ import { logger } from '../../utils/logger';
 import { getPool, getRepository, logPR } from '../../db/postgres';
 import { GitHubService, type CommitFileSpec } from '../../services/github-service';
 import { CodePatcher, type HealingFix } from '../../services/code-patcher';
+import { createRepoPathResolver } from '../../intelligence/repo-path-resolver';
 import * as path from 'path';
 import * as os from 'os';
 import * as fs from 'fs';
@@ -99,7 +100,7 @@ export function createHealingPRRouter(): Router {
 
         let filePath: string | null;
         if (isPageObjectPatch) {
-          filePath = resolveRepoFile(cloneDir, healing.target_file_path);
+          filePath = createRepoPathResolver(cloneDir).toRepoRelative(healing.target_file_path);
           if (!filePath) {
             return res.status(400).json({
               error: `Page Object target "${healing.target_file_path}" could not be located in the repository.`,
@@ -355,50 +356,6 @@ async function getHealingAction(id: number): Promise<any | null> {
     [id],
   );
   return rows[0] || null;
-}
-
-/**
- * Resolve a failure-stack file path (which may be absolute, or relative to a
- * runner workspace) to a path that actually exists inside the freshly-cloned
- * repo. Used by the "Patch the Page Object" flow to locate the shared file.
- *
- * Strategy: try the path verbatim, then progressively strip leading segments and
- * suffix-match against the clone, then fall back to a basename find. Returns a
- * repo-relative path (POSIX separators) or null.
- */
-function resolveRepoFile(repoDir: string, rawPath: string): string | null {
-  if (!rawPath) return null;
-  const norm = rawPath.replace(/\\/g, '/').replace(/^\.\//, '');
-
-  // 1. Verbatim (already repo-relative).
-  if (!path.isAbsolute(norm) && fs.existsSync(path.join(repoDir, norm))) {
-    return norm;
-  }
-
-  // 2. Progressive suffix match — strip leading segments one at a time.
-  const segments = norm.split('/').filter(Boolean);
-  for (let i = 0; i < segments.length; i++) {
-    const candidate = segments.slice(i).join('/');
-    if (candidate && fs.existsSync(path.join(repoDir, candidate))) {
-      return candidate;
-    }
-  }
-
-  // 3. Basename find anywhere in the repo (first match wins).
-  try {
-    const base = segments[segments.length - 1];
-    if (base) {
-      const found = execSync(
-        `find . -type f -name "${base.replace(/"/g, '\\"')}" -not -path "*/node_modules/*" 2>/dev/null | head -1`,
-        { cwd: repoDir, encoding: 'utf-8', timeout: 10_000 },
-      ).trim();
-      if (found) return found.replace(/^\.\//, '');
-    }
-  } catch {
-    /* ignore */
-  }
-
-  return null;
 }
 
 /**
