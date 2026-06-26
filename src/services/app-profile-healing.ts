@@ -30,7 +30,7 @@
  *  • Tenant-safe — every profile read is scoped by companyId / projectId.
  */
 
-import { getProfileByUrl, listProfiles, type ApplicationProfile } from '../db/postgres';
+import { getProfileByUrl, listProfiles, getApplicationProfileForGeneration, type ApplicationProfile } from '../db/postgres';
 import { normalizeBaseUrl } from '../utils/url-normalize';
 import { logger } from '../utils/logger';
 import type { FailureDetails } from '../core/failure-analyzer';
@@ -195,11 +195,30 @@ export async function buildAppProfileHealingInput(
   companyId?: number,
   projectId?: number,
 ): Promise<AppProfileHealingInput> {
-  if (!failure?.url) return EMPTY;
-
   let profile: ApplicationProfile | null = null;
   try {
-    profile = await findProfileForUrl(failure.url, companyId, projectId);
+    if (failure?.url) {
+      // Preferred path: match the failing page URL to a crawled profile.
+      profile = await findProfileForUrl(failure.url, companyId, projectId);
+    }
+
+    // Fallback: many real failures (e.g. a locator timeout — "waiting for
+    // locator('#username')") carry NO page URL in the Playwright error, so
+    // URL-based lookup finds nothing even though a perfectly good crawl exists
+    // for the project. Rather than skip the strongest (grounded) healing layer,
+    // fall back to the freshest profile for this tenant/project. This is the
+    // same project-scoped profile that script generation already grounds on.
+    if (!profile) {
+      profile = await getApplicationProfileForGeneration(companyId, projectId);
+      if (profile) {
+        logger.info(MOD, 'Application Profile resolved via project fallback (no failure URL)', {
+          hasFailureUrl: Boolean(failure?.url),
+          profileBaseUrl: profile.base_url,
+          companyId,
+          projectId,
+        });
+      }
+    }
   } catch (err: any) {
     logger.warn(MOD, 'Application Profile lookup failed (non-critical)', { error: err?.message });
     return EMPTY;
