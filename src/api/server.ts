@@ -1248,10 +1248,14 @@ function createHealingWorker(
         // Always available (no feature flag); fully defensive (never throws).
         let appProfileHealing: AppProfileHealingInput | undefined;
         try {
+          // TODO: Pass execution base URL (from playwright.config baseURL or BASE_URL env)
+          // once the execution layer tracks it. For now the resolver falls back through:
+          // failure.url (from TraceParser) → execution base URL (null for now) → latest active profile.
           appProfileHealing = await buildAppProfileHealingInput(
             failure,
             job.companyId,
             resolvedProjectId,
+            null, // executionBaseUrl: TODO from execution config
           );
           if (appProfileHealing.candidates.length > 0) {
             logger.info(MOD, 'Application Profile healing candidates ready', {
@@ -1260,6 +1264,15 @@ function createHealingWorker(
               description: appProfileHealing.description,
               candidateCount: appProfileHealing.candidates.length,
               topLocator: appProfileHealing.candidates[0]?.locator,
+            });
+          } else if (appProfileHealing.reason) {
+            // Log when App Profile returns EMPTY with a reason (for observability / debugging).
+            logger.info(MOD, 'Application Profile returned no candidates', {
+              testName: failure.testName,
+              url: failure.url,
+              reason: appProfileHealing.reason,
+              profileFound: appProfileHealing.profileFound,
+              elementsScanned: appProfileHealing.elementsScanned,
             });
           }
         } catch (err: any) {
