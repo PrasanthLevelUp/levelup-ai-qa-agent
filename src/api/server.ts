@@ -159,6 +159,7 @@ import {
   buildAppProfileHealingInput,
   type AppProfileHealingInput,
 } from '../services/app-profile-healing';
+import * as TraceParser from '../core/playwright/trace-parser';
 import type { HealingJob } from './queue/job-queue';
 
 const MOD = 'api-server';
@@ -981,6 +982,12 @@ function createHealingWorker(
               resolvedProjectId,
             );
           }
+          // Fall back to the failure-time DOM from the trace when no prior crawl
+          // snapshot exists (fresh repo). Keeps evidence-based diagnosis grounded
+          // on real DOM rather than the parser's inference. Graceful: null-safe.
+          if (!domSnapshot && evidenceArtifact.trace_path) {
+            domSnapshot = TraceParser.extractDomHtml(evidenceArtifact.trace_path);
+          }
           const evidence = await new EvidenceCollector().collect({
             failure,
             domSnapshot,
@@ -1219,6 +1226,31 @@ function createHealingWorker(
           }
         } catch (err: any) {
           logger.warn(MOD, 'DOM snapshot lookup failed (non-critical)', { error: err?.message });
+        }
+
+        // ── Fallback: failure-time DOM from the Playwright trace ──
+        // A prior crawl snapshot only exists if this app was previously crawled.
+        // For a fresh repo (no crawl, no App Profile, no DOM memory) there is no
+        // DOM to ground healing on, so the DOM candidate layer never fires and a
+        // trivial broken locator (e.g. `#username` → `#user-name`) goes unhealed.
+        // The FAILING RUN'S trace already captured the full page DOM — reconstruct
+        // it and use it as the DOM source. Failure-time-accurate and free (no AI,
+        // no extra browser run). Fully graceful: null when no trace/snapshot.
+        if (!domHtmlForFailure && evidenceArtifact.trace_path) {
+          try {
+            const traceDom = TraceParser.extractDomHtml(evidenceArtifact.trace_path);
+            if (traceDom) {
+              domHtmlForFailure = traceDom;
+              logger.info(MOD, 'DOM reconstructed from trace for healing', {
+                testName: failure.testName,
+                url: failure.url,
+                tracePath: evidenceArtifact.trace_path,
+                domLength: traceDom.length,
+              });
+            }
+          } catch (err: any) {
+            logger.warn(MOD, 'Trace DOM reconstruction failed (non-critical)', { error: err?.message });
+          }
         }
 
         // ── Repository-grounded healing intelligence (Sprint 2) ──

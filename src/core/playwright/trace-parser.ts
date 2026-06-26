@@ -30,13 +30,180 @@ import { execSync } from 'child_process';
 export interface ExecutionContext {
   /** The rendered page URL at the time of the trace snapshot (most recent frame). */
   pageUrl: string | null;
+  /**
+   * The page DOM (HTML) captured at failure time, reconstructed from the trace
+   * frame-snapshots. Null if the trace has no usable snapshot. This is the
+   * failure-time-accurate DOM the healing DOM-candidate extractor needs when no
+   * prior crawl snapshot exists.
+   */
+  domHtml: string | null;
   // Future extensions (all nullable):
   // navigationHistory?: string[];
   // frames?: FrameInfo[];
   // consoleEvents?: ConsoleEvent[];
   // networkRequests?: NetworkRequest[];
   // actionTimeline?: Action[];
-  // domSnapshots?: DOMSnapshot[];
+}
+
+/** HTML void elements — serialized without a closing tag. */
+const VOID_ELEMENTS = new Set([
+  'area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input',
+  'link', 'meta', 'param', 'source', 'track', 'wbr',
+]);
+
+/**
+ * Serialize a single Playwright snapshot node tree into HTML.
+ *
+ * SNAPSHOT NODE FORMAT (reverse-engineered from real traces)
+ *   - Element node:   [TAG_string, attrsObject?, ...children]
+ *   - Text node:      a plain string
+ *   - Reference node: an array whose first element is NOT a string
+ *                     (e.g. [1, 51] or [[1, 51]]) — Playwright's incremental
+ *                     "copy N nodes from a previous snapshot" encoding.
+ *
+ * We intentionally DO NOT resolve reference nodes (that encoding is fragile and
+ * Playwright-version-dependent). Instead the caller unions the CONCRETE nodes
+ * across ALL frame-snapshots — every element that ever existed has a concrete
+ * definition in at least one snapshot — which is sufficient because the
+ * downstream DOM candidate extractor scans elements individually.
+ *
+ * Pseudo-attributes Playwright injects (prefixed `__playwright`) are stripped.
+ */
+function serializeSnapshotNode(node: unknown, out: string[]): void {
+  // Element iff it's a non-empty array whose first item is a string tag.
+  if (!Array.isArray(node) || node.length === 0 || typeof node[0] !== 'string') {
+    return; // reference array or unexpected shape — skip
+  }
+  const tag = node[0] as string;
+  let idx = 1;
+  let attrs: Record<string, unknown> = {};
+  if (
+    node.length > 1 &&
+    typeof node[1] === 'object' &&
+    node[1] !== null &&
+    !Array.isArray(node[1])
+  ) {
+    attrs = node[1] as Record<string, unknown>;
+    idx = 2;
+  }
+  const tagLower = tag.toLowerCase();
+  let attrStr = '';
+  for (const [k, v] of Object.entries(attrs)) {
+    if (k.startsWith('__playwright')) continue;
+    attrStr += ` ${k}="${String(v)}"`;
+  }
+  out.push(`<${tagLower}${attrStr}>`);
+  if (VOID_ELEMENTS.has(tagLower)) return;
+  for (let i = idx; i < node.length; i++) {
+    const child = node[i];
+    if (typeof child === 'string') {
+      out.push(child);
+    } else if (Array.isArray(child) && child.length > 0 && typeof child[0] === 'string') {
+      serializeSnapshotNode(child, out);
+    }
+    // else: reference array → skip (unioned from another snapshot)
+  }
+  out.push(`</${tagLower}>`);
+}
+
+/**
+ * Reconstruct the page DOM (HTML) from a Playwright trace.zip.
+ *
+ * WHY THIS EXISTS
+ * Healing's DOM-grounded candidate extractor needs the page DOM to find a real
+ * replacement for a broken locator. The only other DOM source is a PRIOR crawl
+ * snapshot (`getLatestDomHtmlForUrl`), which is empty for a fresh repo that was
+ * never crawled — so healing had no DOM to work from and gave up. The failing
+ * run's trace, however, already captured the full DOM. This unlocks it.
+ *
+ * HOW IT WORKS
+ * Playwright records `frame-snapshot` events whose `snapshot.html` is a node
+ * tree (see {@link serializeSnapshotNode}). We serialize the CONCRETE nodes of
+ * every frame-snapshot and concatenate them. The union guarantees we include
+ * elements that only appear concretely in one snapshot (later snapshots encode
+ * them as references). The downstream extractor scans elements individually, so
+ * the concatenation does not need to be a single well-formed document.
+ *
+ * Returns null on any error (missing trace, no unzip, malformed, no snapshot)
+ * so callers can fall back to their own DOM cascade.
+ */
+export function extractDomHtml(traceZipPath: string): string | null {
+  const events = readTraceEvents(traceZipPath);
+  return events ? domHtmlFromEvents(events) : null;
+}
+
+/**
+ * Unzip a Playwright trace.zip and return every parsed trace event (one JSON
+ * object per line across all `.trace` files). Returns null on any error
+ * (missing trace, no unzip, malformed) so callers degrade gracefully.
+ *
+ * Centralizing the unzip here means {@link parse} reads the trace ONCE even when
+ * it derives multiple fields (pageUrl, domHtml, …) from it.
+ */
+function readTraceEvents(traceZipPath: string): any[] | null {
+  if (!traceZipPath || !fs.existsSync(traceZipPath)) return null;
+  let tmpDir: string | null = null;
+  try {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'levelup-trace-'));
+    // `unzip` is present on the Playwright Docker image and standard Linux runners.
+    execSync(`unzip -o "${traceZipPath}" -d "${tmpDir}"`, { stdio: 'ignore' });
+    const traceFiles = fs.readdirSync(tmpDir).filter((f) => f.endsWith('.trace'));
+    const events: any[] = [];
+    for (const tf of traceFiles) {
+      const lines = fs.readFileSync(path.join(tmpDir, tf), 'utf-8').split('\n');
+      for (const line of lines) {
+        const s = line.trim();
+        if (!s) continue;
+        try { events.push(JSON.parse(s)); } catch { /* skip malformed line */ }
+      }
+    }
+    return events;
+  } catch (err) {
+    return null;
+  } finally {
+    if (tmpDir) {
+      try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* noop */ }
+    }
+  }
+}
+
+/**
+ * Resolve the rendered page URL from parsed trace events. Last non-blank
+ * `frame-snapshot.frameUrl` wins (the page at failure); falls back to the
+ * navigation target (`before` action `params.url`).
+ */
+function pageUrlFromEvents(events: any[]): string | null {
+  let lastPageUrl: string | null = null;
+  let gotoUrl: string | null = null;
+  for (const evt of events) {
+    if (evt.type === 'frame-snapshot') {
+      const url = evt.snapshot?.frameUrl;
+      if (url && url !== 'about:blank') lastPageUrl = url;
+    }
+    if (evt.type === 'before' && evt.params?.url) gotoUrl = evt.params.url;
+  }
+  return lastPageUrl ?? gotoUrl;
+}
+
+/**
+ * Reconstruct the page DOM from parsed trace events by unioning the concrete
+ * nodes of every `frame-snapshot` (see {@link serializeSnapshotNode}). Returns
+ * null when no usable snapshot is present.
+ */
+function domHtmlFromEvents(events: any[]): string | null {
+  const pieces: string[] = [];
+  for (const evt of events) {
+    if (evt.type !== 'frame-snapshot') continue;
+    const html = evt.snapshot?.html;
+    // Only concrete trees (root is an element node) — skip reference roots.
+    if (Array.isArray(html) && html.length > 0 && typeof html[0] === 'string') {
+      const out: string[] = [];
+      serializeSnapshotNode(html, out);
+      const serialized = out.join('');
+      if (serialized) pieces.push(serialized);
+    }
+  }
+  return pieces.length === 0 ? null : pieces.join('\n');
 }
 
 /**
@@ -58,55 +225,28 @@ export interface ExecutionContext {
  * active profile / etc.).
  */
 export function extractPageUrl(traceZipPath: string): string | null {
-  if (!traceZipPath || !fs.existsSync(traceZipPath)) return null;
-  let tmpDir: string | null = null;
-  try {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'levelup-trace-'));
-    // `unzip` is present on the Playwright Docker image and standard Linux runners.
-    execSync(`unzip -o "${traceZipPath}" -d "${tmpDir}"`, { stdio: 'ignore' });
-
-    const traceFiles = fs.readdirSync(tmpDir).filter((f) => f.endsWith('.trace'));
-    let lastPageUrl: string | null = null;
-    let gotoUrl: string | null = null;
-
-    for (const tf of traceFiles) {
-      const lines = fs.readFileSync(path.join(tmpDir, tf), 'utf-8').split('\n');
-      for (const line of lines) {
-        const s = line.trim();
-        if (!s) continue;
-        let evt: any;
-        try { evt = JSON.parse(s); } catch { continue; }
-        // The rendered document URL at each snapshot — last non-blank wins (page at failure).
-        if (evt.type === 'frame-snapshot') {
-          const url = evt.snapshot?.frameUrl;
-          if (url && url !== 'about:blank') lastPageUrl = url;
-        }
-        // Fallback: the navigation target if no snapshot URL is present.
-        if (evt.type === 'before' && evt.params?.url) gotoUrl = evt.params.url;
-      }
-    }
-    return lastPageUrl ?? gotoUrl;
-  } catch (err) {
-    return null;
-  } finally {
-    if (tmpDir) {
-      try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* noop */ }
-    }
-  }
+  const events = readTraceEvents(traceZipPath);
+  return events ? pageUrlFromEvents(events) : null;
 }
 
 /**
  * Parse a Playwright trace.zip into an ExecutionContext.
  *
- * Today: extracts pageUrl only. Future: extend to parse navigation, frames,
- * console, network, actions, DOM snapshots — all in one place, one trace unzip.
+ * Today: pageUrl + domHtml. Future: navigation, frames, console, network,
+ * actions — all derived in one place from a SINGLE trace unzip (see
+ * {@link readTraceEvents}).
  *
- * Returns a context with nullable fields. Callers check `context.pageUrl` and
- * fall back to their own defaults if null.
+ * Returns a context with nullable fields. Callers check each field and fall
+ * back to their own defaults if null.
  */
 export function parse(traceZipPath: string): ExecutionContext {
+  const events = readTraceEvents(traceZipPath);
+  if (!events) {
+    return { pageUrl: null, domHtml: null };
+  }
   return {
-    pageUrl: extractPageUrl(traceZipPath),
+    pageUrl: pageUrlFromEvents(events),
+    domHtml: domHtmlFromEvents(events),
     // Future fields go here as they're implemented
   };
 }
