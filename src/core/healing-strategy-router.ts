@@ -1,16 +1,31 @@
 /**
- * Healing Strategy Router (Diagnosis → Strategy)
- * ----------------------------------------------
- * This is the explicit stage that sits between the diagnosis ("WHAT failed") and
- * the healing advisors ("HOW to fix"). It consumes a `FailureDiagnosis` and
- * decides which remedy pipeline — if any — should run.
+ * Healing Strategy Router (Diagnosis → Disposition)  — ADVISOR architecture
+ * ------------------------------------------------------------------------
+ * This stage sits between the diagnosis ("WHAT failed") and the healing advisors
+ * ("HOW to fix"). It consumes a `FailureDiagnosis` and decides the DISPOSITION
+ * of the failure — NOT a final verdict.
  *
- * Crucially, it is the gate that fixes the false "broken locator" behaviour:
- * only a diagnosis that is genuinely a *locator* problem is routed to
- * locator-swap healing. Timing failures are routed to wait-injection. Everything
- * else (assertion, navigation, api, environment, framework, unknown) is routed to
- * `report_only` — the engine reports an honest finding instead of guessing a new
- * selector.
+ * ── Why this was rewritten (Gate → Advisor) ──
+ * The previous router was a *gate*: a regex-driven category (`framework`,
+ * `unknown`, or a low-confidence guess) could TERMINATE healing at `report_only`
+ * — upstream of Repo Intelligence, App Profile, DOM Memory, Reuse Intelligence,
+ * Rule Engine and AI. That inverted the product promise ("Repo Intelligence
+ * first"): the very intelligence that could disprove a "framework/unknown" guess
+ * never ran, because a regex stopped it.
+ *
+ * In the Advisor architecture the router NEVER lets a weak signal terminate
+ * healing. It only recognises a small set of genuine **hard stops** — failures
+ * where a locator swap is categorically the wrong tool:
+ *   - assertion  (element found, value/state mismatch → product/data finding)
+ *   - navigation (page/site failed to load → infra)
+ *   - api        (request/response failure → backend)
+ *   - environment(missing config/credential/permission)
+ *
+ * Every other category — `locator`, `framework`, `unknown`, and any
+ * low-confidence diagnosis — is dispositioned **`advisor`**: it flows into the
+ * grounded advisor pipeline, where each advisor only proposes candidates and
+ * ONLY the Validation layer (browser rerun) decides whether a candidate
+ * succeeds. `timing` is routed to wait-injection (never a locator change).
  *
  * Pure & deterministic; no side effects.
  */
@@ -19,11 +34,33 @@ import type { FailureDiagnosis, FailureCategory, RecommendedStrategy } from './f
 
 export type HealingRemedy = 'locator_swap' | 'inject_wait' | 'report_only';
 
+/**
+ * The disposition of a failure in the Advisor architecture:
+ *  - `hard_stop`  — categorically not a locator/heal problem; report honestly.
+ *  - `advisor`    — route into the grounded advisor pipeline; no single signal
+ *                   terminates healing. Only Validation decides pass/fail.
+ *  - `inject_wait`— a timing problem; inject/raise a wait, never change the locator.
+ */
+export type HealingDisposition = 'hard_stop' | 'advisor' | 'inject_wait';
+
+/**
+ * Categories where a locator swap is categorically the wrong tool. These — and
+ * ONLY these — terminate at `report_only`. Everything else is an advisor case.
+ */
+const HARD_STOP_CATEGORIES: ReadonlySet<FailureCategory> = new Set<FailureCategory>([
+  'assertion',
+  'navigation',
+  'api',
+  'environment',
+]);
+
 export interface HealingStrategyPlan {
   /** Whether the locator-swap healing loop (advisors + browser rerun) should run. */
   shouldAttemptLocatorHealing: boolean;
   /** The remedy class chosen for this failure. */
   remedy: HealingRemedy;
+  /** Advisor-architecture disposition (hard_stop / advisor / inject_wait). */
+  disposition: HealingDisposition;
   /** The diagnostic category this plan was derived from. */
   category: FailureCategory;
   /** The specific evidence-driven strategy from the diagnosis (e.g. wait_for_overlay). */
@@ -32,7 +69,8 @@ export interface HealingStrategyPlan {
   rationale: string;
   /**
    * When true, the failure is a legitimate finding to surface to humans rather
-   * than something the engine should attempt to auto-fix.
+   * than something the engine should attempt to auto-fix. Only ever true for a
+   * `hard_stop` disposition.
    */
   reportOnly: boolean;
 }
@@ -52,46 +90,53 @@ function remedyForStrategy(s: RecommendedStrategy): HealingRemedy {
   }
 }
 
-/**
- * Minimum diagnosis confidence required before we will route to an *active*
- * remedy (locator_swap / inject_wait). Below this we degrade to report_only so
- * the engine never acts on a shaky diagnosis. Env-overridable.
- */
-function minActionConfidence(): number {
-  const v = Number(process.env.HEALING_ROUTER_MIN_CONFIDENCE);
-  return Number.isFinite(v) && v > 0 && v <= 1 ? v : 0.5;
-}
-
 export function routeHealingStrategy(diagnosis: FailureDiagnosis): HealingStrategyPlan {
-  const { category, confidence } = diagnosis;
+  const { category } = diagnosis;
 
   const reportOnlyPlan = (rationale: string): HealingStrategyPlan => ({
     shouldAttemptLocatorHealing: false,
     remedy: 'report_only',
+    disposition: 'hard_stop',
     category,
     recommendedStrategy: 'report_only',
     rationale,
     reportOnly: true,
   });
 
-  // Guard 1: never act on a low-confidence diagnosis.
-  if (confidence < minActionConfidence() && category !== 'locator') {
-    return reportOnlyPlan(
-      `Diagnosis confidence ${confidence.toFixed(
-        2,
-      )} below action threshold — reporting for human review instead of auto-healing.`,
-    );
+  /**
+   * Route into the grounded advisor pipeline. NO single signal (regex category,
+   * low confidence, missing inline locator) is allowed to terminate healing here
+   * — that is the whole point of the Advisor architecture. The advisors (Repo
+   * Intelligence, App Profile, DOM Memory, Reuse Intelligence, Rule, AI) each
+   * propose candidates from real evidence; if none survive, the Validation layer
+   * (browser rerun) — not this router — declares the failure unhealed.
+   */
+  const advisorPlan = (rationale: string): HealingStrategyPlan => ({
+    shouldAttemptLocatorHealing: true,
+    remedy: 'locator_swap',
+    disposition: 'advisor',
+    category,
+    recommendedStrategy: 'locator_swap',
+    rationale,
+    reportOnly: false,
+  });
+
+  // ── Hard stops ──────────────────────────────────────────────────────────
+  // These four categories are categorically NOT locator/heal problems. They are
+  // the only failures the router is allowed to terminate. (Confidence does not
+  // matter here: an assertion is an assertion regardless of how confident we are.)
+  if (HARD_STOP_CATEGORIES.has(category)) {
+    return reportOnlyPlan(hardStopRationale(category));
   }
 
   switch (category) {
     case 'locator':
-      // Guard 2: only swap a locator when we actually diagnosed a locator
-      // problem AND have a concrete locator to work from. This is the core fix
-      // for the false-positive: no locator ⇒ no swap.
+      // A concrete, grounded locator → high-signal locator healing.
       if (diagnosis.healableByLocatorSwap && diagnosis.locator) {
         return {
           shouldAttemptLocatorHealing: true,
           remedy: 'locator_swap',
+          disposition: 'advisor',
           category,
           recommendedStrategy: 'locator_swap',
           rationale: diagnosis.locatorResolvedFromPageObject
@@ -100,8 +145,14 @@ export function routeHealingStrategy(diagnosis: FailureDiagnosis): HealingStrate
           reportOnly: false,
         };
       }
-      return reportOnlyPlan(
-        'Locator-type failure but no concrete locator could be resolved — cannot safely swap a selector. Reporting instead of guessing.',
+      // ADVISOR (was: report_only). Even without a concrete inline locator, the
+      // grounded advisors can still ground a selector from the failing line, the
+      // URL, the Page Object, or the App Profile crawl. Refusing here is exactly
+      // the "regex starves the advisors" inversion we removed.
+      return advisorPlan(
+        'Locator-type failure with no concrete inline locator — routing to the grounded ' +
+          'advisor pipeline (App Profile / Repo Intelligence may still ground a selector). ' +
+          'No selector is swapped unless an advisor produces one and Validation confirms it.',
       );
 
     case 'timing': {
@@ -119,6 +170,7 @@ export function routeHealingStrategy(diagnosis: FailureDiagnosis): HealingStrate
       return {
         shouldAttemptLocatorHealing: false,
         remedy: remedyForStrategy(strat),
+        disposition: 'inject_wait',
         category,
         recommendedStrategy: strat,
         rationale:
@@ -129,35 +181,44 @@ export function routeHealingStrategy(diagnosis: FailureDiagnosis): HealingStrate
       };
     }
 
-    case 'assertion':
-      return reportOnlyPlan(
-        'Assertion failure — element found but value/state did not match. This is a product/data finding, not a locator issue.',
-      );
-
-    case 'navigation':
-      return reportOnlyPlan(
-        'Navigation/network failure — environment/infra issue, out of scope for locator healing.',
-      );
-
-    case 'api':
-      return reportOnlyPlan(
-        'API/network failure — inspect request/response and backend; out of scope for locator healing.',
-      );
-
-    case 'environment':
-      return reportOnlyPlan(
-        'Environment/config failure — fix configuration; out of scope for locator healing.',
-      );
-
+    // ── Advisor cases (was: terminal report_only) ──────────────────────────
+    // `framework` and `unknown` are the regex-driven categories that previously
+    // STOPPED healing before any grounded advisor ran. A framework/unclassified
+    // signal is now treated as exactly that — a signal, not a verdict. We route
+    // to the advisor pipeline so Repo Intelligence / App Profile can disprove the
+    // guess and ground a real selector. If they cannot, Validation (not the
+    // router) declares the failure unhealed, and an untrustworthy run is reported
+    // as `inconclusive` (see execution-trust), never as a "framework" verdict.
     case 'framework':
-      return reportOnlyPlan(
-        'Framework/runner failure — check Playwright/browser setup; out of scope for locator healing.',
+      return advisorPlan(
+        'Framework/runner signal detected, but a regex must not terminate healing. ' +
+          'Routing to the grounded advisor pipeline (Repo Intelligence / App Profile first); ' +
+          'only Validation decides whether a candidate succeeds.',
       );
 
     case 'unknown':
     default:
-      return reportOnlyPlan(
-        'Unclassified failure — insufficient evidence to prescribe a fix. Reporting for human review instead of guessing a locator.',
+      return advisorPlan(
+        'Unclassified failure — "unknown" is not "unhealable". Routing to the grounded ' +
+          'advisor pipeline so Repo Intelligence / App Profile / DOM Memory can attempt a ' +
+          'grounded selector; nothing is changed unless an advisor produces a candidate that ' +
+          'Validation confirms.',
       );
+  }
+}
+
+/** Rationale text for each terminal hard-stop category. */
+function hardStopRationale(category: FailureCategory): string {
+  switch (category) {
+    case 'assertion':
+      return 'Assertion failure — element found but value/state did not match. This is a product/data finding, not a locator issue.';
+    case 'navigation':
+      return 'Navigation/network failure — environment/infra issue, out of scope for locator healing.';
+    case 'api':
+      return 'API/network failure — inspect request/response and backend; out of scope for locator healing.';
+    case 'environment':
+      return 'Environment/config failure — fix configuration; out of scope for locator healing.';
+    default:
+      return 'Out of scope for locator healing — reporting for human review.';
   }
 }

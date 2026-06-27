@@ -31,13 +31,16 @@ describe('routeHealingStrategy', () => {
     expect(plan.reportOnly).toBe(false);
   });
 
-  it('routes a locator failure WITHOUT a concrete locator to report_only (the bug fix)', () => {
+  it('routes a locator failure WITHOUT a concrete locator to the ADVISOR pipeline (Advisor architecture)', () => {
+    // Advisor architecture: a missing INLINE locator no longer terminates healing
+    // — the grounded advisors (App Profile / Repo Intelligence) may still ground a
+    // selector. Only Validation decides whether a candidate succeeds.
     const plan = routeHealingStrategy(
       diag({ locator: null, healableByLocatorSwap: false, confidence: 0.5 }),
     );
-    expect(plan.remedy).toBe('report_only');
-    expect(plan.shouldAttemptLocatorHealing).toBe(false);
-    expect(plan.reportOnly).toBe(true);
+    expect(plan.disposition).toBe('advisor');
+    expect(plan.shouldAttemptLocatorHealing).toBe(true);
+    expect(plan.reportOnly).toBe(false);
   });
 
   it('routes a timing failure to inject_wait (never changes the locator)', () => {
@@ -71,23 +74,50 @@ describe('routeHealingStrategy', () => {
     expect(plan.remedy).toBe('inject_wait');
   });
 
-  it.each<FailureCategory>(['assertion', 'navigation', 'api', 'environment', 'framework', 'unknown'])(
-    'routes %s failures to report_only',
+  // Hard stops: a locator swap is categorically the wrong tool. These — and ONLY
+  // these — terminate at report_only.
+  it.each<FailureCategory>(['assertion', 'navigation', 'api', 'environment'])(
+    'routes %s failures to report_only (genuine hard stop)',
     (category) => {
       const plan = routeHealingStrategy(
         diag({ category, healableByLocatorSwap: false, confidence: 0.8, locator: null }),
       );
       expect(plan.remedy).toBe('report_only');
+      expect(plan.disposition).toBe('hard_stop');
       expect(plan.shouldAttemptLocatorHealing).toBe(false);
       expect(plan.reportOnly).toBe(true);
     },
   );
 
-  it('degrades a low-confidence non-locator diagnosis to report_only', () => {
+  // Advisor architecture: framework/unknown are SIGNALS, not verdicts. A regex
+  // must never terminate healing before Repo Intelligence / App Profile run.
+  it.each<FailureCategory>(['framework', 'unknown'])(
+    'routes %s failures to the ADVISOR pipeline (no regex terminates healing)',
+    (category) => {
+      const plan = routeHealingStrategy(
+        diag({ category, healableByLocatorSwap: false, confidence: 0.8, locator: null }),
+      );
+      expect(plan.disposition).toBe('advisor');
+      expect(plan.shouldAttemptLocatorHealing).toBe(true);
+      expect(plan.reportOnly).toBe(false);
+    },
+  );
+
+  it('does NOT degrade a low-confidence framework/unknown diagnosis to report_only (advisor wins)', () => {
+    const plan = routeHealingStrategy(
+      diag({ category: 'unknown', confidence: 0.2, healableByLocatorSwap: false, locator: null }),
+    );
+    // Low confidence is a reason to gather more evidence, not to refuse healing.
+    expect(plan.disposition).toBe('advisor');
+    expect(plan.shouldAttemptLocatorHealing).toBe(true);
+  });
+
+  it('routes a low-confidence timing failure to inject_wait (never report_only)', () => {
     const plan = routeHealingStrategy(
       diag({ category: 'timing', confidence: 0.2, healableByLocatorSwap: false, locator: null }),
     );
-    expect(plan.remedy).toBe('report_only');
+    expect(plan.remedy).toBe('inject_wait');
+    expect(plan.disposition).toBe('inject_wait');
   });
 
   it('still attempts locator healing for a high-confidence locator diagnosis even at lower confidence floor', () => {

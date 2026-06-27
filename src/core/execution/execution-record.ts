@@ -82,8 +82,14 @@ export type ExecutionLifecycleStatus =
  * Result — the OUTCOME of the test, independent of lifecycle status. A record can
  * be `completed` (status) with a `pass`, `fail`, or `healed` result. `result` is
  * null until the execution reaches a terminal outcome.
+ *
+ * `inconclusive` is the honest "I don't know" verdict: the run never produced a
+ * trustworthy result (Playwright/browser crashed, OOM, container restarted,
+ * timeout with no per-test evidence, missing report, xauth/command missing). It
+ * is NOT a test pass, NOT a test fail, and must NEVER be relabelled as
+ * `framework` or "locator could not be healed". See `core/execution-trust.ts`.
  */
-export type TestOutcome = 'pass' | 'fail' | 'healed' | 'skipped';
+export type TestOutcome = 'pass' | 'fail' | 'healed' | 'skipped' | 'inconclusive';
 
 /**
  * Stage — the fine-grained pipeline step the execution is currently in (or last
