@@ -36,6 +36,12 @@ import type { ExecutionContext } from '../core/execution/execution-provider';
 import { ArtifactCollector, extractTopLevelErrors, enumerateAllTests, type EnumeratedTest } from '../core/artifact-collector';
 import { FailureAnalyzer } from '../core/failure-analyzer';
 import { HealingOrchestrator, pageObjectPatchLogFields, type HealingOutcome } from '../core/healing-orchestrator';
+// Deterministic Locator Healing — the FIRST, grounded, zero-AI strategy. When
+// Repo Intelligence resolves the Page Object AND the existing Application Profile
+// has a grounded selector, we apply it before the intelligent pipeline runs.
+// Profile-only: it consumes the App Profile we already built; it never crawls.
+import { resolveDeterministicLocator, type DeterministicResolution } from '../core/deterministic-locator-healing';
+import type { ScoredCandidate } from '../core/candidate-ranker';
 import { HealingStrategySelector, type StrategyConfig } from '../core/healing-strategy-selector';
 import { routeHealingStrategy } from '../core/healing-strategy-router';
 import { EvidenceCollector } from '../core/evidence-collector';
@@ -1314,6 +1320,63 @@ function createHealingWorker(
           logger.warn(MOD, 'Application Profile healing build failed (non-critical)', { error: err?.message });
         }
 
+        // ── Deterministic (Grounded) Locator Healing — the FIRST strategy ──
+        // This is the product promise: when Repo Intelligence understands the
+        // failing code (the failing file IS a Page Object whose field resolves
+        // to a concrete locator) AND the existing Application Profile has a
+        // grounded selector for that element, we can heal the broken locator
+        // deterministically — 0 AI tokens — before any intelligent reasoning.
+        //
+        //   if (repoIntelligence.canResolve() && appProfile.hasGroundedSelector())
+        //        → Deterministic Locator Healing
+        //   else → existing Intelligent (waterfall) Pipeline
+        //
+        // It consumes the App Profile we ALREADY built above (no live crawl).
+        // If no profile exists, it does NOT crawl — it returns `no_profile` so
+        // we surface an explicit "crawl this application first" note and fall
+        // through to the intelligent pipeline (which is also profile-aware).
+        // Computed once per failure; applied (best-first) inside the loop.
+        let deterministic: DeterministicResolution | undefined;
+        try {
+          deterministic = await resolveDeterministicLocator(
+            failure,
+            testRepoPath,
+            appProfileHealing ?? { profileFound: false, candidates: [] },
+          );
+          if (deterministic.ok) {
+            logger.info(MOD, 'Deterministic Locator Healing engaged (grounded, 0-AI)', {
+              testName: failure.testName,
+              pageObjectClass: deterministic.pageObjectClass,
+              field: deterministic.fieldName,
+              from: deterministic.currentLocator,
+              to: deterministic.groundedLocator,
+              confidence: Number(deterministic.confidence.toFixed(3)),
+            });
+          } else if (deterministic.stage === 'no_profile') {
+            // Explicit, actionable guidance — we never auto-crawl during healing.
+            logger.info(MOD, 'Deterministic Locator Healing unavailable — crawl this application first', {
+              testName: failure.testName,
+              url: failure.url,
+              reason: deterministic.reason,
+            });
+            trail.record({
+              layer: 'rule_based',
+              decision: 'skipped',
+              reason:
+                'Deterministic Locator Healing skipped: no Application Profile for this app. ' +
+                'Please crawl this application first to enable grounded, zero-AI healing.',
+            });
+          } else {
+            logger.info(MOD, 'Deterministic Locator Healing not applicable — using intelligent pipeline', {
+              testName: failure.testName,
+              stage: deterministic.stage,
+              reason: deterministic.reason,
+            });
+          }
+        } catch (err: any) {
+          logger.warn(MOD, 'Deterministic Locator Healing failed (non-critical, falling through)', { error: err?.message });
+        }
+
         for (let iteration = 0; iteration < MAX_HEAL_ITERATIONS; iteration++) {
           // Stop healing this test if cancelled or out of time (job- or test-level).
           if (isCancelled()) {
@@ -1357,6 +1420,43 @@ function createHealingWorker(
           );
           // Remember the authoritative advisor waterfall for the ExecutionRecord.
           lastDecisionTrail = toAdvisorDecisionTrail(ranked.decisionTrail);
+
+          // ── Apply Deterministic Locator Healing FIRST ──
+          // When the deterministic strategy resolved a grounded fix, try it
+          // ahead of everything else by unshifting it to the front of the
+          // ranked list. It is the same grounded selector the App Profile
+          // advisor would surface, but gated by Repo Intelligence and given
+          // top priority as an explicit product capability. Guard against
+          // duplicates (already first / already tried) so we never loop on it.
+          if (deterministic?.ok) {
+            const detLocator = deterministic.groundedLocator;
+            const alreadyFirst = ranked.candidates[0]?.newLocator === detLocator;
+            if (!alreadyFirst && !triedLocators.has(detLocator)) {
+              const detCandidate: ScoredCandidate = {
+                newLocator: detLocator,
+                strategy: 'rule_based',
+                source: 'app_profile',
+                confidence: deterministic.confidence,
+                tokensUsed: 0,
+                reasoning: `[Deterministic Locator Healing] ${deterministic.reasoning}`,
+                addExplicitWait: false,
+                signals: {
+                  baseConfidence: deterministic.confidence,
+                  syntaxValid: true,
+                  inAppProfile: true,
+                  matchesPageObject: true,
+                },
+                // Sort strictly first: deterministic, grounded, 0-token.
+                score: Number.MAX_SAFE_INTEGER,
+                scoreBreakdown: { deterministic_grounded: Number.MAX_SAFE_INTEGER },
+              };
+              // Drop any lower-ranked duplicate of the same locator, then lead with ours.
+              ranked.candidates = [
+                detCandidate,
+                ...ranked.candidates.filter((c) => c.newLocator !== detLocator),
+              ];
+            }
+          }
 
           if (ranked.candidates.length === 0) {
             logger.warn(MOD, 'No viable candidate for locator — skipping', {
