@@ -7,6 +7,7 @@ import express from 'express';
 import cors from 'cors';
 import * as path from 'path';
 import * as fs from 'fs';
+import { resolveRerunRelFile } from '../core/rerun-target';
 
 import { authMiddleware } from './middleware/auth';
 import { companyMiddleware } from './middleware/company';
@@ -814,7 +815,9 @@ function createHealingWorker(
       // PRE-CHECK: Re-run this specific test to see if it still fails.
       // A previous test's healing may have already fixed shared locators in the same file.
       // Use the base execution profile (not a healing attempt yet).
-      const preCheckRelFile = path.relative(path.join(testRepoPath, 'tests'), failure.filePath);
+      // Target a REAL spec file; never the Page Object (→ 0 tests). When no spec
+      // can be resolved, fall back to grep-only (run by test name across suite).
+      const preCheckRelFile = resolveRerunRelFile(failure, testRepoPath);
       const preCheck = await ExecutionEngine.runAsync(
         testRepoPath,
         preCheckRelFile,
@@ -1110,7 +1113,7 @@ function createHealingWorker(
               );
               if (updatedContent !== originalContent) {
                 fs.writeFileSync(failure.filePath, updatedContent, 'utf-8');
-                const relativeTestFile = path.relative(path.join(testRepoPath, 'tests'), failure.filePath);
+                const relativeTestFile = resolveRerunRelFile(failure, testRepoPath);
                 const rerun = await ExecutionEngine.runAsync(
                   testRepoPath,
                   relativeTestFile,
@@ -1472,15 +1475,13 @@ function createHealingWorker(
             });
 
             // Rerun ONLY the current test for isolation. Target the SPEC file
-            // (where the test is defined) — NOT failure.filePath, which for a
-            // Page Object heal points at the PO source and yields "No tests
-            // found" on rerun, so the heal could never be confirmed (the fix was
-            // applied correctly but silently reverted). Fall back to filePath
-            // when the spec file is unknown (inline-locator failures).
-            const rerunTarget = failure.specFilePath ?? failure.filePath;
-            const relativeTestFile = path.relative(
-              path.join(testRepoPath, 'tests'), rerunTarget,
-            );
+            // (where the test is defined) — NEVER failure.filePath when it is a
+            // Page Object, which yields "No tests found" (0 tests, exit 1, empty
+            // report) so the heal could never be confirmed and a perfectly good
+            // fix was silently reverted ("Report only"). resolveRerunRelFile
+            // returns a real spec path or `undefined` → grep-only (Playwright
+            // finds the test by name across the suite), which always runs it.
+            const relativeTestFile = resolveRerunRelFile(failure, testRepoPath);
             const currentTestName = failure.testName;
             browserTries++; // count this candidate against the per-locator browser budget
             const rerun = await ExecutionEngine.runAsync(
