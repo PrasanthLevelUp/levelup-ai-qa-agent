@@ -1,5 +1,5 @@
 /**
- * REST API Server — Express server for the AI Self-Healing Agent.
+ * REST API Server — Express server for the AI Self-Healing Agent
  */
 
 import 'dotenv/config';
