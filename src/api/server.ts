@@ -44,6 +44,7 @@ import { resolveDeterministicLocator, type DeterministicResolution } from '../co
 import type { ScoredCandidate } from '../core/candidate-ranker';
 import { HealingStrategySelector, type StrategyConfig } from '../core/healing-strategy-selector';
 import { routeHealingStrategy } from '../core/healing-strategy-router';
+import { assessRunTrust, type RunTrustAssessment } from '../core/execution-trust';
 import { EvidenceCollector } from '../core/evidence-collector';
 import { refineDiagnosisWithEvidence } from '../core/failure-classifier';
 // Canonical Execution Record — the single lifecycle record the dashboard reads.
@@ -613,7 +614,7 @@ function createHealingWorker(
     // Minimal `run` view for the downstream legacy paths (all-pass messaging +
     // result tallies). The heal loop consumes `artifacts` directly; `run` only
     // carries the exit/stderr/duration + resultsFile those legacy branches read.
-    const run: RunResult = {
+    let run: RunResult = {
       exitCode: execResult.exitCode,
       stdout: execResult.metadata.stdout ?? '',
       stderr: execResult.metadata.stderr ?? '',
@@ -624,10 +625,97 @@ function createHealingWorker(
     };
     // The provider already parsed failure artifacts AND built the finalized
     // pass/skip records — the worker no longer collects anything itself.
-    const artifacts: any[] = execResult.artifacts;
+    let artifacts: any[] = execResult.artifacts;
     // The Hybrid validation reruns inside the heal loop re-collect artifacts from
     // their (local) rerun results file; keep a collector instance for those.
     const collector = new ArtifactCollector();
+
+    // ── INCONCLUSIVE: retry an untrustworthy run ONCE (Change 2) ──────────────
+    // "Absence of a passing result is NOT a failing test." A run that exited
+    // non-zero yet produced no parseable failure artifact has NO trustworthy
+    // verdict (Playwright/browser crash, OOM, container restart, timeout with no
+    // evidence, missing report, xauth/command missing). Before we treat that as
+    // anything, retry the whole run ONCE clean. We adopt the retry only if it is
+    // at least as informative (trustworthy or it produced an artifact), so a
+    // flaky-infra first run can still yield a real verdict to heal.
+    const trustOf = (r: RunResult, arts: any[]): RunTrustAssessment =>
+      assessRunTrust({
+        exitCode: r.exitCode,
+        hasFailureArtifacts: arts.length > 0,
+        resultsFileExists: !!r.resultsFile && fs.existsSync(r.resultsFile),
+        loadErrorCount: extractTopLevelErrors(r.resultsFile).length,
+      });
+
+    let runTrust = trustOf(run, artifacts);
+    if (!runTrust.trustworthy && !isCancelled() && !jobBudgetExhausted()) {
+      logger.warn(MOD, 'Run produced no trustworthy verdict — retrying once before deciding', {
+        jobId: job.id,
+        signal: runTrust.signal,
+        reason: runTrust.reason,
+      });
+      jobQueue.updateJob(job.id, {
+        progress: `Run inconclusive (${runTrust.signal}) — retrying once...`,
+      });
+      try {
+        const retryResult = await provider.execute(executionContext);
+        const retryRun: RunResult = {
+          exitCode: retryResult.exitCode,
+          stdout: retryResult.metadata.stdout ?? '',
+          stderr: retryResult.metadata.stderr ?? '',
+          resultsFile: retryResult.resultsFile,
+          startTime: retryResult.metadata.startTime,
+          endTime: retryResult.metadata.endTime,
+          durationMs: retryResult.metadata.durationMs,
+        };
+        const retryArtifacts: any[] = retryResult.artifacts;
+        const retryTrust = trustOf(retryRun, retryArtifacts);
+        if (retryTrust.trustworthy || retryArtifacts.length > 0) {
+          logger.info(MOD, 'Retry produced a trustworthy verdict — adopting it', {
+            jobId: job.id, retrySignal: retryTrust.signal, retryArtifacts: retryArtifacts.length,
+          });
+          execResult = retryResult;
+          run = retryRun;
+          artifacts = retryArtifacts;
+          runTrust = retryTrust;
+        } else {
+          logger.warn(MOD, 'Retry also inconclusive — finalizing as INCONCLUSIVE', {
+            jobId: job.id, retrySignal: retryTrust.signal,
+          });
+        }
+      } catch (retryErr) {
+        logger.warn(MOD, 'Inconclusive-retry execution failed (keeping first run)', {
+          jobId: job.id, error: (retryErr as Error).message,
+        });
+      }
+    }
+
+    // After the optional retry: if there are still no artifacts AND the run is
+    // untrustworthy, this is an honest INCONCLUSIVE — never a test "fail" and
+    // never a "framework"/"unhealable locator" verdict.
+    if (artifacts.length === 0 && !runTrust.trustworthy) {
+      const message =
+        `Run is INCONCLUSIVE (${runTrust.signal}): ${runTrust.reason} ` +
+        `The test produced no trustworthy verdict, so LevelUp is not guessing pass/fail. ` +
+        `Diagnostic: exit=${run.exitCode}, resultsFile=${
+          run.resultsFile && fs.existsSync(run.resultsFile) ? 'present' : 'MISSING'
+        }${run.stderr ? `, stderr: ${run.stderr.slice(-300)}` : ''}`;
+      logger.warn(MOD, 'Finalizing job as INCONCLUSIVE', {
+        jobId: job.id, signal: runTrust.signal, exitCode: run.exitCode,
+      });
+      jobQueue.updateJob(job.id, { progress: `Inconclusive: ${runTrust.signal}` });
+      return {
+        totalTests: 0,
+        failed: 0,
+        healed: 0,
+        inconclusive: true,
+        inconclusiveSignal: runTrust.signal,
+        strategy: 'none',
+        tokensUsed: 0,
+        testResults: { exitCode: run.exitCode, durationMs: run.durationMs },
+        healingActions: [],
+        message,
+      };
+    }
 
     if (artifacts.length === 0) {
       let message = 'All tests passed — no healing needed';

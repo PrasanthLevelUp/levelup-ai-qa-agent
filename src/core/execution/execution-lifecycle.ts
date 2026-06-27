@@ -68,6 +68,8 @@ export interface ResultCounts {
   fail: number;
   healed: number;
   skipped: number;
+  /** Runs that produced no trustworthy verdict ("I don't know"). */
+  inconclusive: number;
   /** Records still in flight (no terminal result yet). */
   inFlight: number;
 }
@@ -78,7 +80,7 @@ export interface ResultCounts {
  * failed) so we can prove the canonical store hasn't lost or invented executions.
  */
 export function summarizeResultCounts(records: ReadonlyArray<Pick<ExecutionRecord, 'result'>>): ResultCounts {
-  const counts: ResultCounts = { total: 0, pass: 0, fail: 0, healed: 0, skipped: 0, inFlight: 0 };
+  const counts: ResultCounts = { total: 0, pass: 0, fail: 0, healed: 0, skipped: 0, inconclusive: 0, inFlight: 0 };
   for (const rec of records) {
     counts.total++;
     switch (rec.result) {
@@ -93,6 +95,9 @@ export function summarizeResultCounts(records: ReadonlyArray<Pick<ExecutionRecor
         break;
       case 'skipped':
         counts.skipped++;
+        break;
+      case 'inconclusive':
+        counts.inconclusive++;
         break;
       default:
         counts.inFlight++;

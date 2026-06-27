@@ -156,3 +156,60 @@ classified `framework` because the framework regex matched somewhere in the blob
   which is exactly the inversion an advisor model would fix: let each advisor
   vote, treat "no result" as inconclusive (not failure), and only declare
   "unhealable" after the grounded advisors have actually run.
+
+
+
+---
+
+## RESOLUTION — the two architectural changes (implemented)
+
+The audit above identified many individual premature-exit paths (R1, R7, R8, C5,
+A3, E2/E4, …). Rather than patch each one, we made **two architectural changes**
+that make whole classes of those exits impossible by construction. Individual
+patches were intentionally NOT applied — they disappear naturally under the new
+architecture.
+
+### Change 1 — Gate → Advisor (`src/core/healing-strategy-router.ts`)
+The router used to be a **gate**: a regex classification (`framework`, `unknown`)
+or a low-confidence score could terminate healing (`report_only`) *before* any
+grounded advisor (Repo Intelligence, App Profile, DOM Memory, Reuse, AI) ran.
+
+Now the router is an **advisor dispatcher**:
+- `HARD_STOP_CATEGORIES` is restricted to the four genuine non-healable classes:
+  **assertion, navigation, api, environment**. Only these return `report_only`
+  with `disposition: 'hard_stop'`.
+- `framework`, `unknown`, and any locator failure *without* a concrete locator
+  now return an **advisor plan** (`shouldAttemptLocatorHealing: true`,
+  `disposition: 'advisor'`) — they flow into the grounded advisor pipeline
+  instead of terminating. No regex can stop healing before the advisors vote.
+- timing failures return `disposition: 'inject_wait'` (never a locator swap).
+- The old `minActionConfidence()` floor and the low-confidence Guard were
+  removed: confidence is now an advisor input, never a terminator.
+
+A new `disposition: HealingDisposition` field (`'hard_stop' | 'advisor' |
+'inject_wait'`) on `HealingStrategyPlan` makes the decision explicit and testable.
+
+### Change 2 — INCONCLUSIVE run state (`src/core/execution-trust.ts`)
+"Absence of a passing result is NOT the same as a failing test." A run that
+crashed, timed out with no evidence, lost its results file, hit a missing binary,
+or failed to load a spec produced **no verdict** — labelling that `framework` /
+`fail` / "unhealable locator" was dishonest.
+
+- New pure module `assessRunTrust()` inspects raw run facts (exit code, results
+  file present, failure artifacts parsed, spec-load errors) and returns a
+  `RunTrustAssessment` with a machine `signal` (`command_not_found` /
+  `timeout_no_evidence` / `no_results_file` / `crashed_before_tests` /
+  `spec_load_error`) and an `inconclusive` flag.
+- New `'inconclusive'` `TestOutcome` and `ResultCounts.inconclusive` counter.
+- The worker (`src/api/server.ts`) now **retries an untrustworthy run once**;
+  if it is still untrustworthy and has no failure artifact to heal, it finalizes
+  the run as **inconclusive** (telling the user) instead of inventing a verdict.
+
+### Preserved hard stops (unchanged, correct)
+assertion, navigation, api, environment-config, user cancellation, missing
+dependencies — these still terminate and report honestly.
+
+### Tests
+- `tests/unit/healing-strategy-router.test.ts` — advisor routing + preserved hard
+  stops (14 tests).
+- `tests/unit/execution-trust.test.ts` — every trust/inconclusive signal (10 tests).
