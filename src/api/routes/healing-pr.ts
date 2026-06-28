@@ -612,6 +612,7 @@ async function executeHealingPR(opts: {
     } catch { /* non-fatal */ }
     logger.info(MOD, 'Pre-push diagnostics', {
       branchName,
+      tokenSource,
       tokenPresent: github.hasToken,
       tokenLength: github.tokenLength,
       remoteRedacted,
@@ -625,11 +626,24 @@ async function executeHealingPR(opts: {
       // Never leak the tokenised remote URL in the error surfaced to the client.
       const sanitized = raw.replace(/x-access-token:[^@]+@/g, 'x-access-token:***@');
       if (/Authentication failed|Password authentication is not supported|invalid username or token/i.test(sanitized)) {
+        // Translate the opaque git auth failure into an actionable message that
+        // names the token SOURCE healing actually used and the exact fix per source.
+        const sourceLabel =
+          tokenSource === 'connected-tools-token' ? 'Connected GitHub account (Tools page)'
+          : tokenSource === 'request' ? 'token supplied in the request'
+          : tokenSource === 'env' ? 'GITHUB_TOKEN environment variable'
+          : 'unknown source';
+        const fix =
+          tokenSource === 'connected-tools-token'
+            ? 'Reconnect GitHub from the Tools page, or grant the token push access to this repo ' +
+              '(classic PAT: "repo" scope; fine-grained PAT: Contents: Write + Pull requests: Write on this repository).'
+            : tokenSource === 'env'
+            ? 'Replace GITHUB_TOKEN on the backend with a token that has push access (repo / Contents: Write + Pull requests: Write).'
+            : 'Provide a token with push access (repo / Contents: Write + Pull requests: Write).';
         throw new HttpError(
           401,
-          'GitHub push was rejected: the configured token is invalid/expired or lacks push ' +
-            'access to the target repository. Update GITHUB_TOKEN on the backend with a token ' +
-            'that has write access, then try again.',
+          `Unable to authenticate with GitHub for push.\nToken source: ${sourceLabel}\n` +
+            `The token is invalid/expired or lacks push access to ${parsed.owner}/${parsed.repo}.\n${fix}`,
         );
       }
       throw new HttpError(500, `git push failed: ${sanitized}`);
