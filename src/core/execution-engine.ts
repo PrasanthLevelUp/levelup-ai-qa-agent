@@ -191,9 +191,40 @@ export class ExecutionEngine {
       nodeModulesExists: true,
     });
 
-    // If playwright is not in local node_modules, that's OK — the Docker image
-    // (mcr.microsoft.com/playwright:v1.52.0-jammy) has it globally installed.
-    // The run() method uses `npx playwright test` which resolves global binaries.
+    // Ensure the browser binaries the CLONED repo's Playwright needs are present.
+    //
+    // WHY THIS IS REQUIRED (production "1.1s Framework / Report only" root cause):
+    // The base Docker image ships browsers for ONE Playwright version (currently
+    // mcr.microsoft.com/playwright:v1.59.1-jammy). But a customer repo pins its
+    // OWN Playwright (e.g. SauceDemo → @playwright/test ^1.60.0). After the
+    // `npm install` above, the repo's local Playwright can be a DIFFERENT version
+    // whose Chromium build revision is not the one baked into the image. When the
+    // test then runs, `browserType.launch` fails in ~1s with:
+    //     "Executable doesn't exist at .../chromium_headless_shell-<rev>/..."
+    // No browser launches → no test runs → the results JSON carries NO located
+    // locator error → ArtifactCollector sets failed_locator=null → FailureAnalyzer
+    // classifies it as `framework` → the heal degrades to "Report only / no
+    // candidate". That is exactly the production symptom, and it never reaches
+    // candidate generation regardless of how good the healing pipeline is.
+    //
+    // Installing the browser for the repo's OWN Playwright (honouring the shared
+    // PLAYWRIGHT_BROWSERS_PATH cache) makes the launch succeed for ANY pinned
+    // version, instead of relying on the base image matching every customer repo.
+    // This is best-effort: if it fails (offline/locked-down runner) we keep going
+    // and let the image-global browser serve, so we never make things worse.
+    try {
+      logger.info(MOD, 'Ensuring Playwright browser for cloned repo', { repoPath });
+      await ExecutionEngine.spawnAsync('npx', ['playwright', 'install', 'chromium'], {
+        cwd: repoPath,
+        timeout: 180_000,
+      });
+      logger.info(MOD, 'Playwright browser ensured for cloned repo', { repoPath });
+    } catch (err) {
+      logger.warn(MOD, 'playwright install chromium failed — falling back to image-global browser', {
+        repoPath,
+        error: (err as Error).message,
+      });
+    }
   }
 
   /**
