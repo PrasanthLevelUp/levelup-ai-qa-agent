@@ -31,7 +31,8 @@ export type RunTrustSignal =
   | 'timeout_no_evidence'// exit 124 — killed at wall-clock with no per-test evidence
   | 'no_results_file'    // the reporter never wrote test-results.json
   | 'crashed_before_tests' // non-zero exit, no results / no artifacts — runner died early
-  | 'spec_load_error';   // spec import / global-setup failed before any test ran
+  | 'spec_load_error'    // spec import / global-setup failed before any test ran
+  | 'framework_crash_no_evidence'; // a Playwright/framework crash that never reached a verdict
 
 export interface RunTrustInput {
   /** Process exit code of the run (0 = clean). */
@@ -45,6 +46,18 @@ export interface RunTrustInput {
    * (errors[] with an empty suites[]). These mean the test never ran.
    */
   loadErrorCount?: number;
+  /**
+   * True when the run's ONLY failure signal is a Playwright/framework-level
+   * crash (browser launch failure, "target page/context/browser has been
+   * closed/crashed", protocol error) that never reached a real element — i.e.
+   * there is no failed locator and the run finished far faster than a single
+   * element action timeout could elapse. Such a "crash artifact" is an
+   * environment hiccup, NOT a test verdict: classifying it as a confident
+   * `framework → report only` dead-end hides the genuine (locator) failure the
+   * test would surface on a clean rerun. When true, the run is treated as
+   * INCONCLUSIVE so the worker retries it once before deciding.
+   */
+  frameworkCrashWithoutVerdict?: boolean;
 }
 
 export interface RunTrustAssessment {
@@ -74,6 +87,24 @@ export interface RunTrustAssessment {
 export function assessRunTrust(input: RunTrustInput): RunTrustAssessment {
   const { exitCode, hasFailureArtifacts, resultsFileExists } = input;
   const loadErrorCount = input.loadErrorCount ?? 0;
+
+  // A framework-level crash that never reached a verdict is NOT trustworthy even
+  // though it left a (crash) artifact behind. "Target closed/crashed", a launch
+  // failure or a protocol error that aborts in ~1s is an environment hiccup, not
+  // a test result — treating it as a confident `framework → report only`
+  // dead-end hides the genuine (e.g. locator) failure the test surfaces once the
+  // browser comes up cleanly. Checked BEFORE hasFailureArtifacts so the crash
+  // artifact does not mask it. The worker retries such a run once.
+  if (input.frameworkCrashWithoutVerdict) {
+    return inconclusiveResult(
+      'framework_crash_no_evidence',
+      'The run aborted with a Playwright/framework-level crash (browser launch ' +
+        'failure, target page/context/browser closed/crashed, or protocol error) ' +
+        'before it could reach a real element — far faster than a single action ' +
+        'timeout. That is an environment hiccup, not a test verdict, so the run is ' +
+        'inconclusive and must be retried once before being reported.',
+    );
+  }
 
   // A real, evidence-backed failure is always trustworthy — we have something
   // concrete to diagnose and (potentially) heal. This is the common case and is

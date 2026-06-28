@@ -52,7 +52,7 @@ import { HealingStrategySelector, type StrategyConfig } from '../core/healing-st
 import { routeHealingStrategy } from '../core/healing-strategy-router';
 import { assessRunTrust, type RunTrustAssessment } from '../core/execution-trust';
 import { EvidenceCollector } from '../core/evidence-collector';
-import { refineDiagnosisWithEvidence } from '../core/failure-classifier';
+import { refineDiagnosisWithEvidence, classifyFailure } from '../core/failure-classifier';
 // Canonical Execution Record — the single lifecycle record the dashboard reads.
 import {
   createExecutionRecord,
@@ -682,12 +682,36 @@ function createHealingWorker(
     // anything, retry the whole run ONCE clean. We adopt the retry only if it is
     // at least as informative (trustworthy or it produced an artifact), so a
     // flaky-infra first run can still yield a real verdict to heal.
+    // A framework-level crash that aborts FASTER than a single repo action
+    // timeout never reached a real element (no failed locator) — that is an
+    // environment hiccup, not a verdict. Detect it so the run is retried once
+    // instead of being dead-ended as "framework → report only", which is what
+    // hid the genuine broken-locator diagnosis a clean rerun surfaces.
+    const trustAnalyzer = new FailureAnalyzer();
+    const looksLikeTransientFrameworkCrash = (r: RunResult, arts: any[]): boolean => {
+      if (arts.length === 0) return false;
+      // A real locator failure must WAIT out at least one action timeout, so a
+      // run that finished faster than that could not carry a genuine verdict.
+      if (!(r.durationMs > 0 && r.durationMs < REPO_ACTION_TIMEOUT_MS)) return false;
+      // Every artifact must be a framework crash with NO failed locator. If any
+      // artifact carries a real locator/assertion verdict, the run is trustworthy.
+      return arts.every((a) => {
+        try {
+          const f = trustAnalyzer.analyze(a);
+          if (f.failedLocator && f.failedLocator.trim()) return false;
+          return classifyFailure({ failure: f }).category === 'framework';
+        } catch {
+          return false;
+        }
+      });
+    };
     const trustOf = (r: RunResult, arts: any[]): RunTrustAssessment =>
       assessRunTrust({
         exitCode: r.exitCode,
         hasFailureArtifacts: arts.length > 0,
         resultsFileExists: !!r.resultsFile && fs.existsSync(r.resultsFile),
         loadErrorCount: extractTopLevelErrors(r.resultsFile).length,
+        frameworkCrashWithoutVerdict: looksLikeTransientFrameworkCrash(r, arts),
       });
 
     let runTrust = trustOf(run, artifacts);
@@ -733,10 +757,16 @@ function createHealingWorker(
       }
     }
 
-    // After the optional retry: if there are still no artifacts AND the run is
-    // untrustworthy, this is an honest INCONCLUSIVE — never a test "fail" and
-    // never a "framework"/"unhealable locator" verdict.
-    if (artifacts.length === 0 && !runTrust.trustworthy) {
+    // After the optional retry: if the run is still untrustworthy, this is an
+    // honest INCONCLUSIVE — never a test "fail" and never a
+    // "framework"/"unhealable locator" verdict. This covers both the
+    // no-artifact case AND a persistent framework crash (which leaves a crash
+    // artifact behind but still carries no verdict — without this it would fall
+    // through to the heal loop and be mislabelled "framework → report only").
+    if (
+      !runTrust.trustworthy &&
+      (artifacts.length === 0 || runTrust.signal === 'framework_crash_no_evidence')
+    ) {
       const message =
         `Run is INCONCLUSIVE (${runTrust.signal}): ${runTrust.reason} ` +
         `The test produced no trustworthy verdict, so LevelUp is not guessing pass/fail. ` +

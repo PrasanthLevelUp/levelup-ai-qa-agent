@@ -110,4 +110,36 @@ describe('assessRunTrust', () => {
       expect(result.reason.length).toBeGreaterThan(0);
     }
   });
+
+  it('marks a fast framework crash as INCONCLUSIVE even when a crash artifact exists', () => {
+    // A "target closed/crashed" that aborts in ~1s leaves a crash artifact
+    // behind, but it never reached a verdict. It must NOT be trusted (which
+    // would dead-end it as "framework → report only") — it must be retried.
+    const result = assessRunTrust(
+      input({
+        exitCode: 1,
+        hasFailureArtifacts: true, // crash artifact present...
+        resultsFileExists: true,
+        frameworkCrashWithoutVerdict: true, // ...but it's a framework crash with no verdict
+      }),
+    );
+    expect(result.trustworthy).toBe(false);
+    expect(result.signal).toBe('framework_crash_no_evidence');
+    expect(result.inconclusive).toBe(true);
+  });
+
+  it('still trusts a real failure artifact when it is NOT a framework crash', () => {
+    // Regression guard: a genuine evidence-backed failure (e.g. a located
+    // locator timeout) must remain trustworthy and never be retried away.
+    const result = assessRunTrust(
+      input({
+        exitCode: 1,
+        hasFailureArtifacts: true,
+        resultsFileExists: true,
+        frameworkCrashWithoutVerdict: false,
+      }),
+    );
+    expect(result.trustworthy).toBe(true);
+    expect(result.signal).toBe('ok');
+  });
 });
