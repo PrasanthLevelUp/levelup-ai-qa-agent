@@ -104,9 +104,11 @@ export function createDashboardRouter(): Router {
       const pool = getPool();
 
       const { rows } = await pool.query(
-        `SELECT ha.*, te.test_name AS exec_test_name
+        `SELECT ha.*, te.test_name AS exec_test_name,
+                pa.pr_url, pa.pr_number, pa.status AS pr_status
          FROM healing_actions ha
          LEFT JOIN test_executions te ON ha.test_execution_id = te.id
+         LEFT JOIN pr_automations pa ON ha.pr_automation_id = pa.id
          WHERE ($1::int IS NULL OR ha.company_id = $1) ${pidClause} ${statusClause}
          ORDER BY ha.created_at DESC
          LIMIT $2`,
@@ -128,6 +130,10 @@ export function createDashboardRouter(): Router {
         tokensUsed: a.ai_tokens_used || 0,
         cost: Math.round((a.ai_tokens_used || 0) * 0.000003 * 10000) / 10000,
         validationStatus: a.validation_status || 'unknown',
+        // Healing → PR linkage (Execution → Healed → PR Created → Merged)
+        prUrl: a.pr_url || null,
+        prNumber: a.pr_number || null,
+        prStatus: a.pr_status || null,
       }));
 
       res.json(result);
@@ -145,9 +151,11 @@ export function createDashboardRouter(): Router {
 
       const pool = getPool();
       const { rows } = await pool.query(
-        `SELECT ha.*, te.test_name AS exec_test_name, te.duration_ms
+        `SELECT ha.*, te.test_name AS exec_test_name, te.duration_ms,
+                pa.pr_url, pa.pr_number, pa.status AS pr_status
          FROM healing_actions ha
          LEFT JOIN test_executions te ON ha.test_execution_id = te.id
+         LEFT JOIN pr_automations pa ON ha.pr_automation_id = pa.id
          WHERE ha.id = $1`,
         [id],
       );
@@ -194,6 +202,10 @@ export function createDashboardRouter(): Router {
         cost: Math.round((a.ai_tokens_used || 0) * 0.000003 * 10000) / 10000,
         errorContext: a.error_context || '',
         durationMs: a.duration_ms || 0,
+        // Healing → PR linkage (Execution → Healed → PR Created → Merged)
+        prUrl: a.pr_url || null,
+        prNumber: a.pr_number || null,
+        prStatus: a.pr_status || null,
       });
     } catch (err) {
       logger.error(MOD, 'healings/:id failed', { error: err });

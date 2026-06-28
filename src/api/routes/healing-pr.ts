@@ -1,22 +1,76 @@
 /**
  * Healing Auto-Commit Routes
  *
- * POST /api/healings/:id/create-pr — Apply healing fix to test file and create GitHub PR
- * GET  /api/healings/:id/preview-fix — Preview what the fix would look like
+ * POST /api/healings/:id/create-pr   — Create a PR for ONE healing (back-compat).
+ * POST /api/healings/create-pr       — Create a SINGLE PR for MANY healings.
+ *                                       Bundles exactly the file(s) that were
+ *                                       fixed (grouping multiple fixes per file)
+ *                                       so a reviewer can merge to main manually.
+ * GET  /api/healings/:id/preview-fix — Preview what a fix would look like.
+ *
+ * Design goals (kept deliberately small + scalable):
+ *   • One healing == one (file, locator) repair. A job may produce many.
+ *   • A PR is built from the *resolved set* of healings: each fix is mapped to
+ *     its target file, fixes are grouped by file, and every fix for a file is
+ *     applied to that file's content in sequence. The PR therefore contains
+ *     exactly the files we changed — 1 or N — plus one combined healing report.
+ *   • We NEVER auto-merge. The PR targets the repo's default branch for a human
+ *     to review and merge manually.
  */
 
 import { Router, type Request, type Response } from 'express';
 import { logger } from '../../utils/logger';
-import { getPool, getRepository, logPR } from '../../db/postgres';
+import {
+  getPool,
+  getRepository,
+  getRepositoryByUrl,
+  getHealingJob,
+  getHealingActionsByJobId,
+  linkHealingActionsToPR,
+  logPR,
+} from '../../db/postgres';
 import { GitHubService, type CommitFileSpec } from '../../services/github-service';
 import { CodePatcher, type HealingFix } from '../../services/code-patcher';
 import { createRepoPathResolver } from '../../intelligence/repo-path-resolver';
 import * as path from 'path';
-import * as os from 'os';
 import * as fs from 'fs';
 import { execSync } from 'child_process';
 
 const MOD = 'healing-pr';
+
+/* -------------------------------------------------------------------------- */
+/*  Small typed HTTP error so the core can signal a status code               */
+/* -------------------------------------------------------------------------- */
+
+class HttpError extends Error {
+  constructor(public status: number, message: string) {
+    super(message);
+  }
+}
+
+/* -------------------------------------------------------------------------- */
+/*  Result shapes                                                             */
+/* -------------------------------------------------------------------------- */
+
+interface FixOutcome {
+  healingId: number;
+  testName: string;
+  failedLocator: string;
+  healedLocator: string;
+  strategy: string;
+  confidence: number;
+  patched: boolean;
+  replacements: number;
+  description: string;
+}
+
+interface FileOutcome {
+  filePath: string;
+  isPageObject: boolean;
+  changed: boolean;
+  totalReplacements: number;
+  fixes: FixOutcome[];
+}
 
 /* -------------------------------------------------------------------------- */
 /*  Router                                                                    */
@@ -26,270 +80,80 @@ export function createHealingPRRouter(): Router {
   const router = Router();
   const patcher = new CodePatcher();
 
-  /* ── POST /:id/create-pr — Full auto-commit flow ──────────── */
+  /* ── POST /create-pr — bundle MANY healings into ONE PR ───────────────── */
+  router.post('/create-pr', async (req: Request, res: Response) => {
+    const companyId = (req as any).companyId;
+    try {
+      const { repositoryId, healingIds, githubToken } = req.body || {};
+
+      if (!repositoryId) {
+        return res.status(400).json({ error: 'repositoryId is required' });
+      }
+      if (!Array.isArray(healingIds) || healingIds.length === 0) {
+        return res.status(400).json({ error: 'healingIds (non-empty array) is required' });
+      }
+
+      const ids = healingIds
+        .map((x: unknown) => parseInt(String(x), 10))
+        .filter((n: number) => Number.isFinite(n));
+      if (ids.length === 0) {
+        return res.status(400).json({ error: 'healingIds contained no valid numeric ids' });
+      }
+
+      const healings = await getHealingActionsByIds(ids);
+      if (healings.length === 0) {
+        return res.status(404).json({ error: 'No healing actions found for the provided ids' });
+      }
+
+      const data = await executeHealingPR({
+        patcher,
+        healings,
+        repositoryId,
+        companyId,
+        githubToken,
+      });
+      return res.json({ success: true, data });
+    } catch (err: any) {
+      if (err instanceof HttpError) {
+        return res.status(err.status).json({ error: err.message });
+      }
+      logger.error(MOD, 'Batch healing PR failed', { error: err.message });
+      return res.status(500).json({ error: 'Failed to create healing PR', details: err.message });
+    }
+  });
+
+  /* ── POST /:id/create-pr — single healing (back-compat) ───────────────── */
   router.post('/:id/create-pr', async (req: Request, res: Response) => {
     const healingId = parseInt(String(req.params.id), 10);
     const companyId = (req as any).companyId;
 
     try {
-      const {
-        repositoryId,
-        projectId,
-        testFilePath,    // e.g. "tests/login.spec.ts" — optional, auto-detected
-        githubToken,
-      } = req.body;
+      const { repositoryId, testFilePath, githubToken } = req.body || {};
 
       if (!repositoryId) {
         return res.status(400).json({ error: 'repositoryId is required' });
       }
 
-      logger.info(MOD, 'Healing auto-commit started', { healingId, repositoryId });
-
-      // 1. Fetch the healing record
       const healing = await getHealingAction(healingId);
       if (!healing) {
         return res.status(404).json({ error: 'Healing action not found' });
       }
 
-      if (!healing.success) {
-        return res.status(400).json({ error: 'Cannot create PR for a failed healing — only successful healings can be committed' });
-      }
-
-      if (!healing.healed_locator) {
-        return res.status(400).json({ error: 'Healing has no healed locator' });
-      }
-
-      // 2. Get repository
-      const repo = await getRepository(repositoryId, companyId);
-      if (!repo) {
-        return res.status(404).json({ error: 'Repository not found' });
-      }
-      if (!repo.url) {
-        return res.status(400).json({ error: 'Repository has no URL configured' });
-      }
-
-      // Determine GitHub token
-      const token = githubToken || process.env.GITHUB_TOKEN;
-      if (!token) {
-        return res.status(400).json({
-          error: 'GitHub token required. Provide githubToken in request body or set GITHUB_TOKEN env variable.',
-        });
-      }
-
-      // 3. Parse repo URL
-      const parsed = GitHubService.parseRepoUrl(repo.url);
-      if (!parsed) {
-        return res.status(400).json({ error: `Cannot parse GitHub URL: ${repo.url}` });
-      }
-
-      const github = new GitHubService({ token, owner: parsed.owner, repo: parsed.repo });
-      const baseBranch = repo.branch || 'main';
-
-      // 4. Clone and find the test file
-      let cloneDir: string | null = null;
-      try {
-        cloneDir = await github.cloneRepo(baseBranch);
-
-        // ── Repo Intelligence (Phase 4): "Patch the Page Object" ──
-        // When the heal was attributed to a shared Page Object / helper, patch
-        // THAT one file — one edit repairs every dependent test — instead of
-        // grepping for an individual spec. The target file + line came from the
-        // failure stack and were persisted on the healing_actions row.
-        const isPageObjectPatch =
-          healing.is_page_object_patch === true && !!healing.target_file_path;
-
-        let filePath: string | null;
-        if (isPageObjectPatch) {
-          filePath = createRepoPathResolver(cloneDir).toRepoRelative(healing.target_file_path);
-          if (!filePath) {
-            return res.status(400).json({
-              error: `Page Object target "${healing.target_file_path}" could not be located in the repository.`,
-            });
-          }
-          logger.info(MOD, 'Patching shared Page Object (fixes all dependents)', {
-            healingId,
-            targetFile: filePath,
-            impactedTests: healing.page_object_impact || 0,
-          });
-        } else {
-          // Find the test file — use provided path or search
-          filePath = testFilePath || await findTestFile(cloneDir, healing.test_name);
-          if (!filePath) {
-            return res.status(400).json({
-              error: `Could not locate test file for "${healing.test_name}". Please provide testFilePath in the request body.`,
-            });
-          }
-        }
-
-        const absPath = path.join(cloneDir, filePath);
-        if (!fs.existsSync(absPath)) {
-          return res.status(400).json({ error: `Target file not found: ${filePath}` });
-        }
-
-        // 5. Read the original file and apply the patch
-        const originalCode = fs.readFileSync(absPath, 'utf-8');
-
-        const fix: HealingFix = {
-          testName: healing.test_name,
-          failedLocator: healing.failed_locator,
-          healedLocator: healing.healed_locator,
-          strategy: healing.healing_strategy,
-          confidence: healing.confidence || 0,
-          filePath,
-        };
-
-        const patchResult = patcher.applyHealingFix(originalCode, fix);
-
-        if (!patchResult.patched) {
-          // Even if we can't auto-patch, create a PR with a fix suggestion file
-          logger.warn(MOD, 'Auto-patch failed, creating suggestion PR instead', { healingId });
-        }
-
-        // 6. Prepare files for commit
-        const files: CommitFileSpec[] = [];
-
-        if (patchResult.patched) {
-          // Write the patched file
-          files.push({ filePath, content: patchResult.patchedCode });
-        }
-
-        // Always create a healing report file
-        const reportPath = `${path.dirname(filePath)}/healing-report-${healingId}.md`;
-        files.push({
-          filePath: reportPath,
-          content: generateHealingReport(healing, fix, patchResult),
-        });
-
-        // 7. Create branch, commit, push, PR
-        const timestamp = Date.now();
-        const safeName = healing.test_name
-          .replace(/[^a-zA-Z0-9]/g, '-')
-          .replace(/-+/g, '-')
-          .toLowerCase()
-          .slice(0, 40);
-        const branchName = `heal/${safeName}-${timestamp}`;
-
-        const impactNote =
-          isPageObjectPatch && (healing.page_object_impact || 0) > 0
-            ? `\nShared Page Object patched — fixes ${healing.page_object_impact} dependent test(s).`
-            : isPageObjectPatch
-              ? `\nShared Page Object patched — fixes all dependent tests.`
-              : '';
-        const commitSubject = isPageObjectPatch
-          ? `🤖 fix: auto-heal broken selector in shared Page Object (${path.basename(filePath)})`
-          : `🤖 fix: auto-heal broken selector in "${healing.test_name}"`;
-        const commitMsg = patchResult.patched
-          ? `${commitSubject}\n\nHealing ID: ${healingId}\nStrategy: ${healing.healing_strategy}\nConfidence: ${Math.round((healing.confidence || 0) * 100)}%${impactNote}\n\n- Old: ${healing.failed_locator}\n- New: ${healing.healed_locator}\n\nGenerated by LevelUp AI Self-Healing Engine`
-          : `🤖 docs: healing suggestion for "${healing.test_name}"\n\nHealing ID: ${healingId}\nNote: Auto-patch could not be applied — see healing report for manual fix instructions.`;
-
-        // Write files to the cloned repo before committing
-        for (const f of files) {
-          const abs = path.join(cloneDir, f.filePath);
-          fs.mkdirSync(path.dirname(abs), { recursive: true });
-          fs.writeFileSync(abs, f.content, 'utf-8');
-        }
-
-        // Git operations
-        const git = (args: string) =>
-          execSync(`git ${args}`, { cwd: cloneDir!, encoding: 'utf-8', timeout: 30_000 }).trim();
-
-        git('config user.email "bot@leveluptesting.in"');
-        git('config user.name "LevelUp AI Bot"');
-
-        try {
-          git(`checkout -b ${branchName}`);
-        } catch {
-          git(`checkout ${branchName}`);
-        }
-
-        git('add -A');
-        const status = git('status --porcelain');
-        if (!status) {
-          return res.json({
-            success: true,
-            data: {
-              message: 'No changes to commit — fix may already be applied',
-              healingId,
-            },
-          });
-        }
-
-        const safeMsg = commitMsg.replace(/"/g, '\\"');
-        git(`commit -m "${safeMsg}"`);
-        const commitSha = git('rev-parse HEAD');
-        git(`push -u origin ${branchName}`);
-
-        // Create PR
-        const prBody = generateHealingPRBody(healing, fix, patchResult);
-        const pr = await github.createPR(branchName, baseBranch, {
-          title: patchResult.patched
-            ? (isPageObjectPatch
-                ? `🤖 Auto-Heal (shared Page Object): ${path.basename(filePath)}`
-                : `🤖 Auto-Heal: ${healing.test_name}`)
-            : `📋 Healing Suggestion: ${healing.test_name}`,
-          body: prBody,
-          labels: ['levelup-ai', 'auto-heal', 'test-fix'],
-        });
-
-        if (!pr) {
-          return res.status(500).json({ error: 'Branch was pushed but PR creation failed' });
-        }
-
-        // 8. Log PR to database
-        try {
-          await logPR({
-            job_id: `heal-${healingId}`,
-            pr_url: pr.url,
-            pr_number: pr.number,
-            branch_name: branchName,
-            commit_sha: commitSha,
-            repo_owner: parsed.owner,
-            repo_name: parsed.repo,
-            base_branch: baseBranch,
-            files_changed: files.map(f => f.filePath),
-            healing_count: 1,
-            status: 'open',
-          }, companyId);
-        } catch (dbErr) {
-          logger.warn(MOD, 'Failed to log PR to DB (non-critical)', { error: (dbErr as Error).message });
-        }
-
-        logger.info(MOD, 'Healing PR created successfully', {
-          healingId,
-          prUrl: pr.url,
-          prNumber: pr.number,
-          patched: patchResult.patched,
-        });
-
-        return res.json({
-          success: true,
-          data: {
-            healingId,
-            testName: healing.test_name,
-            patched: patchResult.patched,
-            patchDescription: patchResult.description,
-            github: {
-              prUrl: pr.url,
-              prNumber: pr.number,
-              branchName,
-              commitSha,
-              repoUrl: `https://github.com/${parsed.owner}/${parsed.repo}`,
-            },
-            files: files.map(f => f.filePath),
-          },
-        });
-      } finally {
-        // Cleanup
-        if (cloneDir) {
-          try { fs.rmSync(cloneDir, { recursive: true, force: true }); } catch { /* ok */ }
-        }
-      }
-    } catch (err: any) {
-      logger.error(MOD, 'Healing auto-commit failed', { healingId, error: err.message });
-      return res.status(500).json({
-        error: 'Failed to create healing PR',
-        details: err.message,
+      const data = await executeHealingPR({
+        patcher,
+        healings: [healing],
+        repositoryId,
+        companyId,
+        githubToken,
+        testFilePathOverride: testFilePath,
       });
+      return res.json({ success: true, data });
+    } catch (err: any) {
+      if (err instanceof HttpError) {
+        return res.status(err.status).json({ error: err.message });
+      }
+      logger.error(MOD, 'Healing auto-commit failed', { healingId, error: err.message });
+      return res.status(500).json({ error: 'Failed to create healing PR', details: err.message });
     }
   });
 
@@ -343,7 +207,434 @@ export function createHealingPRRouter(): Router {
 }
 
 /* -------------------------------------------------------------------------- */
-/*  Helpers                                                                   */
+/*  Job-scoped router — the frontend only knows the Job                       */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Mounted at /api/jobs. Exposes:
+ *   POST /api/jobs/:jobId/create-pr
+ *
+ * The frontend already shows a Job, so it should NOT have to know which
+ * healing ids belong to it. The backend owns that relationship:
+ *
+ *   Job → successful healings → group by file → patch → ONE PR.
+ *
+ * The repository is derived from the persisted job (its repository_url), so the
+ * body can be empty. An explicit `repositoryId` in the body still overrides,
+ * and `githubToken` is optional (falls back to GITHUB_TOKEN).
+ */
+export function createJobPRRouter(): Router {
+  const router = Router();
+  const patcher = new CodePatcher();
+
+  router.post('/:jobId/create-pr', async (req: Request, res: Response) => {
+    const jobId = String(req.params.jobId);
+    const companyId = (req as any).companyId;
+
+    try {
+      const { repositoryId, githubToken } = req.body || {};
+
+      // 1. The job owns the repo relationship.
+      const job = await getHealingJob(jobId, companyId);
+      if (!job) {
+        return res.status(404).json({ error: `Job not found: ${jobId}` });
+      }
+
+      // 2. Backend finds the job's successful healings — frontend stays dumb.
+      const healings = await getHealingActionsByJobId(jobId, companyId);
+      if (healings.length === 0) {
+        return res.status(404).json({ error: 'No healing actions found for this job' });
+      }
+
+      // 3. Resolve the repo to target: explicit override → repo row matched by
+      //    the job's stored URL → the job's raw URL + branch as a last resort.
+      let repo: ResolvedRepo | undefined;
+      if (!repositoryId) {
+        if (job.repository_url && companyId != null) {
+          const row = await getRepositoryByUrl(job.repository_url, companyId);
+          if (row?.url) repo = { url: row.url, branch: row.branch || job.branch || 'main' };
+        }
+        if (!repo && job.repository_url) {
+          repo = { url: job.repository_url, branch: job.branch || 'main' };
+        }
+        if (!repo) {
+          return res.status(400).json({
+            error:
+              'Could not resolve a repository for this job. Pass repositoryId explicitly in the body.',
+          });
+        }
+      }
+
+      const data = await executeHealingPR({
+        patcher,
+        healings,
+        repositoryId, // honoured only when repo is undefined
+        repo,
+        companyId,
+        githubToken,
+        jobId,
+      });
+      return res.json({ success: true, data });
+    } catch (err: any) {
+      if (err instanceof HttpError) {
+        return res.status(err.status).json({ error: err.message });
+      }
+      logger.error(MOD, 'Job healing PR failed', { jobId, error: err.message });
+      return res.status(500).json({ error: 'Failed to create healing PR', details: err.message });
+    }
+  });
+
+  return router;
+}
+
+/* -------------------------------------------------------------------------- */
+/*  Core: resolve files → apply fixes per file → ONE PR                       */
+/* -------------------------------------------------------------------------- */
+
+interface ResolvedRepo {
+  url: string;
+  branch: string;
+}
+
+/**
+ * Resolve the repository (url + branch) a PR should target. Callers may pass a
+ * numeric repositoryId (looked up + company-scoped) OR an already-resolved
+ * { url, branch } (used by the jobId path, which derives the repo from the
+ * persisted job). Throws HttpError with the right status on failure.
+ */
+async function resolveRepoForPR(opts: {
+  repositoryId?: number | string;
+  repo?: ResolvedRepo;
+  companyId: number | undefined;
+}): Promise<ResolvedRepo> {
+  if (opts.repo) {
+    if (!opts.repo.url) throw new HttpError(400, 'Resolved repository has no URL');
+    return { url: opts.repo.url, branch: opts.repo.branch || 'main' };
+  }
+  if (opts.repositoryId == null) {
+    throw new HttpError(400, 'repositoryId is required');
+  }
+  if (opts.companyId == null) throw new HttpError(401, 'Missing company context');
+  const row = await getRepository(Number(opts.repositoryId), opts.companyId);
+  if (!row) throw new HttpError(404, 'Repository not found');
+  if (!row.url) throw new HttpError(400, 'Repository has no URL configured');
+  return { url: row.url, branch: row.branch || 'main' };
+}
+
+async function executeHealingPR(opts: {
+  patcher: CodePatcher;
+  healings: any[];
+  repositoryId?: number | string;
+  /** Pre-resolved repo (jobId path). Takes precedence over repositoryId. */
+  repo?: ResolvedRepo;
+  companyId: number | undefined;
+  githubToken?: string;
+  /** Only honoured when committing a single healing. */
+  testFilePathOverride?: string;
+  /** Real owning job id — used for PR bookkeeping (pr_automations.job_id). */
+  jobId?: string;
+}): Promise<any> {
+  const { patcher, healings, companyId, githubToken, testFilePathOverride, jobId } = opts;
+
+  // 1. Keep only healings we can actually commit.
+  const committable = healings.filter((h) => h.success && h.healed_locator);
+  const skipped = healings
+    .filter((h) => !(h.success && h.healed_locator))
+    .map((h) => ({
+      healingId: h.id,
+      testName: h.test_name,
+      reason: !h.success ? 'healing was not successful' : 'no healed locator',
+    }));
+
+  if (committable.length === 0) {
+    throw new HttpError(
+      400,
+      'No committable healings — only successful healings with a healed locator can be turned into a PR.',
+    );
+  }
+
+  // 2. Resolve repository + token.
+  const repo = await resolveRepoForPR({
+    repositoryId: opts.repositoryId,
+    repo: opts.repo,
+    companyId,
+  });
+
+  const token = githubToken || process.env.GITHUB_TOKEN;
+  if (!token) {
+    throw new HttpError(
+      400,
+      'GitHub token required. Provide githubToken in request body or set GITHUB_TOKEN env variable.',
+    );
+  }
+
+  const parsed = GitHubService.parseRepoUrl(repo.url);
+  if (!parsed) throw new HttpError(400, `Cannot parse GitHub URL: ${repo.url}`);
+
+  const github = new GitHubService({ token, owner: parsed.owner, repo: parsed.repo });
+  const baseBranch = repo.branch || 'main';
+  const singleHealing = committable.length === 1;
+
+  // 3. Clone once, do all work, always clean up.
+  let cloneDir: string | null = null;
+  try {
+    cloneDir = await github.cloneRepo(baseBranch);
+    const resolver = createRepoPathResolver(cloneDir);
+
+    /* 3a. Map every committable healing → a repo-relative file path.        */
+    /*     fixesByFile preserves insertion order so reports read naturally.  */
+    const fixesByFile = new Map<string, Array<{ healing: any; fix: HealingFix; isPageObject: boolean }>>();
+
+    for (const healing of committable) {
+      const isPageObject = healing.is_page_object_patch === true && !!healing.target_file_path;
+
+      let filePath: string | null = null;
+      if (isPageObject) {
+        // Patch the shared Page Object — one edit repairs every dependent test.
+        filePath = resolver.toRepoRelative(healing.target_file_path);
+        if (!filePath) {
+          skipped.push({
+            healingId: healing.id,
+            testName: healing.test_name,
+            reason: `Page Object target "${healing.target_file_path}" not found in repo`,
+          });
+          continue;
+        }
+      } else if (singleHealing && testFilePathOverride) {
+        filePath = testFilePathOverride;
+      } else if (healing.target_file_path) {
+        // Prefer the exact file captured from the failure stack when present.
+        filePath = resolver.toRepoRelative(healing.target_file_path) || null;
+      }
+
+      if (!filePath) {
+        filePath = await findTestFile(cloneDir, healing.test_name);
+      }
+      if (!filePath) {
+        skipped.push({
+          healingId: healing.id,
+          testName: healing.test_name,
+          reason: 'Could not locate the test/source file in the repo',
+        });
+        continue;
+      }
+
+      const absPath = path.join(cloneDir, filePath);
+      if (!fs.existsSync(absPath)) {
+        skipped.push({
+          healingId: healing.id,
+          testName: healing.test_name,
+          reason: `Resolved file does not exist: ${filePath}`,
+        });
+        continue;
+      }
+
+      const fix: HealingFix = {
+        testName: healing.test_name,
+        failedLocator: healing.failed_locator,
+        healedLocator: healing.healed_locator,
+        strategy: healing.healing_strategy,
+        confidence: healing.confidence || 0,
+        filePath,
+      };
+
+      if (!fixesByFile.has(filePath)) fixesByFile.set(filePath, []);
+      fixesByFile.get(filePath)!.push({ healing, fix, isPageObject });
+    }
+
+    if (fixesByFile.size === 0) {
+      throw new HttpError(
+        400,
+        `Could not locate any target file for the requested healing(s). ` +
+          `Provide testFilePath (single healing) or ensure the repository matches the tested code.`,
+      );
+    }
+
+    /* 3b. Apply every fix for a file to THAT file's content, in sequence.   */
+    const fileOutcomes: FileOutcome[] = [];
+    const commitFiles: CommitFileSpec[] = [];
+
+    for (const [filePath, entries] of fixesByFile) {
+      const absPath = path.join(cloneDir, filePath);
+      const originalCode = fs.readFileSync(absPath, 'utf-8');
+
+      let current = originalCode;
+      let totalReplacements = 0;
+      const fixOutcomes: FixOutcome[] = [];
+
+      for (const { healing, fix } of entries) {
+        const result = patcher.applyHealingFix(current, fix);
+        if (result.patched) {
+          current = result.patchedCode;
+          totalReplacements += result.replacements;
+        }
+        fixOutcomes.push({
+          healingId: healing.id,
+          testName: fix.testName,
+          failedLocator: fix.failedLocator,
+          healedLocator: fix.healedLocator,
+          strategy: fix.strategy,
+          confidence: fix.confidence,
+          patched: result.patched,
+          replacements: result.replacements,
+          description: result.description,
+        });
+      }
+
+      const changed = current !== originalCode;
+      if (changed) {
+        commitFiles.push({ filePath, content: current });
+      }
+      fileOutcomes.push({
+        filePath,
+        isPageObject: entries.some((e) => e.isPageObject),
+        changed,
+        totalReplacements,
+        fixes: fixOutcomes,
+      });
+    }
+
+    const patchedCount = fileOutcomes.reduce(
+      (n, f) => n + f.fixes.filter((x) => x.patched).length,
+      0,
+    );
+    const changedFiles = fileOutcomes.filter((f) => f.changed).map((f) => f.filePath);
+
+    // 4. Always include a combined healing report (gives manual instructions
+    //    even when a selector could not be auto-patched).
+    const timestamp = Date.now();
+    const reportName = singleHealing
+      ? `healing-report-${committable[0].id}.md`
+      : `healing-report-batch-${timestamp}.md`;
+    const reportPath = `healing-reports/${reportName}`;
+    commitFiles.push({
+      filePath: reportPath,
+      content: generateCombinedReport(fileOutcomes, skipped),
+    });
+
+    // 5. Branch name.
+    const branchName = singleHealing
+      ? `heal/${slug(committable[0].test_name)}-${timestamp}`
+      : `heal/batch-${changedFiles.length || fileOutcomes.length}-files-${timestamp}`;
+
+    // 6. Write files, commit, push, PR — using one cloned worktree.
+    for (const f of commitFiles) {
+      const abs = path.join(cloneDir, f.filePath);
+      fs.mkdirSync(path.dirname(abs), { recursive: true });
+      fs.writeFileSync(abs, f.content, 'utf-8');
+    }
+
+    const git = (args: string) =>
+      execSync(`git ${args}`, { cwd: cloneDir!, encoding: 'utf-8', timeout: 30_000 }).trim();
+
+    git('config user.email "bot@leveluptesting.in"');
+    git('config user.name "LevelUp AI Bot"');
+    try {
+      git(`checkout -b ${branchName}`);
+    } catch {
+      git(`checkout ${branchName}`);
+    }
+    git('add -A');
+    const status = git('status --porcelain');
+    if (!status) {
+      return {
+        message: 'No changes to commit — the fix(es) may already be applied on the base branch.',
+        patchedCount,
+        changedFiles,
+        skipped,
+      };
+    }
+
+    const commitMsg = buildCommitMessage(fileOutcomes, patchedCount, changedFiles.length);
+    git(`commit -m "${commitMsg.replace(/"/g, '\\"')}"`);
+    const commitSha = git('rev-parse HEAD');
+    git(`push -u origin ${branchName}`);
+
+    const pr = await github.createPR(branchName, baseBranch, {
+      title: buildPRTitle(fileOutcomes, changedFiles.length, patchedCount),
+      body: generateCombinedPRBody(fileOutcomes, skipped, baseBranch),
+      labels: ['levelup-ai', 'auto-heal', 'test-fix'],
+    });
+    if (!pr) {
+      throw new HttpError(500, 'Branch was pushed but PR creation failed');
+    }
+
+    // 7. Persist the PR linkage. PR metadata is stored ONCE in pr_automations
+    //    (the single source of truth, keyed by the REAL owning job id when we
+    //    have it). Each healing_action that landed in this PR then just
+    //    references that row via its pr_automation_id FK — no duplicated
+    //    pr_url/number/status, and a later status change (open→merged→closed)
+    //    is a single pr_automations update. Dashboard joins through the FK.
+    const patchedHealingIds = fileOutcomes
+      .flatMap((f) => f.fixes)
+      .filter((fx) => fx.patched)
+      .map((fx) => fx.healingId);
+
+    try {
+      const prAutomationId = await logPR(
+        {
+          job_id: jobId || (singleHealing ? `heal-${committable[0].id}` : `heal-batch-${timestamp}`),
+          pr_url: pr.url,
+          pr_number: pr.number,
+          branch_name: branchName,
+          commit_sha: commitSha,
+          repo_owner: parsed.owner,
+          repo_name: parsed.repo,
+          base_branch: baseBranch,
+          files_changed: commitFiles.map((f) => f.filePath),
+          healing_count: patchedCount,
+          status: 'open',
+        },
+        companyId,
+      );
+      await linkHealingActionsToPR(patchedHealingIds, prAutomationId);
+    } catch (dbErr) {
+      logger.warn(MOD, 'Failed to persist PR linkage to DB (non-critical)', {
+        error: (dbErr as Error).message,
+      });
+    }
+
+    logger.info(MOD, 'Healing PR created', {
+      prUrl: pr.url,
+      prNumber: pr.number,
+      files: changedFiles.length,
+      patchedCount,
+      skipped: skipped.length,
+    });
+
+    return {
+      patchedCount,
+      changedFiles,
+      skipped,
+      files: fileOutcomes.map((f) => ({
+        filePath: f.filePath,
+        changed: f.changed,
+        isPageObject: f.isPageObject,
+        replacements: f.totalReplacements,
+        fixes: f.fixes,
+      })),
+      github: {
+        prUrl: pr.url,
+        prNumber: pr.number,
+        branchName,
+        commitSha,
+        baseBranch,
+        repoUrl: `https://github.com/${parsed.owner}/${parsed.repo}`,
+      },
+    };
+  } finally {
+    if (cloneDir) {
+      try {
+        fs.rmSync(cloneDir, { recursive: true, force: true });
+      } catch {
+        /* ok */
+      }
+    }
+  }
+}
+
+/* -------------------------------------------------------------------------- */
+/*  DB helpers                                                                */
 /* -------------------------------------------------------------------------- */
 
 async function getHealingAction(id: number): Promise<any | null> {
@@ -356,6 +647,20 @@ async function getHealingAction(id: number): Promise<any | null> {
     [id],
   );
   return rows[0] || null;
+}
+
+async function getHealingActionsByIds(ids: number[]): Promise<any[]> {
+  if (ids.length === 0) return [];
+  const pool = getPool();
+  const { rows } = await pool.query(
+    `SELECT ha.*, te.test_name AS exec_test_name, te.duration_ms
+     FROM healing_actions ha
+     LEFT JOIN test_executions te ON ha.test_execution_id = te.id
+     WHERE ha.id = ANY($1::int[])
+     ORDER BY ha.id ASC`,
+    [ids],
+  );
+  return rows;
 }
 
 /**
@@ -377,10 +682,6 @@ async function findTestFile(repoDir: string, testName: string): Promise<string |
     }
 
     // Strategy 2: Fuzzy match on filename
-    const safeName = testName
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, '*');
-
     const findResult = execSync(
       `find . -type f \\( -name "*.spec.ts" -o -name "*.test.ts" -o -name "*.spec.js" -o -name "*.test.js" \\) 2>/dev/null | head -20`,
       { cwd: repoDir, encoding: 'utf-8', timeout: 10_000 },
@@ -389,10 +690,10 @@ async function findTestFile(repoDir: string, testName: string): Promise<string |
     if (findResult) {
       const files = findResult.split('\n').filter(Boolean);
       // Try to find a file that partially matches the test name
-      const words = testName.toLowerCase().split(/\s+/).filter(w => w.length > 3);
+      const words = testName.toLowerCase().split(/\s+/).filter((w) => w.length > 3);
       for (const f of files) {
         const fname = f.toLowerCase();
-        if (words.some(w => fname.includes(w))) {
+        if (words.some((w) => fname.includes(w))) {
           return f.replace(/^\.\//, '');
         }
       }
@@ -407,143 +708,153 @@ async function findTestFile(repoDir: string, testName: string): Promise<string |
 }
 
 /* -------------------------------------------------------------------------- */
-/*  PR Body Generator                                                         */
+/*  Small formatting helpers                                                  */
 /* -------------------------------------------------------------------------- */
 
-function generateHealingPRBody(healing: any, fix: HealingFix, patchResult: any): string {
-  const confidence = Math.round((healing.confidence || 0) * 100);
-  const strategyEmoji: Record<string, string> = {
-    rule_based: '⚙️ Rule Engine',
-    pattern_match: '🧠 Pattern Engine',
-    ai: '🤖 AI Engine',
-  };
-  const strategyLabel = strategyEmoji[healing.healing_strategy] || healing.healing_strategy;
-  const isPO = healing.is_page_object_patch === true && !!healing.target_file_path;
-  const impact = Number(healing.page_object_impact) || 0;
-  const poRow = isPO
-    ? `| **Patch Target** | 🧩 Shared Page Object \`${fix.filePath}\`${impact > 0 ? ` — fixes ${impact} dependent test(s)` : ''} |\n`
-    : '';
-  const poCallout = isPO
-    ? `\n### 🧩 Repo Intelligence — Patched a Shared Page Object\n\n` +
-      `The broken selector lived inside a shared Page Object / helper, not an individual spec. ` +
-      `Patching this one file (\`${fix.filePath}\`) repairs **every test that depends on it**` +
-      `${impact > 0 ? ` — an estimated **${impact} test(s)** in one change` : ''}. ` +
-      `This is more durable than editing each spec separately.\n`
-    : '';
+function slug(s: string): string {
+  return s
+    .replace(/[^a-zA-Z0-9]/g, '-')
+    .replace(/-+/g, '-')
+    .toLowerCase()
+    .replace(/^-|-$/g, '')
+    .slice(0, 40);
+}
+
+const STRATEGY_LABEL: Record<string, string> = {
+  rule_based: '⚙️ Rule Engine',
+  pattern_match: '🧠 Pattern Engine',
+  ai: '🤖 AI Engine',
+};
+
+function labelFor(strategy: string): string {
+  return STRATEGY_LABEL[strategy] || strategy;
+}
+
+function buildCommitMessage(files: FileOutcome[], patchedCount: number, changedFiles: number): string {
+  if (changedFiles <= 1 && files.length === 1 && files[0].fixes.length === 1) {
+    const f = files[0];
+    const fx = f.fixes[0];
+    const subject = f.isPageObject
+      ? `🤖 fix: auto-heal broken selector in shared Page Object (${path.basename(f.filePath)})`
+      : `🤖 fix: auto-heal broken selector in "${fx.testName}"`;
+    return `${subject}\n\nStrategy: ${fx.strategy}\nConfidence: ${Math.round(fx.confidence * 100)}%\n\n- Old: ${fx.failedLocator}\n- New: ${fx.healedLocator}\n\nGenerated by LevelUp AI Self-Healing Engine`;
+  }
+  const lines = files
+    .filter((f) => f.changed)
+    .map((f) => `- ${f.filePath} (${f.fixes.filter((x) => x.patched).length} fix(es))`)
+    .join('\n');
+  return `🤖 fix: auto-heal ${patchedCount} broken selector(s) across ${changedFiles} file(s)\n\n${lines}\n\nGenerated by LevelUp AI Self-Healing Engine`;
+}
+
+function buildPRTitle(files: FileOutcome[], changedFiles: number, patchedCount: number): string {
+  if (files.length === 1 && files[0].fixes.length === 1) {
+    const f = files[0];
+    if (!f.changed) return `📋 Healing Suggestion: ${f.fixes[0].testName}`;
+    return f.isPageObject
+      ? `🤖 Auto-Heal (shared Page Object): ${path.basename(f.filePath)}`
+      : `🤖 Auto-Heal: ${f.fixes[0].testName}`;
+  }
+  return `🤖 Auto-Heal: ${patchedCount} selector fix(es) across ${changedFiles} file(s)`;
+}
+
+/* -------------------------------------------------------------------------- */
+/*  PR body + report generators (handle 1..N files)                          */
+/* -------------------------------------------------------------------------- */
+
+function generateCombinedPRBody(files: FileOutcome[], skipped: any[], baseBranch: string): string {
+  const totalFixes = files.reduce((n, f) => n + f.fixes.length, 0);
+  const patched = files.reduce((n, f) => n + f.fixes.filter((x) => x.patched).length, 0);
+  const changed = files.filter((f) => f.changed);
+
+  const fileSections = files
+    .map((f) => {
+      const poNote = f.isPageObject
+        ? ' 🧩 _shared Page Object — repairs every dependent test_'
+        : '';
+      const diffs = f.fixes
+        .map(
+          (fx) =>
+            `\`\`\`diff\n- ${fx.failedLocator}\n+ ${fx.healedLocator}\n\`\`\`\n` +
+            `${fx.patched ? `✅ ${fx.replacements} replacement(s)` : '⚠️ not auto-patched — apply manually'} · ${labelFor(fx.strategy)} · ${Math.round(fx.confidence * 100)}% · healing #${fx.healingId}`,
+        )
+        .join('\n\n');
+      return `#### \`${f.filePath}\`${poNote}\n\n${diffs}`;
+    })
+    .join('\n\n');
+
+  const skippedSection =
+    skipped.length > 0
+      ? `\n### ⏭️ Skipped (${skipped.length})\n\n` +
+        skipped.map((s) => `- healing #${s.healingId} — ${s.reason}`).join('\n') +
+        '\n'
+      : '';
 
   return `## 🤖 LevelUp AI — Automated Healing Fix
 
-> This PR was automatically generated by [LevelUp AI QA](https://app.leveluptesting.in) Self-Healing Engine.
+> This PR was automatically generated by the LevelUp AI QA Self-Healing Engine.
+> It targets \`${baseBranch}\` for **manual review and merge** — nothing is merged automatically.
 
 ### 📋 Summary
 
 | Field | Value |
 |-------|-------|
-| **Test Name** | \`${healing.test_name}\` |
-| **Healing ID** | #${healing.id} |
-| **Strategy** | ${strategyLabel} |
-| **Confidence** | ${confidence}% |
-${poRow}| **Status** | ${patchResult.patched ? '✅ Auto-patched' : '📋 Suggestion only'} |
-${poCallout}
-### 🔧 What Changed
+| **Files changed** | ${changed.length} |
+| **Selectors healed** | ${patched} / ${totalFixes} |
+| **Status** | ${patched === totalFixes ? '✅ all auto-patched' : patched > 0 ? '⚠️ partial — some need manual fixes' : '📋 suggestion only'} |
 
-\`\`\`diff
-- ${healing.failed_locator}
-+ ${healing.healed_locator}
-\`\`\`
+### 🔧 Changes by file
 
-${patchResult.patched
-    ? `**${patchResult.replacements} replacement(s)** applied automatically.`
-    : `⚠️ **Auto-patch could not be applied.** The selector was not found in the expected format. Please apply the fix manually.`
-  }
-
-${patchResult.description ? `**Details:** ${patchResult.description}` : ''}
-
-### 🔍 Root Cause
-
-${healing.error_context
-    ? `\`\`\`\n${healing.error_context.slice(0, 500)}\n\`\`\``
-    : 'Error context not available.'
-  }
-
-### ✅ Validation
-
-- ${healing.validation_status === 'passed' ? '✅' : '⚠️'} Validation Status: **${healing.validation_status || 'unknown'}**
-${healing.validation_reason ? `- ${healing.validation_reason}` : ''}
-- Confidence Score: **${confidence}%**
-
+${fileSections}
+${skippedSection}
 ### 🧪 How to Verify
 
-1. Pull this branch
-2. Run the affected test: \`npx playwright test --grep "${healing.test_name.slice(0, 60)}"\`
-3. Verify the test passes with the new selector
-4. Check that no other tests are affected
-
-### 🤖 How It Works
-
-1. **Detect** — Test runs and failure is captured with full DOM context
-2. **Analyze** — ${strategyLabel} analyzes the failure pattern
-3. **Heal** — A new locator is generated with ${confidence}% confidence
-4. **Validate** — The healed locator is verified for existence, uniqueness, and interactability
-5. **PR** — This automated PR is created for human review
+1. Pull this branch.
+2. Run the affected tests, e.g. \`npx playwright test\`.
+3. Confirm the previously-broken selectors now pass and no other tests regress.
 
 ---
 
-> ⚠️ **Review recommended** — While this fix has been validated by the AI engine, please review the selector change before merging.
+> ⚠️ **Review recommended** — these fixes were validated by the healing engine, but please review the selector change(s) before merging to \`${baseBranch}\`.
 >
-> 🏷️ *Generated by LevelUp AI Self-Healing Engine • Healing #${healing.id}*
+> 🏷️ *Generated by LevelUp AI Self-Healing Engine*
 `;
 }
 
-/* -------------------------------------------------------------------------- */
-/*  Healing Report Generator                                                  */
-/* -------------------------------------------------------------------------- */
+function generateCombinedReport(files: FileOutcome[], skipped: any[]): string {
+  const totalFixes = files.reduce((n, f) => n + f.fixes.length, 0);
+  const patched = files.reduce((n, f) => n + f.fixes.filter((x) => x.patched).length, 0);
 
-function generateHealingReport(healing: any, fix: HealingFix, patchResult: any): string {
-  const confidence = Math.round((healing.confidence || 0) * 100);
-  const isPO = healing.is_page_object_patch === true && !!healing.target_file_path;
-  const impact = Number(healing.page_object_impact) || 0;
-  const poSection = isPO
-    ? `\n## 🧩 Repo Intelligence — Shared Page Object\n\n` +
-      `The broken selector lived inside a shared Page Object / helper (\`${fix.filePath}\`), ` +
-      `so this single patch repairs **every dependent test**` +
-      `${impact > 0 ? ` (≈ ${impact} test(s))` : ''} rather than one spec.\n`
-    : '';
+  const fileSections = files
+    .map((f) => {
+      const rows = f.fixes
+        .map(
+          (fx) =>
+            `| \`${fx.failedLocator}\` | \`${fx.healedLocator}\` | ${fx.strategy} | ${Math.round(
+              fx.confidence * 100,
+            )}% | ${fx.patched ? `✅ ${fx.replacements}` : '⚠️ manual'} | #${fx.healingId} |`,
+        )
+        .join('\n');
+      return (
+        `## ${f.filePath}${f.isPageObject ? ' (shared Page Object)' : ''}\n\n` +
+        `${f.changed ? `✅ Auto-patched — ${f.totalReplacements} replacement(s).` : '⚠️ No change applied — apply the fix(es) below manually.'}\n\n` +
+        `| Before | After | Strategy | Confidence | Patched | Healing |\n` +
+        `|--------|-------|----------|------------|---------|---------|\n${rows}\n`
+      );
+    })
+    .join('\n');
 
-  return `# Healing Report — ${healing.test_name}
+  const skippedSection =
+    skipped.length > 0
+      ? `\n## Skipped\n\n${skipped.map((s) => `- healing #${s.healingId} (${s.testName || 'unknown'}) — ${s.reason}`).join('\n')}\n`
+      : '';
+
+  return `# Healing Report
 
 **Generated:** ${new Date().toISOString()}
-**Healing ID:** ${healing.id}
-**Strategy:** ${healing.healing_strategy}
-**Confidence:** ${confidence}%
-${isPO ? `**Patch Target:** Shared Page Object \`${fix.filePath}\`${impact > 0 ? ` (fixes ${impact} test(s))` : ''}\n` : ''}${poSection}
-## Selector Change
+**Files:** ${files.length}
+**Selectors healed:** ${patched} / ${totalFixes}
 
-| | Selector |
-|---|---|
-| **Before (broken)** | \`${healing.failed_locator}\` |
-| **After (healed)** | \`${healing.healed_locator}\` |
-
-## Patch Status
-
-${patchResult.patched
-    ? `✅ **Auto-patched successfully** — ${patchResult.replacements} replacement(s) made.`
-    : `⚠️ **Manual fix needed** — The auto-patcher could not find the exact selector in the source code.`
-  }
-
-${patchResult.description}
-
-## Error Context
-
-\`\`\`
-${healing.error_context || 'Not available'}
-\`\`\`
-
-## Validation
-
-- Status: ${healing.validation_status || 'unknown'}
-- Reason: ${healing.validation_reason || 'N/A'}
-
+${fileSections}${skippedSection}
 ---
 
 *Generated by LevelUp AI Self-Healing Engine*
