@@ -108,21 +108,41 @@ function buildAttrSelector(tag: string, attr: string, val: string): string {
  * Returns null when the element has no stable hook (caller keeps its fuzzy match).
  */
 function bestStableSelector(
-  tag: string,
+  _tag: string,
   attributes: Record<string, string>,
 ): { selector: string; attr: string } | null {
+  const [best] = allStableSelectors(attributes);
+  return best ? { selector: best.selector, attr: best.attr } : null;
+}
+
+/**
+ * Every stable hook an element exposes, in priority order
+ * (data-testid → data-test/cy/qa → non-dynamic id). Unlike {@link bestStableSelector},
+ * this returns ALL of them so the caller can surface each as its own grounded
+ * candidate and let the Validation layer (browser rerun) — not a single
+ * "most stable" heuristic — decide the winner.
+ *
+ * This restores the pre-regression behaviour where a broken `#username` against
+ * `<input id="user-name" data-test="username">` surfaced BOTH
+ * `[data-test="username"]` AND `#user-name` before validation, instead of the
+ * single-selector collapse that dropped the id form.
+ */
+function allStableSelectors(
+  attributes: Record<string, string>,
+): Array<{ selector: string; attr: string; baseScore: number }> {
+  const hooks: Array<{ selector: string; attr: string; baseScore: number }> = [];
   if (attributes['data-testid']) {
-    return { selector: `page.getByTestId('${attributes['data-testid']}')`, attr: 'data-testid' };
+    hooks.push({ selector: `page.getByTestId('${attributes['data-testid']}')`, attr: 'data-testid', baseScore: 0.94 });
   }
   for (const attr of ['data-test', 'data-cy', 'data-qa']) {
     if (attributes[attr]) {
-      return { selector: `page.locator('[${attr}="${attributes[attr]}"]')`, attr };
+      hooks.push({ selector: `page.locator('[${attr}="${attributes[attr]}"]')`, attr, baseScore: 0.93 });
     }
   }
   if (attributes['id'] && !isDynamicId(attributes['id'])) {
-    return { selector: `#${attributes['id']}`, attr: 'id' };
+    hooks.push({ selector: `#${attributes['id']}`, attr: 'id', baseScore: 0.9 });
   }
-  return null;
+  return hooks;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -287,9 +307,10 @@ export class DOMCandidateExtractor {
 
         const element = { tag, attributes, textContent, nearbyLabel };
 
-        // Score this candidate against the failed locator
-        const scored = this.scoreCandidate(element, parsed);
-        if (scored) {
+        // Score this candidate against the failed locator. A single confidently
+        // matched element can yield MORE THAN ONE grounded candidate (e.g. its
+        // data-test hook AND its id), so the validator gets the full set.
+        for (const scored of this.scoreCandidate(element, parsed)) {
           candidates.push(scored);
         }
       }
@@ -383,7 +404,7 @@ export class DOMCandidateExtractor {
   private scoreCandidate(
     element: { tag: string; attributes: Record<string, string>; textContent: string; nearbyLabel: string },
     parsed: ParsedLocator,
-  ): DOMCandidate | null {
+  ): DOMCandidate[] {
     const { attributes, tag } = element;
     let bestScore = 0;
     let bestSelector = '';
@@ -391,7 +412,7 @@ export class DOMCandidateExtractor {
     let bestMatchType: DOMCandidate['matchType'] = 'structural';
 
     const failedValue = parsed.value.toLowerCase();
-    if (!failedValue) return null;
+    if (!failedValue) return [];
 
     // Strategy 1: Same attribute type, similar value (HIGHEST PRIORITY)
     if (parsed.attribute && parsed.attribute !== 'class' && parsed.attribute !== 'label') {
@@ -461,27 +482,58 @@ export class DOMCandidateExtractor {
       }
     }
 
-    if (bestScore < 0.45) return null;
+    if (bestScore < 0.45) return [];
 
-    // Stabilize: once we've confidently identified the target element, prefer
-    // the MOST STABLE selector that element actually exposes (data-testid >
-    // data-test/cy/qa > non-dynamic id) over a fuzzy name/value match. This is
-    // what turns "guessed getByRole('button', { name: 'Log in' })" into the
-    // rock-solid "[data-test='login-button']" the element really has.
-    const stable = bestStableSelector(tag, attributes);
-    if (stable && stable.selector !== bestSelector) {
-      bestReasoning = `${bestReasoning}; stabilized to ${stable.attr} → ${stable.selector}`;
-      bestSelector = stable.selector;
-      bestMatchType = 'exact_attribute';
-      bestScore = Math.max(bestScore, 0.92); // stable hooks are reliable
+    const round = (n: number): number => Math.round(n * 100) / 100;
+    const out: DOMCandidate[] = [];
+    const seenSelectors = new Set<string>();
+
+    // Stabilize (ADDITIVE): once we've confidently identified the target
+    // element, surface EVERY stable hook it actually exposes (data-testid >
+    // data-test/cy/qa > non-dynamic id) as its own grounded candidate — most
+    // stable first — and keep the original fuzzy/semantic match too. The
+    // Validation layer (browser rerun) then decides the winner.
+    //
+    // Why additive (and not the old single "most stable" collapse): for
+    // `<input id="user-name" data-test="username">` a broken `#username` must
+    // surface BOTH `[data-test="username"]` AND `#user-name` before validation.
+    // Collapsing to one selector silently dropped the id form and shrank the
+    // candidate set the validator could choose from.
+    const stableHooks = allStableSelectors(attributes);
+    stableHooks.forEach((hook, idx) => {
+      if (seenSelectors.has(hook.selector)) return;
+      seenSelectors.add(hook.selector);
+      // The most-stable hook inherits the match confidence (it IS the grounded
+      // target); alternatives keep their own stability base score so ranking
+      // stays deterministic (data-test above id, etc.).
+      const score = idx === 0 ? Math.max(bestScore, hook.baseScore) : hook.baseScore;
+      out.push({
+        selector: hook.selector,
+        score: round(score),
+        reasoning:
+          idx === 0
+            ? `${bestReasoning}; grounded to stable ${hook.attr} hook → ${hook.selector}`
+            : `Alternative stable ${hook.attr} hook on the same element → ${hook.selector}`,
+        matchType: 'exact_attribute',
+        element,
+      });
+    });
+
+    // Keep the original fuzzy/semantic match ONLY when the element exposed no
+    // stable hook at all (e.g. a getByRole/getByText/getByLabel match for an
+    // element with no test hook or id). When stable hooks exist they fully and
+    // more reliably represent the element, so we don't also emit the noisier raw
+    // attribute form (e.g. `input[id="user-name"]` alongside `#user-name`).
+    if (out.length === 0 && !seenSelectors.has(bestSelector)) {
+      out.push({
+        selector: bestSelector,
+        score: round(bestScore),
+        reasoning: bestReasoning,
+        matchType: bestMatchType,
+        element,
+      });
     }
 
-    return {
-      selector: bestSelector,
-      score: Math.round(bestScore * 100) / 100,
-      reasoning: bestReasoning,
-      matchType: bestMatchType,
-      element,
-    };
+    return out;
   }
 }

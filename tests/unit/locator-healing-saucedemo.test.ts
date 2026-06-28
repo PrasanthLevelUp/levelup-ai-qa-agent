@@ -104,5 +104,41 @@ check('username placeholder grounds to a stable hook',
   !!userTop && (userTop.selector === `page.locator('[data-test="username"]')` || userTop.selector === '#user-name'),
   userTop ? userTop.selector : 'none');
 
+console.log('\n=== 4. Additive grounding (regression: id form must not be dropped) ===');
+
+// A broken `#username` against `<input id="user-name" data-test="username">`
+// MUST surface BOTH the data-test hook AND the #user-name id form before
+// validation. A prior "stabilize to the single most-stable selector" step
+// collapsed each element to one selector and silently dropped the id candidate,
+// shrinking the set the validator could choose from. Grounding is now additive.
+const dualRes = extractor.extractFromHTML(
+  loginDom,
+  '#username',
+  "await page.fill('#username', 'standard_user');",
+);
+const dualSelectors = dualRes.candidates.map((c) => c.selector);
+check('broken #username surfaces the [data-test="username"] candidate',
+  dualSelectors.includes(`page.locator('[data-test="username"]')`),
+  dualSelectors.join(', '));
+check('broken #username ALSO surfaces the #user-name id candidate (restored)',
+  dualSelectors.includes('#user-name'),
+  dualSelectors.join(', '));
+check('data-test hook still ranks above the id hook',
+  dualSelectors.indexOf(`page.locator('[data-test="username"]')`) <
+    dualSelectors.indexOf('#user-name'),
+  dualSelectors.join(', '));
+
+// Elements with no stable hook still fall back to the fuzzy/semantic match
+// (additive grounding must not suppress semantic-only candidates).
+const semanticDom = `<html><body><button>Submit Order</button></body></html>`;
+const semRes = extractor.extractFromHTML(
+  semanticDom,
+  "page.getByRole('button', { name: 'Submit Ordr' })",
+  '',
+);
+check('semantic-only element still yields a candidate',
+  semRes.candidates.length > 0,
+  `count=${semRes.candidates.length}`);
+
 console.log(`\n=== Results: ${passed} passed, ${failed} failed ===`);
 if (failed > 0) process.exit(1);
