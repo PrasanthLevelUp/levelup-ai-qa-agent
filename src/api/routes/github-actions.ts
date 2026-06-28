@@ -128,14 +128,26 @@ export function createGitHubActionsRouter(): Router {
    */
   router.get('/check-pr-access', async (req: Request, res: Response) => {
     try {
+      const companyId = (req as any).companyId as number | undefined;
+      const userId = (req as any).userId as number | undefined;
       const target = resolveOwnerRepo(req.query, res);
       if (!target) return; // resolveOwnerRepo already wrote the 400
 
-      // Resolve the token EXACTLY like executeHealingPR does.
+      // Resolve the token EXACTLY like executeHealingPR does, in the same order:
+      //   1. explicit githubToken  2. connected Tools-page token (DB)  3. env
       const bodyToken = req.query.githubToken ? String(req.query.githubToken) : '';
-      const envToken = process.env.GITHUB_TOKEN || '';
-      const rawToken = bodyToken || envToken;
-      const tokenSource = bodyToken ? 'request' : envToken ? 'env' : 'none';
+      let rawToken = bodyToken;
+      let tokenSource: string = bodyToken ? 'request' : 'none';
+      if (!rawToken) {
+        try {
+          const connected = await github.getToken(companyId, userId);
+          if (connected) { rawToken = connected; tokenSource = 'connected-tools-token'; }
+        } catch { /* ignore — fall through to env */ }
+      }
+      if (!rawToken && process.env.GITHUB_TOKEN) {
+        rawToken = process.env.GITHUB_TOKEN;
+        tokenSource = 'env';
+      }
 
       const gh = new PRGitHubService({ token: rawToken, owner: target.owner, repo: target.repo });
       const access = await gh.verifyAccess();
