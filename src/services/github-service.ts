@@ -55,9 +55,23 @@ export class GitHubService {
   private readonly repo: string;
 
   constructor(config: GitHubConfig) {
-    this.token = config.token;
+    // Trim defensively: env vars frequently arrive with a trailing newline or
+    // surrounding whitespace (copy-paste, Railway/Heroku UI, `.env` quoting).
+    // An untrimmed token produces the SAME opaque git failure as an empty one
+    // ("Password authentication is not supported"), so normalise once here.
+    this.token = (config.token || '').trim();
     this.owner = config.owner;
     this.repo = config.repo;
+  }
+
+  /** True when a usable (non-empty, trimmed) token is present. */
+  get hasToken(): boolean {
+    return this.token.length > 0;
+  }
+
+  /** Token length only — safe to log for diagnosing empty/whitespace tokens. */
+  get tokenLength(): number {
+    return this.token.length;
   }
 
   /* ── helpers ──────────────────────────────────────────────── */
@@ -79,6 +93,68 @@ export class GitHubService {
   }
 
   /* ── public API ──────────────────────────────────────────── */
+
+  /**
+   * Pre-flight check: confirm the configured token can authenticate AND has
+   * push (write) permission to the target repo BEFORE we spend time cloning,
+   * patching and committing.
+   *
+   * This exists because a PUBLIC repo can be cloned with an invalid/expired
+   * token (git ignores the bad creds for anonymous read), so the failure only
+   * surfaces much later at `git push` with the opaque message
+   * "Password authentication is not supported". Failing fast here lets us
+   * return a clear, actionable error to the caller instead.
+   *
+   * Returns `{ ok: true }` on success, or `{ ok: false, reason }` describing
+   * exactly what is wrong (missing token, bad token, or no push permission).
+   */
+  async verifyAccess(): Promise<{ ok: true } | { ok: false; status: number; reason: string }> {
+    if (!this.token) {
+      return { ok: false, status: 400, reason: 'No GitHub token configured.' };
+    }
+    try {
+      const res = await axios.get(
+        `https://api.github.com/repos/${this.owner}/${this.repo}`,
+        { headers: this.headers, timeout: 15_000 },
+      );
+      const perms = res.data?.permissions || {};
+      if (perms.push === true || perms.admin === true || perms.maintain === true) {
+        return { ok: true };
+      }
+      return {
+        ok: false,
+        status: 403,
+        reason:
+          `The configured GitHub token can read ${this.owner}/${this.repo} but does NOT have ` +
+          `push permission. Use a token (or GitHub App installation) with write access to this repo.`,
+      };
+    } catch (err: any) {
+      const status = err?.response?.status;
+      if (status === 401) {
+        return {
+          ok: false,
+          status: 401,
+          reason:
+            'The configured GitHub token is invalid or expired. Update GITHUB_TOKEN on the ' +
+            'backend (or pass a valid githubToken) with push access to the target repo.',
+        };
+      }
+      if (status === 404) {
+        return {
+          ok: false,
+          status: 404,
+          reason:
+            `Repository ${this.owner}/${this.repo} not found, or the token cannot see it. ` +
+            'For a private repo the token needs repo scope / installation access.',
+        };
+      }
+      return {
+        ok: false,
+        status: status || 500,
+        reason: `Could not verify GitHub access: ${err?.message || 'unknown error'}`,
+      };
+    }
+  }
 
   /**
    * Clone the repo into a temporary directory.

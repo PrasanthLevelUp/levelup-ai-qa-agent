@@ -375,6 +375,15 @@ async function executeHealingPR(opts: {
   const baseBranch = repo.branch || 'main';
   const singleHealing = committable.length === 1;
 
+  // 2b. Pre-flight: fail FAST with a clear, actionable message if the token
+  //     cannot push to this repo. Without this, a PUBLIC repo clones fine with
+  //     a bad/expired token and only blows up much later at `git push` with the
+  //     opaque "Password authentication is not supported" error.
+  const access = await github.verifyAccess();
+  if (!access.ok) {
+    throw new HttpError(access.status, access.reason);
+  }
+
   // 3. Clone once, do all work, always clean up.
   let cloneDir: string | null = null;
   try {
@@ -548,7 +557,44 @@ async function executeHealingPR(opts: {
     const commitMsg = buildCommitMessage(fileOutcomes, patchedCount, changedFiles.length);
     git(`commit -m "${commitMsg.replace(/"/g, '\\"')}"`);
     const commitSha = git('rev-parse HEAD');
-    git(`push -u origin ${branchName}`);
+
+    // Pre-push diagnostics (token-safe). These pinpoint the three most common
+    // causes of a "Password authentication is not supported" push failure:
+    //   • token absent/empty  → tokenPresent=false / tokenLength=0
+    //   • token whitespace    → tokenLength looks wrong vs expected
+    //   • origin not authed   → remoteRedacted shows no "x-access-token:***@"
+    // The remote URL is redacted so the secret never reaches logs.
+    let remoteRedacted = '(unknown)';
+    try {
+      remoteRedacted = git('remote -v')
+        .split('\n')[0]
+        .replace(/x-access-token:[^@]+@/g, 'x-access-token:***@')
+        .replace(/https:\/\/[^@/]+@/g, 'https://***@');
+    } catch { /* non-fatal */ }
+    logger.info(MOD, 'Pre-push diagnostics', {
+      branchName,
+      tokenPresent: github.hasToken,
+      tokenLength: github.tokenLength,
+      remoteRedacted,
+      authedOrigin: /x-access-token:\*\*\*@/.test(remoteRedacted),
+    });
+
+    try {
+      git(`push -u origin ${branchName}`);
+    } catch (pushErr: any) {
+      const raw = String(pushErr?.stderr || pushErr?.message || pushErr);
+      // Never leak the tokenised remote URL in the error surfaced to the client.
+      const sanitized = raw.replace(/x-access-token:[^@]+@/g, 'x-access-token:***@');
+      if (/Authentication failed|Password authentication is not supported|invalid username or token/i.test(sanitized)) {
+        throw new HttpError(
+          401,
+          'GitHub push was rejected: the configured token is invalid/expired or lacks push ' +
+            'access to the target repository. Update GITHUB_TOKEN on the backend with a token ' +
+            'that has write access, then try again.',
+        );
+      }
+      throw new HttpError(500, `git push failed: ${sanitized}`);
+    }
 
     const pr = await github.createPR(branchName, baseBranch, {
       title: buildPRTitle(fileOutcomes, changedFiles.length, patchedCount),
