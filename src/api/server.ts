@@ -8,6 +8,12 @@ import cors from 'cors';
 import * as path from 'path';
 import * as fs from 'fs';
 import { resolveRerunRelFile } from '../core/rerun-target';
+import {
+  type RerunBudgetConfig,
+  minTrustworthyRerunMs,
+  canStartTrustworthyRerun as canStartTrustworthyRerunPure,
+  rerunTimeoutMs as rerunTimeoutMsPure,
+} from '../core/rerun-budget';
 
 import { authMiddleware } from './middleware/auth';
 import { companyMiddleware } from './middleware/company';
@@ -451,6 +457,28 @@ function createHealingWorker(
     // candidates ever need a real browser rerun. This is the hard cap on browser
     // reruns per broken locator (the old code ran one rerun PER candidate).
     const MAX_BROWSER_TRIES_PER_LOCATOR = envInt('HEALING_MAX_BROWSER_TRIES_PER_LOCATOR', 2);
+    // The test repo's own per-action / per-test timeout (Playwright default is 30s
+    // when playwright.config sets none). A broken locator does NOT error
+    // immediately — `fill()/click()` WAIT this long, and Playwright only emits the
+    // locator-rich, *located* error (e.g. "waiting for locator('#username')" with a
+    // source location) when that timeout fires NATURALLY. If we kill a validation
+    // rerun before this elapses we destroy the only evidence the entire healing
+    // pipeline depends on (no failed_locator, no trace) — see
+    // docs/raw-playwright-output-divergence.md. Configure higher if the repo sets a
+    // larger test timeout.
+    const REPO_ACTION_TIMEOUT_MS = envInt('HEALING_REPO_ACTION_TIMEOUT_MS', 30_000);
+    // Headroom on top of the action timeout for browser launch, navigation, reporter
+    // flush and trace write, so the rerun finishes a clean, parseable result.
+    const RERUN_BUFFER_MS = envInt('HEALING_RERUN_BUFFER_MS', 15_000);
+    const RERUN_BUDGET_CFG: RerunBudgetConfig = {
+      repoActionTimeoutMs: REPO_ACTION_TIMEOUT_MS,
+      bufferMs: RERUN_BUFFER_MS,
+      ceilingMs: 120_000,
+    };
+    // A validation rerun is only TRUSTWORTHY if it is allowed to run at least as long
+    // as the repo's action timeout + buffer. Below this, the rerun can only ever
+    // produce the evidence-destroying "killed early" shape, so it must never start.
+    const MIN_TRUSTWORTHY_RERUN_MS = minTrustworthyRerunMs(RERUN_BUDGET_CFG);
 
     // Execution settings — load early so they're available for initial test run
     // Use job.projectId if available (will be refined later with resolvedProjectId for healing)
@@ -492,10 +520,26 @@ function createHealingWorker(
     /** True when the overall job time budget is exhausted. */
     const jobBudgetExhausted = (): boolean => jobBudgetRemainingMs() <= 0;
     /**
-     * Effective per-rerun timeout: never exceed the remaining job budget so a
-     * single rerun can't blow past the global limit.
+     * A validation rerun must answer ONE question — "did the candidate fix the
+     * test?" — and that answer is only trustworthy if Playwright is allowed to run
+     * the full action timeout and flush a complete result (located error on
+     * failure, or a clean pass). We therefore only start a rerun when at least
+     * MIN_TRUSTWORTHY_RERUN_MS of job budget remains. Starting a shorter rerun
+     * would guarantee a kill-before-evidence result, which is worse than not
+     * running at all (it invents a fake "fail"/no-locator verdict). When this is
+     * false the caller must STOP rather than start a doomed rerun — the job then
+     * finalizes honestly as timed-out/inconclusive.
      */
-    const rerunTimeoutMs = (): number => Math.max(15_000, Math.min(120_000, jobBudgetRemainingMs()));
+    const canStartTrustworthyRerun = (): boolean =>
+      canStartTrustworthyRerunPure(jobBudgetRemainingMs(), RERUN_BUDGET_CFG);
+    /**
+     * Effective per-rerun timeout. INVARIANT: validationTimeout >=
+     * repositoryActionTimeout + buffer (MIN_TRUSTWORTHY_RERUN_MS) so a rerun is
+     * never killed before Playwright can emit its locator-rich diagnostics.
+     * Capped at 120s. Callers gate on canStartTrustworthyRerun() first, so when a
+     * rerun does start there is always >= MIN_TRUSTWORTHY_RERUN_MS of budget for it.
+     */
+    const rerunTimeoutMs = (): number => rerunTimeoutMsPure(jobBudgetRemainingMs(), RERUN_BUDGET_CFG);
 
     // Resolve repo configuration
     const repo = repoManager.findRepo(job.repositoryId);
@@ -796,9 +840,16 @@ function createHealingWorker(
         logger.warn(MOD, 'Healing job cancelled by user — stopping', { jobId: job.id });
         break;
       }
-      if (jobBudgetExhausted()) {
-        logger.warn(MOD, 'Job time budget exhausted — stopping before next test', {
-          jobId: job.id, budgetMs: JOB_BUDGET_MS,
+      // Stop before the next test if we cannot give its reruns enough time to
+      // produce a TRUSTWORTHY Playwright result. Starting a rerun with < the
+      // repo action timeout + buffer left only yields the evidence-destroying
+      // "killed early" shape (no located error, no trace) — worse than stopping.
+      if (jobBudgetExhausted() || !canStartTrustworthyRerun()) {
+        logger.warn(MOD, 'Insufficient job budget for a trustworthy rerun — stopping before next test', {
+          jobId: job.id,
+          budgetMs: JOB_BUDGET_MS,
+          remainingMs: jobBudgetRemainingMs(),
+          minTrustworthyRerunMs: MIN_TRUSTWORTHY_RERUN_MS,
         });
         break;
       }
@@ -1320,10 +1371,11 @@ function createHealingWorker(
             logger.warn(MOD, 'Cancelled mid-test — aborting locator loop', { testName: failure.testName });
             break;
           }
-          if (jobBudgetExhausted() || testBudgetExhausted()) {
-            logger.warn(MOD, 'Time budget exhausted — stopping locator loop for test', {
+          if (jobBudgetExhausted() || testBudgetExhausted() || !canStartTrustworthyRerun()) {
+            logger.warn(MOD, 'Insufficient budget for a trustworthy rerun — stopping locator loop for test', {
               testName: failure.testName, iteration,
               jobElapsedMs: Date.now() - jobStartMs, testElapsedMs: Date.now() - testStartMs,
+              remainingMs: jobBudgetRemainingMs(), minTrustworthyRerunMs: MIN_TRUSTWORTHY_RERUN_MS,
             });
             break;
           }
@@ -1383,10 +1435,14 @@ function createHealingWorker(
 
           // Try the pre-ranked candidates best-first for the SAME broken locator.
           for (let retry = 0; retry < maxCandidatesToExamine; retry++) {
-            // Bail out of the (expensive) rerun cycle if cancelled or out of time.
-            if (isCancelled() || jobBudgetExhausted() || testBudgetExhausted()) {
-              logger.warn(MOD, 'Stopping retry loop — cancelled or time budget exhausted', {
+            // Bail out of the (expensive) rerun cycle if cancelled, out of time,
+            // or unable to give the next confirmation rerun enough budget to
+            // produce a trustworthy result (don't start a rerun we'd have to kill
+            // before Playwright emits its located diagnostics).
+            if (isCancelled() || jobBudgetExhausted() || testBudgetExhausted() || !canStartTrustworthyRerun()) {
+              logger.warn(MOD, 'Stopping retry loop — cancelled or insufficient budget for a trustworthy rerun', {
                 testName: failure.testName, iteration, retry,
+                remainingMs: jobBudgetRemainingMs(), minTrustworthyRerunMs: MIN_TRUSTWORTHY_RERUN_MS,
               });
               break;
             }
