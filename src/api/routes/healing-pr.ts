@@ -30,6 +30,12 @@ import {
   logPR,
 } from '../../db/postgres';
 import { GitHubService, type CommitFileSpec } from '../../services/github-service';
+// The connected Tools-page token (notification_configs) — the SAME token the
+// script-generation PR flow authenticates with. Aliased to avoid colliding with
+// the git-push GitHubService above. Healing must resolve its token from here
+// first so it behaves identically to script-gen instead of silently depending
+// on a separate process.env.GITHUB_TOKEN that is usually unset in production.
+import { GitHubService as ConnectedGitHubService } from '../../integrations/github-service';
 import { CodePatcher, type HealingFix } from '../../services/code-patcher';
 import { createRepoPathResolver } from '../../intelligence/repo-path-resolver';
 import * as path from 'path';
@@ -83,6 +89,7 @@ export function createHealingPRRouter(): Router {
   /* ── POST /create-pr — bundle MANY healings into ONE PR ───────────────── */
   router.post('/create-pr', async (req: Request, res: Response) => {
     const companyId = (req as any).companyId;
+    const userId = (req as any).userId;
     try {
       const { repositoryId, healingIds, githubToken } = req.body || {};
 
@@ -110,6 +117,7 @@ export function createHealingPRRouter(): Router {
         healings,
         repositoryId,
         companyId,
+        userId,
         githubToken,
       });
       return res.json({ success: true, data });
@@ -126,6 +134,7 @@ export function createHealingPRRouter(): Router {
   router.post('/:id/create-pr', async (req: Request, res: Response) => {
     const healingId = parseInt(String(req.params.id), 10);
     const companyId = (req as any).companyId;
+    const userId = (req as any).userId;
 
     try {
       const { repositoryId, testFilePath, githubToken } = req.body || {};
@@ -144,6 +153,7 @@ export function createHealingPRRouter(): Router {
         healings: [healing],
         repositoryId,
         companyId,
+        userId,
         githubToken,
         testFilePathOverride: testFilePath,
       });
@@ -230,6 +240,7 @@ export function createJobPRRouter(): Router {
   router.post('/:jobId/create-pr', async (req: Request, res: Response) => {
     const jobId = String(req.params.jobId);
     const companyId = (req as any).companyId;
+    const userId = (req as any).userId;
 
     try {
       const { repositoryId, githubToken } = req.body || {};
@@ -271,6 +282,7 @@ export function createJobPRRouter(): Router {
         repositoryId, // honoured only when repo is undefined
         repo,
         companyId,
+        userId,
         githubToken,
         jobId,
       });
@@ -328,13 +340,14 @@ async function executeHealingPR(opts: {
   /** Pre-resolved repo (jobId path). Takes precedence over repositoryId. */
   repo?: ResolvedRepo;
   companyId: number | undefined;
+  userId?: number;
   githubToken?: string;
   /** Only honoured when committing a single healing. */
   testFilePathOverride?: string;
   /** Real owning job id — used for PR bookkeeping (pr_automations.job_id). */
   jobId?: string;
 }): Promise<any> {
-  const { patcher, healings, companyId, githubToken, testFilePathOverride, jobId } = opts;
+  const { patcher, healings, companyId, userId, githubToken, testFilePathOverride, jobId } = opts;
 
   // 1. Keep only healings we can actually commit.
   const committable = healings.filter((h) => h.success && h.healed_locator);
@@ -360,13 +373,39 @@ async function executeHealingPR(opts: {
     companyId,
   });
 
-  const token = githubToken || process.env.GITHUB_TOKEN;
+  // Resolve the token EXACTLY like the script-generation PR flow does:
+  //   1. explicit githubToken in the request (rare override)
+  //   2. the connected Tools-page token in the DB (notification_configs) —
+  //      this is what script-gen uses and what the user actually connected
+  //   3. process.env.GITHUB_TOKEN — last-resort fallback for headless/CI use
+  // Previously healing only looked at (1)/(3), so a perfectly-connected Tools
+  // token still produced a "git push … Password authentication" failure.
+  let token = githubToken;
+  let tokenSource = token ? 'request' : '';
+  if (!token) {
+    try {
+      const connected = await new ConnectedGitHubService().getToken(companyId, userId);
+      if (connected) {
+        token = connected;
+        tokenSource = 'connected-tools-token';
+      }
+    } catch (e: any) {
+      logger.warn(MOD, 'Could not load connected GitHub token; falling back to env', {
+        error: e?.message,
+      });
+    }
+  }
+  if (!token && process.env.GITHUB_TOKEN) {
+    token = process.env.GITHUB_TOKEN;
+    tokenSource = 'env';
+  }
   if (!token) {
     throw new HttpError(
       400,
-      'GitHub token required. Provide githubToken in request body or set GITHUB_TOKEN env variable.',
+      'GitHub token required. Connect GitHub on the Tools page, pass githubToken in the request body, or set the GITHUB_TOKEN env variable.',
     );
   }
+  logger.info(MOD, 'Resolved GitHub token for healing PR', { tokenSource });
 
   const parsed = GitHubService.parseRepoUrl(repo.url);
   if (!parsed) throw new HttpError(400, `Cannot parse GitHub URL: ${repo.url}`);
@@ -573,6 +612,7 @@ async function executeHealingPR(opts: {
     } catch { /* non-fatal */ }
     logger.info(MOD, 'Pre-push diagnostics', {
       branchName,
+      tokenSource,
       tokenPresent: github.hasToken,
       tokenLength: github.tokenLength,
       remoteRedacted,
@@ -586,11 +626,24 @@ async function executeHealingPR(opts: {
       // Never leak the tokenised remote URL in the error surfaced to the client.
       const sanitized = raw.replace(/x-access-token:[^@]+@/g, 'x-access-token:***@');
       if (/Authentication failed|Password authentication is not supported|invalid username or token/i.test(sanitized)) {
+        // Translate the opaque git auth failure into an actionable message that
+        // names the token SOURCE healing actually used and the exact fix per source.
+        const sourceLabel =
+          tokenSource === 'connected-tools-token' ? 'Connected GitHub account (Tools page)'
+          : tokenSource === 'request' ? 'token supplied in the request'
+          : tokenSource === 'env' ? 'GITHUB_TOKEN environment variable'
+          : 'unknown source';
+        const fix =
+          tokenSource === 'connected-tools-token'
+            ? 'Reconnect GitHub from the Tools page, or grant the token push access to this repo ' +
+              '(classic PAT: "repo" scope; fine-grained PAT: Contents: Write + Pull requests: Write on this repository).'
+            : tokenSource === 'env'
+            ? 'Replace GITHUB_TOKEN on the backend with a token that has push access (repo / Contents: Write + Pull requests: Write).'
+            : 'Provide a token with push access (repo / Contents: Write + Pull requests: Write).';
         throw new HttpError(
           401,
-          'GitHub push was rejected: the configured token is invalid/expired or lacks push ' +
-            'access to the target repository. Update GITHUB_TOKEN on the backend with a token ' +
-            'that has write access, then try again.',
+          `Unable to authenticate with GitHub for push.\nToken source: ${sourceLabel}\n` +
+            `The token is invalid/expired or lacks push access to ${parsed.owner}/${parsed.repo}.\n${fix}`,
         );
       }
       throw new HttpError(500, `git push failed: ${sanitized}`);
