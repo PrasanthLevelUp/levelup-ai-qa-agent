@@ -55,9 +55,23 @@ export class GitHubService {
   private readonly repo: string;
 
   constructor(config: GitHubConfig) {
-    this.token = config.token;
+    // Trim defensively: env vars frequently arrive with a trailing newline or
+    // surrounding whitespace (copy-paste, Railway/Heroku UI, `.env` quoting).
+    // An untrimmed token produces the SAME opaque git failure as an empty one
+    // ("Password authentication is not supported"), so normalise once here.
+    this.token = (config.token || '').trim();
     this.owner = config.owner;
     this.repo = config.repo;
+  }
+
+  /** True when a usable (non-empty, trimmed) token is present. */
+  get hasToken(): boolean {
+    return this.token.length > 0;
+  }
+
+  /** Token length only — safe to log for diagnosing empty/whitespace tokens. */
+  get tokenLength(): number {
+    return this.token.length;
   }
 
   /* ── helpers ──────────────────────────────────────────────── */

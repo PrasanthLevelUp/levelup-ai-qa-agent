@@ -557,6 +557,28 @@ async function executeHealingPR(opts: {
     const commitMsg = buildCommitMessage(fileOutcomes, patchedCount, changedFiles.length);
     git(`commit -m "${commitMsg.replace(/"/g, '\\"')}"`);
     const commitSha = git('rev-parse HEAD');
+
+    // Pre-push diagnostics (token-safe). These pinpoint the three most common
+    // causes of a "Password authentication is not supported" push failure:
+    //   • token absent/empty  → tokenPresent=false / tokenLength=0
+    //   • token whitespace    → tokenLength looks wrong vs expected
+    //   • origin not authed   → remoteRedacted shows no "x-access-token:***@"
+    // The remote URL is redacted so the secret never reaches logs.
+    let remoteRedacted = '(unknown)';
+    try {
+      remoteRedacted = git('remote -v')
+        .split('\n')[0]
+        .replace(/x-access-token:[^@]+@/g, 'x-access-token:***@')
+        .replace(/https:\/\/[^@/]+@/g, 'https://***@');
+    } catch { /* non-fatal */ }
+    logger.info(MOD, 'Pre-push diagnostics', {
+      branchName,
+      tokenPresent: github.hasToken,
+      tokenLength: github.tokenLength,
+      remoteRedacted,
+      authedOrigin: /x-access-token:\*\*\*@/.test(remoteRedacted),
+    });
+
     try {
       git(`push -u origin ${branchName}`);
     } catch (pushErr: any) {
