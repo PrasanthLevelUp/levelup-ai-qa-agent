@@ -21,6 +21,11 @@
 
 import { Router, type Request, type Response } from 'express';
 import { GitHubService, parseGitHubRepoUrl } from '../../integrations/github-service';
+// The PR-creation path (healing-pr.ts) authenticates with this SEPARATE
+// service, which uses process.env.GITHUB_TOKEN — NOT the DB-stored Tools-page
+// token used elsewhere. The push-access check below must mirror THAT path, so
+// we deliberately use this class (aliased) rather than the integrations one.
+import { GitHubService as PRGitHubService } from '../../services/github-service';
 import { logger } from '../../utils/logger';
 import { recordRunAsExecutions } from '../../core/execution/record-run-executions';
 import { getProjectIdForRepo } from '../../db/postgres';
@@ -100,6 +105,61 @@ export function createGitHubActionsRouter(): Router {
     } catch (err: any) {
       logger.error(MOD, 'GET /diagnose error', { error: err.message });
       res.status(500).json({ success: false, error: err?.message || 'Diagnostic failed to run' });
+    }
+  });
+
+  /* ── PR push-access pre-flight ──────────────────────────────────────
+   * GET /api/github/actions/check-pr-access?repoUrl=github.com/Owner/Repo.git
+   *
+   * Answers the question "will the Create PR button work?" BEFORE anyone clicks
+   * it. This mirrors the EXACT token resolution the PR-creation flow uses
+   * (process.env.GITHUB_TOKEN, overridable by an explicit githubToken) — which
+   * is a DIFFERENT token from the DB-stored Tools-page PAT used by /diagnose.
+   *
+   * It reports (token value NEVER returned):
+   *   • tokenSource   — "request" | "env" | "none"
+   *   • tokenPresent  — false ⇒ the classic empty-token push failure
+   *   • tokenLength   — length only; an odd value hints at whitespace/newline
+   *   • canPush       — true only when the token authenticates AND has write
+   *   • status/reason — actionable diagnosis when canPush=false
+   *
+   * Always returns HTTP 200: a "no, it won't work" answer is a SUCCESSFUL
+   * diagnosis, not a server error.
+   */
+  router.get('/check-pr-access', async (req: Request, res: Response) => {
+    try {
+      const target = resolveOwnerRepo(req.query, res);
+      if (!target) return; // resolveOwnerRepo already wrote the 400
+
+      // Resolve the token EXACTLY like executeHealingPR does.
+      const bodyToken = req.query.githubToken ? String(req.query.githubToken) : '';
+      const envToken = process.env.GITHUB_TOKEN || '';
+      const rawToken = bodyToken || envToken;
+      const tokenSource = bodyToken ? 'request' : envToken ? 'env' : 'none';
+
+      const gh = new PRGitHubService({ token: rawToken, owner: target.owner, repo: target.repo });
+      const access = await gh.verifyAccess();
+
+      const result = {
+        owner: target.owner,
+        repo: target.repo,
+        tokenSource,
+        tokenPresent: gh.hasToken,
+        tokenLength: gh.tokenLength,
+        canPush: access.ok,
+        ...(access.ok ? {} : { status: access.status, reason: access.reason }),
+      };
+
+      logger.info(MOD, 'GET /check-pr-access', {
+        owner: target.owner, repo: target.repo,
+        tokenSource, tokenPresent: gh.hasToken, tokenLength: gh.tokenLength,
+        canPush: access.ok,
+      });
+
+      res.json({ success: true, data: result });
+    } catch (err: any) {
+      logger.error(MOD, 'GET /check-pr-access error', { error: err.message });
+      res.status(500).json({ success: false, error: err?.message || 'Push-access check failed' });
     }
   });
 
