@@ -133,7 +133,7 @@ import { createEnvironmentsRouter } from './routes/environments';
 import { createSprintsRouter } from './routes/sprints';
 import { createCIWebhookRouter } from './routes/ci-webhooks';
 import { createUsersRouter } from './routes/users';
-import { createHealingPRRouter } from './routes/healing-pr';
+import { createHealingPRRouter, createJobPRRouter } from './routes/healing-pr';
 import { createGitHubRouter } from './routes/github';
 import { createGitHubActionsRouter } from './routes/github-actions';
 import { createIntelligenceRouter } from './routes/intelligence';
@@ -366,6 +366,10 @@ export function createServer(): express.Application {
     const allJobs = jobQueue.listJobs();
     res.json({ jobs: allJobs });
   });
+
+  // Job-scoped healing PR: POST /api/jobs/:jobId/create-pr — the frontend only
+  // passes the jobId; the backend resolves healings + repo and raises ONE PR.
+  app.use('/api/jobs', authMiddleware, companyMiddleware, sessionMiddleware, createJobPRRouter());
 
   // Error handler
   app.use(errorHandler);

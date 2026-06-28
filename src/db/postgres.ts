@@ -987,6 +987,14 @@ async function initSchema(client: PoolClient): Promise<void> {
     IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='notification_logs' AND column_name='user_id') THEN
       ALTER TABLE notification_logs ADD COLUMN user_id INTEGER REFERENCES users(id);
     END IF;
+    -- Healing → PR linkage. PR metadata is stored ONCE in pr_automations
+    -- (the single source of truth); a healing_action only references the PR it
+    -- landed in via this FK. This avoids duplicating pr_url/number/status across
+    -- every healed locator and keeps status updates (open→merged→closed) a
+    -- single-row write. Dashboard joins healing_actions → pr_automations.
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='healing_actions' AND column_name='pr_automation_id') THEN
+      ALTER TABLE healing_actions ADD COLUMN pr_automation_id INTEGER REFERENCES pr_automations(id) ON DELETE SET NULL;
+    END IF;
   END $$`);
 
   // ─── Phase 5: Indexes ───────────────────────────────────────────
@@ -997,6 +1005,7 @@ async function initSchema(client: PoolClient): Promise<void> {
     `CREATE INDEX IF NOT EXISTS idx_exec_test_name ON test_executions(test_name)`,
     `CREATE INDEX IF NOT EXISTS idx_heal_exec_id ON healing_actions(test_execution_id)`,
     `CREATE INDEX IF NOT EXISTS idx_heal_strategy ON healing_actions(healing_strategy)`,
+    `CREATE INDEX IF NOT EXISTS idx_heal_pr_automation ON healing_actions(pr_automation_id)`,
     `CREATE INDEX IF NOT EXISTS idx_pattern_locator ON learned_patterns(failed_locator)`,
     `CREATE INDEX IF NOT EXISTS idx_pattern_test_name ON learned_patterns(test_name)`,
     `CREATE INDEX IF NOT EXISTS idx_pattern_error ON learned_patterns(error_pattern)`,
@@ -3515,6 +3524,55 @@ export async function getProjectIdForRepo(
 export async function loadJobFromDb(jobId: string): Promise<any | null> {
   const result = await getPool().query('SELECT * FROM healing_jobs WHERE id = $1', [jobId]);
   return result.rows[0] ?? null;
+}
+
+/**
+ * Fetch a persisted healing job, scoped to a company when provided. The
+ * company guard prevents cross-tenant access when resolving a job → repo for
+ * PR creation. Returns null when the job does not exist or belongs to another
+ * company.
+ */
+export async function getHealingJob(jobId: string, companyId?: number): Promise<any | null> {
+  const result = await getPool().query(
+    `SELECT * FROM healing_jobs WHERE id = $1 AND ($2::int IS NULL OR company_id = $2)`,
+    [jobId, companyId ?? null],
+  );
+  return result.rows[0] ?? null;
+}
+
+/**
+ * All healing_actions that belong to a job. The job → healing relationship is
+ * owned by the backend: a job's failing tests are persisted as canonical
+ * `execution_records` (keyed by job_id) whose `execution_id` equals the
+ * `test_executions.id` referenced by each healing_action. We join through that
+ * record so callers only ever need the jobId. Company-scoped.
+ */
+export async function getHealingActionsByJobId(jobId: string, companyId?: number): Promise<any[]> {
+  const { rows } = await getPool().query(
+    `SELECT ha.*, te.test_name AS exec_test_name, te.duration_ms
+     FROM healing_actions ha
+     JOIN execution_records er ON er.execution_id = ha.test_execution_id::text
+     LEFT JOIN test_executions te ON ha.test_execution_id = te.id
+     WHERE er.job_id = $1
+       AND ($2::int IS NULL OR ha.company_id = $2)
+     ORDER BY ha.id ASC`,
+    [jobId, companyId ?? null],
+  );
+  return rows;
+}
+
+/**
+ * Associate a set of healing_actions with the PR they landed in. PR metadata
+ * lives once in pr_automations; here we only set the FK so the dashboard can
+ * join through to it. Status changes (open→merged→closed) are then a single
+ * pr_automations row update — never a fan-out across healing rows.
+ */
+export async function linkHealingActionsToPR(ids: number[], prAutomationId: number): Promise<void> {
+  if (!ids.length) return;
+  await getPool().query(
+    `UPDATE healing_actions SET pr_automation_id = $2 WHERE id = ANY($1::int[])`,
+    [ids, prAutomationId],
+  );
 }
 
 export async function loadPersistedJobs(statuses: string[]): Promise<any[]> {
@@ -10691,6 +10749,26 @@ export async function getRepository(id: number, companyId: number): Promise<any 
     [id, companyId],
   );
   return rows[0] || null;
+}
+
+/**
+ * Resolve a repository row by its clone URL (company-scoped). Used to map a
+ * healing job → its repository so PR creation can be driven by jobId alone.
+ * Tolerates a trailing `.git` / slash mismatch between what the job stored and
+ * what the repositories table holds. Returns the active row when several match.
+ */
+export async function getRepositoryByUrl(url: string, companyId: number): Promise<any | null> {
+  if (!url) return null;
+  const norm = (u: string) => u.trim().replace(/\.git$/i, '').replace(/\/$/, '').toLowerCase();
+  const pool = getPool();
+  const { rows } = await pool.query(
+    `SELECT * FROM repositories WHERE company_id = $1`,
+    [companyId],
+  );
+  const target = norm(url);
+  const matches = rows.filter((r: any) => r.url && norm(r.url) === target);
+  if (matches.length === 0) return null;
+  return matches.find((r: any) => r.is_active) || matches[0];
 }
 
 export async function updateRepository(id: number, companyId: number, data: {

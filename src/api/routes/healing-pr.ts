@@ -20,7 +20,15 @@
 
 import { Router, type Request, type Response } from 'express';
 import { logger } from '../../utils/logger';
-import { getPool, getRepository, logPR } from '../../db/postgres';
+import {
+  getPool,
+  getRepository,
+  getRepositoryByUrl,
+  getHealingJob,
+  getHealingActionsByJobId,
+  linkHealingActionsToPR,
+  logPR,
+} from '../../db/postgres';
 import { GitHubService, type CommitFileSpec } from '../../services/github-service';
 import { CodePatcher, type HealingFix } from '../../services/code-patcher';
 import { createRepoPathResolver } from '../../intelligence/repo-path-resolver';
@@ -199,19 +207,134 @@ export function createHealingPRRouter(): Router {
 }
 
 /* -------------------------------------------------------------------------- */
+/*  Job-scoped router — the frontend only knows the Job                       */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Mounted at /api/jobs. Exposes:
+ *   POST /api/jobs/:jobId/create-pr
+ *
+ * The frontend already shows a Job, so it should NOT have to know which
+ * healing ids belong to it. The backend owns that relationship:
+ *
+ *   Job → successful healings → group by file → patch → ONE PR.
+ *
+ * The repository is derived from the persisted job (its repository_url), so the
+ * body can be empty. An explicit `repositoryId` in the body still overrides,
+ * and `githubToken` is optional (falls back to GITHUB_TOKEN).
+ */
+export function createJobPRRouter(): Router {
+  const router = Router();
+  const patcher = new CodePatcher();
+
+  router.post('/:jobId/create-pr', async (req: Request, res: Response) => {
+    const jobId = String(req.params.jobId);
+    const companyId = (req as any).companyId;
+
+    try {
+      const { repositoryId, githubToken } = req.body || {};
+
+      // 1. The job owns the repo relationship.
+      const job = await getHealingJob(jobId, companyId);
+      if (!job) {
+        return res.status(404).json({ error: `Job not found: ${jobId}` });
+      }
+
+      // 2. Backend finds the job's successful healings — frontend stays dumb.
+      const healings = await getHealingActionsByJobId(jobId, companyId);
+      if (healings.length === 0) {
+        return res.status(404).json({ error: 'No healing actions found for this job' });
+      }
+
+      // 3. Resolve the repo to target: explicit override → repo row matched by
+      //    the job's stored URL → the job's raw URL + branch as a last resort.
+      let repo: ResolvedRepo | undefined;
+      if (!repositoryId) {
+        if (job.repository_url && companyId != null) {
+          const row = await getRepositoryByUrl(job.repository_url, companyId);
+          if (row?.url) repo = { url: row.url, branch: row.branch || job.branch || 'main' };
+        }
+        if (!repo && job.repository_url) {
+          repo = { url: job.repository_url, branch: job.branch || 'main' };
+        }
+        if (!repo) {
+          return res.status(400).json({
+            error:
+              'Could not resolve a repository for this job. Pass repositoryId explicitly in the body.',
+          });
+        }
+      }
+
+      const data = await executeHealingPR({
+        patcher,
+        healings,
+        repositoryId, // honoured only when repo is undefined
+        repo,
+        companyId,
+        githubToken,
+        jobId,
+      });
+      return res.json({ success: true, data });
+    } catch (err: any) {
+      if (err instanceof HttpError) {
+        return res.status(err.status).json({ error: err.message });
+      }
+      logger.error(MOD, 'Job healing PR failed', { jobId, error: err.message });
+      return res.status(500).json({ error: 'Failed to create healing PR', details: err.message });
+    }
+  });
+
+  return router;
+}
+
+/* -------------------------------------------------------------------------- */
 /*  Core: resolve files → apply fixes per file → ONE PR                       */
 /* -------------------------------------------------------------------------- */
+
+interface ResolvedRepo {
+  url: string;
+  branch: string;
+}
+
+/**
+ * Resolve the repository (url + branch) a PR should target. Callers may pass a
+ * numeric repositoryId (looked up + company-scoped) OR an already-resolved
+ * { url, branch } (used by the jobId path, which derives the repo from the
+ * persisted job). Throws HttpError with the right status on failure.
+ */
+async function resolveRepoForPR(opts: {
+  repositoryId?: number | string;
+  repo?: ResolvedRepo;
+  companyId: number | undefined;
+}): Promise<ResolvedRepo> {
+  if (opts.repo) {
+    if (!opts.repo.url) throw new HttpError(400, 'Resolved repository has no URL');
+    return { url: opts.repo.url, branch: opts.repo.branch || 'main' };
+  }
+  if (opts.repositoryId == null) {
+    throw new HttpError(400, 'repositoryId is required');
+  }
+  if (opts.companyId == null) throw new HttpError(401, 'Missing company context');
+  const row = await getRepository(Number(opts.repositoryId), opts.companyId);
+  if (!row) throw new HttpError(404, 'Repository not found');
+  if (!row.url) throw new HttpError(400, 'Repository has no URL configured');
+  return { url: row.url, branch: row.branch || 'main' };
+}
 
 async function executeHealingPR(opts: {
   patcher: CodePatcher;
   healings: any[];
-  repositoryId: number | string;
+  repositoryId?: number | string;
+  /** Pre-resolved repo (jobId path). Takes precedence over repositoryId. */
+  repo?: ResolvedRepo;
   companyId: number | undefined;
   githubToken?: string;
   /** Only honoured when committing a single healing. */
   testFilePathOverride?: string;
+  /** Real owning job id — used for PR bookkeeping (pr_automations.job_id). */
+  jobId?: string;
 }): Promise<any> {
-  const { patcher, healings, repositoryId, companyId, githubToken, testFilePathOverride } = opts;
+  const { patcher, healings, companyId, githubToken, testFilePathOverride, jobId } = opts;
 
   // 1. Keep only healings we can actually commit.
   const committable = healings.filter((h) => h.success && h.healed_locator);
@@ -231,10 +354,11 @@ async function executeHealingPR(opts: {
   }
 
   // 2. Resolve repository + token.
-  if (companyId == null) throw new HttpError(401, 'Missing company context');
-  const repo = await getRepository(Number(repositoryId), companyId);
-  if (!repo) throw new HttpError(404, 'Repository not found');
-  if (!repo.url) throw new HttpError(400, 'Repository has no URL configured');
+  const repo = await resolveRepoForPR({
+    repositoryId: opts.repositoryId,
+    repo: opts.repo,
+    companyId,
+  });
 
   const token = githubToken || process.env.GITHUB_TOKEN;
   if (!token) {
@@ -435,11 +559,21 @@ async function executeHealingPR(opts: {
       throw new HttpError(500, 'Branch was pushed but PR creation failed');
     }
 
-    // 7. Best-effort PR log.
+    // 7. Persist the PR linkage. PR metadata is stored ONCE in pr_automations
+    //    (the single source of truth, keyed by the REAL owning job id when we
+    //    have it). Each healing_action that landed in this PR then just
+    //    references that row via its pr_automation_id FK — no duplicated
+    //    pr_url/number/status, and a later status change (open→merged→closed)
+    //    is a single pr_automations update. Dashboard joins through the FK.
+    const patchedHealingIds = fileOutcomes
+      .flatMap((f) => f.fixes)
+      .filter((fx) => fx.patched)
+      .map((fx) => fx.healingId);
+
     try {
-      await logPR(
+      const prAutomationId = await logPR(
         {
-          job_id: singleHealing ? `heal-${committable[0].id}` : `heal-batch-${timestamp}`,
+          job_id: jobId || (singleHealing ? `heal-${committable[0].id}` : `heal-batch-${timestamp}`),
           pr_url: pr.url,
           pr_number: pr.number,
           branch_name: branchName,
@@ -453,8 +587,11 @@ async function executeHealingPR(opts: {
         },
         companyId,
       );
+      await linkHealingActionsToPR(patchedHealingIds, prAutomationId);
     } catch (dbErr) {
-      logger.warn(MOD, 'Failed to log PR to DB (non-critical)', { error: (dbErr as Error).message });
+      logger.warn(MOD, 'Failed to persist PR linkage to DB (non-critical)', {
+        error: (dbErr as Error).message,
+      });
     }
 
     logger.info(MOD, 'Healing PR created', {
