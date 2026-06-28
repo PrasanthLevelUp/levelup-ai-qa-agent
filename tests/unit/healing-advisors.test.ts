@@ -187,4 +187,42 @@ describe('collectRankedCandidates — advisor pipeline', () => {
     expect(aiPropose).toHaveBeenCalledTimes(1);
     expect(result.candidates.some((c) => c.source === 'ai')).toBe(true);
   });
+
+  it('does NOT consult the AI (fallback) advisor when there is no failed locator to anchor on', async () => {
+    // A framework-level crash never reaches an element, so failedLocator is null.
+    // The AI has nothing to ground on and would only fabricate an unrelated
+    // candidate (the historic "login button" guess), so it must be skipped.
+    const aiPropose = jest.fn(
+      async (_ctx: AdvisorContext): Promise<AdvisorProposal> => ({
+        candidates: [
+          {
+            newLocator: "page.getByRole('button', { name: 'Login' })",
+            strategy: 'ai_reasoning',
+            source: 'ai',
+            confidence: 0.88,
+            tokensUsed: 120,
+            reasoning: '[AI fabricated]',
+            addExplicitWait: false,
+          },
+        ],
+      }),
+    );
+    const aiAdvisor: HealingAdvisor = { name: 'AI', source: 'ai', tier: 'fallback', propose: aiPropose };
+    const orch = makeOrchestrator([
+      // Thin grounded candidates (groundedCount < 2) — normally the AI gate opens.
+      groundedAdvisor('Adv A', { newLocator: "page.getByText('Sign In')", confidence: 0.3 }),
+      aiAdvisor,
+    ]);
+    const result = await orch.collectRankedCandidates(
+      makeFailure({ failedLocator: '', failureType: 'unknown', errorPattern: 'target closed' }),
+    );
+    expect(aiPropose).not.toHaveBeenCalled();
+    expect(result.candidates.some((c) => c.source === 'ai')).toBe(false);
+    // The decision trail must honestly record why the AI was skipped.
+    expect(
+      result.decisionTrail.some(
+        (e) => e.layer === 'AI Reasoning' && e.outcome === 'skipped' && /no failed locator/i.test(e.reasoning ?? ''),
+      ),
+    ).toBe(true);
+  });
 });

@@ -537,22 +537,41 @@ export class HealingOrchestrator {
       await runAdvisor(advisor);
     }
 
-    // AI gate: consult fallback advisors only when grounded candidates are thin.
+    // AI gate: consult fallback advisors only when grounded candidates are thin
+    // AND we have a concrete anchor to heal around. Without a failed locator the
+    // AI has nothing to ground on and will fabricate a plausible-looking but
+    // unrelated candidate (e.g. a login button on a framework-level crash that
+    // never reached the real locator). That fabrication is always rejected by
+    // validation later, so it is pure noise — we must not run the AI at all.
     const aiSkipConfidence = envFloat('HEALING_RANK_AI_SKIP_CONFIDENCE', 0.8);
     const minGrounded = envIntLocal('HEALING_RANK_MIN_GROUNDED', 2);
     const groundedCount = raw.filter(
       (c) => c.signals.syntaxValid && c.source !== 'ai' && c.confidence >= aiSkipConfidence,
     ).length;
+    const hasAnchor = !!(failure.failedLocator && failure.failedLocator.trim());
     const fallbackAdvisors = this.advisors.filter((a) => a.tier === 'fallback');
-    if (groundedCount < minGrounded) {
+    let aiSkippedNoAnchor = false;
+    if (groundedCount >= minGrounded) {
+      if (fallbackAdvisors.length) {
+        logger.info(MOD, 'Skipping fallback (AI) advisors — enough grounded candidates', {
+          testName: failure.testName,
+          groundedCount,
+          minGrounded,
+          skipped: fallbackAdvisors.map((a) => a.name),
+        });
+      }
+    } else if (!hasAnchor) {
+      aiSkippedNoAnchor = fallbackAdvisors.length > 0;
+      if (fallbackAdvisors.length) {
+        logger.info(MOD, 'Skipping fallback (AI) advisors — no failed locator to anchor on', {
+          testName: failure.testName,
+          groundedCount,
+          minGrounded,
+          skipped: fallbackAdvisors.map((a) => a.name),
+        });
+      }
+    } else {
       for (const advisor of fallbackAdvisors) await runAdvisor(advisor);
-    } else if (fallbackAdvisors.length) {
-      logger.info(MOD, 'Skipping fallback (AI) advisors — enough grounded candidates', {
-        testName: failure.testName,
-        groundedCount,
-        minGrounded,
-        skipped: fallbackAdvisors.map((a) => a.name),
-      });
     }
 
     const ranked = rankCandidates(raw);
@@ -570,6 +589,17 @@ export class HealingOrchestrator {
           : `No syntactically valid candidate from any layer (${raw.length} raw, all rejected).`,
       },
     ];
+    if (aiSkippedNoAnchor) {
+      decisionTrail.push({
+        layer: 'AI Reasoning',
+        outcome: 'skipped',
+        reasoning:
+          'AI advisor not consulted: the failure has no failed locator to anchor on ' +
+          '(e.g. a framework-level crash that never reached an element). With no anchor the ' +
+          'AI can only fabricate an unrelated candidate, so it was deliberately skipped rather ' +
+          'than producing a guess that validation would reject.',
+      });
+    }
     if (pageObjectPatch) {
       decisionTrail.push({
         layer: 'Repo Intelligence',
