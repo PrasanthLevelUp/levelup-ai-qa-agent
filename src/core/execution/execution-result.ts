@@ -147,11 +147,26 @@ export function assembleExecutionResult(input: {
 
   // 1. Parse failure artifacts (heal-loop input). Guarded — never throw.
   let artifacts: ArtifactCollection[] = [];
+  logger.info(MOD, '▶ STAGE: ArtifactCollector.collect', {
+    resultsFile,
+    resultsFileExists: require('fs').existsSync(resultsFile),
+    repoPath,
+  });
   try {
+    const startCollect = Date.now();
     artifacts = new ArtifactCollector().collect(resultsFile, repoPath);
+    const durationCollect = Date.now() - startCollect;
+    logger.info(MOD, '✓ STAGE: ArtifactCollector.collect COMPLETE', {
+      artifactCount: artifacts.length,
+      durationMs: durationCollect,
+      artifacts: artifacts.map(a => ({ test_name: a.test_name, errorMessage: a.error_message?.slice(0, 100) })),
+    });
   } catch (err) {
-    logger.warn(MOD, 'Artifact collection failed (continuing with none)', {
-      jobId, resultsFile, error: (err as Error).message,
+    logger.error(MOD, '✗ STAGE: ArtifactCollector.collect FAILED', {
+      jobId, resultsFile,
+      resultsFileExists: require('fs').existsSync(resultsFile),
+      error: (err as Error).message,
+      stack: (err as Error).stack,
     });
   }
 

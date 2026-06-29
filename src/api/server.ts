@@ -750,6 +750,14 @@ function createHealingWorker(
     // After the optional retry: if there are still no artifacts AND the run is
     // untrustworthy, this is an honest INCONCLUSIVE — never a test "fail" and
     // never a "framework"/"unhealable locator" verdict.
+    logger.info(MOD, '▶ STAGE: INCONCLUSIVE gate check', {
+      artifactCount: artifacts.length,
+      runTrustworthy: runTrust.trustworthy,
+      runTrustSignal: runTrust.signal,
+      runTrustReason: runTrust.reason,
+      exitCode: run.exitCode,
+      resultsFileExists: run.resultsFile && fs.existsSync(run.resultsFile),
+    });
     if (artifacts.length === 0 && !runTrust.trustworthy) {
       const message =
         `Run is INCONCLUSIVE (${runTrust.signal}): ${runTrust.reason} ` +
@@ -757,8 +765,9 @@ function createHealingWorker(
         `Diagnostic: exit=${run.exitCode}, resultsFile=${
           run.resultsFile && fs.existsSync(run.resultsFile) ? 'present' : 'MISSING'
         }${run.stderr ? `, stderr: ${run.stderr.slice(-300)}` : ''}`;
-      logger.warn(MOD, 'Finalizing job as INCONCLUSIVE', {
+      logger.warn(MOD, '✗ STAGE: INCONCLUSIVE gate - EXITING EARLY', {
         jobId: job.id, signal: runTrust.signal, exitCode: run.exitCode,
+        reason: 'artifacts.length === 0 && !runTrust.trustworthy',
       });
       jobQueue.updateJob(job.id, { progress: `Inconclusive: ${runTrust.signal}` });
       return {
@@ -774,6 +783,11 @@ function createHealingWorker(
         message,
       };
     }
+
+    logger.info(MOD, '✓ STAGE: INCONCLUSIVE gate PASSED - continuing to healing pipeline', {
+      artifactCount: artifacts.length,
+      runTrustworthy: runTrust.trustworthy,
+    });
 
     if (artifacts.length === 0) {
       let message = 'All tests passed — no healing needed';
