@@ -4764,6 +4764,14 @@ export async function getPRForJob(jobId: string): Promise<PRRecord | null> {
   return result.rows[0] ?? null;
 }
 
+export async function getPRByUrl(prUrl: string): Promise<PRRecord | null> {
+  const result = await getPool().query(
+    `SELECT * FROM pr_automations WHERE pr_url = $1 LIMIT 1`,
+    [prUrl],
+  );
+  return result.rows[0] ?? null;
+}
+
 export async function getRecentPRs(limit = 20): Promise<PRRecord[]> {
   const result = await getPool().query(
     `SELECT * FROM pr_automations ORDER BY created_at DESC LIMIT $1`,
