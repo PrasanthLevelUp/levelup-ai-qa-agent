@@ -7,11 +7,49 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { JobQueue } from '../queue/job-queue';
 import { getHistoricalStats } from '../../db/postgres';
+import { getReportStore } from '../../reports/report-store';
+import { logger } from '../../utils/logger';
 
+const MOD = 'reports-routes';
 const router = Router();
 
 export function createReportsRouter(jobQueue: JobQueue): Router {
-  // JSON report
+  /**
+   * GET /api/reports/healing/* — Fetch a healing report document by its storage key.
+   *
+   * The key is the path after `/healing/`, e.g.:
+   *   /api/reports/healing/healing-reports/owner/repo/healing-report-42.md
+   *
+   * Returns the markdown document (200) or 404 if not found. This decouples the
+   * PR creation response (which returns only metadata) from report rendering (which
+   * fetches the document on demand). Benefits: smaller responses, cleaner caching,
+   * future PDF/HTML rendering without changing the PR endpoint.
+   */
+  router.get('/healing/*', async (req: Request, res: Response) => {
+    const key = req.params[0]; // Everything after /healing/
+    if (!key || !key.trim()) {
+      res.status(400).json({ error: 'Bad Request', message: 'Report key is required' });
+      return;
+    }
+
+    try {
+      const markdown = await getReportStore().get(key.trim());
+      if (markdown === null) {
+        logger.warn(MOD, 'Healing report not found', { key });
+        res.status(404).json({ error: 'Not Found', message: `Healing report not found: ${key}` });
+        return;
+      }
+
+      logger.info(MOD, 'Healing report fetched', { key, bytes: Buffer.byteLength(markdown, 'utf-8') });
+      res.setHeader('Content-Type', 'text/markdown; charset=utf-8');
+      res.send(markdown);
+    } catch (err) {
+      logger.error(MOD, 'Failed to fetch healing report', { key, error: (err as Error).message });
+      res.status(500).json({ error: 'Internal Server Error', message: 'Failed to fetch report' });
+    }
+  });
+
+  // Job-level JSON report
   router.get('/:jobId', async (req: Request, res: Response) => {
     const jobId = req.params['jobId'] as string;
     const job = jobQueue.getJob(jobId);
