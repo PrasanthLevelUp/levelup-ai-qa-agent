@@ -46,11 +46,38 @@ export class CodePatcher {
     let replacements = 0;
     const descriptions: string[] = [];
 
-    // Strategy 1: Direct string replacement of the failed locator
-    const directResult = this.directReplace(code, fix.failedLocator, fix.healedLocator);
+    // The text we actually insert (may differ from fix.healedLocator after
+    // kind-normalisation below) — used later to anchor the heal comment.
+    let insertedText = fix.healedLocator;
+
+    // Strategy 1: Direct string replacement of the failed locator.
+    //
+    // CRITICAL kind-safety: the replacement MUST match the syntactic kind of
+    // the text being matched. A *bare* selector ("#username") lives inside a
+    // quote slot — e.g. this.page.locator('#username') — so it must be replaced
+    // by another *bare* selector. If the healed locator is a full expression
+    // (page.locator('...'), getByRole(...)), substituting it raw produces
+    //   this.page.locator('page.locator('[data-test="username"]')')
+    // i.e. nested calls + unbalanced quotes → invalid TS → spec_load_error.
+    // (Strategies 2-4 already extract core selectors; only Strategy 1 was raw.)
+    const failedIsExpr = this.isLocatorExpression(fix.failedLocator);
+    const healedIsExpr = this.isLocatorExpression(fix.healedLocator);
+    let directOld = fix.failedLocator;
+    let directNew = fix.healedLocator;
+    if (!failedIsExpr) {
+      // Matched text is a bare selector → replacement must be a bare selector.
+      directNew = this.extractCoreSelector(fix.healedLocator) || fix.healedLocator;
+    } else if (failedIsExpr && !healedIsExpr) {
+      // Matched text is a full expression but the heal is a bare selector;
+      // a raw swap would drop the call wrapper. Skip the raw direct replace and
+      // let the kind-aware Playwright/CSS strategies handle it correctly.
+      directOld = '';
+    }
+    const directResult = this.directReplace(code, directOld, directNew);
     if (directResult.count > 0) {
       code = directResult.code;
       replacements += directResult.count;
+      insertedText = directNew;
       descriptions.push(`Replaced ${directResult.count} direct occurrence(s) of failed locator`);
     }
 
@@ -60,6 +87,7 @@ export class CodePatcher {
       if (pwResult.count > 0) {
         code = pwResult.code;
         replacements += pwResult.count;
+        insertedText = this.extractCoreSelector(fix.healedLocator) || fix.healedLocator;
         descriptions.push(`Replaced ${pwResult.count} Playwright locator call(s)`);
       }
     }
@@ -70,6 +98,7 @@ export class CodePatcher {
       if (cssResult.count > 0) {
         code = cssResult.code;
         replacements += cssResult.count;
+        insertedText = this.extractCoreSelector(fix.healedLocator) || fix.healedLocator;
         descriptions.push(`Replaced ${cssResult.count} CSS selector reference(s)`);
       }
     }
@@ -83,16 +112,44 @@ export class CodePatcher {
         if (fuzzyResult.count > 0) {
           code = fuzzyResult.code;
           replacements += fuzzyResult.count;
+          insertedText = coreNew || fix.healedLocator;
           descriptions.push(`Replaced ${fuzzyResult.count} fuzzy-matched selector(s)`);
         }
       }
     }
 
+    // Safety net (defense-in-depth): never emit code where a locator EXPRESSION
+    // got embedded inside a selector STRING (the double-wrap that caused the
+    // production spec_load_error). If a patch would introduce this corruption
+    // and the original didn't have it, reject the patch entirely rather than
+    // commit invalid code that breaks every spec import.
+    if (
+      replacements > 0 &&
+      this.hasEmbeddedExpressionCorruption(code) &&
+      !this.hasEmbeddedExpressionCorruption(originalCode)
+    ) {
+      logger.warn(MOD, 'Rejected patch — would embed a locator expression inside a selector string', {
+        testName: fix.testName,
+        failedLocator: fix.failedLocator,
+        healedLocator: fix.healedLocator,
+      });
+      return {
+        patched: false,
+        originalCode,
+        patchedCode: originalCode,
+        replacements: 0,
+        description:
+          'Patch rejected: applying the healed locator would produce invalid code ' +
+          '(a locator expression embedded inside a selector string). Manual review needed.',
+      };
+    }
+
     // Add a comment about the healing
     if (replacements > 0) {
       const comment = `// 🤖 LevelUp AI Auto-Heal: ${fix.strategy} (${Math.round(fix.confidence * 100)}% confidence)`;
-      // Add comment before the first occurrence of the healed locator
-      const healedIdx = code.indexOf(fix.healedLocator);
+      // Anchor the comment to the text we ACTUALLY inserted (kind-normalised),
+      // not fix.healedLocator which may differ after normalisation.
+      const healedIdx = code.indexOf(insertedText);
       if (healedIdx > 0) {
         const lineStart = code.lastIndexOf('\n', healedIdx);
         if (lineStart >= 0) {
@@ -250,5 +307,35 @@ export class CodePatcher {
 
   private escapeRegex(s: string): string {
     return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  }
+
+  /**
+   * Is this a full locator EXPRESSION (e.g. page.locator('#x'),
+   * frame.getByRole(...)) as opposed to a bare selector string ("#x")?
+   * A bare selector lives inside a quote slot; an expression does not.
+   */
+  private isLocatorExpression(expr: string): boolean {
+    if (!expr) return false;
+    // A method call like .locator( / .getByRole( / .click( means it's an
+    // expression. A bare selector ("#username", "[data-test=x]", ".foo") has
+    // no such call.
+    return /\.\s*\w+\s*\(/.test(expr);
+  }
+
+  /**
+   * Detect the specific corruption that broke production: a locator EXPRESSION
+   * embedded inside a selector STRING argument, e.g.
+   *   this.page.locator('page.locator('[data-test="username"]')')
+   *   page.locator("getByRole('button')")
+   * A selector string must never contain page./frame./locator./this. + a call,
+   * nor a getBy* call. This is dependency-free (no TypeScript at runtime).
+   */
+  private hasEmbeddedExpressionCorruption(code: string): boolean {
+    // .<method>( '<...>  page|frame|locator|this . <method> (
+    const nestedCall =
+      /\.\s*\w+\s*\(\s*['"`][^'"`]*\b(?:page|frame|locator|this)\s*\.\s*\w+\s*\(/;
+    // .<method>( '<...> getByRole( / getByTestId( ...
+    const nestedGetBy = /\.\s*\w+\s*\(\s*['"`][^'"`]*\bgetBy\w*\s*\(/;
+    return nestedCall.test(code) || nestedGetBy.test(code);
   }
 }
