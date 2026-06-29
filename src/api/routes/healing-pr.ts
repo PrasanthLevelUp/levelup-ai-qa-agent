@@ -38,6 +38,7 @@ import { GitHubService, GitHubPRError, type CommitFileSpec } from '../../service
 import { GitHubService as ConnectedGitHubService } from '../../integrations/github-service';
 import { CodePatcher, type HealingFix } from '../../services/code-patcher';
 import { createRepoPathResolver } from '../../intelligence/repo-path-resolver';
+import { getReportStore } from '../../reports/report-store';
 import * as path from 'path';
 import * as fs from 'fs';
 import { execSync } from 'child_process';
@@ -548,17 +549,23 @@ async function executeHealingPR(opts: {
     );
     const changedFiles = fileOutcomes.filter((f) => f.changed).map((f) => f.filePath);
 
-    // 4. Always include a combined healing report (gives manual instructions
-    //    even when a selector could not be auto-patched).
+    // 4. Build the combined healing report — but DO NOT commit it to the customer
+    //    repo. The report is execution METADATA owned by LevelUp. The DOCUMENT is
+    //    persisted to object storage (see report-store.ts) and only an opaque
+    //    reference (report_uri) is kept in the database; it is also summarised in the
+    //    PR body. Keeping it out of git means (a) customer repositories contain only
+    //    source code — never an ever-growing healing-reports/ folder — and (b) the
+    //    report's live timestamp can no longer pollute `git status`/`git diff`, so a
+    //    heal that changed no source file now produces a genuinely empty changeset and
+    //    is caught cleanly below instead of pushing a phantom, fix-less PR.
     const timestamp = Date.now();
     const reportName = singleHealing
       ? `healing-report-${committable[0].id}.md`
       : `healing-report-batch-${timestamp}.md`;
-    const reportPath = `healing-reports/${reportName}`;
-    commitFiles.push({
-      filePath: reportPath,
-      content: generateCombinedReport(fileOutcomes, skipped),
-    });
+    const reportMarkdown = generateCombinedReport(fileOutcomes, skipped);
+    // Storage key namespaced by repo so the layout maps 1:1 onto an object-storage
+    // bucket/prefix when we migrate off the local volume.
+    const reportKey = `healing-reports/${parsed.owner}/${parsed.repo}/${reportName}`;
 
     // 5. Branch name.
     const branchName = singleHealing
@@ -566,7 +573,10 @@ async function executeHealingPR(opts: {
       : `heal/batch-${changedFiles.length || fileOutcomes.length}-files-${timestamp}`;
 
     // 6. Write files, commit, push, PR — using one cloned worktree.
-    for (const f of commitFiles) {
+    //    Defensive: selectCommitFiles guarantees no healing report ever lands in
+    //    the commit, even if an upstream change re-introduces one.
+    const filesToCommit = selectCommitFiles(commitFiles);
+    for (const f of filesToCommit) {
       const abs = path.join(cloneDir, f.filePath);
       fs.mkdirSync(path.dirname(abs), { recursive: true });
       fs.writeFileSync(abs, f.content, 'utf-8');
@@ -583,10 +593,25 @@ async function executeHealingPR(opts: {
       git(`checkout ${branchName}`);
     }
     git('add -A');
+
+    // ── Pre-push invariant #1: a PR MUST contain a real SOURCE change ────────
+    // Because the healing report is NO LONGER committed (it is platform metadata),
+    // an empty working tree here unambiguously means healing changed no source
+    // file — the locator is already fixed on the base branch, or it did not match
+    // the freshly-cloned file. Stop cleanly: do NOT commit, push, or call GitHub.
     const status = git('status --porcelain');
     if (!status) {
+      logger.warn(MOD, 'No source change after healing — skipping commit/push/PR', {
+        branchName,
+        baseBranch,
+        changedSourceFiles: changedFiles,
+        patchedCount,
+      });
       return {
-        message: 'No changes to commit — the fix(es) may already be applied on the base branch.',
+        message:
+          'No repository changes detected: healing did not modify any source file. This usually ' +
+          'means the target locator is already fixed on the base branch, or it did not match the ' +
+          'current file contents. No branch was pushed and no pull request was opened.',
         patchedCount,
         changedFiles,
         skipped,
@@ -596,6 +621,43 @@ async function executeHealingPR(opts: {
     const commitMsg = buildCommitMessage(fileOutcomes, patchedCount, changedFiles.length);
     git(`commit -m "${commitMsg.replace(/"/g, '\\"')}"`);
     const commitSha = git('rev-parse HEAD');
+
+    // ── Pre-push invariant #2 (defense-in-depth): diff vs base must be non-empty.
+    // With the report out of git this should always hold when invariant #1 passed,
+    // but a tree-identical commit (e.g. a stale/already-merged state) would still
+    // be rejected by GitHub as 422 "No commits between". Catch it locally first.
+    let committedPaths: string[] = [];
+    try {
+      committedPaths = git(`diff --name-only origin/${baseBranch} HEAD`)
+        .split('\n')
+        .map((p) => p.trim())
+        .filter(Boolean);
+    } catch { /* origin ref may be unavailable on shallow edge cases — fall through */ }
+
+    // Per-stage diagnostics so a failed/empty heal self-explains in the logs.
+    logger.info(MOD, 'Post-commit changeset', {
+      branchName,
+      commitSha,
+      committedPaths,
+      changedSourceFiles: changedFiles,
+      patchedCount,
+    });
+
+    if (committedPaths.length === 0) {
+      logger.warn(MOD, 'Commit is tree-identical to base — skipping push/PR', {
+        branchName,
+        baseBranch,
+        commitSha,
+      });
+      return {
+        message:
+          `No repository changes detected: the commit is identical to "${baseBranch}" (the fix is ` +
+          `already present there). No branch was pushed and no pull request was opened.`,
+        patchedCount,
+        changedFiles,
+        skipped,
+      };
+    }
 
     // Pre-push diagnostics (token-safe). These pinpoint the three most common
     // causes of a "Password authentication is not supported" push failure:
@@ -700,6 +762,19 @@ async function executeHealingPR(opts: {
       .filter((fx) => fx.patched)
       .map((fx) => fx.healingId);
 
+    // Persist the report DOCUMENT to object storage; the DB keeps only the reference.
+    // Storage is best-effort: a failure here must not fail an otherwise-successful PR.
+    let reportUri: string | null = null;
+    try {
+      const saved = await getReportStore().save(reportKey, reportMarkdown);
+      reportUri = saved.uri;
+    } catch (storeErr) {
+      logger.warn(MOD, 'Failed to persist healing report to object storage (non-critical)', {
+        reportKey,
+        error: (storeErr as Error).message,
+      });
+    }
+
     try {
       const prAutomationId = await logPR(
         {
@@ -711,9 +786,10 @@ async function executeHealingPR(opts: {
           repo_owner: parsed.owner,
           repo_name: parsed.repo,
           base_branch: baseBranch,
-          files_changed: commitFiles.map((f) => f.filePath),
+          files_changed: filesToCommit.map((f) => f.filePath),
           healing_count: patchedCount,
           status: 'open',
+          report_uri: reportUri ?? undefined,
         },
         companyId,
       );
@@ -743,6 +819,16 @@ async function executeHealingPR(opts: {
         replacements: f.totalReplacements,
         fixes: f.fixes,
       })),
+      // Healing report is platform-owned metadata: the document lives in object
+      // storage (referenced by uri/key, also persisted to pr_automations.report_uri)
+      // and is intentionally NOT committed to the customer repo. The markdown is
+      // included inline in the response purely for immediate display.
+      report: {
+        name: reportName,
+        key: reportKey,
+        uri: reportUri,
+        markdown: reportMarkdown,
+      },
       github: {
         prUrl: pr.url,
         prNumber: pr.number,
@@ -848,6 +934,41 @@ function slug(s: string): string {
     .toLowerCase()
     .replace(/^-|-$/g, '')
     .slice(0, 40);
+}
+
+/**
+ * Is this repo-relative path a LevelUp healing report?
+ *
+ * Healing reports are execution metadata owned by the platform (persisted to the
+ * DB and surfaced in the PR body / dashboard) — they must NEVER be committed to
+ * the customer repository. This recogniser is the single source of truth for what
+ * counts as a report artifact, used to keep the commit set source-only.
+ */
+export function isHealingReportPath(p: string): boolean {
+  const norm = p.trim().replace(/^\.?\//, '');
+  // Primary invariant: the route only ever writes reports under healing-reports/.
+  // Secondary (defensive): a root-level file matching the generated naming
+  //   healing-report-<id>.md  /  healing-report-batch-<ts>.md  (digit-led, so a
+  //   doc like "healing-report-format.md" is NOT misclassified).
+  return (
+    /^healing-reports\//i.test(norm) ||
+    /(^|\/)healing-report-(?:batch-)?\d[^/]*\.md$/i.test(norm)
+  );
+}
+
+/**
+ * The files that actually get COMMITTED to the customer repo: source changes only.
+ *
+ * Architectural invariant (Option A): the customer repository contains only source
+ * code, never an ever-growing healing-reports/ folder. This is a defensive filter —
+ * the route already builds its commit list from source fixes only, but routing every
+ * write through here guarantees a report can never slip into a commit even if an
+ * upstream change re-introduces one. It also removes the previous failure mode where
+ * the report's live timestamp polluted `git status`/`git diff` and let a no-op heal
+ * push a phantom, fix-less PR.
+ */
+export function selectCommitFiles<T extends { filePath: string }>(files: T[]): T[] {
+  return files.filter((f) => !isHealingReportPath(f.filePath));
 }
 
 const STRATEGY_LABEL: Record<string, string> = {
