@@ -19,6 +19,7 @@
  */
 
 import OpenAI from 'openai';
+import { AnthropicClient, resolveAnthropicModel, isAnthropicConfigured } from '../ai/anthropic-client';
 import { logger } from '../utils/logger';
 import {
   getTestRequirement,
@@ -217,10 +218,55 @@ interface FileGroup {
 export class TestToScriptEngine {
   private readonly openai: OpenAI;
   private readonly model: string;
+  // Phase 1 — optional Claude provider for Test → Script. When
+  // SCRIPT_PROVIDER=anthropic and a key is configured, code generation routes
+  // to Claude and transparently falls back to OpenAI on ANY error.
+  private readonly anthropic: AnthropicClient | null;
+  private readonly scriptProvider: string;
+  private readonly anthropicModel: string;
 
   constructor() {
     this.openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
     this.model = process.env.SCRIPT_GEN_MODEL || 'gpt-4o-mini';
+
+    this.scriptProvider = (process.env.SCRIPT_PROVIDER || 'openai').toLowerCase();
+    this.anthropicModel = resolveAnthropicModel(process.env.SCRIPT_MODEL);
+    this.anthropic =
+      this.scriptProvider === 'anthropic' && isAnthropicConfigured()
+        ? new AnthropicClient({ model: this.anthropicModel })
+        : null;
+  }
+
+  /**
+   * Provider-routed plain-text (code) completion for Test → Script generation.
+   *
+   * Routes to Claude when SCRIPT_PROVIDER=anthropic and configured; on ANY
+   * Anthropic error it logs and transparently falls back to OpenAI so a request
+   * never fails because of the new provider. Returns the raw model text.
+   */
+  private async completeCode(prompt: string, temperature: number, maxTokens: number): Promise<string> {
+    if (this.anthropic) {
+      try {
+        const r = await this.anthropic.createChatCompletion({
+          model: this.anthropicModel,
+          messages: [{ role: 'user', content: prompt }],
+          temperature,
+          maxTokens,
+        });
+        return r.content || '';
+      } catch (err) {
+        logger.warn(MOD, 'Anthropic code generation failed; falling back to OpenAI', {
+          error: (err as Error).message,
+        });
+      }
+    }
+    const response = await this.openai.chat.completions.create({
+      model: this.model,
+      messages: [{ role: 'user', content: prompt }],
+      temperature,
+      max_tokens: maxTokens,
+    });
+    return response.choices[0]?.message?.content?.trim() || '';
   }
 
   /**
@@ -991,13 +1037,7 @@ Return ONLY the TypeScript code. No markdown fences, no explanations.`;
     let aiCode = '';
     const maxTokens = Math.min(8000, 1500 + group.cases.length * 600);
     try {
-      const response = await this.openai.chat.completions.create({
-        model: this.model,
-        messages: [{ role: 'user', content: prompt }],
-        temperature: 0.2,
-        max_tokens: maxTokens,
-      });
-      aiCode = response.choices[0]?.message?.content?.trim() || '';
+      aiCode = await this.completeCode(prompt, 0.2, maxTokens);
       aiCode = aiCode.replace(/^```(?:typescript|ts)?\n?/m, '').replace(/\n?```$/m, '').trim();
       if (aiCode && !aiCode.startsWith('import')) {
         aiCode = `import { test, expect } from '@playwright/test';\n\n${aiCode}`;
@@ -1023,13 +1063,7 @@ Return ONLY the TypeScript code. No markdown fences, no explanations.`;
         });
         try {
           const fixPrompt = `${prompt}\n\n## PREVIOUS ATTEMPT FAILED VALIDATION\nYour previous output had these defects that MUST be fixed:\n${issues.map(i => `- ${i}`).join('\n')}\n\nRegenerate the COMPLETE file fixing ALL of the above. Use the real Base URL "${baseUrl}" verbatim in navigation. Use ONLY the provided credentials and locators. Every Expected Result must map to a concrete, meaningful expect(...). Return ONLY TypeScript code.`;
-          const retry = await this.openai.chat.completions.create({
-            model: this.model,
-            messages: [{ role: 'user', content: fixPrompt }],
-            temperature: 0.1,
-            max_tokens: maxTokens,
-          });
-          let retryCode = retry.choices[0]?.message?.content?.trim() || '';
+          let retryCode = await this.completeCode(fixPrompt, 0.1, maxTokens);
           retryCode = retryCode.replace(/^```(?:typescript|ts)?\n?/m, '').replace(/\n?```$/m, '').trim();
           if (retryCode && !retryCode.startsWith('import')) {
             retryCode = `import { test, expect } from '@playwright/test';\n\n${retryCode}`;
