@@ -29,7 +29,7 @@ import {
   linkHealingActionsToPR,
   logPR,
 } from '../../db/postgres';
-import { GitHubService, type CommitFileSpec } from '../../services/github-service';
+import { GitHubService, GitHubPRError, type CommitFileSpec } from '../../services/github-service';
 // The connected Tools-page token (notification_configs) — the SAME token the
 // script-generation PR flow authenticates with. Aliased to avoid colliding with
 // the git-push GitHubService above. Healing must resolve its token from here
@@ -649,11 +649,42 @@ async function executeHealingPR(opts: {
       throw new HttpError(500, `git push failed: ${sanitized}`);
     }
 
-    const pr = await github.createPR(branchName, baseBranch, {
-      title: buildPRTitle(fileOutcomes, changedFiles.length, patchedCount),
-      body: generateCombinedPRBody(fileOutcomes, skipped, baseBranch),
-      labels: ['levelup-ai', 'auto-heal', 'test-fix'],
-    });
+    let pr: { url: string; number: number } | null;
+    try {
+      pr = await github.createPR(branchName, baseBranch, {
+        title: buildPRTitle(fileOutcomes, changedFiles.length, patchedCount),
+        body: generateCombinedPRBody(fileOutcomes, skipped, baseBranch),
+        labels: ['levelup-ai', 'auto-heal', 'test-fix'],
+      });
+    } catch (prErr) {
+      // Surface GitHub's REAL reason instead of an opaque "PR creation failed".
+      if (prErr instanceof GitHubPRError) {
+        if (prErr.isNoDiff) {
+          // Branch pushed but tree-identical to base (fix already on base).
+          throw new HttpError(
+            409,
+            `The branch "${branchName}" was pushed but GitHub rejected the PR: ${prErr.message}. ` +
+              `The healed change appears to already be present on "${baseBranch}" (a previous PR with the ` +
+              `same fix was likely merged). Nothing new to review.`,
+          );
+        }
+        if (prErr.isPermission) {
+          throw new HttpError(
+            403,
+            `The branch "${branchName}" was pushed, but the GitHub token cannot open a pull request on ` +
+              `${parsed.owner}/${parsed.repo} (GitHub said: ${prErr.message}). ` +
+              `Grant the token "Pull requests: Write" (fine-grained PAT) or the "repo" scope (classic PAT), ` +
+              `then retry.`,
+          );
+        }
+        throw new HttpError(
+          502,
+          `The branch "${branchName}" was pushed, but GitHub rejected the PR` +
+            (prErr.status ? ` (HTTP ${prErr.status})` : '') + `: ${prErr.message}`,
+        );
+      }
+      throw prErr;
+    }
     if (!pr) {
       throw new HttpError(500, 'Branch was pushed but PR creation failed');
     }
