@@ -597,28 +597,6 @@ async function executeHealingPR(opts: {
     git(`commit -m "${commitMsg.replace(/"/g, '\\"')}"`);
     const commitSha = git('rev-parse HEAD');
 
-    // No-diff guard: even though the working tree had staged changes, the commit
-    // may be tree-identical to the base branch — e.g. the user re-ran healing
-    // after an earlier PR with the SAME fix already merged into the base. In that
-    // case GitHub rejects the PR with 422 "No commits between <base> and <branch>".
-    // Detect it here and return a clear, non-error message instead of pushing a
-    // dead branch and surfacing an opaque "Failed to create PR".
-    let effectiveDiff = '';
-    try {
-      effectiveDiff = git(`diff --stat origin/${baseBranch} HEAD`);
-    } catch { /* origin ref may be unavailable; fall through and let push/PR decide */ }
-    if (effectiveDiff === '') {
-      logger.info(MOD, 'No effective diff vs base — skipping PR', { branchName, baseBranch });
-      return {
-        message:
-          `Nothing to open a PR for: the healed change is already present on "${baseBranch}". ` +
-          `This usually means a previous PR with the same fix was already merged. No new branch was pushed.`,
-        patchedCount,
-        changedFiles,
-        skipped,
-      };
-    }
-
     // Pre-push diagnostics (token-safe). These pinpoint the three most common
     // causes of a "Password authentication is not supported" push failure:
     //   • token absent/empty  → tokenPresent=false / tokenLength=0
