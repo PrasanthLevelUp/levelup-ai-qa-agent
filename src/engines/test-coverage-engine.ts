@@ -1135,17 +1135,44 @@ Return ONLY valid JSON array.`;
         return (a.expectedResult?.length || 0) >= (b.expectedResult?.length || 0);
       };
 
+      // Scenario-aware survivor tracking. A test case belongs to a scenario
+      // (scenarioIndex). We must NEVER remove the last surviving case of a
+      // scenario — otherwise that scenario is orphaned ("No test cases linked")
+      // and the total case count drops below the scenario count. Cases without a
+      // numeric scenarioIndex share a single bucket (-1).
+      const scenarioKey = (tc: TestCase): number => {
+        const idx = (tc as any).scenarioIndex;
+        return typeof idx === 'number' ? idx : -1;
+      };
+      const survivorsPerScenario = new Map<number, number>();
+      for (const tc of testCases) {
+        const k = scenarioKey(tc);
+        survivorsPerScenario.set(k, (survivorsPerScenario.get(k) || 0) + 1);
+      }
+
       const removedIdx = new Set<number>();
+      const tryRemove = (idx: number): boolean => {
+        const k = scenarioKey(testCases[idx]);
+        // Protect the last surviving case of its scenario.
+        if ((survivorsPerScenario.get(k) || 0) <= 1) return false;
+        removedIdx.add(idx);
+        survivorsPerScenario.set(k, (survivorsPerScenario.get(k) || 0) - 1);
+        return true;
+      };
+
       for (let i = 0; i < testCases.length; i++) {
         if (removedIdx.has(i)) continue;
         for (let j = i + 1; j < testCases.length; j++) {
           if (removedIdx.has(j)) continue;
           const sim = cosineSimilarity(vectors[i], vectors[j]);
           if (sim >= threshold) {
-            // Drop the weaker of the pair.
-            const loser = isStronger(testCases[i], testCases[j]) ? j : i;
-            removedIdx.add(loser);
-            if (loser === i) break; // i is gone — stop comparing it further
+            // Drop the weaker of the pair — but only if doing so does not orphan
+            // its scenario. If the preferred loser is protected, try the other;
+            // if both are last-of-scenario, keep both (distinct coverage).
+            const preferredLoser = isStronger(testCases[i], testCases[j]) ? j : i;
+            const otherCandidate = preferredLoser === j ? i : j;
+            const removed = tryRemove(preferredLoser) || tryRemove(otherCandidate);
+            if (removed && removedIdx.has(i)) break; // i is gone — stop comparing it
           }
         }
       }
