@@ -80,6 +80,56 @@ interface FileOutcome {
 }
 
 /* -------------------------------------------------------------------------- */
+/*  Token candidate selection                                                 */
+/* -------------------------------------------------------------------------- */
+
+export interface TokenCandidate {
+  token: string;
+  source: string;
+}
+
+export interface VerifiedAccess {
+  ok: boolean;
+  status?: number;
+  reason?: string;
+}
+
+export interface TokenSelectionResult {
+  /** The candidate that has push access, or null if none do. */
+  selected: TokenCandidate | null;
+  /** The most informative failure (prefers 401/403) when nothing can push. */
+  failure: { status: number; reason: string; source: string } | null;
+}
+
+/**
+ * Walk token candidates in priority order and return the FIRST one that has
+ * push access (per `verify`). This is what makes healing robust: it uses the
+ * Tools-page token if it can push, otherwise falls back to the env token that
+ * script-gen successfully uses — instead of stopping at the first non-empty
+ * token and failing.
+ *
+ * Pure + injectable `verify` so it is trivially unit-testable.
+ */
+export async function selectPushableToken(
+  candidates: TokenCandidate[],
+  verify: (token: string) => Promise<VerifiedAccess>,
+): Promise<TokenSelectionResult> {
+  let failure: TokenSelectionResult['failure'] = null;
+  for (const cand of candidates) {
+    const access = await verify(cand.token);
+    if (access.ok) {
+      return { selected: cand, failure: null };
+    }
+    const status = access.status ?? 403;
+    // Prefer a real auth/permission signal (401/403) over 404/500 noise.
+    if (!failure || status === 401 || status === 403) {
+      failure = { status, reason: access.reason ?? 'No push access.', source: cand.source };
+    }
+  }
+  return { selected: null, failure };
+}
+
+/* -------------------------------------------------------------------------- */
 /*  Router                                                                    */
 /* -------------------------------------------------------------------------- */
 
@@ -374,68 +424,82 @@ async function executeHealingPR(opts: {
     companyId,
   });
 
-  // Resolve the token EXACTLY like the script-generation PR flow does:
+  const parsed = GitHubService.parseRepoUrl(repo.url);
+  if (!parsed) throw new HttpError(400, `Cannot parse GitHub URL: ${repo.url}`);
+
+  const baseBranch = repo.branch || 'main';
+  const singleHealing = committable.length === 1;
+
+  // Resolve the token by trying ALL available sources and picking the FIRST one
+  // that ACTUALLY HAS PUSH ACCESS to this repo. This is critical because the
+  // script-gen PR flow uses process.env.GITHUB_TOKEN (often the only token with
+  // write access), while a user may also have connected a *read-only* token on
+  // the Tools page. Previously healing stopped at the first NON-EMPTY token
+  // (the Tools-page one) and failed its push pre-flight — even though the env
+  // token that script-gen uses successfully was sitting right there as a
+  // fallback. We now verify each candidate and use the first that can push.
+  //
+  // Priority order of candidates:
   //   1. explicit githubToken in the request (rare override)
-  //   2. the connected Tools-page token in the DB (notification_configs) —
-  //      this is what script-gen uses and what the user actually connected
-  //   3. process.env.GITHUB_TOKEN — last-resort fallback for headless/CI use
-  // Previously healing only looked at (1)/(3), so a perfectly-connected Tools
-  // token still produced a "git push … Password authentication" failure.
-  let token = githubToken;
-  let tokenSource = token ? 'request' : '';
-  if (!token) {
-    try {
-      const connected = await new ConnectedGitHubService().getToken(companyId, userId);
-      if (connected) {
-        token = connected;
-        tokenSource = 'connected-tools-token';
-      }
-    } catch (e: any) {
-      logger.warn(MOD, 'Could not load connected GitHub token; falling back to env', {
-        error: e?.message,
-      });
-    }
+  //   2. the connected Tools-page token (notification_configs)
+  //   3. process.env.GITHUB_TOKEN — the token script-gen uses
+  const candidates: Array<{ token: string; source: string }> = [];
+  if (githubToken) candidates.push({ token: githubToken, source: 'request' });
+  try {
+    const connected = await new ConnectedGitHubService().getToken(companyId, userId);
+    if (connected) candidates.push({ token: connected, source: 'connected-tools-token' });
+  } catch (e: any) {
+    logger.warn(MOD, 'Could not load connected GitHub token; will try env', { error: e?.message });
   }
-  if (!token && process.env.GITHUB_TOKEN) {
-    token = process.env.GITHUB_TOKEN;
-    tokenSource = 'env';
+  if (process.env.GITHUB_TOKEN) {
+    candidates.push({ token: process.env.GITHUB_TOKEN, source: 'env' });
   }
-  if (!token) {
+
+  if (candidates.length === 0) {
     throw new HttpError(
       400,
       'GitHub token required. Connect GitHub on the Tools page, pass githubToken in the request body, or set the GITHUB_TOKEN env variable.',
     );
   }
-  logger.info(MOD, 'Resolved GitHub token for healing PR', { tokenSource });
 
-  const parsed = GitHubService.parseRepoUrl(repo.url);
-  if (!parsed) throw new HttpError(400, `Cannot parse GitHub URL: ${repo.url}`);
+  // 2b. Pre-flight: walk the candidates, returning the first that authenticates
+  //     AND has push (write) access. Without this, a PUBLIC repo clones fine
+  //     with a read-only/expired token and only blows up much later at
+  //     `git push` with the opaque "Password authentication" error.
+  //
+  //     We build ONE GitHubService per candidate, but reuse the verified one so
+  //     we don't re-instantiate after selection.
+  const servicesByToken = new Map<string, GitHubService>();
+  const { selected, failure } = await selectPushableToken(candidates, async (tok) => {
+    let svc = servicesByToken.get(tok);
+    if (!svc) {
+      svc = new GitHubService({ token: tok, owner: parsed.owner, repo: parsed.repo });
+      servicesByToken.set(tok, svc);
+    }
+    const access = await svc.verifyAccess();
+    return access.ok ? { ok: true } : { ok: false, status: access.status, reason: access.reason };
+  });
 
-  const github = new GitHubService({ token, owner: parsed.owner, repo: parsed.repo });
-  const baseBranch = repo.branch || 'main';
-  const singleHealing = committable.length === 1;
-
-  // 2b. Pre-flight: fail FAST with a clear, actionable message if the token
-  //     cannot push to this repo. Without this, a PUBLIC repo clones fine with
-  //     a bad/expired token and only blows up much later at `git push` with the
-  //     opaque "Password authentication is not supported" error.
-  const access = await github.verifyAccess();
-  if (!access.ok) {
-    // Include token source in the error so frontend/user knows which token to fix
-    const tokenSourceLabel = 
-      tokenSource === 'connected-tools-token' ? 'Tools page GitHub connection'
-      : tokenSource === 'env' ? 'GITHUB_TOKEN environment variable'
-      : tokenSource === 'request' ? 'githubToken request parameter'
+  if (!selected) {
+    const f = failure || { status: 403, reason: 'No GitHub token with push access available.', source: 'unknown' };
+    const triedSources = candidates.map((c) => c.source).join(', ');
+    const tokenSourceLabel =
+      f.source === 'connected-tools-token' ? 'Tools page GitHub connection'
+      : f.source === 'env' ? 'GITHUB_TOKEN environment variable'
+      : f.source === 'request' ? 'githubToken request parameter'
       : 'unknown';
-    const enrichedReason = `${access.reason}\n\nToken source: ${tokenSourceLabel}\n\n` +
-      (tokenSource === 'connected-tools-token' 
-        ? `To fix: Visit the Tools page → GitHub section and reconnect with a token that has write access to ${parsed.owner}/${parsed.repo}. ` +
-          `For a Classic PAT, ensure "repo" scope is enabled. For a Fine-grained PAT, grant "Contents: Read and write" + "Pull requests: Read and write" to this repository.`
-        : tokenSource === 'env'
-        ? `To fix: Update the GITHUB_TOKEN environment variable with a token that has write access to ${parsed.owner}/${parsed.repo}.`
-        : `To fix: Pass a githubToken with write access to ${parsed.owner}/${parsed.repo} in the request, or configure via Tools page.`);
-    throw new HttpError(access.status, enrichedReason);
+    const enrichedReason =
+      `${f.reason}\n\nTried token source(s): ${triedSources}. Closest failure from: ${tokenSourceLabel}.\n\n` +
+      `To fix: Provide at least one token with write access to ${parsed.owner}/${parsed.repo}. ` +
+      `Either reconnect GitHub on the Tools page, or set the GITHUB_TOKEN env var on the backend. ` +
+      `For a Classic PAT enable the "repo" scope; for a Fine-grained PAT grant ` +
+      `"Contents: Read and write" + "Pull requests: Read and write" on this repository.`;
+    throw new HttpError(f.status, enrichedReason);
   }
+
+  const github = servicesByToken.get(selected.token)!;
+  const tokenSource = selected.source;
+  logger.info(MOD, 'Resolved GitHub token for healing PR', { tokenSource });
 
   // 3. Clone once, do all work, always clean up.
   let cloneDir: string | null = null;
