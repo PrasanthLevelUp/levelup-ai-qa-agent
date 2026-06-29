@@ -92,16 +92,35 @@ function remedyForStrategy(s: RecommendedStrategy): HealingRemedy {
 
 export function routeHealingStrategy(diagnosis: FailureDiagnosis): HealingStrategyPlan {
   const { category } = diagnosis;
-
-  const reportOnlyPlan = (rationale: string): HealingStrategyPlan => ({
-    shouldAttemptLocatorHealing: false,
-    remedy: 'report_only',
-    disposition: 'hard_stop',
-    category,
-    recommendedStrategy: 'report_only',
-    rationale,
-    reportOnly: true,
+  
+  const logger = require('../utils/logger').logger;
+  const MOD = 'healing-strategy-router';
+  logger.info(MOD, '▶ STAGE: HealingStrategyRouter.route', {
+    category: diagnosis.category,
+    confidence: diagnosis.confidence,
+    locator: diagnosis.locator,
+    recommendedStrategy: diagnosis.recommendedStrategy,
+    healableByLocatorSwap: diagnosis.healableByLocatorSwap,
   });
+
+  const reportOnlyPlan = (rationale: string): HealingStrategyPlan => {
+    const plan: HealingStrategyPlan = {
+      shouldAttemptLocatorHealing: false,
+      remedy: 'report_only',
+      disposition: 'hard_stop',
+      category,
+      recommendedStrategy: 'report_only',
+      rationale,
+      reportOnly: true,
+    };
+    logger.info(MOD, '✓ STAGE: HealingStrategyRouter.route → HARD_STOP', {
+      disposition: plan.disposition,
+      category: plan.category,
+      shouldAttemptLocatorHealing: plan.shouldAttemptLocatorHealing,
+      rationale: plan.rationale.slice(0, 100),
+    });
+    return plan;
+  };
 
   /**
    * Route into the grounded advisor pipeline. NO single signal (regex category,
@@ -111,15 +130,24 @@ export function routeHealingStrategy(diagnosis: FailureDiagnosis): HealingStrate
    * propose candidates from real evidence; if none survive, the Validation layer
    * (browser rerun) — not this router — declares the failure unhealed.
    */
-  const advisorPlan = (rationale: string): HealingStrategyPlan => ({
-    shouldAttemptLocatorHealing: true,
-    remedy: 'locator_swap',
-    disposition: 'advisor',
-    category,
-    recommendedStrategy: 'locator_swap',
-    rationale,
-    reportOnly: false,
-  });
+  const advisorPlan = (rationale: string): HealingStrategyPlan => {
+    const plan: HealingStrategyPlan = {
+      shouldAttemptLocatorHealing: true,
+      remedy: 'locator_swap',
+      disposition: 'advisor',
+      category,
+      recommendedStrategy: 'locator_swap',
+      rationale,
+      reportOnly: false,
+    };
+    logger.info(MOD, '✓ STAGE: HealingStrategyRouter.route → ADVISOR', {
+      disposition: plan.disposition,
+      category: plan.category,
+      shouldAttemptLocatorHealing: plan.shouldAttemptLocatorHealing,
+      rationale: plan.rationale.slice(0, 100),
+    });
+    return plan;
+  };
 
   // ── Hard stops ──────────────────────────────────────────────────────────
   // These four categories are categorically NOT locator/heal problems. They are

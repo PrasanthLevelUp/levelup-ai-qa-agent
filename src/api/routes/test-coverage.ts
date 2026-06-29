@@ -46,6 +46,23 @@ import { TemplateService } from '../../services/template-service';
 
 const MOD = 'test-coverage-routes';
 
+/**
+ * Build the AI-metadata JSONB bag for a scenario/test case, dropping any
+ * undefined/empty values so we never persist noise like {"objective": null}.
+ * All AI-generated metadata (objective, riskArea, and any future fields such as
+ * confidence/reasoning/coverageEvidence) flows through here — so extending it
+ * NEVER requires another DB migration. Returns {} when nothing is present.
+ */
+function buildAiMetadata(fields: Record<string, any>): Record<string, any> {
+  const out: Record<string, any> = {};
+  for (const [k, v] of Object.entries(fields)) {
+    if (v !== undefined && v !== null && !(typeof v === 'string' && v.trim() === '')) {
+      out[k] = v;
+    }
+  }
+  return out;
+}
+
 export function createTestCoverageRouter(): Router {
   const router = Router();
   let engine: TestCoverageEngine | null = null;
@@ -362,6 +379,11 @@ export function createTestCoverageRouter(): Router {
         // assumption-based test cases (e.g. "No username length limit found — add one?").
         missingRequirements: result.missingRequirements || [],
         missingRequirementsCount: result.stats?.missingRequirementsCount ?? (result.missingRequirements?.length || 0),
+        // Per-selected-coverage-type evaluation — proves EVERY coverage type the
+        // user selected was processed (status "covered" with scenario/case counts,
+        // or "not_applicable" with a reason). Stored so the History detail view can
+        // show a per-type coverage breakdown instead of silently dropping types.
+        coverageTypeEvaluations: result.coverageTypeEvaluations || [],
         // How many near-duplicate test cases the semantic dedup pass removed.
         duplicatesRemoved: result.stats?.duplicatesRemoved ?? 0,
         // Issue #2: record whether real app knowledge was used for this generation
@@ -404,6 +426,9 @@ export function createTestCoverageRouter(): Router {
           coverageType: s.coverageType,
           priority: s.priority,
           riskArea: s.riskArea,
+          // All AI-generated metadata lives in one JSONB bag — adding future
+          // fields (confidence, reasoning, …) never needs a schema migration.
+          aiMetadata: buildAiMetadata({ objective: (s as any).objective }),
         })), companyId);
         logger.info(MOD, 'Scenarios persisted', { count: scenarioIds.length });
       } catch (scenErr: any) {
@@ -443,6 +468,11 @@ export function createTestCoverageRouter(): Router {
               steps: tc.steps || [],
               expectedResult: tc.expectedResult || '',
               testData: tc.testData || '',
+              // Enterprise AI metadata (objective + product riskArea) in one JSONB bag.
+              aiMetadata: buildAiMetadata({
+                objective: (tc as any).objective,
+                riskArea: (tc as any).riskArea,
+              }),
               priority: tc.priority || 'P2',
               severity: tc.severity || 'major',
               tags: tc.tags || [],
