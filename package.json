@@ -13,7 +13,10 @@
     "dev:api": "MODE=api ts-node src/index.ts",
     "run-tests": "ts-node src/core/execution-engine.ts",
     "report": "ts-node src/reports/html-report.ts",
-    "benchmark:saucedemo": "node benchmarks/heal-saucedemo-login.js"
+    "benchmark:saucedemo": "node benchmarks/heal-saucedemo-login.js",
+    "test:unit": "jest tests/unit",
+    "test:integration": "jest tests/integration",
+    "test": "npm run test:unit && npm run test:integration"
   },
   "repository": {
     "type": "git",
