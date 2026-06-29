@@ -13,6 +13,19 @@ import { KnowledgeOptimizer, type KnowledgeItem as OptimizerKnowledgeItem } from
 
 const MOD = 'test-coverage-engine';
 
+/**
+ * Prompt version identifier — increment when the generation prompt logic changes.
+ * Tracked in every generation so we can correlate quality with prompt evolution and
+ * quickly diagnose "last week was better" reports by identifying which version ran.
+ */
+const PROMPT_VERSION = 'v3.2-senior-qa';
+
+/**
+ * Engine architecture version — increment when the pipeline or core algorithm changes
+ * (e.g. dedup logic, grounding approach, evaluation reconciliation).
+ */
+const ENGINE_VERSION = 'test-coverage-v2';
+
 /** Cosine similarity between two equal-length numeric vectors (0..1 for embeddings). */
 function cosineSimilarity(a: number[], b: number[]): number {
   if (!a?.length || !b?.length || a.length !== b.length) return 0;
@@ -35,6 +48,104 @@ export type CoverageType =
   | 'security' | 'api' | 'ui' | 'mobile' | 'accessibility'
   | 'performance' | 'integration' | 'regression'
   | 'cross_browser' | 'data_validation' | 'role_based' | 'localization';
+
+/**
+ * Semantic meaning of each Coverage Type.
+ *
+ * The selected Coverage Types are the user's EXPLICIT testing intent, so the
+ * model is given the GOAL of each selected type (not just its name). This is the
+ * single biggest lever for getting comprehensive, well-organised output: Claude
+ * follows an explicit objective far better than a bare label like "negative".
+ *
+ * `label`     — human title used for the per-type section header in the prompt.
+ * `goal`      — what a senior QA engineer is trying to achieve with this type.
+ * `lookFor`   — concrete, grounded angles to consider (kept requirement-relative,
+ *               never a mandate to invent unsupported functionality).
+ *
+ * To add a future coverage type, add an entry here following the same pattern.
+ */
+export const COVERAGE_TYPE_GOALS: Record<CoverageType, { label: string; goal: string; lookFor: string }> = {
+  positive: {
+    label: 'Positive',
+    goal: 'Verify the requirement works correctly for valid inputs and successful, expected user flows.',
+    lookFor: 'happy paths, every valid variation of the main flow, alternate valid entry points, successful state transitions, and each distinct valid role/option the requirement supports.',
+  },
+  negative: {
+    label: 'Negative',
+    goal: 'Verify the requirement correctly REJECTS invalid input and handles incorrect user behaviour gracefully.',
+    lookFor: 'invalid inputs, incorrect user actions, validation failures, business-rule violations, missing required data, wrong credentials/permissions, and clear error handling/messaging for each.',
+  },
+  edge_cases: {
+    label: 'Edge Cases',
+    goal: 'Verify the requirement behaves correctly in uncommon, corner and boundary-adjacent situations.',
+    lookFor: 'empty values, whitespace (leading/trailing), maximum/long lengths, special characters, unicode/emoji, null/undefined, unusual sequences, repeated/rapid actions, and unexpected-but-possible user behaviour.',
+  },
+  boundary: {
+    label: 'Boundary',
+    goal: 'Verify behaviour exactly at, just below, and just above every defined limit.',
+    lookFor: 'minimum and maximum values, character/length limits, zero and one, off-by-one (limit ±1), and numeric overflow/underflow for any limit the requirement states or implies.',
+  },
+  security: {
+    label: 'Security',
+    goal: 'Verify the requirement is resilient to abuse and unauthorised access.',
+    lookFor: 'authentication/authorization bypass, injection (SQL/script), XSS, CSRF, session handling, and exposure of sensitive data — only where the requirement involves such a surface.',
+  },
+  api: {
+    label: 'API',
+    goal: 'Verify the API contract behind the requirement behaves correctly.',
+    lookFor: 'endpoint contracts, status/response codes, request/response payload validation, required vs optional fields, and error responses for each documented endpoint.',
+  },
+  ui: {
+    label: 'UI',
+    goal: 'Verify the user interface for the requirement renders and behaves correctly.',
+    lookFor: 'layout, inline form validation, loading/empty/error states, enabled/disabled controls, and visible feedback for user actions.',
+  },
+  mobile: {
+    label: 'Mobile',
+    goal: 'Verify the requirement works correctly on mobile form factors.',
+    lookFor: 'touch interactions, responsive layout, orientation changes, and on-screen keyboard behaviour relevant to the requirement.',
+  },
+  accessibility: {
+    label: 'Accessibility',
+    goal: 'Verify the requirement is usable with assistive technology.',
+    lookFor: 'screen-reader labels, keyboard-only navigation, focus order, ARIA roles, and colour-contrast for the elements involved.',
+  },
+  performance: {
+    label: 'Performance',
+    goal: 'Verify the requirement performs acceptably under realistic conditions.',
+    lookFor: 'response/load time of the main flow, behaviour with large datasets, and concurrent requests where the requirement implies scale.',
+  },
+  integration: {
+    label: 'Integration',
+    goal: 'Verify the requirement works correctly end-to-end across modules and dependencies.',
+    lookFor: 'cross-module flows, data consistency across steps, and interactions with the dependencies/APIs the requirement names.',
+  },
+  regression: {
+    label: 'Regression',
+    goal: 'Verify previously-working behaviour related to the requirement still holds after change.',
+    lookFor: 'critical paths impacted by the change and any behaviour the requirement/release notes flag as previously broken.',
+  },
+  cross_browser: {
+    label: 'Cross-Browser',
+    goal: 'Verify the requirement renders and behaves consistently across browsers.',
+    lookFor: 'rendering and interaction differences across Chrome, Firefox, Safari and Edge for the elements involved.',
+  },
+  data_validation: {
+    label: 'Data Validation',
+    goal: 'Verify all input data for the requirement is validated and sanitised correctly.',
+    lookFor: 'format validation, type checking, required-field enforcement, input sanitisation, and acceptance of valid formats / rejection of invalid ones.',
+  },
+  role_based: {
+    label: 'Role-Based',
+    goal: 'Verify the requirement enforces the correct behaviour per user role/permission.',
+    lookFor: 'each role the requirement names, permitted vs denied actions per role, role transitions, and unauthorized-access handling.',
+  },
+  localization: {
+    label: 'Localization',
+    goal: 'Verify the requirement works correctly across locales.',
+    lookFor: 'language switching, RTL layout, and date/number/currency formatting where the requirement involves localised content.',
+  },
+};
 
 export type RiskLevel = 'critical' | 'high' | 'medium' | 'low';
 
@@ -63,6 +174,14 @@ export interface RequirementAnalysis {
 
 export interface TestScenario {
   scenario: string;
+  /**
+   * What this scenario sets out to PROVE — the senior-QA "objective" of the
+   * scenario, distinct from the title. Enterprise reviewers read the objective
+   * first to decide whether the scenario is worth running. Example:
+   * "Confirm a standard user with valid credentials reaches the Inventory page
+   *  and the session is established." Defaults to the scenario text if omitted.
+   */
+  objective?: string;
   coverageType: CoverageType;
   priority: 'P0' | 'P1' | 'P2' | 'P3';
   riskArea: string;
@@ -82,10 +201,25 @@ export type TestCaseSource = 'requirement' | 'knowledge' | 'test_data' | 'app_pr
 
 export interface TestCase {
   title: string;
+  /**
+   * The single, specific thing this test case verifies — the case-level
+   * objective a senior QA writes before the steps. Sharper than the title and
+   * sharper than the scenario objective (which is about the whole scenario).
+   * Example: "Reject login when the password is correct but the account status
+   * is 'locked', and show the account-locked message." Optional; the UI/export
+   * falls back to the title when absent.
+   */
+  objective?: string;
   preconditions: string;
   steps: string[];
   expectedResult: string;
   testData: string;
+  /**
+   * The risk this case guards against, expressed in product terms (e.g.
+   * "Unauthorized access", "Revenue loss on failed checkout", "Data corruption").
+   * Lets reviewers prioritise by business risk, not just by P0/P1. Optional.
+   */
+  riskArea?: string;
   priority: 'P0' | 'P1' | 'P2' | 'P3';
   severity: 'critical' | 'major' | 'minor' | 'trivial';
   tags: string[];
@@ -132,6 +266,25 @@ export interface MissingRequirement {
  */
 export type GenerationMode = 'strict' | 'expanded';
 
+/**
+ * Per-coverage-type evaluation record. Every Coverage Type the user selected is
+ * processed and reported here — so a type is NEVER silently dropped. When a type
+ * legitimately yields no grounded tests, `status` is 'not_applicable' and
+ * `reason` explains why (e.g. "Requirement defines no numeric limits, so no
+ * boundary tests apply"), instead of the UI just showing nothing.
+ */
+export interface CoverageTypeEvaluation {
+  coverageType: string;
+  /** 'covered' — produced grounded scenarios/cases; 'not_applicable' — none apply. */
+  status: 'covered' | 'not_applicable';
+  /** How many scenarios were produced for this type. */
+  scenarioCount: number;
+  /** How many test cases were produced for this type. */
+  testCaseCount: number;
+  /** Required when status is 'not_applicable' — why no grounded test was possible. */
+  reason?: string;
+}
+
 export interface GenerationResult {
   requirementAnalysis: RequirementAnalysis;
   scenarios: TestScenario[];
@@ -142,6 +295,8 @@ export interface GenerationResult {
   /** Open questions raised instead of generating assumption-based test cases. */
   missingRequirements: MissingRequirement[];
   coverageGaps: CoverageGap[];
+  /** Per-selected-type evaluation — proves every Coverage Type was processed. */
+  coverageTypeEvaluations: CoverageTypeEvaluation[];
   /** Which mode produced this result. */
   mode: GenerationMode;
   stats: {
@@ -157,6 +312,22 @@ export interface GenerationResult {
     suggestedCount?: number;
     /** Count of open questions raised instead of assumption test cases. */
     missingRequirementsCount?: number;
+    /** Size of the generation prompt sent to the model — lets us correlate
+     *  prompt size with output volume and cost over time (measure, don't just
+     *  keep raising the budget). */
+    promptChars?: number;
+    /** Generated cases produced per 1,000 prompt chars — a cheap density signal
+     *  for "are we getting more output for more context, or just paying more?". */
+    casesPerKChars?: number;
+    /** Generation versioning metadata — tracks which prompt/engine/model produced
+     *  this run, so quality regressions ("last week was better") can be instantly
+     *  correlated with code changes and A/B tested. */
+    generationMetadata?: {
+      promptVersion: string;
+      engineVersion: string;
+      model: string;
+      timestamp: string;
+    };
   };
 }
 
@@ -473,7 +644,12 @@ Return ONLY valid JSON, no markdown fences.`;
     testCases: TestCase[];
     suggestedTestCases: TestCase[];
     missingRequirements: MissingRequirement[];
+    coverageTypeEvaluations: CoverageTypeEvaluation[];
     tokensUsed: number;
+    /** Size of the generation prompt actually sent — for measurability
+     *  (prompt size → output volume → tokens/cost), per the "measure, don't
+     *  just keep raising the budget" principle. */
+    promptChars: number;
   }> {
     // GAP-ANALYSIS (expanded) mode only: auto-expand to a comprehensive baseline so
     // the *suggested additional coverage* (assumption-based) bucket is thorough.
@@ -500,59 +676,33 @@ Return ONLY valid JSON, no markdown fences.`;
     const appProfileBlock = this.buildApplicationProfileBlock(knowledge);
     const testDataBlock = this.buildTestDataBlock(knowledge);
 
-    // Build per-type coverage expectations
-    const coverageExpectations = coverageTypes.map(ct => {
-      const expectations: Record<string, string> = {
-        positive: 'positive — 2-3 scenarios covering happy paths, successful workflows, valid inputs. 3-5 test cases each.',
-        negative: 'negative — 2-3 scenarios covering invalid inputs, error handling, permission denied, missing data. 3-4 test cases each.',
-        edge_cases: 'edge_cases — 2-3 scenarios covering corner cases, unusual inputs, empty states, concurrent actions, timing issues. 3-4 test cases each.',
-        boundary: 'boundary — 2 scenarios covering min/max values, character limits, zero values, overflow conditions. 2-3 test cases each.',
-        security: 'security — 2 scenarios covering auth bypass, injection, XSS, CSRF, session hijacking. 2-3 test cases each.',
-        api: 'api — 2 scenarios covering endpoint contracts, response codes, payload validation, rate limits. 2-3 test cases each.',
-        ui: 'ui — 2 scenarios covering layout, responsiveness, form validation, loading states. 2-3 test cases each.',
-        mobile: 'mobile — 2 scenarios covering touch interactions, responsive behavior, orientation changes. 2-3 test cases each.',
-        accessibility: 'accessibility — 2 scenarios covering screen reader, keyboard navigation, ARIA labels, color contrast. 2-3 test cases each.',
-        performance: 'performance — 1-2 scenarios covering load time, large datasets, concurrent requests. 2-3 test cases each.',
-        integration: 'integration — 2 scenarios covering cross-module flows, third-party API interactions, data consistency. 2-3 test cases each.',
-        regression: 'regression — 2 scenarios covering previously broken features, critical paths after changes. 2-3 test cases each.',
-        cross_browser: 'cross_browser — 1-2 scenarios covering Chrome, Firefox, Safari, Edge rendering differences. 2-3 test cases each.',
-        data_validation: 'data_validation — 2 scenarios covering input sanitization, format validation, required fields, type checking. 2-3 test cases each.',
-        role_based: 'role_based — 2 scenarios covering permission levels, role transitions, unauthorized access. 2-3 test cases each.',
-        localization: 'localization — 1-2 scenarios covering language switching, RTL support, date/number formats. 2-3 test cases each.',
-      };
-      return expectations[ct] || `${ct} — 2 scenarios, 2-3 test cases each.`;
-    }).join('\n  - ');
+    // ── Per-type coverage objectives ──
+    // Each SELECTED coverage type is an INDEPENDENT objective with its own goal and
+    // the signals to look for. Passing the semantic MEANING (not just the name) is
+    // what drives Claude to produce a dedicated, comprehensive section per type
+    // instead of collapsing everything into a single positive scenario.
+    const coverageObjectives = coverageTypes.map((ct, i) => {
+      const g = COVERAGE_TYPE_GOALS[ct];
+      if (!g) return `  ${i + 1}. ${ct}  (use coverageType: "${ct}") — generate every grounded scenario and test case this coverage type implies for the requirement.`;
+      return `  ${i + 1}. ${g.label}  (use coverageType: "${ct}")\n       Goal: ${g.goal}\n       Look for: ${g.lookFor}`;
+    }).join('\n');
 
-    // ── Mode-specific scope & volume guidance ──
+    // ── Mode-specific scope guidance ──
     // STANDARD (default): committed coverage grounded in requirement + context
     //   (App Knowledge, App Profile, Test Data). No assumptions.
     // GAP ANALYSIS (expanded): grounded coverage + a separate assumption-based
     //   suggestions bucket + missing-requirement questions.
     const scopeBlock = expand
       ? `GENERATION MODE: GAP ANALYSIS (Coverage Gap Analysis is ON)
-  - Produce THREE outputs:
-    1) "testCases" — GROUNDED coverage (see the GROUNDED SCOPE rules below): everything derived from the REQUIREMENT and the PROVIDED CONTEXT (App Knowledge, App Profile, Test Data). This is the same committed coverage you would produce in Standard mode.
-    2) "suggestedTestCases" — ADDITIONAL, ASSUMPTION-BASED coverage that is NOT grounded in the requirement or provided context but a senior QA would still consider (negative paths, security, edge/boundary, role/permission, concurrency, timeouts). These are SUGGESTIONS for review — keep them OUT of "testCases".
-    3) "missingRequirements" — open questions for unstated values/limits/behaviours (see the ASSUMPTIONS rule).
-  - Coverage-type guidance (applies to both grounded testCases and suggestions):
-  - ${coverageExpectations}
-  - Quality over quantity for suggestions: a handful of high-value ones, not dozens.`
+  Produce THREE outputs:
+    1) "testCases" — GROUNDED coverage (see GROUNDED SCOPE below) derived from the REQUIREMENT and the PROVIDED CONTEXT (App Knowledge, App Profile, Test Data), organised by the coverage objectives below. This is the same committed coverage you would produce in Standard mode.
+    2) "suggestedTestCases" — ADDITIONAL, ASSUMPTION-BASED coverage a senior QA would still consider (negative paths, security, edge/boundary, role/permission, concurrency, timeouts) that is NOT grounded in the requirement or context. Keep these OUT of "testCases".
+    3) "missingRequirements" — open questions for unstated values/limits/behaviours (see the ASSUMPTIONS rule).`
       : `GENERATION MODE: STANDARD COVERAGE (Coverage Gap Analysis is OFF)
-  - Produce "testCases" GROUNDED in the REQUIREMENT and the PROVIDED CONTEXT. App Knowledge, App Profile and Test Data are FIRST-CLASS inputs by default — use them to drive AND enrich real, committed test cases (see GROUNDED SCOPE below).
-  - Coverage-type guidance for the requested types:
-  - ${coverageExpectations}
-  - "suggestedTestCases" MUST be an empty array []. "missingRequirements" MUST be an empty array [] — assumptions are only surfaced when Gap Analysis is ON.
-  - Do NOT invent behaviours, limits, or values that are absent from BOTH the requirement AND all provided context (no assumptions).`;
+  Produce "testCases" GROUNDED in the REQUIREMENT and the PROVIDED CONTEXT, organised by the coverage objectives below. App Knowledge, App Profile and Test Data are FIRST-CLASS inputs by default — use them to drive AND enrich real, committed test cases (see GROUNDED SCOPE below).
+  "suggestedTestCases" MUST be an empty array [] and "missingRequirements" MUST be an empty array [] — assumptions are surfaced only when Gap Analysis is ON.`;
 
-    const volumeBlock = expand
-      ? `OUTPUT VOLUME:
-  - "testCases" (grounded): a thorough set covering everything the requirement + App Knowledge + App Profile + Test Data genuinely support across the requested coverage types.
-  - "suggestedTestCases" (assumption-based expansion): up to ~8 high-value additional cases. Fewer is fine.`
-      : `OUTPUT VOLUME:
-  - Generate a thorough set GROUNDED in the requirement and the provided context — as many cases as the requirement + App Knowledge + App Profile + Test Data genuinely support across the requested coverage types.
-  - Do NOT under-generate: if context legitimately supports more cases, include them. Do NOT pad with ungrounded assumptions either. Quality AND coverage.`;
-
-    const prompt = `You are a principal QA engineer. ${expand ? 'Generate grounded coverage PLUS clearly-separated, assumption-based suggested additional coverage.' : 'Generate the committed test cases grounded in the requirement AND the provided context (App Knowledge, App Profile, Test Data) — thorough but no ungrounded assumptions.'}
+    const prompt = `You are a principal QA engineer with deep product intuition, writing an enterprise-grade test design. Think the way a senior tester actually works: first UNDERSTAND the requirement deeply, enumerate every situation worth testing, and only then organise that thinking into the selected coverage types. Be exhaustive — the client has chosen these coverage types deliberately and expects EACH ONE covered thoroughly. Never stop at the first obvious case, and never let one type (usually positive) crowd out the others.
 
 REQUIREMENT:
 Title: ${input.title}
@@ -569,7 +719,45 @@ User Roles: ${analysis.userRolesAffected.join(', ')}${knowledgeBugs}${knowledgeT
 
 ${scopeBlock}
 
-${volumeBlock}
+COVERAGE OBJECTIVES — the user explicitly selected these. Treat EACH as a separate, independent objective; every one MUST be addressed in the output:
+${coverageObjectives}
+
+HOW A SENIOR QA ENGINEER REASONS — follow these phases INTERNALLY before you emit JSON (do NOT output your reasoning, only the final JSON):
+
+  PHASE 1 — EXTRACT TEST OBLIGATIONS from the Acceptance Criteria.
+    Do not paste the AC. Decompose each criterion (including Given/When/Then) into its testable parts:
+      • Precondition (the state that must exist, e.g. "a locked account exists")
+      • Action (what the user/system does, e.g. "submit login")
+      • Expected (the observable outcome, e.g. "account-locked message shown")
+      • Risk (what breaks if this fails, e.g. "Authentication / unauthorized access")
+    Every obligation you extract MUST be verified by at least one test case. Missing an AC obligation is the worst failure mode — do not let it happen.
+
+  PHASE 2 — INFER FLOW SCENARIOS from the Business Flow / Workflow.
+    From the flow (e.g. Login → Dashboard → Checkout → Payment) reason beyond the happy path WITHOUT being told to:
+      • interrupted flow (user abandons or a step fails midway)
+      • resume flow (user returns and continues)
+      • session timeout / expiry during the flow
+      • navigation (back/forward, deep-link into a later step, refresh)
+      • state carried between steps (data from step N still valid at step N+1)
+    Include the flow-derived scenarios that are RELEVANT to the requirement and to the selected coverage types.
+
+  PHASE 3 — ENUMERATE, THEN BUCKET (do not generate one bucket at a time).
+    First list EVERY distinct situation worth testing that the obligations (Phase 1), the flow (Phase 2), and the provided context imply. THEN assign each situation to the selected coverage type it best belongs to:
+      "What scenarios exist? → Which are Positive? → Which are Negative? → Which are Edge? → …"
+    This guarantees a situation is never missed just because you were thinking about one bucket at a time.
+
+  PHASE 4 — COVER EVERY SELECTED TYPE EXHAUSTIVELY.
+    - Handle each selected coverage type ON ITS OWN. Do NOT merge several types into one scenario, and do NOT collapse the work down to a single happy-path scenario.
+    - For each type, emit ALL the distinct grounded scenarios it genuinely implies — one scenario per distinct situation — and the concrete test cases under each. A real requirement normally yields MULTIPLE scenarios and MULTIPLE cases per selected type.
+    - There are NO fixed counts and NO upper cap. The client selected these types on purpose — be thorough. Let the requirement + context decide depth, but never pad with reworded repetition or ungrounded guesses.
+    - Every scenario MUST set "coverageType" to the exact id of the type it belongs to (e.g. "positive", "negative", "edge_cases"). Group your work by coverage type.
+    - Each scenario MUST set "objective": one sentence stating what the scenario PROVES.
+    - Each test case MUST set "scenarioIndex" (0-based) to its scenario, plus its own "objective" (the single thing it verifies) and "riskArea" (the product risk it guards against).
+
+EVERY SELECTED TYPE MUST BE EVALUATED — populate "coverageTypeEvaluations":
+  - Add exactly one entry per selected coverage type.
+  - If the type applies, set status "covered" (you will have produced scenarios/cases for it).
+  - If a type honestly does NOT apply to THIS requirement given the available context (e.g. "localization" for a backend-only rule with no localised content), still add an entry with status "not_applicable" and a one-line "reason" explaining why — NEVER silently skip a selected type.
 
 GROUNDED SCOPE — the single most important rule (defines what belongs in "testCases"):
   - A test case belongs in "testCases" if it is GROUNDED in any of the following:
@@ -578,7 +766,7 @@ GROUNDED SCOPE — the single most important rule (defines what belongs in "test
       • APP PROFILE — real pages/forms/elements/selectors of the application; OR
       • TEST DATA — a dataset/scenario RELEVANT to the requirement (use the real records as the case's test data, and cover the scenarios that dataset is meant to exercise).
   - These four are FIRST-CLASS, DEFAULT inputs. Use them to DRIVE and ENRICH committed cases — do not hold back grounded coverage.
-  - The ONLY thing excluded from "testCases" is an ASSUMPTION: a behaviour/value/limit absent from BOTH the requirement AND all provided context.
+  - Being comprehensive does NOT mean inventing: the ONLY thing excluded from "testCases" is an ASSUMPTION — a behaviour/value/limit absent from BOTH the requirement AND all provided context.
   - Guard against irrelevant grounding: an UNRELATED dataset alone (e.g. a "locked_users" set when the requirement and knowledge never mention lockout) is NOT a reason to test that behaviour. Ground in context that is RELEVANT to this requirement.
   - Concrete example: requirement "standard user logs in and reaches Inventory", with a "standard_user" dataset and an App Profile of the login + inventory pages → GROUNDED testCases: successful login (using the real standard_user record), navigation to Inventory, and any login/inventory behaviour the App Knowledge documents. If nothing states lockout/length limits/concurrency, those are ASSUMPTIONS — ${expand ? 'put them in suggestedTestCases / missingRequirements.' : 'OMIT them (they appear only when Gap Analysis is ON).'}
 ${expand ? `
@@ -587,14 +775,17 @@ ASSUMPTIONS → SUGGESTIONS & MISSING REQUIREMENTS (Gap Analysis is ON):
   - If an idea needs you to ASSUME a value/limit not stated anywhere (e.g. username max length, lockout threshold, session timeout), DO NOT invent a test — add a "missingRequirements" entry phrased as a question (e.g. { "question": "What is the maximum username length?", "area": "Input validation", "rationale": "No length limit is stated, so a boundary test cannot be written reliably." }).
   - NEVER emit a test case with source "assumption".` : `
 ASSUMPTIONS (Gap Analysis is OFF):
-  - Do NOT generate assumption-based cases and do NOT fill "missingRequirements". Both "suggestedTestCases" and "missingRequirements" MUST be []. Assumptions are surfaced only when Gap Analysis is enabled.`}
+  - Do NOT generate assumption-based cases and do NOT fill "missingRequirements". Both "suggestedTestCases" and "missingRequirements" MUST be []. Staying grounded does NOT mean under-generating — produce every case the requirement + provided context genuinely support.`}
 
-QUALITY STANDARDS — each test case must have:
-  - Specific, actionable title (NOT vague like "Verify login works")
-  - Clear preconditions, numbered steps (3-6), precise expected result, realistic test data.
+QUALITY STANDARDS — each test case must be enterprise-reusable and carry the full schema:
+  - Specific, actionable title (NOT vague like "Verify login works").
+  - "objective": the one precise thing this case verifies.
+  - "riskArea": the product risk it guards against (e.g. "Unauthorized access", "Revenue loss").
+  - Clear preconditions, numbered steps (3-6), precise expected result, realistic test data drawn from AVAILABLE TEST DATA when relevant.
+  - Automation fields ("automationReady", "automationComplexity", "selectorAvailability") set honestly.
 
-NO DUPLICATES:
-  - Do NOT emit multiple cases that verify the same behaviour with different wording. "Verify successful login", "Verify navigation after login", and "Verify login+inventory integration" overlap heavily — keep the distinct ones, merge the rest.
+NO TRIVIAL DUPLICATES:
+  - Do NOT emit two cases that verify the SAME behaviour with reworded titles. But distinct situations (different input, role, state, or error) are NOT duplicates — keep them all. Only merge true restatements of one another.
 
 SOURCE TAGGING — every test case (in BOTH buckets) MUST include:
   - "source": one of "requirement" | "knowledge" | "test_data" | "app_profile" | "gap_analysis"
@@ -606,31 +797,35 @@ SOURCE TAGGING — every test case (in BOTH buckets) MUST include:
   - "source" MUST NOT be "assumption" — assumptions go to "missingRequirements" instead.
   - "sourceEvidence": a short phrase naming the exact evidence (e.g. "AC: standard user logs in", "standard_user dataset", "Authentication Rules knowledge").
 
-IMPORTANT: Each test case must include a "scenarioIndex" field (0-based) linking it to the scenario it belongs to.
-
 Return JSON (use [] for empty buckets):
 {
-  "scenarios": [{ "scenario": string, "coverageType": string, "priority": "P0"|"P1"|"P2"|"P3", "riskArea": string }],
+  "scenarios": [{ "scenario": string, "objective": string, "coverageType": string, "priority": "P0"|"P1"|"P2"|"P3", "riskArea": string }],
   "testCases": [{
-    "title": string, "scenarioIndex": number, "preconditions": string, "steps": string[],
+    "title": string, "objective": string, "scenarioIndex": number, "riskArea": string,
+    "preconditions": string, "steps": string[],
     "expectedResult": string, "testData": string,
     "priority": "P0"|"P1"|"P2"|"P3", "severity": "critical"|"major"|"minor"|"trivial",
     "tags": string[], "automationReady": boolean,
     "automationComplexity": "low"|"medium"|"high", "selectorAvailability": "high"|"medium"|"low"|"unknown",
     "source": "requirement"|"knowledge"|"test_data"|"app_profile", "sourceEvidence": string
   }],
+  "coverageTypeEvaluations": [{ "coverageType": string, "status": "covered"|"not_applicable", "reason": string }],
   "suggestedTestCases": [ /* same shape as a testCase; source "gap_analysis". MUST be [] in Standard mode. */ ],
   "missingRequirements": [{ "question": string, "area": string, "rationale": string }]
 }
 
-Return ONLY valid JSON. ${expand ? 'Keep grounded coverage and assumption-based suggestions in SEPARATE buckets.' : 'Use ALL provided context to ground committed coverage; keep suggestedTestCases and missingRequirements empty.'}`;
+Return ONLY valid JSON. Address EVERY selected coverage type, organise scenarios by coverageType, and be comprehensive while staying grounded. ${expand ? 'Keep grounded coverage and assumption-based suggestions in SEPARATE buckets.' : 'Use ALL provided context to ground committed coverage; keep suggestedTestCases and missingRequirements empty.'}`;
 
-    const resp = await this.callLLM(prompt, 6000);
+    // Exhaustive, multi-type coverage with a rich grounding context: request the
+    // full output budget and a generous prompt-char budget so neither the input
+    // context nor the JSON schema at the end of the prompt is truncated.
+    const resp = await this.callLLM(prompt, 8000, { complexity: 'complex', maxPromptChars: 60000 });
     let parsed: {
       scenarios?: TestScenario[];
       testCases?: TestCase[];
       suggestedTestCases?: TestCase[];
       missingRequirements?: MissingRequirement[];
+      coverageTypeEvaluations?: CoverageTypeEvaluation[];
     };
     try {
       parsed = JSON.parse(resp.content);
@@ -667,7 +862,68 @@ Return ONLY valid JSON. ${expand ? 'Keep grounded coverage and assumption-based 
       });
     }
 
-    return { scenarios, testCases, suggestedTestCases, missingRequirements, tokensUsed: resp.tokensUsed };
+    // ── Per-type evaluation — guarantees EVERY selected coverage type is accounted
+    //    for. We trust the model's "not_applicable" reasons but always reconcile the
+    //    counts against what was actually produced, and synthesise any entry the
+    //    model forgot so the UI can show "covered (N scenarios / M cases)" or an
+    //    explicit "not applicable — <reason>" for each type the user selected.
+    const coverageTypeEvaluations = this.buildCoverageTypeEvaluations(
+      coverageTypes,
+      scenarios,
+      testCases,
+      parsed.coverageTypeEvaluations
+    );
+
+    return { scenarios, testCases, suggestedTestCases, missingRequirements, coverageTypeEvaluations, tokensUsed: resp.tokensUsed, promptChars: prompt.length };
+  }
+
+  /**
+   * Reconcile per-coverage-type evaluations. For each SELECTED coverage type we
+   * compute how many scenarios/cases were actually produced and merge that with
+   * the model's self-reported evaluation. Guarantees one entry per selected type
+   * (no silent skips): a type with produced coverage is "covered"; a type with
+   * none is "not_applicable" carrying the model's reason when available.
+   */
+  private buildCoverageTypeEvaluations(
+    coverageTypes: CoverageType[],
+    scenarios: TestScenario[],
+    testCases: TestCase[],
+    modelEvaluations?: CoverageTypeEvaluation[]
+  ): CoverageTypeEvaluation[] {
+    const byType = new Map<string, CoverageTypeEvaluation>();
+    (modelEvaluations || []).forEach(ev => {
+      if (ev && ev.coverageType) byType.set(ev.coverageType, ev);
+    });
+
+    return coverageTypes.map((ct): CoverageTypeEvaluation => {
+      // Scenarios tagged with this coverage type, and the cases linked to them.
+      const typeScenarioIdx = new Set<number>();
+      scenarios.forEach((s, i) => {
+        if (s.coverageType === ct) typeScenarioIdx.add(i);
+      });
+      const scenarioCount = typeScenarioIdx.size;
+      const testCaseCount = testCases.filter(tc => {
+        const idx = (tc as any).scenarioIndex;
+        return typeof idx === 'number' && typeScenarioIdx.has(idx);
+      }).length;
+
+      const modelEv = byType.get(ct);
+      if (scenarioCount > 0 || testCaseCount > 0) {
+        return { coverageType: ct, status: 'covered', scenarioCount, testCaseCount };
+      }
+      // Nothing produced for this type — surface WHY rather than silently dropping it.
+      return {
+        coverageType: ct,
+        status: 'not_applicable',
+        scenarioCount: 0,
+        testCaseCount: 0,
+        reason:
+          modelEv?.reason ||
+          (modelEv?.status === 'not_applicable'
+            ? 'Not applicable to this requirement given the available context.'
+            : 'No grounded scenarios applied for this coverage type given the requirement and provided context.'),
+      };
+    });
   }
 
   /* ---- Phase 6: Coverage Gap Analysis ---- */
@@ -752,7 +1008,7 @@ Return ONLY valid JSON array.`;
 
     // Phase 5: Generate tests (mode-aware — strict vs expanded)
     const gen = await this.generateTestCoverage(input, analysis, coverageTypes, knowledge, mode);
-    const { scenarios, testCases: rawTestCases, missingRequirements, tokensUsed: t2 } = gen;
+    const { scenarios, testCases: rawTestCases, missingRequirements, coverageTypeEvaluations, tokensUsed: t2, promptChars } = gen;
     let rawSuggested = gen.suggestedTestCases || [];
     logger.info(MOD, 'Test generation complete', {
       scenarios: scenarios.length, testCases: rawTestCases.length,
@@ -791,13 +1047,14 @@ Return ONLY valid JSON array.`;
     }
 
     const totalTokens = t1 + t2 + t3;
-    return {
+    const result: GenerationResult = {
       requirementAnalysis: analysis,
       scenarios,
       testCases,
       suggestedTestCases,
       missingRequirements,
       coverageGaps: gaps,
+      coverageTypeEvaluations,
       mode,
       stats: {
         totalScenarios: scenarios.length,
@@ -809,8 +1066,29 @@ Return ONLY valid JSON array.`;
         duplicatesRemoved,
         suggestedCount: suggestedTestCases.length,
         missingRequirementsCount: missingRequirements.length,
+        promptChars,
+        casesPerKChars: promptChars > 0
+          ? Math.round((testCases.length / promptChars) * 1000 * 100) / 100
+          : 0,
+        generationMetadata: {
+          promptVersion: PROMPT_VERSION,
+          engineVersion: ENGINE_VERSION,
+          model: this.testModel || 'unknown',
+          timestamp: new Date().toISOString(),
+        },
       },
     };
+    logger.info(MOD, 'Generation complete', {
+      promptVersion: PROMPT_VERSION,
+      engineVersion: ENGINE_VERSION,
+      model: this.testModel,
+      promptChars,
+      totalTestCases: testCases.length,
+      tokensUsed: totalTokens,
+      casesPerKChars: result.stats.casesPerKChars,
+      timestamp: result.stats.generationMetadata!.timestamp,
+    });
+    return result;
   }
 
   /* ---- Semantic de-duplication of generated test cases ---- */
@@ -885,13 +1163,22 @@ Return ONLY valid JSON array.`;
   }
 
   /* ---- LLM Call Helper (cost-optimized) ---- */
-  private async callLLM(prompt: string, maxTokens: number): Promise<{ content: string; tokensUsed: number }> {
+  private async callLLM(
+    prompt: string,
+    maxTokens: number,
+    opts?: { complexity?: 'simple' | 'standard' | 'complex'; maxPromptChars?: number }
+  ): Promise<{ content: string; tokensUsed: number }> {
     // Use ModelSelector for intelligent model selection
-    const modelConfig = this.modelSelector.selectModel('test_generation', 'standard');
+    const modelConfig = this.modelSelector.selectModel('test_generation', opts?.complexity || 'standard');
     const effectiveMaxTokens = Math.min(maxTokens, modelConfig.maxTokens);
 
-    // Truncate prompt to avoid excessive token usage (token optimization)
-    const maxPromptChars = parseInt(process.env['MAX_TOKENS_PER_REQUEST'] || '4000', 10) * 4;
+    // Truncate prompt to avoid excessive token usage (token optimization).
+    // Callers that build long, structured prompts where the OUTPUT SCHEMA sits at
+    // the END (e.g. test generation) pass an explicit, larger budget so the JSON
+    // contract is never truncated away — silently dropping it would make the model
+    // emit malformed output. Default keeps the historical cost-safety behaviour.
+    const maxPromptChars = opts?.maxPromptChars
+      ?? parseInt(process.env['MAX_TOKENS_PER_REQUEST'] || '4000', 10) * 4;
     const truncatedPrompt = prompt.length > maxPromptChars
       ? prompt.slice(0, maxPromptChars) + '\n\n[Context truncated for cost optimization]'
       : prompt;
