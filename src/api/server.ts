@@ -96,6 +96,7 @@ import { generateReport, type ReportData, type ReportTest, type ReportHealing } 
 import { RCAEngine, type RCAResult } from '../engines/rca-engine';
 import { createRCARouter } from './routes/rca';
 import { createPRRouter } from './routes/pr';
+import { createPRAutomationsRouter } from './routes/pr-automations';
 import { createScriptGenRouter } from './routes/script-gen';
 import { createScriptHealthRouter } from './routes/script-health';
 import { createMigrationsRouter } from './routes/migrations';
@@ -132,6 +133,7 @@ import { createProjectsRouter } from './routes/projects';
 import { createEnvironmentsRouter } from './routes/environments';
 import { createSprintsRouter } from './routes/sprints';
 import { createCIWebhookRouter } from './routes/ci-webhooks';
+import { createPRWebhookRouter } from './routes/pr-webhooks';
 import { createUsersRouter } from './routes/users';
 import { createHealingPRRouter, createJobPRRouter } from './routes/healing-pr';
 import { createGitHubRouter } from './routes/github';
@@ -282,6 +284,9 @@ export function createServer(): express.Application {
   // CI Webhooks — autonomous healing (no auth, uses HMAC signature)
   app.use('/api/ci-webhooks', createCIWebhookRouter(jobQueue));
 
+  // PR Status Webhooks — automatic PR status sync (no auth, uses HMAC signature)
+  app.use('/api/pr-webhooks', createPRWebhookRouter());
+
   // Repo Intelligence webhook — incremental re-scan on GitHub push (Phase 2).
   // Unauthenticated (uses its own HMAC signature validation) and ONLY mounted
   // when the GITHUB_WEBHOOKS feature flag is enabled, so it adds no surface by
@@ -309,6 +314,7 @@ export function createServer(): express.Application {
   app.use('/api/repos', authMiddleware, companyMiddleware, sessionMiddleware, createReposRouter(repoManager));
   app.use('/api/rca', authMiddleware, companyMiddleware, sessionMiddleware, createRCARouter());
   app.use('/api/pr', authMiddleware, companyMiddleware, sessionMiddleware, createPRRouter());
+  app.use('/api/pr-automations', authMiddleware, companyMiddleware, sessionMiddleware, createPRAutomationsRouter());
   app.use('/api/scripts', authMiddleware, companyMiddleware, sessionMiddleware, projectContextMiddleware, contextMiddleware, createScriptGenRouter());
   app.use('/api/script-health', authMiddleware, companyMiddleware, sessionMiddleware, projectContextMiddleware, contextMiddleware, createScriptHealthRouter());
   app.use('/api/migrations', authMiddleware, companyMiddleware, sessionMiddleware, projectContextMiddleware, contextMiddleware, createMigrationsRouter());
