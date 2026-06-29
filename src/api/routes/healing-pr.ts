@@ -421,7 +421,20 @@ async function executeHealingPR(opts: {
   //     opaque "Password authentication is not supported" error.
   const access = await github.verifyAccess();
   if (!access.ok) {
-    throw new HttpError(access.status, access.reason);
+    // Include token source in the error so frontend/user knows which token to fix
+    const tokenSourceLabel = 
+      tokenSource === 'connected-tools-token' ? 'Tools page GitHub connection'
+      : tokenSource === 'env' ? 'GITHUB_TOKEN environment variable'
+      : tokenSource === 'request' ? 'githubToken request parameter'
+      : 'unknown';
+    const enrichedReason = `${access.reason}\n\nToken source: ${tokenSourceLabel}\n\n` +
+      (tokenSource === 'connected-tools-token' 
+        ? `To fix: Visit the Tools page → GitHub section and reconnect with a token that has write access to ${parsed.owner}/${parsed.repo}. ` +
+          `For a Classic PAT, ensure "repo" scope is enabled. For a Fine-grained PAT, grant "Contents: Read and write" + "Pull requests: Read and write" to this repository.`
+        : tokenSource === 'env'
+        ? `To fix: Update the GITHUB_TOKEN environment variable with a token that has write access to ${parsed.owner}/${parsed.repo}.`
+        : `To fix: Pass a githubToken with write access to ${parsed.owner}/${parsed.repo} in the request, or configure via Tools page.`);
+    throw new HttpError(access.status, enrichedReason);
   }
 
   // 3. Clone once, do all work, always clean up.
