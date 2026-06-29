@@ -287,6 +287,10 @@ export function createServer(): express.Application {
   // PR Status Webhooks — automatic PR status sync (no auth, uses HMAC signature)
   app.use('/api/pr-webhooks', createPRWebhookRouter());
 
+  // TEMPORARY: Diagnostic endpoint for checking AI provider config (DELETE AFTER TESTING)
+  const { createDiagnosticRouter } = require('./routes/diagnostic');
+  app.use('/api/diagnostic', createDiagnosticRouter());
+
   // Repo Intelligence webhook — incremental re-scan on GitHub push (Phase 2).
   // Unauthenticated (uses its own HMAC signature validation) and ONLY mounted
   // when the GITHUB_WEBHOOKS feature flag is enabled, so it adds no surface by
