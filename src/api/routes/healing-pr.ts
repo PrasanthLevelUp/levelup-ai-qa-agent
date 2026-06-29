@@ -29,7 +29,7 @@ import {
   linkHealingActionsToPR,
   logPR,
 } from '../../db/postgres';
-import { GitHubService, type CommitFileSpec } from '../../services/github-service';
+import { GitHubService, GitHubPRError, type CommitFileSpec } from '../../services/github-service';
 // The connected Tools-page token (notification_configs) — the SAME token the
 // script-generation PR flow authenticates with. Aliased to avoid colliding with
 // the git-push GitHubService above. Healing must resolve its token from here
@@ -597,6 +597,28 @@ async function executeHealingPR(opts: {
     git(`commit -m "${commitMsg.replace(/"/g, '\\"')}"`);
     const commitSha = git('rev-parse HEAD');
 
+    // No-diff guard: even though the working tree had staged changes, the commit
+    // may be tree-identical to the base branch — e.g. the user re-ran healing
+    // after an earlier PR with the SAME fix already merged into the base. In that
+    // case GitHub rejects the PR with 422 "No commits between <base> and <branch>".
+    // Detect it here and return a clear, non-error message instead of pushing a
+    // dead branch and surfacing an opaque "Failed to create PR".
+    let effectiveDiff = '';
+    try {
+      effectiveDiff = git(`diff --stat origin/${baseBranch} HEAD`);
+    } catch { /* origin ref may be unavailable; fall through and let push/PR decide */ }
+    if (effectiveDiff === '') {
+      logger.info(MOD, 'No effective diff vs base — skipping PR', { branchName, baseBranch });
+      return {
+        message:
+          `Nothing to open a PR for: the healed change is already present on "${baseBranch}". ` +
+          `This usually means a previous PR with the same fix was already merged. No new branch was pushed.`,
+        patchedCount,
+        changedFiles,
+        skipped,
+      };
+    }
+
     // Pre-push diagnostics (token-safe). These pinpoint the three most common
     // causes of a "Password authentication is not supported" push failure:
     //   • token absent/empty  → tokenPresent=false / tokenLength=0
@@ -649,11 +671,42 @@ async function executeHealingPR(opts: {
       throw new HttpError(500, `git push failed: ${sanitized}`);
     }
 
-    const pr = await github.createPR(branchName, baseBranch, {
-      title: buildPRTitle(fileOutcomes, changedFiles.length, patchedCount),
-      body: generateCombinedPRBody(fileOutcomes, skipped, baseBranch),
-      labels: ['levelup-ai', 'auto-heal', 'test-fix'],
-    });
+    let pr: { url: string; number: number } | null;
+    try {
+      pr = await github.createPR(branchName, baseBranch, {
+        title: buildPRTitle(fileOutcomes, changedFiles.length, patchedCount),
+        body: generateCombinedPRBody(fileOutcomes, skipped, baseBranch),
+        labels: ['levelup-ai', 'auto-heal', 'test-fix'],
+      });
+    } catch (prErr) {
+      // Surface GitHub's REAL reason instead of an opaque "PR creation failed".
+      if (prErr instanceof GitHubPRError) {
+        if (prErr.isNoDiff) {
+          // Branch pushed but tree-identical to base (fix already on base).
+          throw new HttpError(
+            409,
+            `The branch "${branchName}" was pushed but GitHub rejected the PR: ${prErr.message}. ` +
+              `The healed change appears to already be present on "${baseBranch}" (a previous PR with the ` +
+              `same fix was likely merged). Nothing new to review.`,
+          );
+        }
+        if (prErr.isPermission) {
+          throw new HttpError(
+            403,
+            `The branch "${branchName}" was pushed, but the GitHub token cannot open a pull request on ` +
+              `${parsed.owner}/${parsed.repo} (GitHub said: ${prErr.message}). ` +
+              `Grant the token "Pull requests: Write" (fine-grained PAT) or the "repo" scope (classic PAT), ` +
+              `then retry.`,
+          );
+        }
+        throw new HttpError(
+          502,
+          `The branch "${branchName}" was pushed, but GitHub rejected the PR` +
+            (prErr.status ? ` (HTTP ${prErr.status})` : '') + `: ${prErr.message}`,
+        );
+      }
+      throw prErr;
+    }
     if (!pr) {
       throw new HttpError(500, 'Branch was pushed but PR creation failed');
     }

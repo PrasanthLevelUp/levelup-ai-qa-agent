@@ -45,6 +45,29 @@ export interface PRResult {
   filesCount: number;
 }
 
+/**
+ * Raised when the GitHub PR-creation API call fails for a reason the caller
+ * should surface to the user (instead of an opaque "PR creation failed").
+ * Carries the HTTP status and GitHub's own validation message(s) so the UI can
+ * show *why* — e.g. "No commits between main and <branch>" (empty diff) or a
+ * permission problem ("Resource not accessible by integration").
+ */
+export class GitHubPRError extends Error {
+  readonly status: number | null;
+  /** True when GitHub rejected the PR because the branch has no diff vs base. */
+  readonly isNoDiff: boolean;
+  /** True when the token lacks Pull-requests:write permission. */
+  readonly isPermission: boolean;
+
+  constructor(message: string, opts: { status?: number | null; isNoDiff?: boolean; isPermission?: boolean } = {}) {
+    super(message);
+    this.name = 'GitHubPRError';
+    this.status = opts.status ?? null;
+    this.isNoDiff = opts.isNoDiff ?? false;
+    this.isPermission = opts.isPermission ?? false;
+  }
+}
+
 /* -------------------------------------------------------------------------- */
 /*  Service                                                                   */
 /* -------------------------------------------------------------------------- */
@@ -260,8 +283,16 @@ export class GitHubService {
       logger.info(MOD, 'PR created', { prUrl, prNumber });
       return { url: prUrl, number: prNumber };
     } catch (error: any) {
-      // Handle "PR already exists" gracefully
-      if (error?.response?.status === 422) {
+      const status: number | null = error?.response?.status ?? null;
+      // GitHub returns { message, errors: [{ message, code, ... }] } on 4xx.
+      const ghMessage: string = error?.response?.data?.message || error?.message || 'Unknown error';
+      const ghErrors: string[] = Array.isArray(error?.response?.data?.errors)
+        ? error.response.data.errors.map((e: any) => e?.message || e?.code).filter(Boolean)
+        : [];
+      const detail = [ghMessage, ...ghErrors].filter(Boolean).join(' — ');
+
+      // Handle "PR already exists" gracefully — return the existing open PR.
+      if (status === 422) {
         try {
           const existing = await axios.get(
             `https://api.github.com/repos/${this.owner}/${this.repo}/pulls`,
@@ -273,10 +304,19 @@ export class GitHubService {
           if (existing.data.length > 0) {
             return { url: existing.data[0].html_url, number: existing.data[0].number };
           }
-        } catch { /* fall through */ }
+        } catch { /* fall through to typed error below */ }
       }
-      logger.error(MOD, 'PR creation failed', { error: error.message });
-      return null;
+
+      // Classify the most common, actionable failures so callers/UI can explain
+      // *why* the PR could not be created (instead of an opaque null).
+      const isNoDiff = status === 422 && /no commits between/i.test(detail);
+      const isPermission =
+        status === 403 ||
+        (status === 404 /* GitHub masks no-write-access as 404 on some endpoints */) ||
+        /resource not accessible|must have admin|write access|permission/i.test(detail);
+
+      logger.error(MOD, 'PR creation failed', { status, detail });
+      throw new GitHubPRError(detail, { status, isNoDiff, isPermission });
     }
   }
 
