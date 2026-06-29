@@ -782,6 +782,7 @@ async function initSchema(client: PoolClient): Promise<void> {
     files_changed TEXT[],
     healing_count INTEGER DEFAULT 0,
     status TEXT DEFAULT 'open',
+    report_uri TEXT,
     merged_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ DEFAULT NOW()
   )`);
@@ -994,6 +995,14 @@ async function initSchema(client: PoolClient): Promise<void> {
     -- single-row write. Dashboard joins healing_actions → pr_automations.
     IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='healing_actions' AND column_name='pr_automation_id') THEN
       ALTER TABLE healing_actions ADD COLUMN pr_automation_id INTEGER REFERENCES pr_automations(id) ON DELETE SET NULL;
+    END IF;
+    -- Healing report is execution METADATA owned by LevelUp, NOT versioned in the
+    -- customer repo. The DOCUMENT itself lives in object storage (see report-store.ts);
+    -- this column stores only an opaque REFERENCE (file://, s3://, gcs://, …). The name
+    -- is intentionally storage-agnostic (report_uri, not report_md) so the backing store
+    -- can change later without another migration.
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='pr_automations' AND column_name='report_uri') THEN
+      ALTER TABLE pr_automations ADD COLUMN report_uri TEXT;
     END IF;
   END $$`);
 
@@ -4710,6 +4719,13 @@ export interface PRRecord {
   files_changed?: string[];
   healing_count: number;
   status?: string;
+  /**
+   * Opaque reference to the healing report DOCUMENT in object storage
+   * (file://, s3://, gcs://, …). Owned by LevelUp — never committed to the customer
+   * repo, and never stored inline here. Storage-agnostic by design so the backend can
+   * change without a migration. See src/reports/report-store.ts.
+   */
+  report_uri?: string;
   merged_at?: string;
   created_at?: string;
 }
@@ -4718,8 +4734,8 @@ export async function logPR(data: PRRecord, companyId?: number): Promise<number>
   const result = await getPool().query(
     `INSERT INTO pr_automations
       (job_id, pr_url, pr_number, branch_name, commit_sha,
-       repo_owner, repo_name, base_branch, files_changed, healing_count, status, company_id)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+       repo_owner, repo_name, base_branch, files_changed, healing_count, status, report_uri, company_id)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
     RETURNING id`,
     [
       data.job_id,
@@ -4733,6 +4749,7 @@ export async function logPR(data: PRRecord, companyId?: number): Promise<number>
       data.files_changed ?? [],
       data.healing_count,
       data.status ?? 'open',
+      data.report_uri ?? null,
       companyId ?? null,
     ],
   );
