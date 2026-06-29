@@ -299,6 +299,13 @@ export interface GenerationResult {
     suggestedCount?: number;
     /** Count of open questions raised instead of assumption test cases. */
     missingRequirementsCount?: number;
+    /** Size of the generation prompt sent to the model — lets us correlate
+     *  prompt size with output volume and cost over time (measure, don't just
+     *  keep raising the budget). */
+    promptChars?: number;
+    /** Generated cases produced per 1,000 prompt chars — a cheap density signal
+     *  for "are we getting more output for more context, or just paying more?". */
+    casesPerKChars?: number;
   };
 }
 
@@ -617,6 +624,10 @@ Return ONLY valid JSON, no markdown fences.`;
     missingRequirements: MissingRequirement[];
     coverageTypeEvaluations: CoverageTypeEvaluation[];
     tokensUsed: number;
+    /** Size of the generation prompt actually sent — for measurability
+     *  (prompt size → output volume → tokens/cost), per the "measure, don't
+     *  just keep raising the budget" principle. */
+    promptChars: number;
   }> {
     // GAP-ANALYSIS (expanded) mode only: auto-expand to a comprehensive baseline so
     // the *suggested additional coverage* (assumption-based) bucket is thorough.
@@ -841,7 +852,7 @@ Return ONLY valid JSON. Address EVERY selected coverage type, organise scenarios
       parsed.coverageTypeEvaluations
     );
 
-    return { scenarios, testCases, suggestedTestCases, missingRequirements, coverageTypeEvaluations, tokensUsed: resp.tokensUsed };
+    return { scenarios, testCases, suggestedTestCases, missingRequirements, coverageTypeEvaluations, tokensUsed: resp.tokensUsed, promptChars: prompt.length };
   }
 
   /**
@@ -975,7 +986,7 @@ Return ONLY valid JSON array.`;
 
     // Phase 5: Generate tests (mode-aware — strict vs expanded)
     const gen = await this.generateTestCoverage(input, analysis, coverageTypes, knowledge, mode);
-    const { scenarios, testCases: rawTestCases, missingRequirements, coverageTypeEvaluations, tokensUsed: t2 } = gen;
+    const { scenarios, testCases: rawTestCases, missingRequirements, coverageTypeEvaluations, tokensUsed: t2, promptChars } = gen;
     let rawSuggested = gen.suggestedTestCases || [];
     logger.info(MOD, 'Test generation complete', {
       scenarios: scenarios.length, testCases: rawTestCases.length,
@@ -1014,7 +1025,7 @@ Return ONLY valid JSON array.`;
     }
 
     const totalTokens = t1 + t2 + t3;
-    return {
+    const result: GenerationResult = {
       requirementAnalysis: analysis,
       scenarios,
       testCases,
@@ -1033,8 +1044,19 @@ Return ONLY valid JSON array.`;
         duplicatesRemoved,
         suggestedCount: suggestedTestCases.length,
         missingRequirementsCount: missingRequirements.length,
+        promptChars,
+        casesPerKChars: promptChars > 0
+          ? Math.round((testCases.length / promptChars) * 1000 * 100) / 100
+          : 0,
       },
     };
+    logger.info(MOD, 'Generation metrics', {
+      promptChars,
+      totalTestCases: testCases.length,
+      tokensUsed: totalTokens,
+      casesPerKChars: result.stats.casesPerKChars,
+    });
+    return result;
   }
 
   /* ---- Semantic de-duplication of generated test cases ---- */

@@ -46,6 +46,23 @@ import { TemplateService } from '../../services/template-service';
 
 const MOD = 'test-coverage-routes';
 
+/**
+ * Build the AI-metadata JSONB bag for a scenario/test case, dropping any
+ * undefined/empty values so we never persist noise like {"objective": null}.
+ * All AI-generated metadata (objective, riskArea, and any future fields such as
+ * confidence/reasoning/coverageEvidence) flows through here — so extending it
+ * NEVER requires another DB migration. Returns {} when nothing is present.
+ */
+function buildAiMetadata(fields: Record<string, any>): Record<string, any> {
+  const out: Record<string, any> = {};
+  for (const [k, v] of Object.entries(fields)) {
+    if (v !== undefined && v !== null && !(typeof v === 'string' && v.trim() === '')) {
+      out[k] = v;
+    }
+  }
+  return out;
+}
+
 export function createTestCoverageRouter(): Router {
   const router = Router();
   let engine: TestCoverageEngine | null = null;
@@ -406,10 +423,12 @@ export function createTestCoverageRouter(): Router {
       try {
         scenarioIds = await insertTestScenarios(reqId, result.scenarios.map(s => ({
           scenario: s.scenario,
-          objective: (s as any).objective || undefined,
           coverageType: s.coverageType,
           priority: s.priority,
           riskArea: s.riskArea,
+          // All AI-generated metadata lives in one JSONB bag — adding future
+          // fields (confidence, reasoning, …) never needs a schema migration.
+          aiMetadata: buildAiMetadata({ objective: (s as any).objective }),
         })), companyId);
         logger.info(MOD, 'Scenarios persisted', { count: scenarioIds.length });
       } catch (scenErr: any) {
@@ -445,12 +464,15 @@ export function createTestCoverageRouter(): Router {
 
             const newIds = await insertTestCases(matchingScenario.dbId, [{
               title: tc.title,
-              objective: (tc as any).objective || undefined,
               preconditions: tc.preconditions || '',
               steps: tc.steps || [],
               expectedResult: tc.expectedResult || '',
               testData: tc.testData || '',
-              riskArea: (tc as any).riskArea || undefined,
+              // Enterprise AI metadata (objective + product riskArea) in one JSONB bag.
+              aiMetadata: buildAiMetadata({
+                objective: (tc as any).objective,
+                riskArea: (tc as any).riskArea,
+              }),
               priority: tc.priority || 'P2',
               severity: tc.severity || 'major',
               tags: tc.tags || [],
