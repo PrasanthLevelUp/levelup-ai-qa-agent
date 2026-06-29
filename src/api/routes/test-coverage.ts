@@ -362,6 +362,11 @@ export function createTestCoverageRouter(): Router {
         // assumption-based test cases (e.g. "No username length limit found — add one?").
         missingRequirements: result.missingRequirements || [],
         missingRequirementsCount: result.stats?.missingRequirementsCount ?? (result.missingRequirements?.length || 0),
+        // Per-selected-coverage-type evaluation — proves EVERY coverage type the
+        // user selected was processed (status "covered" with scenario/case counts,
+        // or "not_applicable" with a reason). Stored so the History detail view can
+        // show a per-type coverage breakdown instead of silently dropping types.
+        coverageTypeEvaluations: result.coverageTypeEvaluations || [],
         // How many near-duplicate test cases the semantic dedup pass removed.
         duplicatesRemoved: result.stats?.duplicatesRemoved ?? 0,
         // Issue #2: record whether real app knowledge was used for this generation
