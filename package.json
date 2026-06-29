@@ -33,6 +33,7 @@
   "author": "PrasanthLevelUp",
   "license": "ISC",
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.65.0",
     "@prisma/client": "^6.7.0",
     "axios": "^1.16.0",
     "bcrypt": "^6.0.0",

@@ -7,6 +7,7 @@
 import OpenAI from 'openai';
 import { logger } from '../utils/logger';
 import { ModelSelector } from '../ai/model-selector';
+import { AnthropicClient, resolveAnthropicModel, isAnthropicConfigured } from '../ai/anthropic-client';
 import { CostTracker } from '../ai/cost-tracker';
 import { KnowledgeOptimizer, type KnowledgeItem as OptimizerKnowledgeItem } from '../ai/knowledge-optimizer';
 
@@ -229,6 +230,12 @@ export class TestCoverageEngine {
   private openai: OpenAI;
   private modelSelector: ModelSelector;
   private costTracker: CostTracker;
+  // Phase 1 — optional Claude provider for Test Generation. When
+  // TEST_PROVIDER=anthropic and a key is configured, callLLM routes to Claude
+  // and transparently falls back to OpenAI on ANY error.
+  private anthropic: AnthropicClient | null;
+  private testProvider: string;
+  private testModel: string;
 
   constructor() {
     const apiKey = process.env['OPENAI_API_KEY'];
@@ -236,6 +243,13 @@ export class TestCoverageEngine {
     this.openai = new OpenAI({ apiKey });
     this.modelSelector = new ModelSelector();
     this.costTracker = new CostTracker();
+
+    this.testProvider = (process.env['TEST_PROVIDER'] || 'openai').toLowerCase();
+    this.testModel = resolveAnthropicModel(process.env['TEST_MODEL']);
+    this.anthropic =
+      this.testProvider === 'anthropic' && isAnthropicConfigured()
+        ? new AnthropicClient({ model: this.testModel })
+        : null;
   }
 
   /* ---- Build Enterprise Knowledge Block (uses KnowledgeOptimizer for smart selection) ---- */
@@ -882,26 +896,64 @@ Return ONLY valid JSON array.`;
       ? prompt.slice(0, maxPromptChars) + '\n\n[Context truncated for cost optimization]'
       : prompt;
 
-    const resp = await this.openai.chat.completions.create({
-      model: modelConfig.model,
-      temperature: modelConfig.temperature,
-      max_tokens: effectiveMaxTokens,
-      messages: [
-        { role: 'system', content: 'You are a senior QA architect and test engineer. Always return valid JSON only — no markdown, no explanation, no code fences.' },
-        { role: 'user', content: truncatedPrompt },
-      ],
-    });
-    let content = resp.choices[0]?.message?.content || '{}';
-    // Strip markdown code fences that GPT sometimes wraps around JSON
+    const systemPrompt = 'You are a senior QA architect and test engineer. Always return valid JSON only — no markdown, no explanation, no code fences.';
+
+    let content = '';
+    let tokensUsed = 0;
+    let usedModel = modelConfig.model;
+
+    // Provider routing — Claude when TEST_PROVIDER=anthropic + configured;
+    // transparent fallback to OpenAI on ANY error so a request never fails
+    // because of the new provider.
+    let routed = false;
+    if (this.anthropic) {
+      try {
+        const r = await this.anthropic.createChatCompletion({
+          model: this.testModel,
+          temperature: modelConfig.temperature,
+          maxTokens: effectiveMaxTokens,
+          messages: [
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: truncatedPrompt },
+          ],
+          jsonMode: true,
+        });
+        content = r.content || '{}';
+        tokensUsed = r.tokensUsed;
+        usedModel = r.model;
+        routed = true;
+      } catch (err) {
+        logger.warn(MOD, 'Anthropic test generation failed; falling back to OpenAI', {
+          error: (err as Error).message,
+        });
+      }
+    }
+
+    if (!routed) {
+      const resp = await this.openai.chat.completions.create({
+        model: modelConfig.model,
+        temperature: modelConfig.temperature,
+        max_tokens: effectiveMaxTokens,
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: truncatedPrompt },
+        ],
+      });
+      content = resp.choices[0]?.message?.content || '{}';
+      tokensUsed = (resp.usage?.prompt_tokens || 0) + (resp.usage?.completion_tokens || 0);
+      usedModel = modelConfig.model;
+    }
+
+    // Strip markdown code fences that models sometimes wrap around JSON
     content = content.trim();
     if (content.startsWith('```')) {
       content = content.replace(/^```(?:json)?\s*\n?/, '').replace(/\n?```\s*$/, '');
     }
-    const tokensUsed = (resp.usage?.prompt_tokens || 0) + (resp.usage?.completion_tokens || 0);
 
-    // Track cost (fire-and-forget to avoid blocking)
+    // Track cost (fire-and-forget to avoid blocking). Records the model that
+    // actually served the request so cost attribution stays accurate.
     this.costTracker.trackRequest({
-      model: modelConfig.model,
+      model: usedModel,
       tokensUsed,
       feature: 'test_coverage',
       taskType: 'test_generation',

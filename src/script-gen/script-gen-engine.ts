@@ -19,6 +19,7 @@
  */
 
 import OpenAI from 'openai';
+import { AnthropicClient, resolveAnthropicModel, isAnthropicConfigured } from '../ai/anthropic-client';
 import * as nodePath from 'path';
 import { PageCrawler, type CrawlResult, type CrawlConfig, type PageElement } from './page-crawler';
 import type { AuthConfig, AuthResult } from './auth-engine';
@@ -342,6 +343,12 @@ export interface GenerationConfig {
 export class ScriptGenEngine {
   private readonly _openai: OpenAI | null;
   private readonly model: string;
+  // Phase 1 — optional Claude provider for Script Generation. When
+  // SCRIPT_PROVIDER=anthropic and a key is configured, the AI test-plan call
+  // routes to Claude; on ANY failure it transparently falls back to OpenAI.
+  private readonly _anthropic: AnthropicClient | null;
+  private readonly scriptProvider: string;
+  private readonly anthropicModel: string;
   private readonly selectorEngine = new SelectorQualityEngine();
   private readonly assertionEngine = new AssertionEngine();
   private readonly waitEngine = new WaitStrategyEngine();
@@ -356,6 +363,15 @@ export class ScriptGenEngine {
     const apiKey = config?.apiKey || process.env['OPENAI_API_KEY'];
     this._openai = apiKey ? new OpenAI({ apiKey }) : null;
     this.model = config?.model || process.env['SCRIPT_GEN_MODEL'] || 'gpt-4o-mini';
+
+    // Phase 1 provider routing (Script Generation only). Defaults to OpenAI;
+    // opt into Claude with SCRIPT_PROVIDER=anthropic + ANTHROPIC_API_KEY.
+    this.scriptProvider = (process.env['SCRIPT_PROVIDER'] || 'openai').toLowerCase();
+    this.anthropicModel = resolveAnthropicModel(process.env['SCRIPT_MODEL']);
+    this._anthropic =
+      this.scriptProvider === 'anthropic' && isAnthropicConfigured()
+        ? new AnthropicClient({ model: this.anthropicModel })
+        : null;
   }
 
   /** Access the OpenAI client, throwing a clear error only when it's actually needed. */
@@ -364,6 +380,55 @@ export class ScriptGenEngine {
       throw new Error('OPENAI_API_KEY is required for URL-based script generation (test-case-based generation is deterministic and does not need it)');
     }
     return this._openai;
+  }
+
+  /**
+   * Provider-routed JSON chat completion for the AI test-plan step.
+   *
+   * Routes to Claude when SCRIPT_PROVIDER=anthropic and configured; on ANY
+   * Anthropic error it logs and transparently falls back to the existing OpenAI
+   * path so a request never fails because of the new provider. Returns the raw
+   * JSON string content and the model that produced it.
+   */
+  private async generateTestPlanCompletion(
+    systemPrompt: string,
+    userPrompt: string,
+  ): Promise<{ content: string; tokens: number; model: string }> {
+    if (this._anthropic) {
+      try {
+        const r = await this._anthropic.createChatCompletion({
+          model: this.anthropicModel,
+          messages: [
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: userPrompt },
+          ],
+          temperature: 0.3,
+          maxTokens: 4000,
+          jsonMode: true,
+        });
+        return { content: r.content || '{}', tokens: r.tokensUsed, model: r.model };
+      } catch (err) {
+        logger.warn(MOD, 'Anthropic test-plan generation failed; falling back to OpenAI', {
+          error: (err as Error).message,
+        });
+      }
+    }
+
+    const response = await this.openai.chat.completions.create({
+      model: this.model,
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userPrompt },
+      ],
+      response_format: { type: 'json_object' },
+      temperature: 0.3,
+      max_tokens: 4000,
+    });
+    return {
+      content: response.choices[0]?.message?.content || '{}',
+      tokens: response.usage?.total_tokens || 0,
+      model: this.model,
+    };
   }
 
   /**
@@ -2993,20 +3058,12 @@ ${config.testCase
   : 'Generate comprehensive test flows covering all detected functionality.'}`;
 
     try {
-      const response = await this.openai.chat.completions.create({
-        model: this.model,
-        messages: [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: userPrompt },
-        ],
-        response_format: { type: 'json_object' },
-        temperature: 0.3,
-        max_tokens: 4000,
-      });
+      const completion = await this.generateTestPlanCompletion(systemPrompt, userPrompt);
 
-      const content = response.choices[0]?.message?.content || '{}';
+      const content = completion.content || '{}';
       const parsed = JSON.parse(content);
-      const tokens = response.usage?.total_tokens || 0;
+      const tokens = completion.tokens;
+      const usedModel = completion.model;
 
       return {
         name: `Test Plan: ${crawl.title || config.url}`,
@@ -3057,7 +3114,7 @@ ${config.testCase
           crawlTimeMs: crawl.crawlTimeMs,
           totalElements: crawl.elements.length,
           selectorQuality: avgSelectorScore,
-          model: this.model,
+          model: usedModel,
           tokensUsed: tokens,
         },
       };
