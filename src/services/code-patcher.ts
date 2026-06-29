@@ -4,6 +4,33 @@
  * Handles selector replacement across Playwright, Cypress, and generic
  * test frameworks.  Preserves formatting and handles edge-cases like
  * multi-line selectors, template literals, and chained locators.
+ *
+ * ⚠️ ARCHITECTURAL NOTE — Future migration path:
+ * ==============================================
+ * The current implementation uses regex-based text replacement. This approach
+ * has proven brittle: nearly every production bug over the last month
+ * (double-wrapping, identifier corruption, quote conflicts, expression
+ * embedding, variable-name replacement) stems from treating code as text
+ * rather than as syntax.
+ *
+ * RECOMMENDATION (post-MVP):
+ *   • CodePatcher V2 should use AST-based transformations (TypeScript Compiler
+ *     API `ts.transform`, Babel, or similar) to:
+ *       - Parse code to an AST
+ *       - Identify locator call sites syntactically (not via string patterns)
+ *       - Replace ONLY the selector argument nodes
+ *       - Regenerate source while preserving formatting
+ *   • Benefits:
+ *       - Eliminates identifier-position bugs (selectors can't land as variable
+ *         names or member accessors)
+ *       - Handles nested calls, template literals, and complex expressions
+ *         correctly by construction
+ *       - Extends cleanly to Script Generation and Migration use cases
+ *   • This will pay dividends across Healing, Script Gen, and Migration.
+ *
+ * DO NOT rewrite today — ship the current regex-hardened version for customer
+ * onboarding, then prioritize AST migration as first technical debt item once
+ * real customer feedback is flowing.
  */
 
 import { logger } from '../utils/logger';

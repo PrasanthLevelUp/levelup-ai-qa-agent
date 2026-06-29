@@ -121,9 +121,26 @@ describe('CodePatcher identifier-safety — Page Object bare-word heal', () => {
     expect(res.patchedCode).not.toContain('this.[data-test');
   });
 
-  it('still heals correctly when the bare word also appears inside the new selector', () => {
-    // new selector contains the old word as a substring — must not recurse or
-    // double-replace, and must stay valid.
+  it('substring regression: new selector CONTAINS the old word as a substring — no double-replace', () => {
+    // This is the bug my own first implementation had: the sequential quote loop
+    // re-scanned freshly inserted text, so `password` → `[data-test="password"]`
+    // got double-wrapped as `'[data-test='[data-test="password"]']'`.
+    // The single-pass regex fix prevents rescanning inserted text.
+    const res = patcher.applyHealingFix(
+      POM,
+      fix({ failedLocator: 'password', healedLocator: '[data-test="password"]' }),
+    );
+    expect(res.patched).toBe(true);
+    // Healed selector appears exactly once, cleanly wrapped.
+    expect(res.patchedCode).toContain(`this.page.locator('[data-test="password"]')`);
+    // NOT double-wrapped like '[data-test='[data-test="password"]']'.
+    expect(res.patchedCode).not.toMatch(/\[data-test=['"`][^'"`]*\[data-test=/);
+    expect(parseErrorCount(res.patchedCode)).toBe(0);
+  });
+
+  it('substring variation: old word in new selector with different quote style', () => {
+    // Another substring variant where the old word is in the new selector but the
+    // new selector uses a different quote inside (single quote vs double quote).
     const res = patcher.applyHealingFix(
       POM,
       fix({ failedLocator: 'password', healedLocator: '[name="password"]' }),
@@ -132,5 +149,91 @@ describe('CodePatcher identifier-safety — Page Object bare-word heal', () => {
     expect(res.patchedCode).toContain(`this.page.locator('[name="password"]')`);
     expect(res.patchedCode).toMatch(/^\s*password = this\.page\.locator/m);
     expect(parseErrorCount(res.patchedCode)).toBe(0);
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/*  INTEGRATION TEST — Production Regression Guard                            */
+/*  The real safety bar: patched code must not only parse (TS), it must also  */
+/*  INSTANTIATE and EXECUTE without runtime exceptions.                       */
+/* -------------------------------------------------------------------------- */
+
+describe('CodePatcher integration — patch → compile → instantiate → execute', () => {
+  const patcher = new CodePatcher();
+
+  it('INTEGRATION: patched Page Object compiles, instantiates, and runs login() without runtime exception', () => {
+    // Start with a realistic Page Object using bare-word locators.
+    // Using getter pattern (common in Page Objects) to avoid initialization-order issues.
+    const original = [
+      'import { Page } from "@playwright/test";',
+      '',
+      'export class LoginPage {',
+      '  constructor(private page: Page) {}',
+      '',
+      "  get username() { return this.page.locator('username'); }",
+      "  get password() { return this.page.locator('password'); }",
+      "  get loginBtn() { return this.page.locator('#login-button'); }",
+      '',
+      '  async login(user: string, pass: string) {',
+      '    await this.username.fill(user);',
+      '    await this.password.fill(pass);',
+      '    await this.loginBtn.click();',
+      '  }',
+      '}',
+    ].join('\n');
+
+    // Heal the bare-word `password` locator → attribute selector.
+    const res = patcher.applyHealingFix(
+      original,
+      fix({ failedLocator: 'password', healedLocator: '[data-test="password"]' }),
+    );
+
+    expect(res.patched).toBe(true);
+    expect(parseErrorCount(res.patchedCode)).toBe(0);
+
+    // STEP 1: Compile the patched TS → JS (verify no TS errors).
+    const compiled = ts.transpileModule(res.patchedCode, {
+      compilerOptions: {
+        target: ts.ScriptTarget.ES2020,
+        module: ts.ModuleKind.CommonJS,
+      },
+    });
+    expect(compiled.diagnostics || []).toHaveLength(0);
+
+    // STEP 2: Execute the compiled JS to define the class.
+    // Mock the @playwright/test module so the class can be instantiated.
+    const mockPage = {
+      locator: jest.fn((sel: string) => ({
+        fill: jest.fn(),
+        click: jest.fn(),
+        selector: sel,
+      })),
+    };
+    const mockExports: any = {};
+    const moduleCode = compiled.outputText;
+    // Execute as a CommonJS module with our mock exports object.
+    const fn = new Function('exports', 'require', 'mockPage', moduleCode + '\nreturn exports;');
+    const exports = fn(mockExports, () => ({}), mockPage);
+
+    expect(exports.LoginPage).toBeDefined();
+
+    // STEP 3: Instantiate the patched Page Object.
+    const loginPage = new exports.LoginPage(mockPage);
+    expect(loginPage).toBeDefined();
+    expect(loginPage.username).toBeDefined();
+    expect(loginPage.password).toBeDefined();
+    expect(loginPage.loginBtn).toBeDefined();
+
+    // STEP 4: Call the login() method — must not throw a runtime exception.
+    expect(async () => {
+      await loginPage.login('standard_user', 'secret_sauce');
+    }).not.toThrow();
+
+    // STEP 5: Verify the healed locator was used correctly.
+    // The getter `this.password` was called and returned the correct locator.
+    expect(mockPage.locator).toHaveBeenCalledWith('[data-test="password"]');
+    // The getter still works (NOT `this.[data-test...]` — that would be a syntax error).
+    const passwordLocator = loginPage.password;
+    expect(passwordLocator.selector).toBe('[data-test="password"]');
   });
 });
