@@ -406,6 +406,7 @@ export function createTestCoverageRouter(): Router {
       try {
         scenarioIds = await insertTestScenarios(reqId, result.scenarios.map(s => ({
           scenario: s.scenario,
+          objective: (s as any).objective || undefined,
           coverageType: s.coverageType,
           priority: s.priority,
           riskArea: s.riskArea,
@@ -444,10 +445,12 @@ export function createTestCoverageRouter(): Router {
 
             const newIds = await insertTestCases(matchingScenario.dbId, [{
               title: tc.title,
+              objective: (tc as any).objective || undefined,
               preconditions: tc.preconditions || '',
               steps: tc.steps || [],
               expectedResult: tc.expectedResult || '',
               testData: tc.testData || '',
+              riskArea: (tc as any).riskArea || undefined,
               priority: tc.priority || 'P2',
               severity: tc.severity || 'major',
               tags: tc.tags || [],

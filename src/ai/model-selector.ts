@@ -178,7 +178,11 @@ export class ModelSelector {
   private getMaxTokens(taskType: TaskType, complexity: TaskComplexity): number {
     const base: Record<TaskType, number> = {
       healing: 500,
-      test_generation: 6000,
+      // Test generation aims for EXHAUSTIVE, enterprise-grade coverage of every
+      // selected coverage type, so it needs a large output budget to avoid
+      // truncating the JSON mid-array. Actual usage is still governed by the
+      // maxTokens the caller requests (min'd against this cap).
+      test_generation: 8000,
       script_generation: 2000,
       rca: 1000,
       enterprise_demo: 4000,

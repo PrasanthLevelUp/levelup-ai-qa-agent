@@ -451,6 +451,77 @@ describe('TestCoverageEngine - Source Tagging and Provenance', () => {
   });
 });
 
+describe('TestCoverageEngine - Enterprise Output Schema (objective + riskArea)', () => {
+  const engine = new TestCoverageEngine();
+
+  it('should accept scenario-level objective and reconcile coverage with it present', () => {
+    const selectedTypes: CoverageType[] = ['positive', 'negative'];
+
+    // Scenarios now carry the senior-QA "objective" (what the scenario proves).
+    const scenarios: TestScenario[] = [
+      { scenario: 'Valid login', objective: 'Prove a valid user reaches the dashboard', coverageType: 'positive', priority: 'P0', riskArea: 'Authentication' },
+      { scenario: 'Locked account login', objective: 'Prove a locked account is rejected with the locked message', coverageType: 'negative', priority: 'P1', riskArea: 'Unauthorized access' },
+    ];
+
+    const testCases: TestCase[] = [
+      {
+        title: 'Valid credentials reach dashboard',
+        objective: 'Verify a standard user logging in with valid credentials lands on the dashboard',
+        scenarioIndex: 0,
+        riskArea: 'Authentication',
+        preconditions: 'Standard user exists',
+        steps: ['Open login', 'Enter valid creds', 'Submit'],
+        expectedResult: 'Dashboard shown',
+        testData: 'standard_user',
+        priority: 'P0', severity: 'critical', tags: ['positive'],
+        automationReady: true, automationComplexity: 'low', selectorAvailability: 'high',
+        source: 'requirement', sourceEvidence: 'AC: valid login',
+      } as any,
+      {
+        title: 'Locked account shows locked message',
+        objective: 'Verify a locked account with correct password is rejected with the locked message',
+        scenarioIndex: 1,
+        riskArea: 'Unauthorized access',
+        preconditions: 'Locked account exists',
+        steps: ['Open login', 'Enter locked-user creds', 'Submit'],
+        expectedResult: 'Account-locked message shown',
+        testData: 'locked_user',
+        priority: 'P1', severity: 'major', tags: ['negative'],
+        automationReady: true, automationComplexity: 'low', selectorAvailability: 'high',
+        source: 'knowledge', sourceEvidence: 'Auth rule: lockout',
+      } as any,
+    ];
+
+    // The enterprise fields are optional metadata — they must not break the
+    // per-type reconciliation that proves every selected type is accounted for.
+    const evaluations = (engine as any).buildCoverageTypeEvaluations(
+      selectedTypes, scenarios, testCases, []
+    );
+
+    expect(evaluations).toHaveLength(2);
+    const positive = evaluations.find((e: CoverageTypeEvaluation) => e.coverageType === 'positive');
+    const negative = evaluations.find((e: CoverageTypeEvaluation) => e.coverageType === 'negative');
+    expect(positive!.status).toBe('covered');
+    expect(negative!.status).toBe('covered');
+    // Objective is carried on the scenario without disturbing the linkage.
+    expect(scenarios[0].objective).toContain('dashboard');
+    expect(testCases[1].riskArea).toBe('Unauthorized access');
+  });
+
+  it('should treat objective and riskArea as optional (back-compat)', () => {
+    // A case omitting the new enterprise fields is still a valid TestCase.
+    const legacy: TestCase = {
+      title: 'Legacy case without enterprise fields',
+      preconditions: '', steps: [], expectedResult: '', testData: '',
+      priority: 'P2', severity: 'minor', tags: [],
+      automationReady: false, automationComplexity: 'medium', selectorAvailability: 'unknown',
+    };
+    expect(legacy.objective).toBe(undefined);
+    expect(legacy.riskArea).toBe(undefined);
+    expect(legacy.title).toContain('Legacy');
+  });
+});
+
 // ============================================================================
 // Test Runner
 // ============================================================================

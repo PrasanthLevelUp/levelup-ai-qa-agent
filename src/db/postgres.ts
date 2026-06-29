@@ -2464,12 +2464,18 @@ async function migrateDefaultCompany(client: PoolClient): Promise<void> {
     id SERIAL PRIMARY KEY,
     requirement_id INTEGER NOT NULL REFERENCES test_requirements(id) ON DELETE CASCADE,
     scenario TEXT NOT NULL,
+    objective TEXT,
     coverage_type VARCHAR(50) NOT NULL,
     priority VARCHAR(10) DEFAULT 'P1',
     risk_area VARCHAR(200),
     company_id INTEGER REFERENCES companies(id),
     created_at TIMESTAMPTZ DEFAULT NOW()
   )`);
+  // Migration for pre-existing installs: add the scenario-level "objective"
+  // (senior-QA statement of what the scenario proves) introduced with the
+  // enterprise test-design output schema.
+  await safeExec(client, 'generated_test_scenarios.objective',
+    `ALTER TABLE generated_test_scenarios ADD COLUMN IF NOT EXISTS objective TEXT`);
   await safeExec(client, 'idx_gen_scenarios_req',
     `CREATE INDEX IF NOT EXISTS idx_gen_scenarios_req ON generated_test_scenarios(requirement_id)`);
 
@@ -2477,10 +2483,12 @@ async function migrateDefaultCompany(client: PoolClient): Promise<void> {
     id SERIAL PRIMARY KEY,
     scenario_id INTEGER NOT NULL REFERENCES generated_test_scenarios(id) ON DELETE CASCADE,
     title VARCHAR(500) NOT NULL,
+    objective TEXT,
     preconditions TEXT,
     steps JSONB NOT NULL DEFAULT '[]',
     expected_result TEXT NOT NULL,
     test_data TEXT,
+    risk_area VARCHAR(200),
     priority VARCHAR(10) DEFAULT 'P1',
     severity VARCHAR(20) DEFAULT 'major',
     tags JSONB DEFAULT '[]',
@@ -2492,6 +2500,13 @@ async function migrateDefaultCompany(client: PoolClient): Promise<void> {
     company_id INTEGER REFERENCES companies(id),
     created_at TIMESTAMPTZ DEFAULT NOW()
   )`);
+  // Migration for pre-existing installs: add the case-level "objective" (the one
+  // thing the case verifies) and "risk_area" (the product risk it guards against)
+  // introduced with the enterprise test-design output schema.
+  await safeExec(client, 'generated_test_cases.objective',
+    `ALTER TABLE generated_test_cases ADD COLUMN IF NOT EXISTS objective TEXT`);
+  await safeExec(client, 'generated_test_cases.risk_area',
+    `ALTER TABLE generated_test_cases ADD COLUMN IF NOT EXISTS risk_area VARCHAR(200)`);
   await safeExec(client, 'idx_gen_cases_scenario',
     `CREATE INDEX IF NOT EXISTS idx_gen_cases_scenario ON generated_test_cases(scenario_id)`);
 
@@ -8096,15 +8111,15 @@ export async function getApplicationProfileForGeneration(
 
 // ---- Generated Test Scenarios ----
 export async function insertTestScenarios(requirementId: number, scenarios: Array<{
-  scenario: string; coverageType: string; priority: string; riskArea: string;
+  scenario: string; objective?: string; coverageType: string; priority: string; riskArea: string;
 }>, companyId?: number): Promise<number[]> {
   const pool = getPool();
   const ids: number[] = [];
   for (const s of scenarios) {
     const r = await pool.query(
-      `INSERT INTO generated_test_scenarios (requirement_id, scenario, coverage_type, priority, risk_area, company_id)
-       VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
-      [requirementId, s.scenario, s.coverageType, s.priority, s.riskArea || '', companyId || null]
+      `INSERT INTO generated_test_scenarios (requirement_id, scenario, objective, coverage_type, priority, risk_area, company_id)
+       VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id`,
+      [requirementId, s.scenario, s.objective || null, s.coverageType, s.priority, s.riskArea || '', companyId || null]
     );
     ids.push(r.rows[0].id);
   }
@@ -8124,8 +8139,8 @@ export async function getTestScenarios(requirementId: number): Promise<any[]> {
 
 // ---- Generated Test Cases ----
 export async function insertTestCases(scenarioId: number, cases: Array<{
-  title: string; preconditions: string; steps: string[]; expectedResult: string;
-  testData: string; priority: string; severity: string; tags: string[];
+  title: string; objective?: string; preconditions: string; steps: string[]; expectedResult: string;
+  testData: string; riskArea?: string; priority: string; severity: string; tags: string[];
   automationReady: boolean; automationComplexity: string; selectorAvailability: string;
   source?: string; sourceEvidence?: string;
 }>, companyId?: number): Promise<number[]> {
@@ -8134,12 +8149,12 @@ export async function insertTestCases(scenarioId: number, cases: Array<{
   for (const c of cases) {
     const r = await pool.query(
       `INSERT INTO generated_test_cases
-         (scenario_id, title, preconditions, steps, expected_result, test_data,
-          priority, severity, tags, automation_ready, automation_complexity,
+         (scenario_id, title, objective, preconditions, steps, expected_result, test_data,
+          risk_area, priority, severity, tags, automation_ready, automation_complexity,
           selector_availability, source, source_evidence, company_id)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING id`,
-      [scenarioId, c.title, c.preconditions, JSON.stringify(c.steps),
-       c.expectedResult, c.testData, c.priority, c.severity,
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) RETURNING id`,
+      [scenarioId, c.title, c.objective || null, c.preconditions, JSON.stringify(c.steps),
+       c.expectedResult, c.testData, c.riskArea || null, c.priority, c.severity,
        JSON.stringify(c.tags), c.automationReady, c.automationComplexity,
        c.selectorAvailability, c.source || null, c.sourceEvidence || null,
        companyId || null]
