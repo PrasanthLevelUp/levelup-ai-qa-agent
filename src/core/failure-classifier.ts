@@ -24,6 +24,9 @@
 
 import type { FailureDetails, FailureType } from './failure-analyzer';
 import type { EvidenceBundle } from './evidence-collector';
+import { logger } from '../utils/logger';
+
+const MOD = 'failure-classifier';
 
 /**
  * Diagnostic failure categories from the Healing Classifier spec. These map onto
@@ -187,6 +190,14 @@ export function classifyFailure(input: ClassifierInput): FailureDiagnosis {
   const { failure, pageObject } = input;
   const msg = failure.errorMessage || '';
   const evidence: DiagnosisEvidence[] = [];
+  
+  logger.info(MOD, '▶ STAGE: FailureClassifier.classify', {
+    testName: failure.testName,
+    failureType: failure.failureType,
+    failedLocator: failure.failedLocator,
+    hasPageObject: !!pageObject,
+    errorMessagePreview: msg.slice(0, 150),
+  });
 
   // ---- Resolve the locator (inline first, then Page Object) --------------
   let locator: string | null = failure.failedLocator?.trim() || null;
@@ -294,7 +305,7 @@ export function classifyFailure(input: ClassifierInput): FailureDiagnosis {
     actual,
   );
 
-  return {
+  const diagnosis: FailureDiagnosis = {
     category,
     confidence,
     locator,
@@ -312,6 +323,17 @@ export function classifyFailure(input: ClassifierInput): FailureDiagnosis {
     healableByLocatorSwap,
     evidence,
   };
+  
+  logger.info(MOD, '✓ STAGE: FailureClassifier.classify COMPLETE', {
+    category: diagnosis.category,
+    confidence: diagnosis.confidence,
+    locator: diagnosis.locator,
+    recommendedStrategy: diagnosis.recommendedStrategy,
+    healableByLocatorSwap: diagnosis.healableByLocatorSwap,
+    rootCause: diagnosis.rootCause.slice(0, 100),
+  });
+  
+  return diagnosis;
 }
 
 /** Default recommended strategy from category alone (parser-based first pass). */

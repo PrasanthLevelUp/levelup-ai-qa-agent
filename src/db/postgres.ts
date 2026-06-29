@@ -2467,9 +2467,16 @@ async function migrateDefaultCompany(client: PoolClient): Promise<void> {
     coverage_type VARCHAR(50) NOT NULL,
     priority VARCHAR(10) DEFAULT 'P1',
     risk_area VARCHAR(200),
+    -- Flexible bag for ALL AI-generated metadata (objective, and any future
+    -- fields like confidence/reasoning/coverageEvidence). Using one JSONB column
+    -- means a smarter model NEVER requires another schema migration.
+    ai_metadata JSONB DEFAULT '{}',
     company_id INTEGER REFERENCES companies(id),
     created_at TIMESTAMPTZ DEFAULT NOW()
   )`);
+  // Migration for pre-existing installs: add the single AI-metadata JSONB column.
+  await safeExec(client, 'generated_test_scenarios.ai_metadata',
+    `ALTER TABLE generated_test_scenarios ADD COLUMN IF NOT EXISTS ai_metadata JSONB DEFAULT '{}'`);
   await safeExec(client, 'idx_gen_scenarios_req',
     `CREATE INDEX IF NOT EXISTS idx_gen_scenarios_req ON generated_test_scenarios(requirement_id)`);
 
@@ -2489,9 +2496,16 @@ async function migrateDefaultCompany(client: PoolClient): Promise<void> {
     selector_availability VARCHAR(20) DEFAULT 'unknown',
     source VARCHAR(20),
     source_evidence TEXT,
+    -- Flexible bag for ALL AI-generated metadata (objective, riskArea, and any
+    -- future fields like confidence/reasoning/coverageEvidence). One JSONB column
+    -- keeps the schema stable as the model gets smarter — no more ALTER per field.
+    ai_metadata JSONB DEFAULT '{}',
     company_id INTEGER REFERENCES companies(id),
     created_at TIMESTAMPTZ DEFAULT NOW()
   )`);
+  // Migration for pre-existing installs: add the single AI-metadata JSONB column.
+  await safeExec(client, 'generated_test_cases.ai_metadata',
+    `ALTER TABLE generated_test_cases ADD COLUMN IF NOT EXISTS ai_metadata JSONB DEFAULT '{}'`);
   await safeExec(client, 'idx_gen_cases_scenario',
     `CREATE INDEX IF NOT EXISTS idx_gen_cases_scenario ON generated_test_cases(scenario_id)`);
 
@@ -8097,14 +8111,17 @@ export async function getApplicationProfileForGeneration(
 // ---- Generated Test Scenarios ----
 export async function insertTestScenarios(requirementId: number, scenarios: Array<{
   scenario: string; coverageType: string; priority: string; riskArea: string;
+  /** Flexible AI-generated metadata (e.g. { objective }). Stored as JSONB. */
+  aiMetadata?: Record<string, any>;
 }>, companyId?: number): Promise<number[]> {
   const pool = getPool();
   const ids: number[] = [];
   for (const s of scenarios) {
     const r = await pool.query(
-      `INSERT INTO generated_test_scenarios (requirement_id, scenario, coverage_type, priority, risk_area, company_id)
-       VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
-      [requirementId, s.scenario, s.coverageType, s.priority, s.riskArea || '', companyId || null]
+      `INSERT INTO generated_test_scenarios (requirement_id, scenario, coverage_type, priority, risk_area, ai_metadata, company_id)
+       VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id`,
+      [requirementId, s.scenario, s.coverageType, s.priority, s.riskArea || '',
+       JSON.stringify(s.aiMetadata || {}), companyId || null]
     );
     ids.push(r.rows[0].id);
   }
@@ -8128,6 +8145,8 @@ export async function insertTestCases(scenarioId: number, cases: Array<{
   testData: string; priority: string; severity: string; tags: string[];
   automationReady: boolean; automationComplexity: string; selectorAvailability: string;
   source?: string; sourceEvidence?: string;
+  /** Flexible AI-generated metadata (e.g. { objective, riskArea }). Stored as JSONB. */
+  aiMetadata?: Record<string, any>;
 }>, companyId?: number): Promise<number[]> {
   const pool = getPool();
   const ids: number[] = [];
@@ -8136,13 +8155,13 @@ export async function insertTestCases(scenarioId: number, cases: Array<{
       `INSERT INTO generated_test_cases
          (scenario_id, title, preconditions, steps, expected_result, test_data,
           priority, severity, tags, automation_ready, automation_complexity,
-          selector_availability, source, source_evidence, company_id)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING id`,
+          selector_availability, source, source_evidence, ai_metadata, company_id)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) RETURNING id`,
       [scenarioId, c.title, c.preconditions, JSON.stringify(c.steps),
        c.expectedResult, c.testData, c.priority, c.severity,
        JSON.stringify(c.tags), c.automationReady, c.automationComplexity,
        c.selectorAvailability, c.source || null, c.sourceEvidence || null,
-       companyId || null]
+       JSON.stringify(c.aiMetadata || {}), companyId || null]
     );
     ids.push(r.rows[0].id);
   }
