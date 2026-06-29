@@ -13,6 +13,19 @@ import { KnowledgeOptimizer, type KnowledgeItem as OptimizerKnowledgeItem } from
 
 const MOD = 'test-coverage-engine';
 
+/**
+ * Prompt version identifier — increment when the generation prompt logic changes.
+ * Tracked in every generation so we can correlate quality with prompt evolution and
+ * quickly diagnose "last week was better" reports by identifying which version ran.
+ */
+const PROMPT_VERSION = 'v3.2-senior-qa';
+
+/**
+ * Engine architecture version — increment when the pipeline or core algorithm changes
+ * (e.g. dedup logic, grounding approach, evaluation reconciliation).
+ */
+const ENGINE_VERSION = 'test-coverage-v2';
+
 /** Cosine similarity between two equal-length numeric vectors (0..1 for embeddings). */
 function cosineSimilarity(a: number[], b: number[]): number {
   if (!a?.length || !b?.length || a.length !== b.length) return 0;
@@ -306,6 +319,15 @@ export interface GenerationResult {
     /** Generated cases produced per 1,000 prompt chars — a cheap density signal
      *  for "are we getting more output for more context, or just paying more?". */
     casesPerKChars?: number;
+    /** Generation versioning metadata — tracks which prompt/engine/model produced
+     *  this run, so quality regressions ("last week was better") can be instantly
+     *  correlated with code changes and A/B tested. */
+    generationMetadata?: {
+      promptVersion: string;
+      engineVersion: string;
+      model: string;
+      timestamp: string;
+    };
   };
 }
 
@@ -1048,13 +1070,23 @@ Return ONLY valid JSON array.`;
         casesPerKChars: promptChars > 0
           ? Math.round((testCases.length / promptChars) * 1000 * 100) / 100
           : 0,
+        generationMetadata: {
+          promptVersion: PROMPT_VERSION,
+          engineVersion: ENGINE_VERSION,
+          model: this.testModel || 'unknown',
+          timestamp: new Date().toISOString(),
+        },
       },
     };
-    logger.info(MOD, 'Generation metrics', {
+    logger.info(MOD, 'Generation complete', {
+      promptVersion: PROMPT_VERSION,
+      engineVersion: ENGINE_VERSION,
+      model: this.testModel,
       promptChars,
       totalTestCases: testCases.length,
       tokensUsed: totalTokens,
       casesPerKChars: result.stats.casesPerKChars,
+      timestamp: result.stats.generationMetadata!.timestamp,
     });
     return result;
   }
