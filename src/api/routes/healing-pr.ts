@@ -821,13 +821,13 @@ async function executeHealingPR(opts: {
       })),
       // Healing report is platform-owned metadata: the document lives in object
       // storage (referenced by uri/key, also persisted to pr_automations.report_uri)
-      // and is intentionally NOT committed to the customer repo. The markdown is
-      // included inline in the response purely for immediate display.
+      // and is intentionally NOT committed to the customer repo. The dashboard fetches
+      // the document separately via GET /api/reports/healing/<key>, keeping this
+      // response small and enabling cleaner caching / future PDF/HTML rendering.
       report: {
         name: reportName,
         key: reportKey,
         uri: reportUri,
-        markdown: reportMarkdown,
       },
       github: {
         prUrl: pr.url,
