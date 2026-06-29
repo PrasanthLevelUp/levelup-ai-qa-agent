@@ -64,16 +64,31 @@ export class CodePatcher {
     const healedIsExpr = this.isLocatorExpression(fix.healedLocator);
     let directOld = fix.failedLocator;
     let directNew = fix.healedLocator;
+    let directResult: { code: string; count: number };
     if (!failedIsExpr) {
       // Matched text is a bare selector → replacement must be a bare selector.
       directNew = this.extractCoreSelector(fix.healedLocator) || fix.healedLocator;
+      // CRITICAL identifier-safety: a bare selector must ONLY be replaced where
+      // it lives inside a string literal — i.e. the locator argument
+      //   this.page.locator('password')  →  this.page.locator('[data-test="password"]')
+      // A raw global text replace would ALSO hit the same word used as a class
+      // PROPERTY NAME (`password = ...`) and a PROPERTY ACCESS (`this.password`)
+      // in a Page Object, producing invalid TS:
+      //   [data-test="password"] = ...      // selector as a variable name
+      //   await this.[data-test="password"] // selector as a member accessor
+      // So bare selectors are replaced QUOTE-SCOPED only, never unquoted.
+      directResult = this.quotedReplace(code, directOld, directNew);
     } else if (failedIsExpr && !healedIsExpr) {
       // Matched text is a full expression but the heal is a bare selector;
       // a raw swap would drop the call wrapper. Skip the raw direct replace and
       // let the kind-aware Playwright/CSS strategies handle it correctly.
       directOld = '';
+      directResult = this.directReplace(code, directOld, directNew);
+    } else {
+      // Both are full expressions → the failed expression is a long, unique
+      // string that is safe to replace verbatim.
+      directResult = this.directReplace(code, directOld, directNew);
     }
-    const directResult = this.directReplace(code, directOld, directNew);
     if (directResult.count > 0) {
       code = directResult.code;
       replacements += directResult.count;
@@ -144,6 +159,31 @@ export class CodePatcher {
       };
     }
 
+    // Safety net #2: never emit code where a CSS selector landed in IDENTIFIER
+    // position — as a class property name (`[data-test="x"] = ...`) or a member
+    // accessor (`this.[data-test="x"]`). This is the Page-Object corruption that
+    // a naive bare-word replace produced. Reject rather than commit invalid TS.
+    if (
+      replacements > 0 &&
+      this.hasBareSelectorIdentifierCorruption(code) &&
+      !this.hasBareSelectorIdentifierCorruption(originalCode)
+    ) {
+      logger.warn(MOD, 'Rejected patch — selector landed in identifier position', {
+        testName: fix.testName,
+        failedLocator: fix.failedLocator,
+        healedLocator: fix.healedLocator,
+      });
+      return {
+        patched: false,
+        originalCode,
+        patchedCode: originalCode,
+        replacements: 0,
+        description:
+          'Patch rejected: applying the healed locator would produce invalid code ' +
+          '(a CSS selector used as a variable name or property accessor). Manual review needed.',
+      };
+    }
+
     // Add a comment about the healing
     if (replacements > 0) {
       const comment = `// 🤖 LevelUp AI Auto-Heal: ${fix.strategy} (${Math.round(fix.confidence * 100)}% confidence)`;
@@ -211,6 +251,56 @@ export class CodePatcher {
   }
 
   /**
+   * Replace a BARE selector ONLY where it appears inside a string literal —
+   * i.e. as the argument of a locator/click/fill call — never as a bare word
+   * elsewhere in the code (a property name, identifier, or member accessor).
+   *
+   * This is the identifier-safe counterpart to directReplace. It is what keeps
+   * a Page Object intact when the failed locator is a plain word like
+   * `password`:
+   *   this.page.locator('password')   → this.page.locator('[data-test="password"]')   ✅
+   *   password = ...        (left untouched — it is a property name)                   ✅
+   *   this.password.fill()  (left untouched — it is a member accessor)                 ✅
+   *
+   * It also keeps the result valid when the NEW selector contains a quote char
+   * (e.g. [data-test="password"]) by choosing an outer quote that does not
+   * collide with the selector's own quotes.
+   */
+  private quotedReplace(code: string, oldSel: string, newSel: string): { code: string; count: number } {
+    if (!oldSel) return { code, count: 0 };
+    // Match the bare selector wrapped in ANY one quote style in a SINGLE pass.
+    // A sequential per-quote loop is unsafe: the inserted selector may itself
+    // contain the old word (e.g. heal `password` → `[data-test="password"]`),
+    // so a later quote iteration would re-match the freshly-inserted text and
+    // double-wrap it (`'[data-test='[data-test="password"]']'`). One regex pass
+    // over the original text avoids rescanning what we just wrote.
+    const esc = this.escapeRegex(oldSel);
+    const re = new RegExp(`(['"\`])${esc}\\1`, 'g');
+    let count = 0;
+    const result = code.replace(re, (_m: string, q: string) => {
+      count++;
+      const wrap = this.pickSafeQuote(newSel, q);
+      return `${wrap}${newSel}${wrap}`;
+    });
+    return { code: result, count };
+  }
+
+  /**
+   * Choose a quote character to wrap `value` in so the result stays valid.
+   * Prefers `preferred`; if `value` itself contains that quote, falls back to
+   * the first quote char not present in `value`.
+   */
+  private pickSafeQuote(value: string, preferred: string): string {
+    if (!value.includes(preferred)) return preferred;
+    for (const q of ["'", '"', '`']) {
+      if (!value.includes(q)) return q;
+    }
+    // Every quote char is present in the selector (extremely unlikely) — keep
+    // the preferred one; downstream TS parse-guard will reject if invalid.
+    return preferred;
+  }
+
+  /**
    * Replace selectors within Playwright-style locator calls:
    *   page.locator('old') → page.locator('new')
    *   page.click('old')   → page.click('new')
@@ -226,23 +316,23 @@ export class CodePatcher {
     const bareNew = this.extractCoreSelector(newSelector) || newSelector;
 
     // Pattern: page.locator('...'), page.click('...'), page.$('...')
-    const patterns = [
-      // Single-quoted
-      new RegExp(`((?:page|frame|locator)\\.[a-zA-Z$]+\\(')${this.escapeRegex(bareOld)}('\\))`, 'g'),
-      // Double-quoted
-      new RegExp(`((?:page|frame|locator)\\.[a-zA-Z$]+\\(")${this.escapeRegex(bareOld)}("\\))`, 'g'),
-      // Template literal
-      new RegExp(`((?:page|frame|locator)\\.[a-zA-Z$]+\\(\`)${this.escapeRegex(bareOld)}(\`\\))`, 'g'),
+    // Each entry carries the quote char so we can pick a non-colliding wrapper
+    // when the NEW selector itself contains that quote (e.g. [data-test="x"]).
+    const patterns: Array<{ q: string; re: RegExp }> = [
+      { q: "'", re: new RegExp(`((?:page|frame|locator)\\.[a-zA-Z$]+\\()'${this.escapeRegex(bareOld)}'(\\))`, 'g') },
+      { q: '"', re: new RegExp(`((?:page|frame|locator)\\.[a-zA-Z$]+\\()"${this.escapeRegex(bareOld)}"(\\))`, 'g') },
+      { q: '`', re: new RegExp(`((?:page|frame|locator)\\.[a-zA-Z$]+\\()\`${this.escapeRegex(bareOld)}\`(\\))`, 'g') },
     ];
 
     let count = 0;
     let result = code;
 
-    for (const pattern of patterns) {
-      const matches = result.match(pattern);
+    for (const { q, re } of patterns) {
+      const matches = result.match(re);
       if (matches) {
         count += matches.length;
-        result = result.replace(pattern, `$1${bareNew}$2`);
+        const wrap = this.pickSafeQuote(bareNew, q);
+        result = result.replace(re, `$1${wrap}${bareNew}${wrap}$2`);
       }
     }
 
@@ -270,14 +360,16 @@ export class CodePatcher {
     let count = 0;
     let result = code;
 
-    // Replace within quotes
+    // Replace within quotes, choosing a wrapper quote that does not collide
+    // with quotes inside the new selector (e.g. [data-test="x"]).
     for (const q of ["'", '"', '`']) {
       const escaped = this.escapeRegex(bareOld);
       const pattern = new RegExp(`${q}${escaped}${q}`, 'g');
       const matches = result.match(pattern);
       if (matches) {
         count += matches.length;
-        result = result.replace(pattern, `${q}${bareNew}${q}`);
+        const wrap = this.pickSafeQuote(bareNew, q);
+        result = result.replace(pattern, `${wrap}${bareNew}${wrap}`);
       }
     }
 
@@ -337,5 +429,30 @@ export class CodePatcher {
     // .<method>( '<...> getByRole( / getByTestId( ...
     const nestedGetBy = /\.\s*\w+\s*\(\s*['"`][^'"`]*\bgetBy\w*\s*\(/;
     return nestedCall.test(code) || nestedGetBy.test(code);
+  }
+
+  /**
+   * Detect a CSS selector that landed in IDENTIFIER position — the Page-Object
+   * corruption produced by a naive bare-word replace:
+   *   [data-test="password"] = this.page.locator(...)   // selector as var name
+   *   await this.[data-test="password"].fill(pass)        // selector as accessor
+   *   this.#submit.click()                                // id selector as accessor
+   * These never occur in valid TS. Dependency-free (no TypeScript at runtime).
+   */
+  private hasBareSelectorIdentifierCorruption(code: string): boolean {
+    // A `[...]` attribute selector used as a class property name:  ^  [..] =
+    // (a leading `[` followed by `]` then `=`/`:` at statement start).
+    const attrAsPropName = /^[ \t]*\[[^\]\n]+\]\s*[:=]/m;
+    // A member access onto an attribute selector:  this.[data-test="x"]
+    //   `.` (NOT optional chaining `?.`) immediately followed by `[`.
+    const memberOntoAttrSelector = /(?<!\?)\.\s*\[/;
+    // A class selector used as a dot accessor:  this..foo  obj..bar
+    //   letter, then `..`, then a letter (excludes number-literal `1..toString`).
+    const doubleDotSelector = /[A-Za-z_$]\.\.[A-Za-z_-]/;
+    return (
+      attrAsPropName.test(code) ||
+      memberOntoAttrSelector.test(code) ||
+      doubleDotSelector.test(code)
+    );
   }
 }
