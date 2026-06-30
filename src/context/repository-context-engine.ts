@@ -479,9 +479,18 @@ function detectCodingStyle(repoRoot: string, analyses: FileAnalysis[]): CodingSt
   const quoteStyle: CodingStyle['quoteStyle'] = pickMax(votes.quote, 'single');
   const semicolons = votes.semicolons >= votes.noSemicolons;
 
+  // ── Logging & wait conventions (Repo Intelligence — "attentional" signals) ──
+  // We tally, across ALL analysed test/source files, how many files use each
+  // step-logging mechanism and each synchronization strategy. Ranking by file
+  // frequency (not raw occurrence count) keeps a single noisy file from
+  // dominating, mirroring how `preferredLocators` is ranked elsewhere.
+  const { loggingStyle, loggingStyles } = detectLoggingStyle(analyses);
+  const { waitStyle, waitStyles, usesFixedTimeouts } = detectWaitStyle(analyses);
+
   logger.info(MOD, 'Coding-style detection (multi-file majority vote)', {
     filesSampled: sampleFiles.length,
     indentStyle, quoteStyle, semicolons, votes,
+    loggingStyle, loggingStyles, waitStyle, waitStyles, usesFixedTimeouts,
   });
 
   return {
@@ -492,7 +501,77 @@ function detectCodingStyle(repoRoot: string, analyses: FileAnalysis[]): CodingSt
     indentStyle,
     quoteStyle,
     semicolons,
+    loggingStyle,
+    loggingStyles,
+    waitStyle,
+    waitStyles,
+    usesFixedTimeouts,
   };
+}
+
+/**
+ * Rank the step-logging mechanisms used across the repo by how many files use
+ * each one. Returns the dominant style plus the full ranked list. `test.step`
+ * wins ties over `console.log` because it produces the richest Playwright
+ * reports — when a repo uses both, mirroring `test.step` is the better choice.
+ */
+function detectLoggingStyle(analyses: FileAnalysis[]): {
+  loggingStyle: CodingStyle['loggingStyle'];
+  loggingStyles: CodingStyle['loggingStyles'];
+} {
+  const order: Array<CodingStyle['loggingStyle']> = ['test-step', 'annotations', 'logger', 'console-log'];
+  const counts: Record<string, number> = {};
+  for (const a of analyses) {
+    for (const label of a.loggingPatterns || []) {
+      counts[label] = (counts[label] || 0) + 1;
+    }
+  }
+  const ranked = Object.entries(counts)
+    .sort((a, b) => b[1] - a[1] || order.indexOf(a[0] as any) - order.indexOf(b[0] as any))
+    .map(([label]) => label as CodingStyle['loggingStyle']);
+
+  if (ranked.length === 0) return { loggingStyle: 'none', loggingStyles: [] };
+  // 'mixed' only when the top two mechanisms appear in the SAME number of files
+  // (a genuine tie). A clear leader is honoured so generation has a confident
+  // target rather than defaulting to ambiguous 'mixed'.
+  const top = ranked[0];
+  const second = ranked[1];
+  const tie = second != null && counts[top] === counts[second];
+  return { loggingStyle: tie ? 'mixed' : top, loggingStyles: ranked };
+}
+
+/**
+ * Rank synchronization strategies across the repo by file frequency. The
+ * `fixed-timeout` anti-pattern is tracked separately (so we can warn) and is
+ * never chosen as the dominant style unless it is the ONLY thing the repo uses.
+ */
+function detectWaitStyle(analyses: FileAnalysis[]): {
+  waitStyle: CodingStyle['waitStyle'];
+  waitStyles: CodingStyle['waitStyles'];
+  usesFixedTimeouts: boolean;
+} {
+  const order: Array<CodingStyle['waitStyle']> = [
+    'web-first-assertions', 'load-state', 'locator-waitfor', 'response-wait', 'fixed-timeout',
+  ];
+  const counts: Record<string, number> = {};
+  for (const a of analyses) {
+    for (const label of a.waitPatterns || []) {
+      counts[label] = (counts[label] || 0) + 1;
+    }
+  }
+  const usesFixedTimeouts = (counts['fixed-timeout'] || 0) > 0;
+
+  const ranked = Object.entries(counts)
+    .sort((a, b) => b[1] - a[1] || order.indexOf(a[0] as any) - order.indexOf(b[0] as any))
+    .map(([label]) => label as CodingStyle['waitStyle']);
+
+  if (ranked.length === 0) return { waitStyle: 'none', waitStyles: [], usesFixedTimeouts };
+
+  // Pick the dominant *good* strategy; only fall back to 'fixed-timeout' as the
+  // headline style when it is literally the only strategy present.
+  const goodRanked = ranked.filter((s) => s !== 'fixed-timeout');
+  const waitStyle: CodingStyle['waitStyle'] = goodRanked.length ? goodRanked[0] : 'fixed-timeout';
+  return { waitStyle, waitStyles: ranked, usesFixedTimeouts };
 }
 
 /* ------------------------------------------------------------------ */

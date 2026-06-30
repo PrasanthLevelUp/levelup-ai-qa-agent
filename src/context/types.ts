@@ -102,6 +102,8 @@ export interface FileAnalysis {
   testCount: number;              // number of test() / it() / describe() calls
   locatorPatterns: string[];      // unique locator patterns found
   assertionPatterns: string[];    // assertion styles used
+  loggingPatterns: string[];      // step-reporting / logging styles used (test.step, console.log, annotations, ...)
+  waitPatterns: string[];         // synchronization styles used (waitForLoadState, locator.waitFor, expect-visible, waitForTimeout, ...)
   lineCount: number;
   hasFixtures: boolean;
   hasPageObject: boolean;
@@ -122,6 +124,35 @@ export interface FolderStructure {
   supportFiles: string[];          // setup/teardown files
 }
 
+/**
+ * How the repo surfaces step progress in tests/reports. This is a SEPARATE
+ * axis from `stepStyle` (which captures GWT vs AAA *structure*): `loggingStyle`
+ * captures the *mechanism* — Playwright `test.step()` blocks, `console.log`
+ * breadcrumbs, `test.info().annotations.push(...)`, or none. Generation mirrors
+ * this so emitted scripts read like the team already writes them.
+ */
+export type LoggingStyle =
+  | 'test-step'      // await test.step('...', async () => { ... })  (richest reports)
+  | 'console-log'    // console.log('...') breadcrumbs
+  | 'annotations'    // test.info().annotations.push({ type, description })
+  | 'logger'         // a custom logger util (logger.info(...), log(...))
+  | 'none'           // no step logging detected
+  | 'mixed';
+
+/**
+ * How the repo synchronizes with the app under test. Captured so generated
+ * scripts adopt the team's waiting discipline instead of guessing — and so we
+ * can flag the `waitForTimeout` anti-pattern when a repo (accidentally) uses it.
+ */
+export type WaitStyle =
+  | 'web-first-assertions' // relies on auto-waiting expect(locator).toBeVisible()/toBeEditable()
+  | 'load-state'           // page.waitForLoadState('networkidle'|'load'|'domcontentloaded')
+  | 'locator-waitfor'      // locator.waitFor() / waitForSelector — explicit element waits
+  | 'response-wait'        // page.waitForResponse/waitForRequest — network-driven sync
+  | 'fixed-timeout'        // page.waitForTimeout(ms) — ANTI-PATTERN, surfaced as a warning
+  | 'none'                 // no explicit synchronization detected
+  | 'mixed';
+
 export interface CodingStyle {
   namingConvention: 'camelCase' | 'snake_case' | 'kebab-case' | 'PascalCase' | 'mixed';
   testNaming: string;             // e.g. 'should_do_x_when_y', 'TC01-descriptive'
@@ -130,6 +161,29 @@ export interface CodingStyle {
   indentStyle: 'spaces-2' | 'spaces-4' | 'tabs' | 'mixed';
   quoteStyle: 'single' | 'double' | 'mixed';
   semicolons: boolean;
+  /**
+   * Dominant step-logging mechanism the repo uses (test.step / console.log /
+   * annotations / logger / none). Drives how generated scripts report progress.
+   */
+  loggingStyle: LoggingStyle;
+  /**
+   * All logging mechanisms observed, most-used first (e.g. ['test-step','console-log']).
+   * Lets the generator prefer the dominant one while knowing the secondary exists.
+   */
+  loggingStyles: LoggingStyle[];
+  /**
+   * Dominant synchronization strategy (web-first-assertions / load-state /
+   * locator-waitfor / response-wait / fixed-timeout / none). Drives the wait
+   * code emitted for navigation and post-action sync.
+   */
+  waitStyle: WaitStyle;
+  /** All wait strategies observed, most-used first. */
+  waitStyles: WaitStyle[];
+  /**
+   * True when the repo uses `page.waitForTimeout(...)` (hard sleeps). Surfaced
+   * so the generator can AVOID propagating the anti-pattern even if present.
+   */
+  usesFixedTimeouts: boolean;
 }
 
 export interface RepositoryProfile {

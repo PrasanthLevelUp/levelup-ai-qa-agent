@@ -31,6 +31,7 @@ import {
   getLinkedDatasets,
   getTestDataRecords,
   resolveTestData,
+  listTestDataSets,
   getRequirement,
   getProfileByUrl,
   markTestCaseAutomated,
@@ -264,6 +265,61 @@ export function createScriptGenRouter(): Router {
               }
             }
           }
+
+          // ── Fallback: resolve datasets REFERENCED BY NAME in a case's
+          // `test_data` text but never formally linked. Authors frequently type
+          // a free-text reference (e.g. test_data: "locked_user") without
+          // creating the dataset↔case association, which previously left the
+          // generator with no record to bind — emitting bogus literals scraped
+          // from the step prose. We match those references against the company's
+          // Test Data Store by name (tolerant of singular/plural & punctuation)
+          // so the real record (e.g. locked_users → locked_out_user) resolves.
+          try {
+            const scopedCases = [
+              ...(testCase ? [testCase] : []),
+              ...requirementTestCases,
+            ];
+            const refTexts = scopedCases
+              .map((c: any) => `${c?.test_data ?? ''} ${c?.title ?? ''}`.toLowerCase())
+              .filter(Boolean);
+            if (refTexts.length > 0) {
+              const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9]/g, '').replace(/s$/, '');
+              const allSets = await listTestDataSets(companyId as number, projectIdForData).catch(() => []);
+              for (const ds of allSets) {
+                const dedupeKey = `${ds.name}::${ds.environment}`;
+                if (seenDatasets.has(dedupeKey)) continue;
+                const dsNorm = norm(ds.name);
+                if (!dsNorm) continue;
+                // A reference matches when the (normalized) dataset name appears
+                // as a token in a case's test_data/title, or vice-versa — covers
+                // "locked_user" ↔ "locked_users" and "valid_users" ↔ "valid user".
+                const referenced = refTexts.some((txt) => {
+                  const tokens = txt.split(/[^a-z0-9]+/).filter(Boolean).map((t) => t.replace(/s$/, ''));
+                  return tokens.includes(dsNorm) || tokens.some((t) => t && (t.includes(dsNorm) || dsNorm.includes(t)) && Math.min(t.length, dsNorm.length) >= 4);
+                });
+                if (!referenced) continue;
+                seenDatasets.add(dedupeKey);
+                let records: Array<{ key: string; value: any }> = [];
+                try {
+                  const resolved = await resolveTestData(ds.name, companyId as number, projectIdForData, ds.environment);
+                  if (Array.isArray(resolved) && resolved.length > 0) {
+                    records = resolved.map((r: any) => ({ key: String(r.key), value: r.value }));
+                  }
+                } catch { /* fall through to raw records */ }
+                if (records.length === 0) {
+                  const raw = await getTestDataRecords(ds.id).catch(() => []);
+                  records = raw.map((r: any) => ({ key: String(r.key), value: r.value_jsonb }));
+                }
+                if (records.length > 0) {
+                  resolvedTestData.push({ name: ds.name, environment: ds.environment, records });
+                  console.log(`[ScriptGen] 🔗 Resolved by-name reference → dataset "${ds.name}" (${records.length} record(s))`);
+                }
+              }
+            }
+          } catch (nameErr: any) {
+            console.warn(`[ScriptGen] By-name test-data resolution skipped (non-blocking): ${nameErr?.message}`);
+          }
+
           if (resolvedTestData.length > 0) {
             const totalRecords = resolvedTestData.reduce((n, d) => n + d.records.length, 0);
             console.log(`[ScriptGen] 🔗 Test data resolved — ${resolvedTestData.length} dataset(s), ${totalRecords} record(s) for ${scopedCaseIds.length} case(s)`);

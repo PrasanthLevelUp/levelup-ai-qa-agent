@@ -1284,8 +1284,28 @@ ${combined.map(l => (l ? `    ${l}` : '')).join('\n')}
   private looksLikeCredential(v: string): boolean {
     const t = v.trim();
     if (!t || /^<.*>$/.test(t)) return false;
-    if (/^(the|a|an|to|valid|invalid|empty|blank|field|fields|account|user|users|username|password|placeholder|credentials?|with|and|into|from|enter|leave)$/i.test(t)) return false;
+    // Reject articles/instruction verbs/field words AND English prepositions &
+    // stop-words (in/on/at/for/of/by/…). The latter are what produced bogus
+    // fills like `login('username', 'in')` — the word after "password" in
+    // "Enter the password in [data-testid='password'] field" is the preposition
+    // "in", never a credential value.
+    if (/^(the|a|an|to|valid|invalid|empty|blank|field|fields|account|user|users|username|password|placeholder|credentials?|with|and|into|from|enter|leave|in|on|at|for|of|by|as|is|are|be|or|if|it|button|page|click|here|then|next|after|before|login|logon|signin)$/i.test(t)) return false;
     return /^[a-z0-9][a-z0-9._@+-]*$/i.test(t);
+  }
+
+  /**
+   * Strip CSS / attribute selector noise from a step description so credential
+   * extraction never mines a locator fragment as a value. Without this,
+   * "Enter the username in [data-testid='username'] field" yielded the literal
+   * `'username'` (the attribute value) instead of resolving the bound dataset
+   * record. Removes [bracketed] selectors, attr='…'/attr="…" assignments, and
+   * #id / .class tokens.
+   */
+  private stripSelectorNoise(raw: string): string {
+    return String(raw)
+      .replace(/\[[^\]]*\]/g, ' ')               // [data-testid='username']
+      .replace(/[\w-]+\s*=\s*(['"]).*?\1/g, ' ')  // data-testid='username'
+      .replace(/[#.][a-z][\w-]*/gi, ' ');         // #login-button .btn-primary
   }
 
   /**
@@ -1458,6 +1478,37 @@ ${combined.map(l => (l ? `    ${l}` : '')).join('\n')}
   ): { datasetName: string; recordKey: string; value: any; ref: string; representative: boolean } | null {
     if (!this.hasResolvedData(index)) return null;
     const haystack = `${tc.test_data || ''}\n${steps.join('\n')}`.toLowerCase();
+    // Token set for tolerant matching: a free-text reference like "locked_user"
+    // should still bind to a dataset named "locked_users" (singular/plural,
+    // punctuation differences). We compare on normalized, de-pluralized tokens.
+    const normTok = (s: string) => s.toLowerCase().replace(/[^a-z0-9]/g, '').replace(/s$/, '');
+    const refTokens = new Set(
+      haystack.split(/[^a-z0-9]+/).filter(Boolean).map(normTok).filter((t) => t.length >= 3),
+    );
+    // Match for DATASET NAMES: a name is referenced when it appears verbatim,
+    // OR every significant (de-pluralized) token of the dataset name appears as
+    // a distinct word token in the case text. Token-level (word-boundary) match
+    // tolerates singular/plural and punctuation ("locked_user" → "locked_users",
+    // "standard_user from valid_users" → "valid_users") WITHOUT the cross-word
+    // character collisions that a raw substring check would cause — e.g.
+    // "invalid username" must NOT bind to "valid_users" (its tokens are
+    // {invalid, username}, which do not include the name token "user").
+    const isReferenced = (name: string): boolean => {
+      const n = name.toLowerCase();
+      if (haystack.includes(n)) return true;
+      const nameToks = name
+        .split(/[^a-z0-9]+/i)
+        .map(normTok)
+        .filter((t) => t.length >= 3);
+      if (nameToks.length === 0) return false;
+      return nameToks.every((t) => refTokens.has(t));
+    };
+    // STRICT match for RECORD KEYS: only a verbatim substring or an exact
+    // normalized-token match counts. Substring overlap is deliberately NOT used
+    // here so a generic key like "standard_user" isn't picked just because the
+    // case text contains the word "user".
+    const isKeyReferenced = (key: string): boolean =>
+      haystack.includes(key.toLowerCase()) || refTokens.has(normTok(key));
 
     // Build a dataset binding. When the matched record is the dataset's
     // representative row, OMIT the selector so the script binds to the dataset
@@ -1474,24 +1525,33 @@ ${combined.map(l => (l ? `    ${l}` : '')).join('\n')}
       };
     };
 
-    // 1) Best match: a dataset name AND one of its record keys both appear.
-    for (const [dsName, recMap] of index) {
-      if (!haystack.includes(dsName.toLowerCase())) continue;
+    // Pick the record whose key best matches the case intent: prefer a key that
+    // is referenced (exactly/tolerantly) by the case text, else the first row.
+    const pickRecord = (recMap: Map<string, any>): string => {
       for (const key of recMap.keys()) {
-        if (haystack.includes(key.toLowerCase())) return bind(dsName, recMap, key);
+        if (isKeyReferenced(key)) return key;
+      }
+      // Intent keywords (locked/invalid/…) → a record key carrying that token.
+      const intent = haystack.match(/lock|problem|glitch|invalid|expired|disabled|blocked|error|standard|valid|default|primary/);
+      if (intent) {
+        for (const key of recMap.keys()) {
+          if (key.toLowerCase().includes(intent[0])) return key;
+        }
+      }
+      return [...recMap.keys()][0]!;
+    };
+
+    // 1) A record key is referenced verbatim → bind that exact record.
+    for (const [dsName, recMap] of index) {
+      for (const key of recMap.keys()) {
+        if (isKeyReferenced(key)) return bind(dsName, recMap, key);
       }
     }
-    // 2) A record key appears anywhere (infer its dataset).
+    // 2) A dataset name is referenced (exact or tolerant) → bind to the record
+    //    whose key best matches the case intent (locked/invalid/…), else first.
     for (const [dsName, recMap] of index) {
-      for (const key of recMap.keys()) {
-        if (haystack.includes(key.toLowerCase())) return bind(dsName, recMap, key);
-      }
-    }
-    // 3) Only a dataset name appears → bind to the dataset (first record).
-    for (const [dsName, recMap] of index) {
-      if (haystack.includes(dsName.toLowerCase())) {
-        const key = [...recMap.keys()][0]!;
-        return bind(dsName, recMap, key);
+      if (isReferenced(dsName)) {
+        return bind(dsName, recMap, pickRecord(recMap));
       }
     }
     return null;
@@ -2456,19 +2516,29 @@ ${gotoB}${sessionLogin('pageB')}
     const fieldExpr = (kind: 'username' | 'password', raw: string, t: string): string => {
       // 1) Intentionally-empty field (negative "empty/blank" test) → ''.
       if (/empty|blank|without|no\s+(user|pass)|leave.*(blank|empty)/.test(t)) return `''`;
-      // 2) Explicit quoted literal in the step ('standard_user') → that literal.
-      const quoted = raw.match(/'([^']*)'|"([^"]*)"/);
+      // Strip CSS/attribute selector fragments BEFORE any prose mining so a
+      // locator like [data-testid='username'] can never be read as a value.
+      const prose = this.stripSelectorNoise(raw);
+      // 2) Explicit quoted REAL literal authored in the step ('standard_user').
+      //    Selector fragments are already stripped; field-name keywords and
+      //    stop-words are rejected by looksLikeCredential so we only honor a
+      //    genuine value the author typed.
+      const quoted = prose.match(/'([^']*)'|"([^"]*)"/);
       if (quoted) {
-        const lit = quoted[1] ?? quoted[2] ?? '';
-        // A `<placeholder>` token is NOT a real literal — fall through.
-        if (!/^<.*>$/.test(lit.trim())) return `'${escapeStr(lit)}'`;
+        const lit = (quoted[1] ?? quoted[2] ?? '').trim();
+        if (lit && !/^<.*>$/.test(lit) && this.looksLikeCredential(lit)) return `'${escapeStr(lit)}'`;
       }
-      // 3) A concrete value written in the step text itself, e.g.
-      //    "...from valid_users: standard_user" → 'standard_user'. This is the
-      //    fix for silent fill('') when the value is right there in the step.
-      const stepVal = this.extractStepCredential(kind, raw);
+      // 3) A concrete value the author wrote directly in the (selector-stripped)
+      //    step text, e.g. "...from valid_users: standard_user" → 'standard_user'.
+      //    An explicit authored value is the strongest signal, so it wins. The
+      //    selector strip + stop-word rejection (see looksLikeCredential) ensure
+      //    this no longer mines locator fragments or prepositions.
+      const stepVal = this.extractStepCredential(kind, prose);
       if (stepVal) return `'${escapeStr(stepVal)}'`;
-      // 4) Resolved Test Data Store record → user.username / user.password.
+      // 4) Bound Test Data Store record — the dataset-resolution fix. When the
+      //    step carries NO explicit value (e.g. "Enter the username in
+      //    [data-testid='username']"), resolve from the case's bound dataset
+      //    record (→ user.username / user.password) instead of emitting junk.
       if (ctx.data) {
         if (kind === 'username' && ctx.data.hasUsername) return `${ctx.data.varName}.username ?? ''`;
         if (kind === 'password' && ctx.data.hasPassword) return `${ctx.data.varName}.password ?? ''`;

@@ -40,11 +40,16 @@ const baseProfile: RepositoryProfile = {
   codingStyle: {
     namingConvention: 'camelCase',
     testNaming: 'should_x_when_y',
-    stepStyle: 'describe-it',
+    stepStyle: 'arrange_act_assert',
     tagConvention: '@smoke',
     indentStyle: 'spaces-2',
     quoteStyle: 'single',
     semicolons: true,
+    loggingStyle: 'test-step',
+    loggingStyles: ['test-step', 'console-log'],
+    waitStyle: 'web-first-assertions',
+    waitStyles: ['web-first-assertions', 'load-state'],
+    usesFixedTimeouts: false,
   },
   helperFunctions: [
     { name: 'login', filePath: 'utils/auth.ts', params: ['page', 'user'], returnType: 'Promise<void>', isExported: true, isAsync: true, lineNumber: 1 } as any,
@@ -108,6 +113,16 @@ if (guide) {
   assert(guide.summary.pageObjects.length > 0, 'page objects captured for reuse');
   assert(guide.promptBlock.length > 0, 'prompt block is non-empty');
   assert(/playwright/i.test(guide.promptBlock), 'prompt block mentions the framework');
+
+  // Logging + wait conventions (Repo Intelligence — attentional signals) must
+  // be carried into the summary AND surfaced as actionable prompt guidance.
+  assertEqual(guide.summary.loggingStyle, 'test-step', 'logging style carried through');
+  assertEqual(guide.summary.waitStyle, 'web-first-assertions', 'wait style carried through');
+  assert(/STEP LOGGING/.test(guide.promptBlock), 'prompt block has STEP LOGGING section');
+  assert(/test\.step/.test(guide.promptBlock), 'prompt block instructs test.step() for logging');
+  assert(/SYNCHRONIZATION/.test(guide.promptBlock), 'prompt block has SYNCHRONIZATION section');
+  assert(/toBeVisible|toBeEditable/.test(guide.promptBlock), 'prompt block instructs web-first assertions for waits');
+  assert(/NEVER use page\.waitForTimeout/.test(guide.promptBlock), 'prompt block forbids the waitForTimeout anti-pattern');
 
   // Repo-consistent file naming: camelCase + .spec (from testNaming/suites).
   const fileName = guide.buildFileName('user-login');

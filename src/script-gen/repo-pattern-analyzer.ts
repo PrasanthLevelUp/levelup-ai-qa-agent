@@ -38,6 +38,7 @@ import type {
   ClassInfo,
   FunctionSignature,
 } from '../context/types';
+import { categorizeHelpers } from '../context/reusable-helpers';
 
 /* -------------------------------------------------------------------------- */
 /*  Public Types                                                              */
@@ -59,6 +60,24 @@ export interface RepoPatternSummary {
   testNaming: string;
   /** Tag convention (e.g. '@smoke') or null. */
   tagConvention: string | null;
+  /**
+   * How the repo reports step progress — 'test-step' | 'console-log' |
+   * 'annotations' | 'logger' | 'none' | 'mixed'. Generation mirrors this so
+   * emitted scripts log the way the team already does (e.g. test.step blocks).
+   */
+  loggingStyle: string;
+  /** All logging mechanisms observed, most-used first. */
+  loggingStyles: string[];
+  /**
+   * How the repo synchronizes with the app — 'web-first-assertions' |
+   * 'load-state' | 'locator-waitfor' | 'response-wait' | 'fixed-timeout' |
+   * 'none' | 'mixed'. Generation adopts this instead of guessing waits.
+   */
+  waitStyle: string;
+  /** All wait strategies observed, most-used first. */
+  waitStyles: string[];
+  /** True when the repo contains the waitForTimeout hard-sleep anti-pattern. */
+  usesFixedTimeouts: boolean;
   quoteStyle: 'single' | 'double';
   semicolons: boolean;
   /** Preferred locator patterns, most-used first. */
@@ -67,6 +86,22 @@ export interface RepoPatternSummary {
   avoidLocators: string[];
   /** Reusable helpers to import instead of re-implementing. */
   helpers: Array<{ name: string; params: string; filePath: string }>;
+  /**
+   * Helpers bucketed by purpose so generation can REUSE the right existing
+   * project method instead of emitting new raw Playwright code. Each bucket is
+   * a subset of `helpers` (a helper may appear in at most one bucket; anything
+   * not classified lands in `utilityHelpers`).
+   */
+  assertionHelpers: Array<{ name: string; params: string; filePath: string }>;
+  waitHelpers: Array<{ name: string; params: string; filePath: string }>;
+  loggerHelpers: Array<{ name: string; params: string; filePath: string }>;
+  dataAccessHelpers: Array<{ name: string; params: string; filePath: string }>;
+  utilityHelpers: Array<{ name: string; params: string; filePath: string }>;
+  /**
+   * The repo's existing logger implementation to import & call (e.g. a `logger`
+   * util or a `log()` function) instead of using console.log. Null when none.
+   */
+  loggerImpl: { name: string; filePath: string } | null;
   /** Page objects to reuse. */
   pageObjects: Array<{ name: string; filePath: string; methods: string[] }>;
   /** Fixtures available. */
@@ -139,7 +174,7 @@ function fingerprint(profile: RepositoryProfile): string {
     preferredLocators: (profile.preferredLocators || []).map((l) => `${l.pattern}|${l.example ?? ''}`),
     avoidPatterns: profile.avoidPatterns || [],
     style: s
-      ? `${s.namingConvention}|${s.testNaming}|${s.stepStyle}|${s.quoteStyle}|${s.semicolons}|${s.tagConvention}`
+      ? `${s.namingConvention}|${s.testNaming}|${s.stepStyle}|${s.quoteStyle}|${s.semicolons}|${s.tagConvention}|${s.loggingStyle ?? ''}|${(s.loggingStyles || []).join(',')}|${s.waitStyle ?? ''}|${(s.waitStyles || []).join(',')}|${s.usesFixedTimeouts ?? ''}`
       : 'no-style',
     folders: profile.folderStructure || null,
   };
@@ -247,6 +282,8 @@ function buildSummary(profile: RepositoryProfile): RepoPatternSummary {
     utils: profile.folderStructure?.utilsFolder || undefined,
   };
 
+  const buckets = categorizeHelpers(profile);
+
   const assertionLibrary = profile.assertionLibrary || (framework === 'playwright' ? '@playwright/test expect' : 'expect');
   const assertionExample = buildAssertionExample(framework, assertionLibrary);
   const imports = buildImports(profile, framework, language, quoteStyle, semicolons);
@@ -274,11 +311,22 @@ function buildSummary(profile: RepositoryProfile): RepoPatternSummary {
     structure,
     testNaming: style?.testNaming || 'descriptive',
     tagConvention: style?.tagConvention ?? null,
+    loggingStyle: style?.loggingStyle || 'none',
+    loggingStyles: style?.loggingStyles || [],
+    waitStyle: style?.waitStyle || 'none',
+    waitStyles: style?.waitStyles || [],
+    usesFixedTimeouts: style?.usesFixedTimeouts ?? false,
     quoteStyle,
     semicolons,
     preferredLocators,
     avoidLocators: (profile.avoidPatterns || []).slice(0, 5),
     helpers,
+    assertionHelpers: buckets.assertion,
+    waitHelpers: buckets.wait,
+    loggerHelpers: buckets.logger,
+    dataAccessHelpers: buckets.data,
+    utilityHelpers: buckets.utility,
+    loggerImpl: buckets.loggerImpl,
     pageObjects,
     fixtures,
     dataFiles,
@@ -363,6 +411,73 @@ function buildFileName(featureSlug: string, summary: RepoPatternSummary): string
 /*  Prompt block                                                              */
 /* -------------------------------------------------------------------------- */
 
+/**
+ * Concrete, copy-pasteable guidance for the detected step-logging style.
+ * Returns null when there's nothing useful to instruct (style 'none').
+ */
+function describeLoggingStyle(style: string): string[] | null {
+  switch (style) {
+    case 'test-step':
+      return [
+        "- Wrap each logical phase in a Playwright step so reports stay readable:",
+        "    await test.step('Open Login Page', async () => { /* ... */ });",
+        "    await test.step('Verify error message', async () => { /* ... */ });",
+      ];
+    case 'console-log':
+      return [
+        '- Emit a console.log breadcrumb before each phase:',
+        "    console.log('Logging in using locked user');",
+      ];
+    case 'annotations':
+      return [
+        '- Tag tests with structured annotations the reporter surfaces:',
+        "    test.info().annotations.push({ type: 'TestCase', description: 'TC1392' });",
+      ];
+    case 'logger':
+      return ['- Use the repo logger util for progress (e.g. logger.info(...)/log.step(...)) — import it, do NOT use console.log.'];
+    case 'mixed':
+      return ["- The repo mixes test.step() and console.log — prefer test.step() blocks (richest reports) for new tests."];
+    default:
+      return null;
+  }
+}
+
+/**
+ * Concrete, copy-pasteable guidance for the detected synchronization style.
+ * Returns null only when nothing meaningful was detected.
+ */
+function describeWaitStyle(style: string): string[] | null {
+  switch (style) {
+    case 'web-first-assertions':
+      return [
+        '- Rely on auto-waiting web-first assertions instead of manual waits:',
+        '    await expect(loginPage.errorBanner).toBeVisible();',
+        '    await expect(usernameInput).toBeEditable();',
+      ];
+    case 'load-state':
+      return [
+        '- Synchronize on load state after navigation/submit:',
+        "    await page.waitForLoadState('networkidle');",
+      ];
+    case 'locator-waitfor':
+      return [
+        '- Use explicit element waits (ideally inside Page Objects):',
+        '    await this.username.waitFor();',
+      ];
+    case 'response-wait':
+      return [
+        '- Synchronize on the network response that drives the UI:',
+        "    await page.waitForResponse(r => r.url().includes('/login'));",
+      ];
+    case 'fixed-timeout':
+      return ['- The repo uses fixed sleeps, but DO NOT replicate them — use web-first assertions / waitForLoadState instead.'];
+    case 'mixed':
+      return ['- The repo mixes wait strategies — prefer web-first assertions, fall back to waitForLoadState/locator.waitFor for sync.'];
+    default:
+      return null;
+  }
+}
+
 function buildPromptBlock(s: RepoPatternSummary): string {
   const lines: string[] = [];
   lines.push('--- REPO PATTERN GUIDE (match the existing test suite EXACTLY) ---');
@@ -379,6 +494,27 @@ function buildPromptBlock(s: RepoPatternSummary): string {
   lines.push(`ASSERTIONS — use ${s.assertionLibrary}. Example to mirror:`);
   lines.push(`  ${s.assertionExample}`);
 
+  // STEP LOGGING — mirror the repo's progress-reporting mechanism so reviewers
+  // see familiar output. Concrete snippet keyed to the detected dominant style.
+  const loggingGuidance = describeLoggingStyle(s.loggingStyle);
+  if (loggingGuidance) {
+    lines.push('');
+    lines.push(`STEP LOGGING — the repo reports progress via ${s.loggingStyle}${s.loggingStyles.length > 1 ? ` (also: ${s.loggingStyles.filter(x => x !== s.loggingStyle).join(', ')})` : ''}. Match it:`);
+    for (const g of loggingGuidance) lines.push(`  ${g}`);
+  }
+
+  // SYNCHRONIZATION — adopt the repo's waiting discipline; never inject hard sleeps.
+  const waitGuidance = describeWaitStyle(s.waitStyle);
+  if (waitGuidance) {
+    lines.push('');
+    lines.push(`SYNCHRONIZATION — the repo waits via ${s.waitStyle}${s.waitStyles.length > 1 ? ` (also: ${s.waitStyles.filter(x => x !== s.waitStyle).join(', ')})` : ''}. Match it:`);
+    for (const g of waitGuidance) lines.push(`  ${g}`);
+  }
+  // Always forbid the anti-pattern — explicitly louder if the repo already has it.
+  lines.push(s.usesFixedTimeouts
+    ? '  - NOTE: the repo contains page.waitForTimeout() hard sleeps — do NOT copy them; replace with web-first assertions / waitForLoadState.'
+    : '  - NEVER use page.waitForTimeout() / fixed sleeps; rely on auto-waiting assertions and explicit element/load-state waits.');
+
   if (s.preferredLocators.length) {
     lines.push('');
     lines.push('PREFERRED LOCATORS (most-used first — prefer these strategies):');
@@ -388,20 +524,61 @@ function buildPromptBlock(s: RepoPatternSummary): string {
     lines.push(`AVOID these locator patterns: ${s.avoidLocators.join(', ')}`);
   }
 
-  if (s.helpers.length) {
+  // -------------------------------------------------------------------------
+  // REUSE-FIRST CATALOG — the single most important section. The generator must
+  // PREFER calling these existing project methods over emitting new raw
+  // Playwright code. Helpers are grouped by purpose so the right reusable is
+  // obvious for each kind of step (assert / wait / log / data / generic).
+  // -------------------------------------------------------------------------
+  const fmtHelpers = (hs: Array<{ name: string; params: string; filePath: string }>) =>
+    hs.map((h) => `  - ${h.name}(${h.params}) from ${h.filePath}`);
+  const anyReusable =
+    s.pageObjects.length || s.helpers.length || s.fixtures.length ||
+    s.assertionHelpers.length || s.waitHelpers.length || s.loggerHelpers.length ||
+    s.dataAccessHelpers.length || s.utilityHelpers.length;
+
+  if (anyReusable) {
     lines.push('');
-    lines.push('REUSABLE HELPERS (import & call these — do NOT re-implement):');
-    for (const h of s.helpers) lines.push(`  - ${h.name}(${h.params}) from ${h.filePath}`);
+    lines.push('=== REUSE EXISTING PROJECT CODE (HIGHEST PRIORITY) ===');
+    lines.push('ALWAYS prefer calling the existing methods/helpers below over writing new raw');
+    lines.push('Playwright code. Only write new low-level code when NO existing method fits.');
   }
+
   if (s.pageObjects.length) {
     lines.push('');
-    lines.push('PAGE OBJECTS (reuse these classes & methods):');
+    lines.push('PAGE OBJECTS (instantiate & call these classes/methods — do NOT inline raw locators/fills):');
     for (const po of s.pageObjects) lines.push(`  - ${po.name}${po.methods.length ? ` [${po.methods.join(', ')}]` : ''} from ${po.filePath}`);
+  }
+  if (s.assertionHelpers.length) {
+    lines.push('');
+    lines.push('ASSERTION HELPERS (call these instead of hand-writing expect(...) chains):');
+    lines.push(...fmtHelpers(s.assertionHelpers));
+  }
+  if (s.waitHelpers.length) {
+    lines.push('');
+    lines.push('WAIT / SYNCHRONIZATION HELPERS (call these instead of new waits or hard sleeps):');
+    lines.push(...fmtHelpers(s.waitHelpers));
+  }
+  if (s.loggerImpl || s.loggerHelpers.length) {
+    lines.push('');
+    lines.push('LOGGER (use the repo logger for progress — do NOT use console.log):');
+    if (s.loggerImpl) lines.push(`  - import ${s.loggerImpl.name} from ${s.loggerImpl.filePath} and call it (e.g. ${s.loggerImpl.name}.info(...) / ${s.loggerImpl.name}(...))`);
+    for (const h of s.loggerHelpers) if (!s.loggerImpl || h.name !== s.loggerImpl.name) lines.push(`  - ${h.name}(${h.params}) from ${h.filePath}`);
+  }
+  if (s.dataAccessHelpers.length) {
+    lines.push('');
+    lines.push('TEST DATA ACCESS (resolve dataset values through these — do NOT hardcode credentials/data):');
+    lines.push(...fmtHelpers(s.dataAccessHelpers));
   }
   if (s.fixtures.length) {
     lines.push('');
-    lines.push('FIXTURES:');
+    lines.push('FIXTURES (consume these via the test signature instead of manual setup):');
     for (const f of s.fixtures) lines.push(`  - ${f.name} from ${f.filePath}`);
+  }
+  if (s.utilityHelpers.length) {
+    lines.push('');
+    lines.push('UTILITY HELPERS (reuse for common operations — do NOT re-implement):');
+    lines.push(...fmtHelpers(s.utilityHelpers));
   }
 
   if (s.dataFiles.length) {
@@ -434,7 +611,9 @@ function buildPromptBlock(s: RepoPatternSummary): string {
   if (folders.length) lines.push(`\nFolder layout: ${folders.join(', ')}`);
 
   lines.push('');
-  lines.push('RULES: match the imports, structure, assertion style and locator strategy above so the new tests fit the suite and do NOT break existing tests.');
+  lines.push('RULES:');
+  lines.push('  1. REUSE FIRST — call the existing Page Object methods, assertion/wait/logger/data-access helpers and fixtures above instead of writing new raw Playwright code. Generate new low-level code ONLY when no existing method fits.');
+  lines.push('  2. Match the imports, structure, assertion style and locator strategy above so the new tests fit the suite and do NOT break existing tests.');
   lines.push('--- END REPO PATTERN GUIDE ---');
   return lines.join('\n');
 }
