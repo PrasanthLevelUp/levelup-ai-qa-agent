@@ -130,6 +130,34 @@ const ASSERTION_PATTERNS = [
   { regex: /cy\..*\.should\(/g, label: 'cy.should' },
 ];
 
+/**
+ * Step-logging / progress-reporting mechanisms. Labels map 1:1 to the
+ * `LoggingStyle` union so the context engine can tally them directly. We
+ * deliberately separate `test.step` (richest Playwright reports) from
+ * `console.log` breadcrumbs, structured `annotations`, and a custom `logger`.
+ */
+const LOGGING_PATTERNS = [
+  { regex: /\btest\.step\s*\(/g, label: 'test-step' },
+  { regex: /\.annotations\.push\s*\(|test\.info\s*\(\s*\)\.annotations/g, label: 'annotations' },
+  { regex: /\bconsole\.(log|info|debug|warn)\s*\(/g, label: 'console-log' },
+  { regex: /\b(logger|log)\.(info|debug|warn|step|trace)\s*\(/g, label: 'logger' },
+];
+
+/**
+ * Synchronization / waiting strategies. Labels map 1:1 to the `WaitStyle`
+ * union. `fixed-timeout` is the anti-pattern we want to detect so generation
+ * never propagates hard sleeps even when a repo (accidentally) ships them.
+ */
+const WAIT_PATTERNS = [
+  // Web-first assertions auto-wait — the Playwright-recommended strategy.
+  { regex: /\.(?:toBeVisible|toBeEditable|toBeEnabled|toBeHidden|toBeAttached|toHaveText|toContainText|toHaveURL|toHaveValue|toHaveCount)\s*\(/g, label: 'web-first-assertions' },
+  { regex: /\.waitForLoadState\s*\(/g, label: 'load-state' },
+  { regex: /\.waitFor\s*\(|\.waitForSelector\s*\(/g, label: 'locator-waitfor' },
+  { regex: /\.waitForResponse\s*\(|\.waitForRequest\s*\(/g, label: 'response-wait' },
+  // Anti-pattern: hard sleeps. Both Playwright and Cypress variants.
+  { regex: /\.waitForTimeout\s*\(|cy\.wait\s*\(\s*\d/g, label: 'fixed-timeout' },
+];
+
 function extractPatterns(content: string, patterns: Array<{ regex: RegExp; label: string }>): string[] {
   const found = new Set<string>();
   for (const { regex, label } of patterns) {
@@ -263,6 +291,8 @@ export class ASTAnalyzer {
     const testCount = this.countTests(sourceFile);
     const locatorPatterns = extractPatterns(content, LOCATOR_PATTERNS);
     const assertionPatterns = extractPatterns(content, ASSERTION_PATTERNS);
+    const loggingPatterns = extractPatterns(content, LOGGING_PATTERNS);
+    const waitPatterns = extractPatterns(content, WAIT_PATTERNS);
 
     // Cleanup virtual file to avoid memory leak
     this.project.removeSourceFile(sourceFile);
@@ -278,6 +308,8 @@ export class ASTAnalyzer {
       testCount,
       locatorPatterns,
       assertionPatterns,
+      loggingPatterns,
+      waitPatterns,
       lineCount: content.split('\n').length,
       hasFixtures: functions.some(f => f.category === 'fixture') || imports.some(i => i.module.includes('fixture')),
       hasPageObject: classes.some(c => c.category === 'page-object') || relativePath.toLowerCase().includes('page'),

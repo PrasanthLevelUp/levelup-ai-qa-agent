@@ -59,6 +59,24 @@ export interface RepoPatternSummary {
   testNaming: string;
   /** Tag convention (e.g. '@smoke') or null. */
   tagConvention: string | null;
+  /**
+   * How the repo reports step progress — 'test-step' | 'console-log' |
+   * 'annotations' | 'logger' | 'none' | 'mixed'. Generation mirrors this so
+   * emitted scripts log the way the team already does (e.g. test.step blocks).
+   */
+  loggingStyle: string;
+  /** All logging mechanisms observed, most-used first. */
+  loggingStyles: string[];
+  /**
+   * How the repo synchronizes with the app — 'web-first-assertions' |
+   * 'load-state' | 'locator-waitfor' | 'response-wait' | 'fixed-timeout' |
+   * 'none' | 'mixed'. Generation adopts this instead of guessing waits.
+   */
+  waitStyle: string;
+  /** All wait strategies observed, most-used first. */
+  waitStyles: string[];
+  /** True when the repo contains the waitForTimeout hard-sleep anti-pattern. */
+  usesFixedTimeouts: boolean;
   quoteStyle: 'single' | 'double';
   semicolons: boolean;
   /** Preferred locator patterns, most-used first. */
@@ -139,7 +157,7 @@ function fingerprint(profile: RepositoryProfile): string {
     preferredLocators: (profile.preferredLocators || []).map((l) => `${l.pattern}|${l.example ?? ''}`),
     avoidPatterns: profile.avoidPatterns || [],
     style: s
-      ? `${s.namingConvention}|${s.testNaming}|${s.stepStyle}|${s.quoteStyle}|${s.semicolons}|${s.tagConvention}`
+      ? `${s.namingConvention}|${s.testNaming}|${s.stepStyle}|${s.quoteStyle}|${s.semicolons}|${s.tagConvention}|${s.loggingStyle ?? ''}|${(s.loggingStyles || []).join(',')}|${s.waitStyle ?? ''}|${(s.waitStyles || []).join(',')}|${s.usesFixedTimeouts ?? ''}`
       : 'no-style',
     folders: profile.folderStructure || null,
   };
@@ -274,6 +292,11 @@ function buildSummary(profile: RepositoryProfile): RepoPatternSummary {
     structure,
     testNaming: style?.testNaming || 'descriptive',
     tagConvention: style?.tagConvention ?? null,
+    loggingStyle: style?.loggingStyle || 'none',
+    loggingStyles: style?.loggingStyles || [],
+    waitStyle: style?.waitStyle || 'none',
+    waitStyles: style?.waitStyles || [],
+    usesFixedTimeouts: style?.usesFixedTimeouts ?? false,
     quoteStyle,
     semicolons,
     preferredLocators,
@@ -363,6 +386,73 @@ function buildFileName(featureSlug: string, summary: RepoPatternSummary): string
 /*  Prompt block                                                              */
 /* -------------------------------------------------------------------------- */
 
+/**
+ * Concrete, copy-pasteable guidance for the detected step-logging style.
+ * Returns null when there's nothing useful to instruct (style 'none').
+ */
+function describeLoggingStyle(style: string): string[] | null {
+  switch (style) {
+    case 'test-step':
+      return [
+        "- Wrap each logical phase in a Playwright step so reports stay readable:",
+        "    await test.step('Open Login Page', async () => { /* ... */ });",
+        "    await test.step('Verify error message', async () => { /* ... */ });",
+      ];
+    case 'console-log':
+      return [
+        '- Emit a console.log breadcrumb before each phase:',
+        "    console.log('Logging in using locked user');",
+      ];
+    case 'annotations':
+      return [
+        '- Tag tests with structured annotations the reporter surfaces:',
+        "    test.info().annotations.push({ type: 'TestCase', description: 'TC1392' });",
+      ];
+    case 'logger':
+      return ['- Use the repo logger util for progress (e.g. logger.info(...)/log.step(...)) — import it, do NOT use console.log.'];
+    case 'mixed':
+      return ["- The repo mixes test.step() and console.log — prefer test.step() blocks (richest reports) for new tests."];
+    default:
+      return null;
+  }
+}
+
+/**
+ * Concrete, copy-pasteable guidance for the detected synchronization style.
+ * Returns null only when nothing meaningful was detected.
+ */
+function describeWaitStyle(style: string): string[] | null {
+  switch (style) {
+    case 'web-first-assertions':
+      return [
+        '- Rely on auto-waiting web-first assertions instead of manual waits:',
+        '    await expect(loginPage.errorBanner).toBeVisible();',
+        '    await expect(usernameInput).toBeEditable();',
+      ];
+    case 'load-state':
+      return [
+        '- Synchronize on load state after navigation/submit:',
+        "    await page.waitForLoadState('networkidle');",
+      ];
+    case 'locator-waitfor':
+      return [
+        '- Use explicit element waits (ideally inside Page Objects):',
+        '    await this.username.waitFor();',
+      ];
+    case 'response-wait':
+      return [
+        '- Synchronize on the network response that drives the UI:',
+        "    await page.waitForResponse(r => r.url().includes('/login'));",
+      ];
+    case 'fixed-timeout':
+      return ['- The repo uses fixed sleeps, but DO NOT replicate them — use web-first assertions / waitForLoadState instead.'];
+    case 'mixed':
+      return ['- The repo mixes wait strategies — prefer web-first assertions, fall back to waitForLoadState/locator.waitFor for sync.'];
+    default:
+      return null;
+  }
+}
+
 function buildPromptBlock(s: RepoPatternSummary): string {
   const lines: string[] = [];
   lines.push('--- REPO PATTERN GUIDE (match the existing test suite EXACTLY) ---');
@@ -378,6 +468,27 @@ function buildPromptBlock(s: RepoPatternSummary): string {
   lines.push('');
   lines.push(`ASSERTIONS — use ${s.assertionLibrary}. Example to mirror:`);
   lines.push(`  ${s.assertionExample}`);
+
+  // STEP LOGGING — mirror the repo's progress-reporting mechanism so reviewers
+  // see familiar output. Concrete snippet keyed to the detected dominant style.
+  const loggingGuidance = describeLoggingStyle(s.loggingStyle);
+  if (loggingGuidance) {
+    lines.push('');
+    lines.push(`STEP LOGGING — the repo reports progress via ${s.loggingStyle}${s.loggingStyles.length > 1 ? ` (also: ${s.loggingStyles.filter(x => x !== s.loggingStyle).join(', ')})` : ''}. Match it:`);
+    for (const g of loggingGuidance) lines.push(`  ${g}`);
+  }
+
+  // SYNCHRONIZATION — adopt the repo's waiting discipline; never inject hard sleeps.
+  const waitGuidance = describeWaitStyle(s.waitStyle);
+  if (waitGuidance) {
+    lines.push('');
+    lines.push(`SYNCHRONIZATION — the repo waits via ${s.waitStyle}${s.waitStyles.length > 1 ? ` (also: ${s.waitStyles.filter(x => x !== s.waitStyle).join(', ')})` : ''}. Match it:`);
+    for (const g of waitGuidance) lines.push(`  ${g}`);
+  }
+  // Always forbid the anti-pattern — explicitly louder if the repo already has it.
+  lines.push(s.usesFixedTimeouts
+    ? '  - NOTE: the repo contains page.waitForTimeout() hard sleeps — do NOT copy them; replace with web-first assertions / waitForLoadState.'
+    : '  - NEVER use page.waitForTimeout() / fixed sleeps; rely on auto-waiting assertions and explicit element/load-state waits.');
 
   if (s.preferredLocators.length) {
     lines.push('');
