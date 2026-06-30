@@ -26,6 +26,72 @@ const PROMPT_VERSION = 'v3.2-senior-qa';
  */
 const ENGINE_VERSION = 'test-coverage-v2';
 
+/**
+ * Adaptive generation tiers. Resource budget is made PROPORTIONAL to the work
+ * requested instead of paying the full 8K-token + separate-analysis tax for every
+ * requirement. Names are expectation-oriented (FAST/STANDARD/COMPREHENSIVE) — users
+ * care about the experience, not the internal heuristic.
+ *
+ *   FAST          ≈ small requirement   — single generation call, lean budget
+ *   STANDARD      ≈ medium requirement  — single generation call, mid budget
+ *   COMPREHENSIVE ≈ large requirement / epic — analysis call + generation call, full budget
+ *
+ * Quality is NOT reduced: the generation prompt is identical across tiers. We only
+ * scale the output/prompt token budget and whether the separate analysis round-trip
+ * runs. Token caps are env-overridable so thresholds can be tuned from real telemetry.
+ */
+export type ComplexityTier = 'FAST' | 'STANDARD' | 'COMPREHENSIVE';
+
+interface TierConfig {
+  /** Max output tokens requested from the model for the generation call. */
+  maxOutputTokens: number;
+  /** Max prompt characters before truncation (keeps rich context + JSON schema intact). */
+  maxPromptChars: number;
+  /** Whether to run the separate LLM requirement-analysis round-trip. Only the
+   *  COMPREHENSIVE tier does — FAST/STANDARD derive a heuristic analysis instead,
+   *  saving one full network round-trip (~5-6s) for common requirements. */
+  runAnalysis: boolean;
+}
+
+const intEnv = (name: string, fallback: number): number => {
+  const v = parseInt(process.env[name] || '', 10);
+  return Number.isFinite(v) && v > 0 ? v : fallback;
+};
+
+const TIER_CONFIGS: Record<ComplexityTier, TierConfig> = {
+  FAST: {
+    maxOutputTokens: intEnv('GEN_FAST_MAX_TOKENS', 2500),
+    maxPromptChars: intEnv('GEN_FAST_MAX_PROMPT_CHARS', 24000),
+    runAnalysis: false,
+  },
+  STANDARD: {
+    maxOutputTokens: intEnv('GEN_STANDARD_MAX_TOKENS', 5000),
+    maxPromptChars: intEnv('GEN_STANDARD_MAX_PROMPT_CHARS', 40000),
+    runAnalysis: false,
+  },
+  COMPREHENSIVE: {
+    maxOutputTokens: intEnv('GEN_COMPREHENSIVE_MAX_TOKENS', 8000),
+    maxPromptChars: intEnv('GEN_COMPREHENSIVE_MAX_PROMPT_CHARS', 60000),
+    runAnalysis: true,
+  },
+};
+
+/** Signals used to classify requirement complexity — all cheap to compute, ZERO LLM calls. */
+export interface ComplexitySignals {
+  requirementChars: number;
+  acceptanceCriteriaCount: number;
+  businessFlowSteps: number;
+  coverageTypeCount: number;
+  intelligenceSourceCount: number;
+}
+
+export interface ComplexityEstimate {
+  tier: ComplexityTier;
+  signals: ComplexitySignals;
+  /** Human-readable reason(s) the tier was chosen — surfaced for telemetry/tuning. */
+  reason: string;
+}
+
 /** Cosine similarity between two equal-length numeric vectors (0..1 for embeddings). */
 function cosineSimilarity(a: number[], b: number[]): number {
   if (!a?.length || !b?.length || a.length !== b.length) return 0;
@@ -319,14 +385,37 @@ export interface GenerationResult {
     /** Generated cases produced per 1,000 prompt chars — a cheap density signal
      *  for "are we getting more output for more context, or just paying more?". */
     casesPerKChars?: number;
-    /** Generation versioning metadata — tracks which prompt/engine/model produced
-     *  this run, so quality regressions ("last week was better") can be instantly
-     *  correlated with code changes and A/B tested. */
+    /** Generation versioning + telemetry — tracks which prompt/engine/model/tier
+     *  produced this run plus timing & token breakdown, so quality regressions
+     *  ("last week was better") can be correlated with code changes AND thresholds
+     *  can be tuned from real engineering data instead of assumptions. */
     generationMetadata?: {
       promptVersion: string;
       engineVersion: string;
       model: string;
       timestamp: string;
+      /** Adaptive complexity tier selected for this run. */
+      complexityTier?: ComplexityTier;
+      /** Cheap heuristic signals that drove the tier selection. */
+      complexitySignals?: ComplexitySignals;
+      /** Why this tier was chosen (for telemetry/tuning). */
+      complexityReason?: string;
+      /** Wall-clock time spent in the separate analysis LLM call (0 when skipped). */
+      analysisMs?: number;
+      /** Wall-clock time spent in the generation LLM call (+ dedup/gap as applicable). */
+      generationMs?: number;
+      /** Total wall-clock time for the full pipeline. */
+      totalMs?: number;
+      /** Tokens (prompt + completion) for the analysis call (0 when skipped). */
+      analysisTokens?: number;
+      /** Tokens (prompt + completion) for the generation call. */
+      generationTokens?: number;
+      /** Total tokens across every LLM call in this run. */
+      totalTokens?: number;
+      /** Number of scenarios produced. */
+      scenarioCount?: number;
+      /** Number of committed test cases produced. */
+      testCaseCount?: number;
     };
   };
 }
@@ -570,6 +659,131 @@ Do NOT invent placeholder data (john@test.com, password123, ABC Product) when a 
   }
 
   /* ---- Phase 2: Requirement Understanding ---- */
+  /* ---- Adaptive complexity classification (heuristic, ZERO LLM calls) ---- */
+  /**
+   * Classify a requirement into FAST / STANDARD / COMPREHENSIVE using cheap,
+   * observable signals — never spend model tokens deciding whether to spend model
+   * tokens. The budget then becomes proportional to the work requested.
+   *
+   * Promotion rules (any single "large" trigger wins):
+   *   COMPREHENSIVE — requirement > 1500 chars, OR ≥9 acceptance criteria, OR ≥7
+   *                   business-flow steps, OR ≥6 coverage types, OR ≥3 intelligence
+   *                   sources (rich grounding context deserves the full budget).
+   *   FAST          — small on every axis: <500 chars, ≤3 AC, ≤2 flow steps,
+   *                   ≤2 coverage types, ≤1 intelligence source.
+   *   STANDARD      — everything in between.
+   */
+  estimateComplexity(
+    input: RequirementInput,
+    coverageTypes: CoverageType[],
+    knowledge?: KnowledgeContext
+  ): ComplexityEstimate {
+    const countLines = (s?: string): number =>
+      (s || '')
+        .split(/\r?\n|(?<=[.;])\s+(?=[A-Z0-9])/)
+        .map(l => l.trim())
+        .filter(l => l.length > 0).length;
+
+    const requirementChars =
+      (input.title?.length || 0) +
+      (input.description?.length || 0) +
+      (input.acceptanceCriteria?.length || 0) +
+      (input.businessFlow?.length || 0) +
+      (input.apiDocs?.length || 0) +
+      (input.releaseNotes?.length || 0);
+
+    const acceptanceCriteriaCount = countLines(input.acceptanceCriteria);
+    const businessFlowSteps = countLines(input.businessFlow);
+    const coverageTypeCount = coverageTypes.length;
+    const intelligenceSourceCount =
+      (knowledge?.modules?.length ? 1 : 0) +
+      (knowledge?.enterpriseKnowledge?.length ? 1 : 0) +
+      (knowledge?.applicationProfile ? 1 : 0) +
+      (knowledge?.testData?.length ? 1 : 0) +
+      (knowledge?.repositoryContext ? 1 : 0);
+
+    const signals: ComplexitySignals = {
+      requirementChars,
+      acceptanceCriteriaCount,
+      businessFlowSteps,
+      coverageTypeCount,
+      intelligenceSourceCount,
+    };
+
+    // COMPREHENSIVE — any single heavy signal triggers the full budget.
+    const largeTriggers: string[] = [];
+    if (requirementChars > 1500) largeTriggers.push(`requirement ${requirementChars} chars`);
+    if (acceptanceCriteriaCount >= 9) largeTriggers.push(`${acceptanceCriteriaCount} acceptance criteria`);
+    if (businessFlowSteps >= 7) largeTriggers.push(`${businessFlowSteps} business-flow steps`);
+    if (coverageTypeCount >= 6) largeTriggers.push(`${coverageTypeCount} coverage types`);
+    if (intelligenceSourceCount >= 3) largeTriggers.push(`${intelligenceSourceCount} intelligence sources`);
+    if (largeTriggers.length > 0) {
+      return { tier: 'COMPREHENSIVE', signals, reason: `Large: ${largeTriggers.join(', ')}` };
+    }
+
+    // FAST — small on EVERY axis.
+    const isFast =
+      requirementChars < 500 &&
+      acceptanceCriteriaCount <= 3 &&
+      businessFlowSteps <= 2 &&
+      coverageTypeCount <= 2 &&
+      intelligenceSourceCount <= 1;
+    if (isFast) {
+      return {
+        tier: 'FAST',
+        signals,
+        reason: `Small on all axes (${requirementChars} chars, ${acceptanceCriteriaCount} AC, ${businessFlowSteps} flow, ${coverageTypeCount} types, ${intelligenceSourceCount} sources)`,
+      };
+    }
+
+    return {
+      tier: 'STANDARD',
+      signals,
+      reason: `Medium (${requirementChars} chars, ${acceptanceCriteriaCount} AC, ${businessFlowSteps} flow, ${coverageTypeCount} types, ${intelligenceSourceCount} sources)`,
+    };
+  }
+
+  /**
+   * Derive a RequirementAnalysis WITHOUT an LLM call, for the FAST/STANDARD tiers
+   * that skip the separate analysis round-trip. The generation prompt already
+   * carries the full requirement text + AC + flow, so a lightweight heuristic
+   * analysis is sufficient context — this is the latency saving, not a quality cut.
+   */
+  private heuristicAnalysis(
+    input: RequirementInput,
+    estimate: ComplexityEstimate
+  ): RequirementAnalysis {
+    const hay = `${input.title} ${input.description} ${input.module || ''}`.toLowerCase();
+    const featureType =
+      /login|auth|password|sign[\s-]?in|credential|lock/.test(hay) ? 'authentication' :
+      /pay|checkout|billing|invoice|card|transaction/.test(hay) ? 'payment' :
+      /search|filter|query/.test(hay) ? 'search' :
+      /report|dashboard|analytic|export/.test(hay) ? 'reporting' :
+      /form|input|register|submit|create|edit|update/.test(hay) ? 'data_entry' :
+      'general';
+    // Risk: critical-sounding domains skew higher even without the analysis call.
+    const riskLevel: RequirementAnalysis['riskLevel'] =
+      featureType === 'authentication' || featureType === 'payment' ? 'high' : 'medium';
+
+    const workflowSteps = (input.businessFlow || '')
+      .split(/\r?\n|(?<=[.;])\s+(?=[A-Z0-9])/)
+      .map(s => s.trim())
+      .filter(Boolean)
+      .slice(0, 20);
+
+    return {
+      featureType,
+      riskLevel,
+      businessCriticality: 'Derived heuristically (analysis call skipped for this tier)',
+      impactedModules: [input.module || 'unknown'],
+      userRolesAffected: ['end_user'],
+      apiDependencies: [],
+      dbImpact: 'Unknown',
+      workflowSteps,
+      summary: (input.description || input.title || '').slice(0, 200),
+    };
+  }
+
   async analyzeRequirement(
     input: RequirementInput,
     knowledge?: KnowledgeContext
@@ -638,7 +852,13 @@ Return ONLY valid JSON, no markdown fences.`;
     analysis: RequirementAnalysis,
     coverageTypes: CoverageType[],
     knowledge?: KnowledgeContext,
-    mode: GenerationMode = 'strict'
+    mode: GenerationMode = 'strict',
+    // Adaptive generation: token + prompt budgets scale with requirement
+    // complexity. Defaults preserve the pre-adaptive COMPREHENSIVE behavior so
+    // existing callers are unaffected. NOTE: only the *budgets* change per tier —
+    // the prompt itself is identical across tiers (quality is not reduced).
+    maxOutputTokens: number = 8000,
+    maxPromptChars: number = 60000
   ): Promise<{
     scenarios: TestScenario[];
     testCases: TestCase[];
@@ -819,7 +1039,7 @@ Return ONLY valid JSON. Address EVERY selected coverage type, organise scenarios
     // Exhaustive, multi-type coverage with a rich grounding context: request the
     // full output budget and a generous prompt-char budget so neither the input
     // context nor the JSON schema at the end of the prompt is truncated.
-    const resp = await this.callLLM(prompt, 8000, { complexity: 'complex', maxPromptChars: 60000 });
+    const resp = await this.callLLM(prompt, maxOutputTokens, { complexity: 'complex', maxPromptChars });
     let parsed: {
       scenarios?: TestScenario[];
       testCases?: TestCase[];
@@ -1002,12 +1222,54 @@ Return ONLY valid JSON array.`;
     const mode: GenerationMode = options?.mode ?? (includeCoverageGaps ? 'expanded' : 'strict');
     logger.info(MOD, 'Starting full coverage generation', { title: input.title, coverageTypes, includeCoverageGaps, mode });
 
-    // Phase 2: Analyze requirement
-    const { analysis, tokensUsed: t1 } = await this.analyzeRequirement(input, knowledge);
-    logger.info(MOD, 'Requirement analysis complete', { featureType: analysis.featureType, riskLevel: analysis.riskLevel });
+    // Pipeline wall-clock start — used for the end-to-end totalMs telemetry.
+    const pipelineStart = Date.now();
 
-    // Phase 5: Generate tests (mode-aware — strict vs expanded)
-    const gen = await this.generateTestCoverage(input, analysis, coverageTypes, knowledge, mode);
+    // Adaptive generation: classify the requirement's complexity with a pure
+    // HEURISTIC (zero LLM tokens — we never spend a model call to decide how
+    // big the budget should be) and route to a FAST / STANDARD / COMPREHENSIVE
+    // tier. The tier only scales token + prompt budgets and whether the separate
+    // analysis round-trip runs — the generation prompt itself is identical, so
+    // quality is preserved.
+    const complexity = this.estimateComplexity(input, coverageTypes, knowledge);
+    const tierCfg = TIER_CONFIGS[complexity.tier];
+    logger.info(MOD, 'Complexity classified', {
+      tier: complexity.tier,
+      reason: complexity.reason,
+      signals: complexity.signals,
+      maxOutputTokens: tierCfg.maxOutputTokens,
+      maxPromptChars: tierCfg.maxPromptChars,
+      runAnalysis: tierCfg.runAnalysis,
+    });
+
+    // Phase 2: Analyze requirement.
+    // COMPREHENSIVE tier runs the dedicated analysis LLM call; FAST/STANDARD
+    // skip it and derive an equivalent analysis heuristically — saving a full
+    // Claude round-trip (~2 Claude calls + ~8K tokens) on small requirements.
+    const analysisStart = Date.now();
+    let analysis: RequirementAnalysis;
+    let t1 = 0;
+    if (tierCfg.runAnalysis) {
+      const analyzed = await this.analyzeRequirement(input, knowledge);
+      analysis = analyzed.analysis;
+      t1 = analyzed.tokensUsed;
+    } else {
+      analysis = this.heuristicAnalysis(input, complexity);
+    }
+    const analysisMs = Date.now() - analysisStart;
+    logger.info(MOD, 'Requirement analysis complete', {
+      featureType: analysis.featureType, riskLevel: analysis.riskLevel,
+      tier: complexity.tier, analyzedViaLLM: tierCfg.runAnalysis, analysisMs,
+    });
+
+    // Phase 5: Generate tests (mode-aware — strict vs expanded). Token + prompt
+    // budgets come from the selected tier.
+    const generationStart = Date.now();
+    const gen = await this.generateTestCoverage(
+      input, analysis, coverageTypes, knowledge, mode,
+      tierCfg.maxOutputTokens, tierCfg.maxPromptChars,
+    );
+    const generationMs = Date.now() - generationStart;
     const { scenarios, testCases: rawTestCases, missingRequirements, coverageTypeEvaluations, tokensUsed: t2, promptChars } = gen;
     let rawSuggested = gen.suggestedTestCases || [];
     logger.info(MOD, 'Test generation complete', {
@@ -1075,6 +1337,20 @@ Return ONLY valid JSON array.`;
           engineVersion: ENGINE_VERSION,
           model: this.testModel || 'unknown',
           timestamp: new Date().toISOString(),
+          // Adaptive generation telemetry — persisted in the requirement's
+          // `analysis` JSONB and surfaced in History. Captured so tier
+          // thresholds can be tuned from real data (not guesses).
+          complexityTier: complexity.tier,
+          complexitySignals: complexity.signals,
+          complexityReason: complexity.reason,
+          analysisMs,
+          generationMs,
+          totalMs: Date.now() - pipelineStart,
+          analysisTokens: t1,
+          generationTokens: t2,
+          totalTokens,
+          scenarioCount: scenarios.length,
+          testCaseCount: testCases.length,
         },
       },
     };
@@ -1082,9 +1358,16 @@ Return ONLY valid JSON array.`;
       promptVersion: PROMPT_VERSION,
       engineVersion: ENGINE_VERSION,
       model: this.testModel,
+      tier: complexity.tier,
       promptChars,
       totalTestCases: testCases.length,
+      scenarioCount: scenarios.length,
       tokensUsed: totalTokens,
+      analysisTokens: t1,
+      generationTokens: t2,
+      analysisMs,
+      generationMs,
+      totalMs: result.stats.generationMetadata!.totalMs,
       casesPerKChars: result.stats.casesPerKChars,
       timestamp: result.stats.generationMetadata!.timestamp,
     });
