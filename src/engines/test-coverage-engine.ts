@@ -76,6 +76,36 @@ const TIER_CONFIGS: Record<ComplexityTier, TierConfig> = {
   },
 };
 
+/** Complexity scoring weights — env-overridable so they can be tuned from telemetry.
+ *  These define how much each signal contributes to the composite complexity score.
+ *  Sum should ideally be 1.0 but code normalizes if not. Default weights favor
+ *  coverage types + acceptance criteria (the actual work requested) over requirement
+ *  length (which may just be verbose prose). */
+interface ComplexityWeights {
+  requirementChars: number;
+  acceptanceCriteria: number;
+  coverageTypes: number;
+  businessFlow: number;
+  intelligenceSources: number;
+}
+
+const floatEnv = (name: string, fallback: number): number => {
+  const v = parseFloat(process.env[name] || '');
+  return Number.isFinite(v) && v >= 0 ? v : fallback;
+};
+
+const COMPLEXITY_WEIGHTS: ComplexityWeights = {
+  requirementChars: floatEnv('GEN_WEIGHT_REQ_CHARS', 0.10),
+  acceptanceCriteria: floatEnv('GEN_WEIGHT_AC', 0.40),
+  coverageTypes: floatEnv('GEN_WEIGHT_COVERAGE_TYPES', 0.40),
+  businessFlow: floatEnv('GEN_WEIGHT_FLOW', 0.05),
+  intelligenceSources: floatEnv('GEN_WEIGHT_SOURCES', 0.05),
+};
+
+/** Composite score ranges for tier classification — env-overridable. */
+const FAST_THRESHOLD = floatEnv('GEN_FAST_THRESHOLD', 25);
+const STANDARD_THRESHOLD = floatEnv('GEN_STANDARD_THRESHOLD', 40);
+
 /** Signals used to classify requirement complexity — all cheap to compute, ZERO LLM calls. */
 export interface ComplexitySignals {
   requirementChars: number;
@@ -83,6 +113,9 @@ export interface ComplexitySignals {
   businessFlowSteps: number;
   coverageTypeCount: number;
   intelligenceSourceCount: number;
+  /** Weighted composite score (0-100) used for tier classification. Recorded for
+   *  telemetry so weights + thresholds can be tuned from real data. */
+  complexityScore: number;
 }
 
 export interface ComplexityEstimate {
@@ -684,6 +717,7 @@ Do NOT invent placeholder data (john@test.com, password123, ABC Product) when a 
         .map(l => l.trim())
         .filter(l => l.length > 0).length;
 
+    // ---- Raw signal extraction (cheap, zero LLM) ----
     const requirementChars =
       (input.title?.length || 0) +
       (input.description?.length || 0) +
@@ -702,44 +736,66 @@ Do NOT invent placeholder data (john@test.com, password123, ABC Product) when a 
       (knowledge?.testData?.length ? 1 : 0) +
       (knowledge?.repositoryContext ? 1 : 0);
 
-    const signals: ComplexitySignals = {
-      requirementChars,
-      acceptanceCriteriaCount,
-      businessFlowSteps,
-      coverageTypeCount,
-      intelligenceSourceCount,
+    // ---- Weighted scoring: normalize each signal to 0-100, then composite ----
+    // Normalization caps chosen so that COMPREHENSIVE-tier complexity hits ~100%.
+    // These represent the threshold where a requirement becomes objectively complex:
+    //   • requirementChars: 1200 chars ≈ epic-sized text (title + long desc + many AC)
+    //   • AC: 8 criteria ≈ detailed/epic requirement
+    //   • coverage types: 5 types ≈ comprehensive testing (positive+negative+edge+boundary+security)
+    //   • flow steps: 6 steps ≈ multi-step workflow
+    //   • sources: 4 ≈ heavy intelligence use (modules + enterprise + profile + testData)
+    // With these caps + weights (0.40 coverage, 0.40 AC), a requirement hits
+    // COMPREHENSIVE when it requests significant testing work (4-5+ types OR 6+ AC)
+    // even if the prose is short. Tune from telemetry after collecting data.
+    const charScore = Math.min(100, (requirementChars / 1200) * 100);
+    const acScore = Math.min(100, (acceptanceCriteriaCount / 8) * 100);
+    const coverageScore = Math.min(100, (coverageTypeCount / 5) * 100);
+    const flowScore = Math.min(100, (businessFlowSteps / 6) * 100);
+    const sourceScore = Math.min(100, (intelligenceSourceCount / 4) * 100);
+
+    // Weighted composite (env-overridable). Normalize weights to sum=1.0 for stability.
+    const w = COMPLEXITY_WEIGHTS;
+    const weightSum = w.requirementChars + w.acceptanceCriteria + w.coverageTypes + w.businessFlow + w.intelligenceSources;
+    const normalizedWeights = {
+      chars: w.requirementChars / weightSum,
+      ac: w.acceptanceCriteria / weightSum,
+      coverage: w.coverageTypes / weightSum,
+      flow: w.businessFlow / weightSum,
+      sources: w.intelligenceSources / weightSum,
     };
 
-    // COMPREHENSIVE — any single heavy signal triggers the full budget.
-    const largeTriggers: string[] = [];
-    if (requirementChars > 1500) largeTriggers.push(`requirement ${requirementChars} chars`);
-    if (acceptanceCriteriaCount >= 9) largeTriggers.push(`${acceptanceCriteriaCount} acceptance criteria`);
-    if (businessFlowSteps >= 7) largeTriggers.push(`${businessFlowSteps} business-flow steps`);
-    if (coverageTypeCount >= 6) largeTriggers.push(`${coverageTypeCount} coverage types`);
-    if (intelligenceSourceCount >= 3) largeTriggers.push(`${intelligenceSourceCount} intelligence sources`);
-    if (largeTriggers.length > 0) {
-      return { tier: 'COMPREHENSIVE', signals, reason: `Large: ${largeTriggers.join(', ')}` };
-    }
+    const complexityScore =
+      charScore * normalizedWeights.chars +
+      acScore * normalizedWeights.ac +
+      coverageScore * normalizedWeights.coverage +
+      flowScore * normalizedWeights.flow +
+      sourceScore * normalizedWeights.sources;
 
-    // FAST — small on EVERY axis.
-    const isFast =
-      requirementChars < 500 &&
-      acceptanceCriteriaCount <= 3 &&
-      businessFlowSteps <= 2 &&
-      coverageTypeCount <= 2 &&
-      intelligenceSourceCount <= 1;
-    if (isFast) {
-      return {
-        tier: 'FAST',
-        signals,
-        reason: `Small on all axes (${requirementChars} chars, ${acceptanceCriteriaCount} AC, ${businessFlowSteps} flow, ${coverageTypeCount} types, ${intelligenceSourceCount} sources)`,
-      };
+    // ---- Tier classification by composite score ----
+    let tier: ComplexityTier;
+    let reason: string;
+    if (complexityScore < FAST_THRESHOLD) {
+      tier = 'FAST';
+      reason = `Low complexity score ${Math.round(complexityScore)} < ${FAST_THRESHOLD} (${coverageTypeCount} types, ${acceptanceCriteriaCount} AC, ${requirementChars} chars)`;
+    } else if (complexityScore < STANDARD_THRESHOLD) {
+      tier = 'STANDARD';
+      reason = `Medium complexity score ${Math.round(complexityScore)} (${FAST_THRESHOLD}–${STANDARD_THRESHOLD}) — ${coverageTypeCount} types, ${acceptanceCriteriaCount} AC, ${requirementChars} chars`;
+    } else {
+      tier = 'COMPREHENSIVE';
+      reason = `High complexity score ${Math.round(complexityScore)} ≥ ${STANDARD_THRESHOLD} (${coverageTypeCount} types, ${acceptanceCriteriaCount} AC, ${requirementChars} chars)`;
     }
 
     return {
-      tier: 'STANDARD',
-      signals,
-      reason: `Medium (${requirementChars} chars, ${acceptanceCriteriaCount} AC, ${businessFlowSteps} flow, ${coverageTypeCount} types, ${intelligenceSourceCount} sources)`,
+      tier,
+      signals: {
+        requirementChars,
+        acceptanceCriteriaCount,
+        businessFlowSteps,
+        coverageTypeCount,
+        intelligenceSourceCount,
+        complexityScore: Math.round(complexityScore * 10) / 10, // 1 decimal precision for telemetry
+      },
+      reason,
     };
   }
 
