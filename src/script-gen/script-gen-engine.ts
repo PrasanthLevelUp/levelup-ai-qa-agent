@@ -48,6 +48,11 @@ import { analyzeRepoPatterns } from './repo-pattern-analyzer';
 import { adaptiveGenerateFiles } from './adaptive-codegen';
 import { getRAGService } from '../services/rag-service';
 import { TrueReuseEngine } from '../services/true-reuse-engine';
+import {
+  IntelligenceOrchestrator,
+  getIntelligenceOrchestrator,
+  type OrchestratorSource,
+} from '../services/intelligence-orchestrator';
 import { auditFramework, type FrameworkAuditResult, type GenerationContext } from './framework-auditor';
 
 const MOD = 'script-gen-engine';
@@ -2889,6 +2894,96 @@ ${gotoB}${sessionLogin('pageB')}
   }
 
   /**
+   * Derive a concise INTENT string from the strongest available signal. The
+   * orchestrator is intent-driven ("Login", "Add to cart", "Checkout") rather
+   * than a flat repo dump, so we distil one short phrase from the test case
+   * title / instructions / detected page type.
+   */
+  private deriveIntent(config: GenerationConfig, crawl: CrawlResult): string {
+    const candidates = [
+      config.testCase?.title,
+      config.testCase?.scenario,
+      config.instructions,
+      crawl?.pageType ? `${crawl.pageType}` : '',
+      crawl?.title,
+    ].map(s => (s ?? '').trim()).filter(Boolean);
+    const intent = candidates[0] ?? '';
+    // Keep it short — first ~12 words is plenty to seed keyword matching.
+    return intent.split(/\s+/).slice(0, 12).join(' ');
+  }
+
+  /**
+   * Knowledge-Graph-First: build the generation prompt block from the
+   * Intelligence Orchestrator instead of the legacy flat repository summary.
+   *
+   * Gathers intent-scoped intelligence across the repository graph
+   * (relationship-traversing reuse candidates), app profile, test data, and
+   * learned patterns, then renders a compact, confidence-annotated block.
+   *
+   * Fully gated: returns '' unless the INTELLIGENCE_ORCHESTRATOR flag is on AND
+   * a company scope is present. Any failure degrades to '' so generation is
+   * never blocked. This is the single integration point that validates the new
+   * architecture end-to-end for Script Generation (Phase 1).
+   */
+  private async buildOrchestratedIntelligenceBlock(
+    config: GenerationConfig,
+    crawl: CrawlResult,
+  ): Promise<string> {
+    if (!IntelligenceOrchestrator.isEnabled()) return '';
+    // companyId is the minimum scope the orchestrator needs (knowledge/test-data
+    // are tenant-scoped). Without it we can't safely query, so degrade to ''.
+    if (config.companyId == null) return '';
+
+    const intent = this.deriveIntent(config, crawl);
+    if (!intent) return '';
+
+    // Script Generation cares about: existing code to reuse (repository graph),
+    // the app's UI structure (app profile), datasets to drive the test (test
+    // data), and best practices (patterns). It does NOT need DOM-memory selector
+    // history or org-wide knowledge stats for the *plan* prompt — so we request
+    // a focused subset and avoid paying for unnecessary context.
+    const sources: OrchestratorSource[] = ['repository', 'appProfile', 'testData', 'patterns'];
+
+    try {
+      const orchestrator = getIntelligenceOrchestrator();
+      const intel = await orchestrator.gatherIntelligence({
+        intent,
+        repoContextId: config.repoContextId,
+        companyId: config.companyId,
+        projectId: config.projectId ?? undefined,
+        targetUrl: config.url,
+        caller: 'script-gen',
+        sources,
+      });
+
+      if (!intel.available) {
+        console.log('[ScriptGenEngine] ℹ️ Orchestrator returned no intelligence for intent:', intent);
+        return '';
+      }
+
+      const block = orchestrator.buildPromptContext(intel);
+      if (!block || block.startsWith('(No intelligence')) return '';
+
+      logger.info(MOD, 'Injecting orchestrated intelligence into prompt', {
+        intent,
+        sourcesUsed: intel.metadata.sourcesUsed,
+        confidenceScore: intel.metadata.confidenceScore,
+        confidenceBySource: intel.metadata.confidenceBySource,
+        timingsMs: intel.metadata.timingsMs,
+      });
+      console.log(
+        `[ScriptGenEngine] 🧭 Orchestrated intelligence injected (intent="${intent}", ` +
+          `sources=[${intel.metadata.sourcesUsed.join(', ')}], confidence=${intel.metadata.confidenceScore}%, ` +
+          `total=${intel.metadata.timingsMs.total}ms)`,
+      );
+      return `\n--- ORCHESTRATED INTELLIGENCE (INTENT-SCOPED) ---\n${block}\n--- END ORCHESTRATED INTELLIGENCE ---`;
+    } catch (err: any) {
+      logger.warn(MOD, 'Orchestrated intelligence failed (non-blocking)', { error: err?.message });
+      return '';
+    }
+  }
+
+  /**
    * Phase 2 (RAG / few-shot learning): retrieve the most similar EXISTING tests
    * from the scanned repository's embedded code_chunks and format them as a
    * few-shot example block for the generation prompt.
@@ -3032,6 +3127,10 @@ ${gotoB}${sessionLogin('pageB')}
     const fewShotBlock = await this.buildFewShotBlock(config, crawl);
     // Phase 3: True-reuse block (existing helpers to call). '' when TRUE_REUSE off.
     const reuseBlock = await this.buildReuseBlock(config, crawl, workflowMap);
+    // Knowledge-Graph-First: intent-scoped orchestrated intelligence. '' when the
+    // INTELLIGENCE_ORCHESTRATOR flag is off. When present it REPLACES the legacy
+    // flat repository-summary block below (validated as the Phase 1 milestone).
+    const orchestratedBlock = await this.buildOrchestratedIntelligenceBlock(config, crawl);
     const flowSummary = workflowMap.flows.map(f => ({
       name: f.name,
       type: f.flowType,
@@ -3110,6 +3209,14 @@ ${config.includeNegativeTests ? 'Include negative test cases (invalid inputs, em
 ${config.credentials ? 'Credentials will be provided via environment variables (process.env.USERNAME, process.env.PASSWORD)' : ''}
 ${config.knowledgeContext ? `\n--- APP KNOWLEDGE ---\nBusiness context and domain knowledge to incorporate into test scenarios:\n\n${config.knowledgeContext}\n\nIMPORTANT: Use the above knowledge to:\n- Validate business rules in assertions\n- Create regression tests for known bug patterns\n- Test workflow transitions and edge cases\n- Verify integration points and dependencies\n--- END APP KNOWLEDGE ---` : ''}
 ${(() => {
+  // Knowledge-Graph-First: when the orchestrator produced an intent-scoped
+  // block, it REPLACES the legacy flat repository summary (don't inject both —
+  // the orchestrated block already grounds reuse on relationship-traversed
+  // candidates). Falls back to the legacy summary when the flag is off / empty.
+  if (orchestratedBlock) {
+    console.log('[ScriptGenEngine] 🧭 Using orchestrated intelligence in place of legacy repository summary');
+    return orchestratedBlock;
+  }
   if (config.repoIntelligence) {
     console.log(`[ScriptGenEngine] 🧠 Injecting repository intelligence into AI prompt (${config.repoIntelligence.length} chars)`);
     return `\n--- REPOSITORY INTELLIGENCE ---\nThe target repo already has existing tests. Match its style, reuse its helpers/page-objects, and follow its conventions:\n\n${config.repoIntelligence}\n--- END REPOSITORY INTELLIGENCE ---`;
