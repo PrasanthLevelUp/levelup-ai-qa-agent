@@ -179,6 +179,23 @@ export const FEATURE_FLAGS = {
      * Enable with: ENABLE_HEALING_INTELLIGENCE=true
      */
     HEALING_INTELLIGENCE: envBool('ENABLE_HEALING_INTELLIGENCE', false),
+
+    /**
+     * Intelligence Orchestrator — Knowledge-Graph-First (intent-driven retrieval).
+     *
+     * When enabled, AI features (starting with Script Generation) replace the
+     * legacy flat "repository summary" prompt with an intent-scoped intelligence
+     * bundle gathered by the `IntelligenceOrchestrator`: it queries the
+     * repository graph (relationship-traversing reuse candidates), app profile,
+     * test data, knowledge, DOM memory and learned patterns for the specific
+     * intent (e.g. "Login") and emits a compact, confidence-annotated prompt
+     * block. Builds on METHOD_INTELLIGENCE for the graph source; every other
+     * source degrades gracefully when absent. Default off: the generation prompt
+     * is byte-for-byte unchanged and the orchestrator is never invoked.
+     *
+     * Enable with: ENABLE_INTELLIGENCE_ORCHESTRATOR=true
+     */
+    INTELLIGENCE_ORCHESTRATOR: envBool('ENABLE_INTELLIGENCE_ORCHESTRATOR', false),
   },
 } as const;
 
