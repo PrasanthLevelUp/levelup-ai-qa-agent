@@ -38,6 +38,7 @@ import type {
   ClassInfo,
   FunctionSignature,
 } from '../context/types';
+import { categorizeHelpers } from '../context/reusable-helpers';
 
 /* -------------------------------------------------------------------------- */
 /*  Public Types                                                              */
@@ -85,6 +86,22 @@ export interface RepoPatternSummary {
   avoidLocators: string[];
   /** Reusable helpers to import instead of re-implementing. */
   helpers: Array<{ name: string; params: string; filePath: string }>;
+  /**
+   * Helpers bucketed by purpose so generation can REUSE the right existing
+   * project method instead of emitting new raw Playwright code. Each bucket is
+   * a subset of `helpers` (a helper may appear in at most one bucket; anything
+   * not classified lands in `utilityHelpers`).
+   */
+  assertionHelpers: Array<{ name: string; params: string; filePath: string }>;
+  waitHelpers: Array<{ name: string; params: string; filePath: string }>;
+  loggerHelpers: Array<{ name: string; params: string; filePath: string }>;
+  dataAccessHelpers: Array<{ name: string; params: string; filePath: string }>;
+  utilityHelpers: Array<{ name: string; params: string; filePath: string }>;
+  /**
+   * The repo's existing logger implementation to import & call (e.g. a `logger`
+   * util or a `log()` function) instead of using console.log. Null when none.
+   */
+  loggerImpl: { name: string; filePath: string } | null;
   /** Page objects to reuse. */
   pageObjects: Array<{ name: string; filePath: string; methods: string[] }>;
   /** Fixtures available. */
@@ -265,6 +282,8 @@ function buildSummary(profile: RepositoryProfile): RepoPatternSummary {
     utils: profile.folderStructure?.utilsFolder || undefined,
   };
 
+  const buckets = categorizeHelpers(profile);
+
   const assertionLibrary = profile.assertionLibrary || (framework === 'playwright' ? '@playwright/test expect' : 'expect');
   const assertionExample = buildAssertionExample(framework, assertionLibrary);
   const imports = buildImports(profile, framework, language, quoteStyle, semicolons);
@@ -302,6 +321,12 @@ function buildSummary(profile: RepositoryProfile): RepoPatternSummary {
     preferredLocators,
     avoidLocators: (profile.avoidPatterns || []).slice(0, 5),
     helpers,
+    assertionHelpers: buckets.assertion,
+    waitHelpers: buckets.wait,
+    loggerHelpers: buckets.logger,
+    dataAccessHelpers: buckets.data,
+    utilityHelpers: buckets.utility,
+    loggerImpl: buckets.loggerImpl,
     pageObjects,
     fixtures,
     dataFiles,
@@ -499,20 +524,61 @@ function buildPromptBlock(s: RepoPatternSummary): string {
     lines.push(`AVOID these locator patterns: ${s.avoidLocators.join(', ')}`);
   }
 
-  if (s.helpers.length) {
+  // -------------------------------------------------------------------------
+  // REUSE-FIRST CATALOG — the single most important section. The generator must
+  // PREFER calling these existing project methods over emitting new raw
+  // Playwright code. Helpers are grouped by purpose so the right reusable is
+  // obvious for each kind of step (assert / wait / log / data / generic).
+  // -------------------------------------------------------------------------
+  const fmtHelpers = (hs: Array<{ name: string; params: string; filePath: string }>) =>
+    hs.map((h) => `  - ${h.name}(${h.params}) from ${h.filePath}`);
+  const anyReusable =
+    s.pageObjects.length || s.helpers.length || s.fixtures.length ||
+    s.assertionHelpers.length || s.waitHelpers.length || s.loggerHelpers.length ||
+    s.dataAccessHelpers.length || s.utilityHelpers.length;
+
+  if (anyReusable) {
     lines.push('');
-    lines.push('REUSABLE HELPERS (import & call these — do NOT re-implement):');
-    for (const h of s.helpers) lines.push(`  - ${h.name}(${h.params}) from ${h.filePath}`);
+    lines.push('=== REUSE EXISTING PROJECT CODE (HIGHEST PRIORITY) ===');
+    lines.push('ALWAYS prefer calling the existing methods/helpers below over writing new raw');
+    lines.push('Playwright code. Only write new low-level code when NO existing method fits.');
   }
+
   if (s.pageObjects.length) {
     lines.push('');
-    lines.push('PAGE OBJECTS (reuse these classes & methods):');
+    lines.push('PAGE OBJECTS (instantiate & call these classes/methods — do NOT inline raw locators/fills):');
     for (const po of s.pageObjects) lines.push(`  - ${po.name}${po.methods.length ? ` [${po.methods.join(', ')}]` : ''} from ${po.filePath}`);
+  }
+  if (s.assertionHelpers.length) {
+    lines.push('');
+    lines.push('ASSERTION HELPERS (call these instead of hand-writing expect(...) chains):');
+    lines.push(...fmtHelpers(s.assertionHelpers));
+  }
+  if (s.waitHelpers.length) {
+    lines.push('');
+    lines.push('WAIT / SYNCHRONIZATION HELPERS (call these instead of new waits or hard sleeps):');
+    lines.push(...fmtHelpers(s.waitHelpers));
+  }
+  if (s.loggerImpl || s.loggerHelpers.length) {
+    lines.push('');
+    lines.push('LOGGER (use the repo logger for progress — do NOT use console.log):');
+    if (s.loggerImpl) lines.push(`  - import ${s.loggerImpl.name} from ${s.loggerImpl.filePath} and call it (e.g. ${s.loggerImpl.name}.info(...) / ${s.loggerImpl.name}(...))`);
+    for (const h of s.loggerHelpers) if (!s.loggerImpl || h.name !== s.loggerImpl.name) lines.push(`  - ${h.name}(${h.params}) from ${h.filePath}`);
+  }
+  if (s.dataAccessHelpers.length) {
+    lines.push('');
+    lines.push('TEST DATA ACCESS (resolve dataset values through these — do NOT hardcode credentials/data):');
+    lines.push(...fmtHelpers(s.dataAccessHelpers));
   }
   if (s.fixtures.length) {
     lines.push('');
-    lines.push('FIXTURES:');
+    lines.push('FIXTURES (consume these via the test signature instead of manual setup):');
     for (const f of s.fixtures) lines.push(`  - ${f.name} from ${f.filePath}`);
+  }
+  if (s.utilityHelpers.length) {
+    lines.push('');
+    lines.push('UTILITY HELPERS (reuse for common operations — do NOT re-implement):');
+    lines.push(...fmtHelpers(s.utilityHelpers));
   }
 
   if (s.dataFiles.length) {
@@ -545,7 +611,9 @@ function buildPromptBlock(s: RepoPatternSummary): string {
   if (folders.length) lines.push(`\nFolder layout: ${folders.join(', ')}`);
 
   lines.push('');
-  lines.push('RULES: match the imports, structure, assertion style and locator strategy above so the new tests fit the suite and do NOT break existing tests.');
+  lines.push('RULES:');
+  lines.push('  1. REUSE FIRST — call the existing Page Object methods, assertion/wait/logger/data-access helpers and fixtures above instead of writing new raw Playwright code. Generate new low-level code ONLY when no existing method fits.');
+  lines.push('  2. Match the imports, structure, assertion style and locator strategy above so the new tests fit the suite and do NOT break existing tests.');
   lines.push('--- END REPO PATTERN GUIDE ---');
   return lines.join('\n');
 }

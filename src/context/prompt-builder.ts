@@ -7,6 +7,7 @@
  */
 
 import type { RepositoryProfile } from './types';
+import { categorizeHelpers } from './reusable-helpers';
 
 /**
  * Build a compact context string from a RepositoryProfile for AI prompt injection.
@@ -44,33 +45,79 @@ export function buildAIPromptContext(profile: RepositoryProfile): string {
     lines.push(`Preferred Locators: ${locStr}`);
   }
 
-  // Reusable helpers (the money — prevents AI from reinventing)
-  if (profile.helperFunctions.length > 0) {
+  // ---------------------------------------------------------------------------
+  // REUSE-FIRST CATALOG (the money — prevents the model from reinventing code).
+  // Helpers are bucketed by purpose so the right existing project method is
+  // obvious for each kind of step (assert / wait / log / data / generic), and
+  // generation is instructed to prefer them over new raw Playwright code.
+  // ---------------------------------------------------------------------------
+  const buckets = categorizeHelpers(profile);
+  const fmt = (hs: Array<{ name: string; params: string; filePath: string }>) =>
+    hs.map((h) => `  - ${h.name}(${h.params}) from ${h.filePath}`);
+  const anyReusable =
+    profile.pageObjects.length > 0 || profile.fixtures.length > 0 ||
+    buckets.assertion.length > 0 || buckets.wait.length > 0 || buckets.logger.length > 0 ||
+    buckets.data.length > 0 || buckets.utility.length > 0;
+
+  if (anyReusable) {
     lines.push('');
-    lines.push('REUSABLE HELPERS (import these, do NOT rewrite):');
-    for (const h of profile.helperFunctions.slice(0, 12)) {
-      const params = h.parameters?.join(', ') || '';
-      lines.push(`  - ${h.name}(${params}) from ${h.filePath}`);
-    }
+    lines.push('=== REUSE EXISTING PROJECT CODE (HIGHEST PRIORITY) ===');
+    lines.push('ALWAYS prefer calling the existing methods/helpers below over writing new raw Playwright code. Only write new low-level code when NO existing method fits.');
   }
 
   // Page Objects
   if (profile.pageObjects.length > 0) {
     lines.push('');
-    lines.push('PAGE OBJECTS (use these classes):');
+    lines.push('PAGE OBJECTS (instantiate & call these classes/methods — do NOT inline raw locators/fills):');
     for (const po of profile.pageObjects.slice(0, 8)) {
-      const methods = po.methods?.slice(0, 5).join(', ') || '';
+      const methods = po.methods?.slice(0, 6).map((m: any) => typeof m === 'string' ? m : m.name).join(', ') || '';
       lines.push(`  - ${po.name} from ${po.filePath}${methods ? ` [${methods}]` : ''}`);
     }
+  }
+
+  // Assertion helpers
+  if (buckets.assertion.length > 0) {
+    lines.push('');
+    lines.push('ASSERTION HELPERS (call these instead of hand-writing expect(...) chains):');
+    lines.push(...fmt(buckets.assertion));
+  }
+
+  // Wait / synchronization helpers
+  if (buckets.wait.length > 0) {
+    lines.push('');
+    lines.push('WAIT / SYNCHRONIZATION HELPERS (call these instead of new waits or hard sleeps):');
+    lines.push(...fmt(buckets.wait));
+  }
+
+  // Logger implementation
+  if (buckets.loggerImpl || buckets.logger.length > 0) {
+    lines.push('');
+    lines.push('LOGGER (use the repo logger for progress — do NOT use console.log):');
+    if (buckets.loggerImpl) lines.push(`  - import ${buckets.loggerImpl.name} from ${buckets.loggerImpl.filePath} and call it (e.g. ${buckets.loggerImpl.name}.info(...) / ${buckets.loggerImpl.name}(...))`);
+    for (const h of buckets.logger) if (!buckets.loggerImpl || h.name !== buckets.loggerImpl.name) lines.push(`  - ${h.name}(${h.params}) from ${h.filePath}`);
+  }
+
+  // Test-data access patterns
+  if (buckets.data.length > 0) {
+    lines.push('');
+    lines.push('TEST DATA ACCESS (resolve dataset values through these — do NOT hardcode credentials/data):');
+    lines.push(...fmt(buckets.data));
   }
 
   // Fixtures
   if (profile.fixtures.length > 0) {
     lines.push('');
-    lines.push('FIXTURES:');
+    lines.push('FIXTURES (consume these via the test signature instead of manual setup):');
     for (const f of profile.fixtures.slice(0, 6)) {
       lines.push(`  - ${f.name} from ${f.filePath}`);
     }
+  }
+
+  // Generic utilities
+  if (buckets.utility.length > 0) {
+    lines.push('');
+    lines.push('UTILITY HELPERS (reuse for common operations — do NOT re-implement):');
+    lines.push(...fmt(buckets.utility));
   }
 
   // Custom commands (Cypress)
