@@ -170,6 +170,41 @@ export interface OrchestratedIntelligence {
      * buildPromptContext runs). Surfaces which source is becoming slow.
      */
     timingsMs: Record<string, number>;
+    /**
+     * Counts of what each source actually returned. If Script Generation
+     * suddenly degrades you'll see `repositoryMethods: 0` instead of `9` — an
+     * immediate signal that retrieval (not the model) regressed.
+     */
+    retrievalMetrics: {
+      repositoryMethods: number;
+      testDatasets: number;
+      knowledgeRules: number;
+      learnedPatterns: number;
+      appProfilePages: number;
+      domSelectors: number;
+    };
+    /**
+     * The actual items selected for the prompt (names only). This is gold for
+     * answering "why did Claude generate this?" — you see exactly which methods,
+     * datasets and patterns it received, not just how many.
+     */
+    selected: {
+      repositoryMethods: string[];
+      datasets: string[];
+      patterns: string[];
+    };
+    /**
+     * Which snapshot of each source was used, so two differing generations can
+     * be explained. Lightweight: identifiers/timestamps already on the rows
+     * (full numeric versioning of knowledge/datasets is deferred — needs schema).
+     */
+    sourceVersions: {
+      repoContextId?: number;
+      appProfileId?: string;
+      appProfileFingerprint?: string;
+      appProfileCrawledAt?: string;
+      appProfileUpdatedAt?: string;
+    };
   };
 }
 
@@ -217,6 +252,10 @@ export class IntelligenceOrchestrator {
     const warnings: string[] = [];
     const timingsMs: Record<string, number> = {};
     const confidenceBySource: Partial<Record<OrchestratorSource, number>> = {};
+    // Source versioning — which snapshot of each source fed this generation.
+    const sourceVersions: OrchestratedIntelligence['metadata']['sourceVersions'] = {
+      repoContextId: query.repoContextId,
+    };
 
     /** Time an async source-gathering step, recording its ms into `timingsMs`. */
     const timed = async <T>(name: OrchestratorSource, fn: () => Promise<T>): Promise<T> => {
@@ -283,6 +322,11 @@ export class IntelligenceOrchestrator {
               sourcesUsed.push('app-profile');
               const flows = (profile.business_flows ?? []).length;
               confidenceBySource.appProfile = Math.min(100, 70 + flows * 5);
+              // Versioning: record which crawl snapshot was used.
+              sourceVersions.appProfileId = profile.id;
+              sourceVersions.appProfileFingerprint = profile.app_fingerprint ?? undefined;
+              sourceVersions.appProfileCrawledAt = profile.crawled_at;
+              sourceVersions.appProfileUpdatedAt = profile.updated_at;
             }
           }
         } catch (err: any) {
@@ -428,6 +472,31 @@ export class IntelligenceOrchestrator {
 
     const durationMs = Date.now() - start;
     timingsMs.total = durationMs;
+
+    // ── Selected items (names only) — answers "what did Claude actually receive?"
+    const allRepoMethods: ReusableMethod[] = [
+      ...repoGraph.primaryMethods,
+      ...repoGraph.supportingMethods.assertions,
+      ...repoGraph.supportingMethods.waits,
+      ...repoGraph.supportingMethods.dataAccess,
+      ...repoGraph.supportingMethods.utilities,
+    ];
+    const selected = {
+      repositoryMethods: allRepoMethods.map(m => m.name),
+      datasets: testData.datasets.map(d => d.name),
+      patterns: learnedPatterns.patterns.map((p: any) => p.pattern_description),
+    };
+
+    // ── Retrieval metrics — counts of what each source returned.
+    const retrievalMetrics = {
+      repositoryMethods: allRepoMethods.length,
+      testDatasets: testData.datasets.length,
+      knowledgeRules: (knowledge as OrchestratedIntelligence['knowledge'])?.itemsCount ?? 0,
+      learnedPatterns: learnedPatterns.patterns.length,
+      appProfilePages: (appProfile as OrchestratedIntelligence['appProfile'])?.pageCount ?? 0,
+      domSelectors: domMemory.selectors.length,
+    };
+
     logger.info(MOD, 'Intelligence orchestration complete', {
       intent: query.intent,
       caller: query.caller,
@@ -437,6 +506,9 @@ export class IntelligenceOrchestrator {
       confidenceBySource,
       timingsMs,
       durationMs,
+      retrievalMetrics,
+      selected,
+      sourceVersions,
     });
 
     return {
@@ -462,6 +534,9 @@ export class IntelligenceOrchestrator {
         confidenceScore,
         confidenceBySource,
         timingsMs,
+        retrievalMetrics,
+        selected,
+        sourceVersions,
       },
     };
   }

@@ -44,6 +44,16 @@ function meta(over: Partial<OrchestratedIntelligence['metadata']> = {}): Orchest
     confidenceScore: 0,
     confidenceBySource: {},
     timingsMs: {},
+    retrievalMetrics: {
+      repositoryMethods: 0,
+      testDatasets: 0,
+      knowledgeRules: 0,
+      learnedPatterns: 0,
+      appProfilePages: 0,
+      domSelectors: 0,
+    },
+    selected: { repositoryMethods: [], datasets: [], patterns: [] },
+    sourceVersions: {},
     ...over,
   };
 }
@@ -233,6 +243,25 @@ console.log('\n=== gatherIntelligence: configurable sources filter ===');
   assert(typeof intel.metadata.timingsMs.total === 'number', 'total timing recorded');
   // Only the learned_patterns query should have run.
   assert(queries.length === 1 && /learned_patterns/.test(queries[0]), 'Only learned_patterns query executed');
+
+  // Retrieval metrics, selected items, and source versions are always present.
+  assert(intel.metadata.retrievalMetrics.repositoryMethods === 0, 'retrievalMetrics.repositoryMethods present (0)');
+  assert(intel.metadata.retrievalMetrics.learnedPatterns === 0, 'retrievalMetrics.learnedPatterns present (0)');
+  assert(Array.isArray(intel.metadata.selected.repositoryMethods), 'selected.repositoryMethods is an array');
+  assert(Array.isArray(intel.metadata.selected.datasets), 'selected.datasets is an array');
+  assert(Array.isArray(intel.metadata.selected.patterns), 'selected.patterns is an array');
+  // No repoContextId passed → versioning reflects that.
+  assert(intel.metadata.sourceVersions.repoContextId === undefined, 'sourceVersions.repoContextId undefined when not provided');
+
+  // When repoContextId IS provided it is echoed into sourceVersions.
+  const intel3 = await orch.gatherIntelligence({
+    intent: 'Login',
+    companyId: 1,
+    repoContextId: 48,
+    caller: 'script-gen',
+    sources: ['patterns'],
+  });
+  assert(intel3.metadata.sourceVersions.repoContextId === 48, 'sourceVersions.repoContextId echoes provided id');
 
   // Now request knowledge too and ensure both are timed.
   const intel2 = await orch.gatherIntelligence({

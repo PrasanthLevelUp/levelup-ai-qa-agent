@@ -2970,6 +2970,9 @@ ${gotoB}${sessionLogin('pageB')}
         confidenceScore: intel.metadata.confidenceScore,
         confidenceBySource: intel.metadata.confidenceBySource,
         timingsMs: intel.metadata.timingsMs,
+        retrievalMetrics: intel.metadata.retrievalMetrics,
+        selected: intel.metadata.selected,
+        sourceVersions: intel.metadata.sourceVersions,
       });
       console.log(
         `[ScriptGenEngine] 🧭 Orchestrated intelligence injected (intent="${intent}", ` +
