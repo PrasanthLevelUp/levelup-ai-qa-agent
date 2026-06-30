@@ -394,6 +394,12 @@ export function createTestCoverageRouter(): Router {
           : undefined,
         // Provenance proof — which intelligence sources actually fed the model.
         intelligenceUsed,
+        // Adaptive generation telemetry — selected complexity tier, per-phase
+        // timings, token usage, and scenario/case counts. Persisted here (one
+        // JSONB column, no per-field migration) so the History view can surface
+        // token usage per generation and so tier thresholds can be tuned from
+        // real data.
+        generationMetadata: result.stats?.generationMetadata,
       };
 
       let reqId: number;
