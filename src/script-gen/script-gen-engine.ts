@@ -888,12 +888,12 @@ export class ScriptGenEngine {
     // lines are preserved verbatim (graceful fallback, no hallucinated methods).
     let finalLines = lines;
     if (matchedPOs.length) {
-      const applied = this.applyPageObjectActions(lines, matchedPOs, { creds, data: dataRef }, dataIndex);
+      const applied = this.applyPageObjectActions(lines, matchedPOs, { creds, data: dataRef }, dataIndex, tc, steps);
       finalLines = applied.lines;
       applied.used.forEach((v) => usedPOVars.add(v));
     }
 
-    const assertions = this.buildTcAssertions(`${tc.expected_result || ''}`, ctx, tc);
+    const assertions = this.buildTcAssertions(`${tc.expected_result || ''}`, ctx, tc, matchedPOs, usedPOVars);
 
     // ── Page-Object-based assertions (e.g. inventoryPage.verifyLoaded()) ──
     if (matchedPOs.length) {
@@ -924,7 +924,16 @@ export class ScriptGenEngine {
     // fill the form and click, expecting the caller to already be on the page
     // (e.g. SauceDemo's LoginPage). Treating login() as navigation previously
     // left specs running against about:blank, timing out on `#user-name`.
-    const bodyNavigates = [...preLines, ...finalLines].some((l) => /\bpage\.goto\s*\(/.test(l));
+    // An explicit page.goto() OR a repo Page Object navigation method
+    // (open/goto/navigate/load/visit — emitted by the P4 nav-reuse rewrite)
+    // counts as the entry navigation. login()/fill()/click() do NOT.
+    const bodyNavigates = [...preLines, ...finalLines].some(
+      (l) =>
+        /\bpage\.goto\s*\(/.test(l) ||
+        matchedPOs.some((po) =>
+          new RegExp(`\\b${po.varName}\\.(open|goto|navigate|load|visit)\\s*\\(`).test(l),
+        ),
+    );
     if (bodyTouchesPage && !bodyNavigates) {
       navLines.push(
         `await page.goto('${escapeStr(baseUrl)}');`,
@@ -984,6 +993,10 @@ export class ScriptGenEngine {
       importLine += `\nimport { ${po.name} } from '${po.importPath}';`;
     }
 
+    // Priority #5 — derive real coverage categories + the repository assets this
+    // spec reuses, instead of emitting a useless `Coverage: n/a`.
+    const coverageMeta = this.deriveCoverageMetadata(tc, activePOs, caseData);
+
     const content = `${importLine}
 
 /**
@@ -991,7 +1004,8 @@ export class ScriptGenEngine {
  *
  * Test Case ID: ${tc.id ?? 'n/a'}
  * Priority: ${tc.priority ?? tc['Priority'] ?? 'n/a'}
- * Coverage: ${tc.scenario ?? tc.coverage_type ?? 'n/a'}
+ * Coverage: ${coverageMeta.categories}
+ * Repository Assets Reused: ${coverageMeta.assets}
  * Steps:
 ${stepComments}
  * Expected Result: ${this.escapeBlockComment(`${tc.expected_result || ''}`)}
@@ -1358,6 +1372,147 @@ ${combined.map(l => (l ? `    ${l}` : '')).join('\n')}
     return kind === 'username'
       ? `process.env.TEST_USERNAME ?? ''`
       : `process.env.TEST_PASSWORD ?? ''`;
+  }
+
+  /* ──────────────────────────────────────────────────────────────────────── */
+  /*  Scenario Intent Fidelity (Script-Gen Quality review — Priority #1)       */
+  /*  The deterministic builder must IMPLEMENT the exact scenario each test    */
+  /*  case describes (whitespace / special-char / max-length / empty /         */
+  /*  invalid) rather than copying the happy-path login. These helpers detect  */
+  /*  the intent from the case (title + scenario + coverage_type + steps) and  */
+  /*  transform the resolved username expression accordingly.                  */
+  /* ──────────────────────────────────────────────────────────────────────── */
+
+  /**
+   * Classify the input-mutation intent of a login test case. Precedence is
+   * chosen so the most specific, testable mutation wins:
+   *   empty → whitespace → special-char → max-length → invalid → normal
+   * `literal` carries an explicit special-character value authored in a step
+   * (e.g. "Enter '@locked_user'"); `length` carries a boundary length.
+   */
+  private deriveLoginScenario(
+    tc: NonNullable<GenerationConfig['testCase']> | undefined,
+    steps: string[],
+  ): { kind: 'empty' | 'whitespace' | 'special' | 'maxlength' | 'invalid' | 'normal'; literal?: string; length?: number } {
+    const hay = [
+      tc?.title, tc?.scenario, (tc as any)?.coverage_type, (steps || []).join(' '),
+    ].map((s) => `${s ?? ''}`).join(' ').toLowerCase();
+
+    if (/\bempty\b|\bblank\b|leave.*(empty|blank)|without\s+(a\s+)?(username|password|credential)/.test(hay)) {
+      return { kind: 'empty' };
+    }
+    if (/leading|trailing|whitespace|\bspaces?\b/.test(hay)) {
+      return { kind: 'whitespace' };
+    }
+    if (/special[\s-]*char/.test(hay)) {
+      return { kind: 'special', literal: this.extractSpecialCharLiteral(steps) || undefined };
+    }
+    if (/max(?:imum)?[\s-]*length|too\s+long|very\s+long|exceed\w*\s+length|\blong\b.*(user|name)/.test(hay)) {
+      const num = hay.match(/\b(\d{2,4})\b/);
+      const length = num ? Math.min(parseInt(num[1]!, 10), 4096) : 256;
+      return { kind: 'maxlength', length };
+    }
+    if (/\b(invalid|incorrect|wrong|unregistered|nonexistent|non-existent)\b|do not match/.test(hay)) {
+      return { kind: 'invalid' };
+    }
+    return { kind: 'normal' };
+  }
+
+  /**
+   * Pull an explicit special-character username authored in a username step,
+   * e.g. "Enter '@locked_user' in [data-testid='username']" → "@locked_user".
+   * Bracketed selectors are stripped first so an attribute value is never mined.
+   * Returns '' when no special-character literal is present.
+   */
+  private extractSpecialCharLiteral(steps: string[]): string {
+    for (const s of steps || []) {
+      if (!/user|email|login\s*id/i.test(s)) continue;
+      const cleaned = String(s).replace(/\[[^\]]*\]/g, ' '); // drop [data-testid='…']
+      const m = cleaned.match(/'([^']+)'|"([^"]+)"/);
+      const v = m ? (m[1] ?? m[2] ?? '').trim() : '';
+      if (v && /[^a-zA-Z0-9_]/.test(v)) return v; // contains a genuine special char
+    }
+    return '';
+  }
+
+  /**
+   * Wrap a resolved username expression so it carries a leading AND trailing
+   * space (leading/trailing-whitespace scenario). Keeps the value data-driven:
+   *   - literal 'locked_out_user' → ' locked_out_user '
+   *   - expression user.username  → ` ${user.username} `
+   */
+  private wrapWhitespaceExpr(baseExpr: string): string {
+    const lit = baseExpr.match(/^'(.*)'$/);
+    if (lit) return `' ${lit[1]} '`;
+    return '`' + ' ${' + baseExpr + '} ' + '`';
+  }
+
+  /**
+   * Prepend a special character to a resolved username expression when the case
+   * did not author an explicit special-character value:
+   *   - literal 'locked_out_user' → '@locked_out_user'
+   *   - expression user.username  → `@${user.username}`
+   */
+  private specialCharExpr(baseExpr: string): string {
+    const lit = baseExpr.match(/^'(.*)'$/);
+    if (lit) return `'@${lit[1]}'`;
+    return '`@${' + baseExpr + '}`';
+  }
+
+  /* ──────────────────────────────────────────────────────────────────────── */
+  /*  Coverage Metadata (Script-Gen Quality review — Priority #5)              */
+  /*  Replace the useless `Coverage: n/a` header with derived test categories  */
+  /*  (Functional / Negative / Boundary / Validation) and the concrete         */
+  /*  repository assets the generated script reuses (Page Objects + datasets). */
+  /* ──────────────────────────────────────────────────────────────────────── */
+
+  /** Normalize a test case's `tags` (array or delimited string) to a list. */
+  private normalizeTags(tc: NonNullable<GenerationConfig['testCase']> | undefined): string[] {
+    const raw: any = (tc as any)?.tags;
+    if (!raw) return [];
+    if (Array.isArray(raw)) return raw.map((t) => `${t}`.trim()).filter(Boolean);
+    return `${raw}`.split(/[,;|]/).map((t) => t.trim()).filter(Boolean);
+  }
+
+  /**
+   * Derive human-meaningful coverage categories + the repository assets the
+   * script reuses. Categories are inferred from tags + coverage_type + scenario
+   * + expected result (NOT invented). Returns { categories, assets } as
+   * pre-formatted strings ready to drop into the spec header.
+   */
+  private deriveCoverageMetadata(
+    tc: NonNullable<GenerationConfig['testCase']> | undefined,
+    activePOs: Array<{ name: string }>,
+    caseData?: { datasetName: string; recordKey?: string; representative?: boolean } | null,
+  ): { categories: string; assets: string } {
+    const tags = this.normalizeTags(tc);
+    const cov = `${(tc as any)?.coverage_type ?? ''}`.toLowerCase();
+    const hay = [
+      tc?.title, tc?.scenario, cov, tags.join(' '), `${tc?.expected_result ?? ''}`,
+    ].map((s) => `${s ?? ''}`).join(' ').toLowerCase();
+
+    const cats: string[] = [];
+    const add = (c: string) => { if (!cats.includes(c)) cats.push(c); };
+    if (/\bnegative\b|fail|invalid|incorrect|wrong|locked|error|denied|reject/.test(hay)) add('Negative');
+    if (/edge|boundary|\bmax(?:imum)?\b|\bmin(?:imum)?\b|length|whitespace|special\s*char|limit|overflow/.test(hay)) add('Boundary');
+    if (/empty|required|blank|validation|format|missing|mandatory/.test(hay)) add('Validation');
+    if (/\bpositive\b|smoke|happy\s*path|\bsuccess\b/.test(hay)) add('Functional');
+    // Default: a case that is none of the above is a straightforward Functional
+    // check. Always surface at least one category.
+    if (!cats.length) add('Functional');
+
+    const assets: string[] = [];
+    for (const po of activePOs) assets.push(`${po.name} (Page Object)`);
+    if (caseData?.datasetName) {
+      assets.push(caseData.representative
+        ? `Test Data Store → dataset "${caseData.datasetName}" (representative record)`
+        : `Test Data Store → dataset "${caseData.datasetName}"${caseData.recordKey ? ` → record "${caseData.recordKey}"` : ''}`);
+    }
+
+    return {
+      categories: cats.join(', '),
+      assets: assets.length ? assets.join('; ') : 'none (raw Playwright APIs)',
+    };
   }
 
   /* ──────────────────────────────────────────────────────────────────────── */
@@ -2031,6 +2186,9 @@ export default datasets;
     const gotoA = `    await pageA.goto('${escapeStr(baseUrl)}');\n`;
     const gotoB = `    await pageB.goto('${escapeStr(baseUrl)}');\n`;
 
+    // Priority #5 — derive coverage categories + reused repository assets.
+    const coverageMeta = this.deriveCoverageMetadata(tc, usePO ? [loginPO!] : [], null);
+
     return `${importLine}
 
 /**
@@ -2038,7 +2196,8 @@ export default datasets;
  *
  * Test Case ID: ${tc.id ?? 'n/a'}
  * Priority: ${tc.priority ?? tc['Priority'] ?? 'n/a'}
- * Coverage: ${tc.scenario ?? tc.coverage_type ?? 'n/a'}
+ * Coverage: ${coverageMeta.categories}
+ * Repository Assets Reused: ${coverageMeta.assets}
  * Steps:
 ${stepComments}
  * Expected Result: ${this.escapeBlockComment(`${tc.expected_result || ''}`)}
@@ -2190,6 +2349,8 @@ ${gotoB}${sessionLogin('pageB')}
     pos: Array<{ name: string; varName: string; methods: string[]; kind: string }>,
     ctx: { creds: { username: string; password: string }; data?: { varName: string; ref: string; hasUsername: boolean; hasPassword: boolean } },
     index: Map<string, Map<string, any>>,
+    tc?: NonNullable<GenerationConfig['testCase']>,
+    steps?: string[],
   ): { lines: string[]; used: Set<string> } {
     const used = new Set<string>();
     let work = [...lines];
@@ -2209,30 +2370,27 @@ ${gotoB}${sessionLogin('pageB')}
       const passFillLine = work.find((l) => /#password|\bpwd\b|\bpass\b/i.test(l) && /\.fill\(/i.test(l));
       const hasLoginClick = work.some((l) => /login.*button|#login-button/i.test(l) && /\.click\(/i.test(l));
       if (loginMethod && userFillLine && passFillLine && hasLoginClick) {
-        // Review fix (final): negative scenario data mutation — parse the actual
-        // fill values from the generated lines to detect empty/invalid scenarios.
-        // When the test is "empty credentials" or "invalid username", we honor
-        // those fill values instead of substituting valid credentials.
+        // ── Scenario Intent Fidelity (review Priority #1 & #2) ──
+        // The deterministic builder must IMPLEMENT the exact scenario the case
+        // describes (leading/trailing whitespace, special characters, maximum
+        // length, empty, invalid) rather than copying a happy-path login. We
+        // (a) resolve BASE credential expressions bound to the repository
+        // test-data record whenever one was loaded (Priority #2 — actually use
+        // `user.username`/`user.password`), then (b) layer the scenario mutation
+        // on top of that base.
         const extractFillValue = (line: string): string | { literal: string; unquoted: string } | null => {
           const m = line.match(/\.fill\(([^)]+)\)/);
           if (!m) return null;
           const arg = m[1].trim();
-          // Empty string literal
           if (arg === `''` || arg === `""`) return `''`;
-          // Literal string 'some_value' or "some_value"
           if (/^['"]/.test(arg)) {
             const unquoted = arg.slice(1, -1);
             return { literal: arg, unquoted };
           }
-          // Expression like user.username or process.env.TEST_USERNAME
-          return null; // not a literal, use normal flow
+          return null; // expression (e.g. user.username) — use normal flow
         };
-        const userFillVal = extractFillValue(userFillLine);
-        const passFillVal = extractFillValue(passFillLine);
-        
-        // Helper: check if a literal value matches a known test-data record key.
-        // If it does, it's a POSITIVE test referencing test data (should bind to
-        // the record, not use the literal). If it doesn't, it's a NEGATIVE value.
+        // Whether a literal matches a known test-data record key (POSITIVE ref)
+        // as opposed to a hand-authored negative value.
         const isKnownRecordKey = (val: string | { literal: string; unquoted: string } | null): boolean => {
           if (!val || typeof val === 'string') return false;
           const key = val.unquoted;
@@ -2241,58 +2399,128 @@ ${gotoB}${sessionLogin('pageB')}
           }
           return false;
         };
-        
-        // Determine credentials: distinguish positive (test-data reference) from
-        // negative (invalid/wrong/empty) scenarios by checking if literals match
-        // known record keys in the test-data index.
+        const userFillVal = extractFillValue(userFillLine);
+        const passFillVal = extractFillValue(passFillLine);
+
+        const localDecls: string[] = [];
+        // Resolve the BASE (data-bound) username/password expressions LAZILY.
+        // Priority #2: if a record was loaded into `ctx.data.varName` (e.g. the
+        // locked_users record → `user`), bind to it — even when the record has
+        // no password field (fall back to env for the password only). Computed
+        // on demand so scenarios that don't need a base (empty / invalid) never
+        // emit an unused `const user`.
+        let baseComputed = false;
+        let baseUser = '';
+        let basePass = '';
+        const ensureBase = (): void => {
+          if (baseComputed) return;
+          baseComputed = true;
+          if (ctx.data?.varName && ctx.data.hasUsername) {
+            baseUser = `${ctx.data.varName}.username ?? ''`;
+            basePass = ctx.data.hasPassword
+              ? `${ctx.data.varName}.password ?? ''`
+              : `${ctx.data.varName}.password ?? process.env.TEST_PASSWORD ?? ''`;
+          } else {
+            const valid = this.resolveValidUserRecord(index);
+            if (valid && 'username' in (valid.value || {})) {
+              localDecls.push(`const user = ${valid.ref};`);
+              baseUser = `user.username ?? ''`;
+              basePass = 'password' in (valid.value || {})
+                ? `user.password ?? ''`
+                : `user.password ?? process.env.TEST_PASSWORD ?? ''`;
+            } else {
+              baseUser = ctx.creds.username ? `'${escapeStr(ctx.creds.username)}'` : `process.env.TEST_USERNAME ?? ''`;
+              basePass = ctx.creds.password ? `'${escapeStr(ctx.creds.password)}'` : `process.env.TEST_PASSWORD ?? ''`;
+            }
+          }
+        };
+        // Resolve a VALID counterpart credential for negative cases where ONE
+        // field is deliberately invalid and the OTHER must stay valid. Declared
+        // as `validUser` for clarity in the emitted spec.
+        const validCounterpart = (): { u?: string; p?: string } => {
+          const valid = this.resolveValidUserRecord(index);
+          const val = valid?.value || {};
+          if (valid && ('username' in val || 'password' in val)) {
+            localDecls.push(`const validUser = ${valid.ref};`);
+            return {
+              u: 'username' in val ? `validUser.username ?? ''` : undefined,
+              p: 'password' in val ? `validUser.password ?? ''` : undefined,
+            };
+          }
+          return {};
+        };
+        const envUser = () => ctx.creds.username ? `'${escapeStr(ctx.creds.username)}'` : `process.env.TEST_USERNAME ?? ''`;
+        const envPass = () => ctx.creds.password ? `'${escapeStr(ctx.creds.password)}'` : `process.env.TEST_PASSWORD ?? ''`;
+
+        // Classify the input-mutation intent from the case itself and transform
+        // the base expressions accordingly.
+        const scenario = this.deriveLoginScenario(tc, steps ?? []);
         let u: string;
         let p: string;
-        const localDecls: string[] = [];
-        
-        // If BOTH fills are empty literals, it's an "empty credentials" test.
-        if (userFillVal === `''` && passFillVal === `''`) {
-          u = `''`;
-          p = `''`;
-        }
-        // If username is a literal that does NOT match a known record, it's negative.
-        else if (userFillVal && userFillVal !== `''` && !isKnownRecordKey(userFillVal)) {
-          u = typeof userFillVal === 'object' ? userFillVal.literal : userFillVal;
-          // For "invalid username" test, pair it with a VALID password.
-          const valid = this.resolveValidUserRecord(index);
-          if (valid && 'password' in (valid.value || {})) {
-            localDecls.push(`const validUser = ${valid.ref};`);
-            p = `validUser.password ?? ''`;
-          } else {
-            p = ctx.creds.password ? `'${escapeStr(ctx.creds.password)}'` : `process.env.TEST_PASSWORD ?? ''`;
+        switch (scenario.kind) {
+          case 'empty':
+            // Leave BOTH fields empty (the field-emptiness IS the scenario).
+            u = `''`;
+            p = `''`;
+            break;
+          case 'whitespace':
+            // Leading/trailing whitespace around the real username value.
+            ensureBase();
+            u = this.wrapWhitespaceExpr(baseUser);
+            p = basePass;
+            break;
+          case 'special':
+            // Use the special-character value authored in the step when present
+            // (e.g. '@locked_user'); otherwise prepend a special char to base.
+            ensureBase();
+            u = scenario.literal ? `'${escapeStr(scenario.literal)}'` : this.specialCharExpr(baseUser);
+            p = basePass;
+            break;
+          case 'maxlength':
+            // Maximum-length username boundary.
+            ensureBase();
+            u = `'A'.repeat(${scenario.length ?? 256})`;
+            p = basePass;
+            break;
+          case 'invalid': {
+            // Honor an explicit invalid literal the step-writer emitted; else
+            // pair a clearly-invalid credential with its valid counterpart.
+            if (userFillVal && userFillVal !== `''` && !isKnownRecordKey(userFillVal)) {
+              u = typeof userFillVal === 'object' ? userFillVal.literal : userFillVal;
+              p = validCounterpart().p ?? envPass();
+            } else if (passFillVal && passFillVal !== `''` && !isKnownRecordKey(passFillVal)) {
+              p = typeof passFillVal === 'object' ? passFillVal.literal : passFillVal;
+              u = validCounterpart().u ?? envUser();
+            } else {
+              u = `'invalid_user'`;
+              p = `'wrong_password'`;
+            }
+            break;
           }
+          default:
+            // normal → honor an explicit empty/negative literal the writer
+            // emitted, otherwise bind to the resolved record (positive path).
+            if (userFillVal === `''` && passFillVal === `''`) {
+              u = `''`;
+              p = `''`;
+            } else if (userFillVal && userFillVal !== `''` && !isKnownRecordKey(userFillVal)) {
+              u = typeof userFillVal === 'object' ? userFillVal.literal : userFillVal;
+              p = validCounterpart().p ?? envPass();
+            } else if (passFillVal && passFillVal !== `''` && !isKnownRecordKey(passFillVal)) {
+              p = typeof passFillVal === 'object' ? passFillVal.literal : passFillVal;
+              u = validCounterpart().u ?? envUser();
+            } else {
+              ensureBase();
+              u = baseUser;
+              p = basePass;
+            }
         }
-        // If password is a literal that does NOT match a known record, it's negative.
-        else if (passFillVal && passFillVal !== `''` && !isKnownRecordKey(passFillVal)) {
-          p = typeof passFillVal === 'object' ? passFillVal.literal : passFillVal;
-          // For "invalid password" test, pair it with a VALID username.
-          const valid = this.resolveValidUserRecord(index);
-          if (valid && 'username' in (valid.value || {})) {
-            localDecls.push(`const validUser = ${valid.ref};`);
-            u = `validUser.username ?? ''`;
-          } else {
-            u = ctx.creds.username ? `'${escapeStr(ctx.creds.username)}'` : `process.env.TEST_USERNAME ?? ''`;
-          }
-        }
-        // Normal positive case: bind to test data or valid record.
-        else if (ctx.data?.varName && ctx.data.hasUsername && ctx.data.hasPassword) {
-          u = `${ctx.data.varName}.username ?? ''`;
-          p = `${ctx.data.varName}.password ?? ''`;
-        } else {
-          const valid = this.resolveValidUserRecord(index);
-          if (valid && 'username' in (valid.value || {}) && 'password' in (valid.value || {})) {
-            localDecls.push(`const user = ${valid.ref};`);
-            u = `user.username ?? ''`;
-            p = `user.password ?? ''`;
-          } else {
-            u = ctx.creds.username ? `'${escapeStr(ctx.creds.username)}'` : `process.env.TEST_USERNAME ?? ''`;
-            p = ctx.creds.password ? `'${escapeStr(ctx.creds.password)}'` : `process.env.TEST_PASSWORD ?? ''`;
-          }
-        }
+        // Priority #4 — Repository Reuse. When the LoginPage exposes an explicit
+        // navigation method (open / goto / navigate / load), prefer it over a
+        // raw `page.goto(baseUrl)` so the spec drives entry through the repo's
+        // own abstraction. Strictly method-gated: if no such method exists we
+        // keep the literal goto (no hallucinated calls).
+        const navMethod = this.findPoMethod(loginPO.methods, /^(open|goto|navigate|load|visit)$/i);
         const filtered: string[] = [];
         // Position at which to splice in the single high-level login() call. We
         // insert it where the FIRST credential fill was, so any preceding entry
@@ -2316,12 +2544,17 @@ ${gotoB}${sessionLogin('pageB')}
             if (/page\.waitForLoadState/i.test(work[i + 1] || '')) i++;
             continue;
           }
-          // IMPORTANT: We deliberately KEEP the initial page.goto(). We cannot
-          // assume the repo's login() navigates (most only fill+click, expecting
-          // the caller to already be on the page). Preserving the entry goto
-          // guarantees the test lands on the app before login() fills the form.
-          // A redundant goto in front of a login() that *does* navigate is
-          // harmless; a missing one makes the test run against about:blank.
+          // Entry navigation: reuse the repo's LoginPage.open() when it exists,
+          // otherwise KEEP the literal page.goto(). We cannot assume login()
+          // navigates (most only fill+click), so a goto/open must precede it —
+          // dropping it would leave the test running against about:blank.
+          if (navMethod && /\bpage\.goto\s*\(/.test(l)) {
+            filtered.push(`await ${loginPO.varName}.${navMethod}();`);
+            used.add(loginPO.varName);
+            // Absorb an immediately-following waitForLoadState — open() awaits it.
+            if (/page\.waitForLoadState/i.test(work[i + 1] || '')) i++;
+            continue;
+          }
           filtered.push(l);
         }
         const loginCall = `await ${loginPO.varName}.${loginMethod}(${u}, ${p});`;
@@ -2749,10 +2982,29 @@ ${gotoB}${sessionLogin('pageB')}
     expected: string,
     ctx: { url: string; creds: { username: string; password: string }; sel: Record<string, string>; data?: { varName: string; ref: string; hasUsername: boolean; hasPassword: boolean } },
     _tc: NonNullable<GenerationConfig['testCase']>,
+    pos: Array<{ name: string; varName: string; methods: string[]; kind: string }> = [],
+    usedPOVars?: Set<string>,
   ): string[] {
     const exp = expected.trim();
     const lc = exp.toLowerCase();
     const lines: string[] = [];
+
+    // Priority #4 — Repository Reuse. Prefer the LoginPage's own error accessor
+    // (e.g. `loginPage.getError()`, which returns a Locator) over a raw
+    // `page.locator('[data-test=error]')` when the matched Page Object exposes a
+    // method whose name references the error surface. Strictly method-gated so
+    // we never reference a getter the repo doesn't have. `errorRef()` records the
+    // PO var in the caller's used-set (so it gets instantiated/imported) only
+    // when the reference is actually emitted.
+    const loginPO = pos.find((p) => p.kind === 'login');
+    const errGetter = loginPO ? this.findPoMethod(loginPO.methods, /error/i) : null;
+    const errorRef = (): string => {
+      if (loginPO && errGetter) {
+        usedPOVars?.add(loginPO.varName);
+        return `${loginPO.varName}.${errGetter}()`;
+      }
+      return ctx.sel.error;
+    };
 
     const quoted = exp.match(/'([^']+)'|"([^"]+)"/);
     const message = quoted ? (quoted[1] ?? quoted[2] ?? '') : '';
@@ -2772,27 +3024,46 @@ ${gotoB}${sessionLogin('pageB')}
       lines.push(`  await expect(page).toHaveURL(/inventory\\.html/);`);
       lines.push(`  await expect(${ctx.sel.title}).toHaveText(/Products/i);`);
       lines.push(`} else {`);
-      lines.push(`  await expect(${ctx.sel.error}).toBeVisible();`);
+      lines.push(`  await expect(${errorRef()}).toBeVisible();`);
       lines.push(`  await expect(page).toHaveURL('${escapeStr(ctx.url)}');`);
       lines.push(`}`);
       return lines;
     }
 
     if (isError) {
-      // Review priority #1 — a negative case must assert the ERROR container
-      // (never the username input) AND verify the actual message. When the
-      // expected text doesn't quote a message, derive a deterministic fragment
-      // from the case intent so invalid / locked / empty all assert meaningfully.
+      // A negative case must assert the ERROR container (never the username
+      // input) AND verify the actual message.
+      // Priority #3 — Assertion Intelligence. Derive the expected message from
+      // the Expected Result and the SCENARIO INTENT, never from the title.
+      // Previously this checked /locked/ first against a haystack that included
+      // the case title, so every "Locked user …" variant wrongly asserted
+      // 'locked out'. We now classify the scenario (empty / whitespace /
+      // special / maxlength / invalid / normal) and map deterministically:
+      //   empty → 'is required', invalid → 'do not match', locked → 'locked out'.
+      // Ambiguous input mutations (whitespace / special / maxlength) get NO
+      // guessed text — we assert the error surface + that we stayed on the login
+      // page, which is the reliable, scenario-faithful expectation.
       let frag = messageFrag;
       if (!frag) {
-        const hay = `${lc} ${`${_tc.title || ''}`.toLowerCase()} ${`${_tc.test_data || ''}`.toLowerCase()}`;
-        if (/locked|account is locked/.test(hay)) frag = 'locked out';
-        else if (/empty|required|blank|cannot be (empty|blank)|no .*(username|password)/.test(hay)) frag = 'is required';
-        else if (/do not match|not match|invalid|incorrect|wrong|bad credential/.test(hay)) frag = 'do not match';
+        const scenario = this.deriveLoginScenario(_tc, this.parseTestCaseSteps(_tc));
+        // Intent signals from Expected Result + scenario/test-data (NOT title).
+        const hay = `${lc} ${`${_tc.scenario ?? ''}`.toLowerCase()} ${`${_tc.test_data || ''}`.toLowerCase()}`;
+        if (scenario.kind === 'empty' || /empty|required|blank|cannot be (empty|blank)|no .*(username|password)/.test(lc)) {
+          frag = 'is required';
+        } else if (scenario.kind === 'invalid') {
+          frag = 'do not match';
+        } else if (scenario.kind === 'whitespace' || scenario.kind === 'special' || scenario.kind === 'maxlength') {
+          frag = ''; // ambiguous mutation — assert the error surface, not a guessed message
+        } else if (/account is locked|locked out|\blocked\b/.test(hay)) {
+          frag = 'locked out';
+        } else if (/do not match|not match|invalid|incorrect|wrong|bad credential/.test(hay)) {
+          frag = 'do not match';
+        }
       }
-      lines.push(`await expect(${ctx.sel.error}).toBeVisible();`);
+      const errTarget = errorRef();
+      lines.push(`await expect(${errTarget}).toBeVisible();`);
       if (frag) {
-        lines.push(`await expect(${ctx.sel.error}).toContainText('${escapeStr(frag)}');`);
+        lines.push(`await expect(${errTarget}).toContainText('${escapeStr(frag)}');`);
       }
       // A failed/invalid login must KEEP the user on the login page.
       lines.push(`await expect(page).toHaveURL('${escapeStr(ctx.url)}');`);
