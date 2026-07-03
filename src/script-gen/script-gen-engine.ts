@@ -1393,9 +1393,10 @@ ${combined.map(l => (l ? `    ${l}` : '')).join('\n')}
   // NOTE: Login-scenario classification and the per-scenario credential/assertion
   // transforms (empty / whitespace / special-char / max-length / invalid /
   // normal) now live in the dedicated Scenario Intelligence layer at
-  // ./scenario-intelligence (ScenarioClassifier + independent transformers),
-  // accessed via `this.scenario`. This keeps the generator free of embedded
-  // per-scenario branching and makes new scenario types drop-in.
+  // ./scenario-intelligence, accessed via `this.scenario`. Each scenario type is
+  // a self-describing transformer that owns its own detection (`matches`), so
+  // there is no central classifier to keep in sync. This keeps the generator
+  // free of embedded per-scenario branching and makes new scenario types drop-in.
 
   /* ──────────────────────────────────────────────────────────────────────── */
   /*  Coverage Metadata (Script-Gen Quality review — Priority #5)              */

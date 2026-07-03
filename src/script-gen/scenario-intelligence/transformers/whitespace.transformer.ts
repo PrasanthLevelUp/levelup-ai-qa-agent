@@ -1,4 +1,11 @@
-import type { CredentialPair, CredentialResolver, ScenarioTransformer } from '../types';
+import type {
+  CredentialPair,
+  CredentialResolver,
+  ScenarioCaseInput,
+  ScenarioClassification,
+  ScenarioTransformer,
+} from '../types';
+import { buildHaystack } from '../detection';
 import { wrapWhitespace } from '../expressions';
 
 /**
@@ -9,6 +16,11 @@ import { wrapWhitespace } from '../expressions';
 export class WhitespaceTransformer implements ScenarioTransformer {
   readonly kind = 'whitespace' as const;
   readonly coverageCategories = ['Negative', 'Boundary'] as const;
+
+  matches(input: ScenarioCaseInput | undefined, steps: string[]): ScenarioClassification | null {
+    const hay = buildHaystack(input, steps);
+    return /leading|trailing|whitespace|\bspaces?\b/.test(hay) ? { kind: this.kind } : null;
+  }
 
   transformCredentials(_c: unknown, r: CredentialResolver): CredentialPair {
     const base = r.base();

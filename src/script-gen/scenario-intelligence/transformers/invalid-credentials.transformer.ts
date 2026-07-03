@@ -1,4 +1,11 @@
-import type { CredentialPair, CredentialResolver, ScenarioTransformer } from '../types';
+import type {
+  CredentialPair,
+  CredentialResolver,
+  ScenarioCaseInput,
+  ScenarioClassification,
+  ScenarioTransformer,
+} from '../types';
+import { buildHaystack } from '../detection';
 
 /**
  * Invalid Credentials — honour an explicit invalid literal the step-writer
@@ -9,6 +16,13 @@ import type { CredentialPair, CredentialResolver, ScenarioTransformer } from '..
 export class InvalidCredentialsTransformer implements ScenarioTransformer {
   readonly kind = 'invalid' as const;
   readonly coverageCategories = ['Negative'] as const;
+
+  matches(input: ScenarioCaseInput | undefined, steps: string[]): ScenarioClassification | null {
+    const hay = buildHaystack(input, steps);
+    return /\b(invalid|incorrect|wrong|unregistered|nonexistent|non-existent)\b|do not match/.test(hay)
+      ? { kind: this.kind }
+      : null;
+  }
 
   transformCredentials(_c: unknown, r: CredentialResolver): CredentialPair {
     if (r.authoredUsername) {

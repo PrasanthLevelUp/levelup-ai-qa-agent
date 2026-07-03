@@ -1,4 +1,10 @@
-import type { CredentialPair, CredentialResolver, ScenarioTransformer } from '../types';
+import type {
+  CredentialPair,
+  CredentialResolver,
+  ScenarioCaseInput,
+  ScenarioClassification,
+  ScenarioTransformer,
+} from '../types';
 
 /**
  * Normal — no input mutation. Honour an explicit empty/negative literal the
@@ -10,6 +16,15 @@ import type { CredentialPair, CredentialResolver, ScenarioTransformer } from '..
 export class NormalTransformer implements ScenarioTransformer {
   readonly kind = 'normal' as const;
   readonly coverageCategories = [] as const;
+
+  /**
+   * The catch-all. Normal is the fallback scenario, so it matches unconditionally
+   * — the registry only consults it after every more-specific transformer has
+   * declined, so a case reaches here precisely when no mutation applies.
+   */
+  matches(_input: ScenarioCaseInput | undefined, _steps: string[]): ScenarioClassification | null {
+    return { kind: this.kind };
+  }
 
   transformCredentials(_c: unknown, r: CredentialResolver): CredentialPair {
     if (r.authoredBothEmpty) {

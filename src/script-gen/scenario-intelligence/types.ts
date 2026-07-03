@@ -1,15 +1,17 @@
 /**
  * Scenario Intelligence — shared contracts.
  *
- * Flow:  Test Case → ScenarioClassifier → ScenarioTransformer → Script Generation
+ * Flow:  Test Case → ScenarioTransformer (self-matching) → Script Generation
  *
- * The classifier decides WHAT kind of scenario a test case exercises; a
- * transformer decides HOW that scenario is realised in the generated script
- * (the credential expressions it feeds into `login(...)`, the error fragment it
- * expects, and the coverage categories it contributes). Each scenario type is an
- * independent transformer, so new types (SQL Injection, XSS, MFA, Session
- * Timeout, …) can be added by dropping in a new transformer + one classifier
- * rule — without touching the generator.
+ * Each transformer is fully self-describing: it decides BOTH whether it applies
+ * to a test case (`matches`) AND how that scenario is realised in the generated
+ * script — the credential expressions it feeds into `login(...)`, the error
+ * fragment it expects, and the coverage categories it contributes. There is no
+ * central classifier to keep in sync: the registry simply asks each transformer,
+ * in precedence order, whether it matches and uses the first that does. Adding a
+ * new scenario type (SQL Injection, XSS, MFA, Session Timeout, …) is therefore a
+ * single-file change — drop in a new transformer that owns its own detection —
+ * with zero edits to the generator or any classifier.
  */
 
 /** The built-in scenario kinds. Extend the union when adding a transformer. */
@@ -21,7 +23,11 @@ export type ScenarioKind =
   | 'invalid'
   | 'normal';
 
-/** Output of the classifier: the scenario kind plus any extracted parameters. */
+/**
+ * What a transformer's `matches` reports when it claims a case: the scenario
+ * kind plus any parameters it mined while matching (so detection and parameter
+ * extraction stay co-located in the transformer that owns them).
+ */
 export interface ScenarioClassification {
   kind: ScenarioKind;
   /** Explicit special-character value authored in a step, e.g. "@locked_user". */
@@ -31,8 +37,8 @@ export interface ScenarioClassification {
 }
 
 /**
- * Generator-agnostic view of a test case, so the classifier never depends on the
- * engine's internal `GenerationConfig` shape.
+ * Generator-agnostic view of a test case, so a transformer's detection never
+ * depends on the engine's internal `GenerationConfig` shape.
  */
 export interface ScenarioCaseInput {
   title?: string | null;
@@ -80,6 +86,19 @@ export interface CredentialResolver {
 export interface ScenarioTransformer {
   /** The kind this transformer handles (also its registry key). */
   readonly kind: ScenarioKind;
+  /**
+   * Self-describing detection. Given a generator-agnostic view of the case and
+   * its parsed steps, return this scenario's {@link ScenarioClassification}
+   * (including any parameters mined while matching, e.g. a special-char literal
+   * or boundary length) when the case belongs to this transformer, or `null`
+   * when it does not. The registry consults transformers in precedence order and
+   * uses the first non-null result, so each transformer owns its own detection
+   * logic and no central classifier is required.
+   */
+  matches(
+    input: ScenarioCaseInput | undefined,
+    steps: string[],
+  ): ScenarioClassification | null;
   /**
    * Coverage categories (Functional / Negative / Boundary / Validation / …) this
    * scenario contributes to the spec header. Empty means "contributes nothing"

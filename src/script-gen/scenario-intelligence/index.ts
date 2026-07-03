@@ -1,20 +1,20 @@
 /**
  * Scenario Intelligence — public surface.
  *
- *   Test Case → ScenarioClassifier → ScenarioTransformer → Script Generation
+ *   Test Case → ScenarioTransformer (self-matching) → Script Generation
  *
  * The generator uses the {@link ScenarioIntelligence} facade to classify a case
- * and obtain its transformer; each scenario type lives in its own transformer
- * under ./transformers, so the layer is extensible without generator changes.
+ * and obtain its transformer. Each scenario type lives in its own transformer
+ * under ./transformers and owns its own detection (`matches`), so the layer is
+ * extensible without a central classifier or any generator changes.
  */
-import { ScenarioClassifier } from './scenario-classifier';
-import { getScenarioTransformer } from './transformers';
+import { classifyScenario, getScenarioTransformer } from './transformers';
 import type { ScenarioCaseInput, ScenarioClassification, ScenarioTransformer } from './types';
 
 export * from './types';
-export { ScenarioClassifier } from './scenario-classifier';
 export {
   SCENARIO_TRANSFORMERS,
+  classifyScenario,
   getScenarioTransformer,
   EmptyFieldsTransformer,
   WhitespaceTransformer,
@@ -24,16 +24,14 @@ export {
   NormalTransformer,
 } from './transformers';
 
-/** Thin facade tying the classifier to the transformer registry. */
+/** Thin facade over the self-matching transformer registry. */
 export class ScenarioIntelligence {
-  private readonly classifier = new ScenarioClassifier();
-
-  /** Classify a test case's input-mutation intent. */
+  /** Classify a test case's input-mutation intent (first matching transformer wins). */
   classify(tc: ScenarioCaseInput | undefined, steps: string[]): ScenarioClassification {
-    return this.classifier.classify(tc, steps);
+    return classifyScenario(tc, steps).classification;
   }
 
-  /** Resolve the transformer for a classified kind. */
+  /** Resolve the transformer for an already-known classification. */
   transformer(classification: ScenarioClassification): ScenarioTransformer {
     return getScenarioTransformer(classification.kind);
   }
@@ -43,7 +41,6 @@ export class ScenarioIntelligence {
     tc: ScenarioCaseInput | undefined,
     steps: string[],
   ): { classification: ScenarioClassification; transformer: ScenarioTransformer } {
-    const classification = this.classify(tc, steps);
-    return { classification, transformer: getScenarioTransformer(classification.kind) };
+    return classifyScenario(tc, steps);
   }
 }

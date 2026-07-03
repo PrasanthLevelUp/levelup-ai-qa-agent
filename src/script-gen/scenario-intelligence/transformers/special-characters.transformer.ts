@@ -1,9 +1,11 @@
 import type {
   CredentialPair,
   CredentialResolver,
+  ScenarioCaseInput,
   ScenarioClassification,
   ScenarioTransformer,
 } from '../types';
+import { buildHaystack, extractSpecialCharLiteral } from '../detection';
 import { prependSpecialChar } from '../expressions';
 
 /**
@@ -14,6 +16,12 @@ import { prependSpecialChar } from '../expressions';
 export class SpecialCharactersTransformer implements ScenarioTransformer {
   readonly kind = 'special' as const;
   readonly coverageCategories = ['Negative', 'Boundary'] as const;
+
+  matches(input: ScenarioCaseInput | undefined, steps: string[]): ScenarioClassification | null {
+    const hay = buildHaystack(input, steps);
+    if (!/special[\s-]*char/.test(hay)) return null;
+    return { kind: this.kind, literal: extractSpecialCharLiteral(steps) || undefined };
+  }
 
   transformCredentials(c: ScenarioClassification, r: CredentialResolver): CredentialPair {
     const base = r.base();
