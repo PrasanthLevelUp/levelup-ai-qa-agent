@@ -28,6 +28,10 @@ import { SelectorQualityEngine, type ScoredSelector } from './selector-quality-e
 import { buildStabilityProvider, trackGeneratedSelector } from '../services/intelligence-learning-service';
 import { getCrawlAdaptationForUrl } from '../services/crawl-adaptation-service';
 import { AssertionEngine, type GeneratedAssertion } from './assertion-engine';
+import {
+  ScenarioIntelligence,
+  type CredentialResolver as ScenarioCredentialResolver,
+} from './scenario-intelligence';
 import { WaitStrategyEngine, type WaitStrategy } from './wait-strategy-engine';
 import { logger } from '../utils/logger';
 import type { RepositoryProfile, ClassInfo } from '../context/types';
@@ -358,6 +362,10 @@ export class ScriptGenEngine {
   private readonly assertionEngine = new AssertionEngine();
   private readonly waitEngine = new WaitStrategyEngine();
   private readonly workflowMapper = new WorkflowMapper();
+  // Scenario Intelligence layer: Test Case → Classifier → Transformer → Script.
+  // Owns all scenario-specific credential mutation, assertion hints and coverage
+  // categories; keeps the generator free of embedded per-scenario branching.
+  private readonly scenario = new ScenarioIntelligence();
 
   constructor(config?: { apiKey?: string; model?: string }) {
     // Lazy/optional API key: url-based generation still needs the LLM to infer a
@@ -1376,88 +1384,18 @@ ${combined.map(l => (l ? `    ${l}` : '')).join('\n')}
 
   /* ──────────────────────────────────────────────────────────────────────── */
   /*  Scenario Intent Fidelity (Script-Gen Quality review — Priority #1)       */
-  /*  The deterministic builder must IMPLEMENT the exact scenario each test    */
-  /*  case describes (whitespace / special-char / max-length / empty /         */
-  /*  invalid) rather than copying the happy-path login. These helpers detect  */
-  /*  the intent from the case (title + scenario + coverage_type + steps) and  */
-  /*  transform the resolved username expression accordingly.                  */
+  /*  The deterministic builder IMPLEMENTS the exact scenario each test case    */
+  /*  describes (whitespace / special-char / max-length / empty / invalid)     */
+  /*  rather than copying the happy-path login — via the Scenario Intelligence */
+  /*  layer (classifier + independent transformers), not inline branching.     */
   /* ──────────────────────────────────────────────────────────────────────── */
 
-  /**
-   * Classify the input-mutation intent of a login test case. Precedence is
-   * chosen so the most specific, testable mutation wins:
-   *   empty → whitespace → special-char → max-length → invalid → normal
-   * `literal` carries an explicit special-character value authored in a step
-   * (e.g. "Enter '@locked_user'"); `length` carries a boundary length.
-   */
-  private deriveLoginScenario(
-    tc: NonNullable<GenerationConfig['testCase']> | undefined,
-    steps: string[],
-  ): { kind: 'empty' | 'whitespace' | 'special' | 'maxlength' | 'invalid' | 'normal'; literal?: string; length?: number } {
-    const hay = [
-      tc?.title, tc?.scenario, (tc as any)?.coverage_type, (steps || []).join(' '),
-    ].map((s) => `${s ?? ''}`).join(' ').toLowerCase();
-
-    if (/\bempty\b|\bblank\b|leave.*(empty|blank)|without\s+(a\s+)?(username|password|credential)/.test(hay)) {
-      return { kind: 'empty' };
-    }
-    if (/leading|trailing|whitespace|\bspaces?\b/.test(hay)) {
-      return { kind: 'whitespace' };
-    }
-    if (/special[\s-]*char/.test(hay)) {
-      return { kind: 'special', literal: this.extractSpecialCharLiteral(steps) || undefined };
-    }
-    if (/max(?:imum)?[\s-]*length|too\s+long|very\s+long|exceed\w*\s+length|\blong\b.*(user|name)/.test(hay)) {
-      const num = hay.match(/\b(\d{2,4})\b/);
-      const length = num ? Math.min(parseInt(num[1]!, 10), 4096) : 256;
-      return { kind: 'maxlength', length };
-    }
-    if (/\b(invalid|incorrect|wrong|unregistered|nonexistent|non-existent)\b|do not match/.test(hay)) {
-      return { kind: 'invalid' };
-    }
-    return { kind: 'normal' };
-  }
-
-  /**
-   * Pull an explicit special-character username authored in a username step,
-   * e.g. "Enter '@locked_user' in [data-testid='username']" → "@locked_user".
-   * Bracketed selectors are stripped first so an attribute value is never mined.
-   * Returns '' when no special-character literal is present.
-   */
-  private extractSpecialCharLiteral(steps: string[]): string {
-    for (const s of steps || []) {
-      if (!/user|email|login\s*id/i.test(s)) continue;
-      const cleaned = String(s).replace(/\[[^\]]*\]/g, ' '); // drop [data-testid='…']
-      const m = cleaned.match(/'([^']+)'|"([^"]+)"/);
-      const v = m ? (m[1] ?? m[2] ?? '').trim() : '';
-      if (v && /[^a-zA-Z0-9_]/.test(v)) return v; // contains a genuine special char
-    }
-    return '';
-  }
-
-  /**
-   * Wrap a resolved username expression so it carries a leading AND trailing
-   * space (leading/trailing-whitespace scenario). Keeps the value data-driven:
-   *   - literal 'locked_out_user' → ' locked_out_user '
-   *   - expression user.username  → ` ${user.username} `
-   */
-  private wrapWhitespaceExpr(baseExpr: string): string {
-    const lit = baseExpr.match(/^'(.*)'$/);
-    if (lit) return `' ${lit[1]} '`;
-    return '`' + ' ${' + baseExpr + '} ' + '`';
-  }
-
-  /**
-   * Prepend a special character to a resolved username expression when the case
-   * did not author an explicit special-character value:
-   *   - literal 'locked_out_user' → '@locked_out_user'
-   *   - expression user.username  → `@${user.username}`
-   */
-  private specialCharExpr(baseExpr: string): string {
-    const lit = baseExpr.match(/^'(.*)'$/);
-    if (lit) return `'@${lit[1]}'`;
-    return '`@${' + baseExpr + '}`';
-  }
+  // NOTE: Login-scenario classification and the per-scenario credential/assertion
+  // transforms (empty / whitespace / special-char / max-length / invalid /
+  // normal) now live in the dedicated Scenario Intelligence layer at
+  // ./scenario-intelligence (ScenarioClassifier + independent transformers),
+  // accessed via `this.scenario`. This keeps the generator free of embedded
+  // per-scenario branching and makes new scenario types drop-in.
 
   /* ──────────────────────────────────────────────────────────────────────── */
   /*  Coverage Metadata (Script-Gen Quality review — Priority #5)              */
@@ -1497,6 +1435,14 @@ ${combined.map(l => (l ? `    ${l}` : '')).join('\n')}
     if (/edge|boundary|\bmax(?:imum)?\b|\bmin(?:imum)?\b|length|whitespace|special\s*char|limit|overflow/.test(hay)) add('Boundary');
     if (/empty|required|blank|validation|format|missing|mandatory/.test(hay)) add('Validation');
     if (/\bpositive\b|smoke|happy\s*path|\bsuccess\b/.test(hay)) add('Functional');
+    // Fold in the categories declared by the classified scenario's transformer,
+    // so a new scenario type contributes its coverage category automatically
+    // (the 'normal' transformer contributes nothing and defers to the heuristics
+    // above). This keeps coverage metadata in lock-step with the transformer set.
+    if (tc) {
+      const { transformer } = this.scenario.resolve(tc, this.parseTestCaseSteps(tc));
+      for (const c of transformer.coverageCategories) add(c);
+    }
     // Default: a case that is none of the above is a straightforward Functional
     // check. Always surface at least one category.
     if (!cats.length) add('Functional');
@@ -2452,69 +2398,31 @@ ${gotoB}${sessionLogin('pageB')}
         const envUser = () => ctx.creds.username ? `'${escapeStr(ctx.creds.username)}'` : `process.env.TEST_USERNAME ?? ''`;
         const envPass = () => ctx.creds.password ? `'${escapeStr(ctx.creds.password)}'` : `process.env.TEST_PASSWORD ?? ''`;
 
-        // Classify the input-mutation intent from the case itself and transform
-        // the base expressions accordingly.
-        const scenario = this.deriveLoginScenario(tc, steps ?? []);
-        let u: string;
-        let p: string;
-        switch (scenario.kind) {
-          case 'empty':
-            // Leave BOTH fields empty (the field-emptiness IS the scenario).
-            u = `''`;
-            p = `''`;
-            break;
-          case 'whitespace':
-            // Leading/trailing whitespace around the real username value.
-            ensureBase();
-            u = this.wrapWhitespaceExpr(baseUser);
-            p = basePass;
-            break;
-          case 'special':
-            // Use the special-character value authored in the step when present
-            // (e.g. '@locked_user'); otherwise prepend a special char to base.
-            ensureBase();
-            u = scenario.literal ? `'${escapeStr(scenario.literal)}'` : this.specialCharExpr(baseUser);
-            p = basePass;
-            break;
-          case 'maxlength':
-            // Maximum-length username boundary.
-            ensureBase();
-            u = `'A'.repeat(${scenario.length ?? 256})`;
-            p = basePass;
-            break;
-          case 'invalid': {
-            // Honor an explicit invalid literal the step-writer emitted; else
-            // pair a clearly-invalid credential with its valid counterpart.
-            if (userFillVal && userFillVal !== `''` && !isKnownRecordKey(userFillVal)) {
-              u = typeof userFillVal === 'object' ? userFillVal.literal : userFillVal;
-              p = validCounterpart().p ?? envPass();
-            } else if (passFillVal && passFillVal !== `''` && !isKnownRecordKey(passFillVal)) {
-              p = typeof passFillVal === 'object' ? passFillVal.literal : passFillVal;
-              u = validCounterpart().u ?? envUser();
-            } else {
-              u = `'invalid_user'`;
-              p = `'wrong_password'`;
-            }
-            break;
-          }
-          default:
-            // normal → honor an explicit empty/negative literal the writer
-            // emitted, otherwise bind to the resolved record (positive path).
-            if (userFillVal === `''` && passFillVal === `''`) {
-              u = `''`;
-              p = `''`;
-            } else if (userFillVal && userFillVal !== `''` && !isKnownRecordKey(userFillVal)) {
-              u = typeof userFillVal === 'object' ? userFillVal.literal : userFillVal;
-              p = validCounterpart().p ?? envPass();
-            } else if (passFillVal && passFillVal !== `''` && !isKnownRecordKey(passFillVal)) {
-              p = typeof passFillVal === 'object' ? passFillVal.literal : passFillVal;
-              u = validCounterpart().u ?? envUser();
-            } else {
-              ensureBase();
-              u = baseUser;
-              p = basePass;
-            }
-        }
+        // Scenario Intelligence: classify the input-mutation intent, then let the
+        // matching transformer build the login() credentials. All per-scenario
+        // logic (whitespace / special / max-length / empty / invalid / normal)
+        // lives in independent transformers under ./scenario-intelligence — the
+        // generator only supplies a resolver describing HOW to obtain the base,
+        // valid-counterpart and env credentials, and normalises the writer's
+        // authored literals. Adding a scenario type never touches this code.
+        const authoredLiteral = (v: any): string | null =>
+          v && v !== `''` && !isKnownRecordKey(v)
+            ? (typeof v === 'object' ? v.literal : v)
+            : null;
+        const credentialResolver: ScenarioCredentialResolver = {
+          base: () => { ensureBase(); return { username: baseUser, password: basePass }; },
+          validCounterpart: () => { const v = validCounterpart(); return { username: v.u, password: v.p }; },
+          envUsername: () => envUser(),
+          envPassword: () => envPass(),
+          authoredUsername: authoredLiteral(userFillVal),
+          authoredPassword: authoredLiteral(passFillVal),
+          authoredBothEmpty: userFillVal === `''` && passFillVal === `''`,
+          escape: escapeStr,
+        };
+        const { classification, transformer } = this.scenario.resolve(tc, steps ?? []);
+        const creds = transformer.transformCredentials(classification, credentialResolver);
+        let u = creds.username;
+        let p = creds.password;
         // Priority #4 — Repository Reuse. When the LoginPage exposes an explicit
         // navigation method (open / goto / navigate / load), prefer it over a
         // raw `page.goto(baseUrl)` so the spec drives entry through the repo's
@@ -3045,14 +2953,18 @@ ${gotoB}${sessionLogin('pageB')}
       // page, which is the reliable, scenario-faithful expectation.
       let frag = messageFrag;
       if (!frag) {
-        const scenario = this.deriveLoginScenario(_tc, this.parseTestCaseSteps(_tc));
+        // The transformer for the classified scenario supplies the deterministic
+        // fragment: a string to assert, '' to assert the error surface only, or
+        // null when the scenario dictates nothing (defer to Expected-Result text).
+        const { transformer } = this.scenario.resolve(_tc, this.parseTestCaseSteps(_tc));
+        const scenarioFrag = transformer.errorFragment();
         // Intent signals from Expected Result + scenario/test-data (NOT title).
         const hay = `${lc} ${`${_tc.scenario ?? ''}`.toLowerCase()} ${`${_tc.test_data || ''}`.toLowerCase()}`;
-        if (scenario.kind === 'empty' || /empty|required|blank|cannot be (empty|blank)|no .*(username|password)/.test(lc)) {
+        if (scenarioFrag === 'is required' || /empty|required|blank|cannot be (empty|blank)|no .*(username|password)/.test(lc)) {
           frag = 'is required';
-        } else if (scenario.kind === 'invalid') {
+        } else if (scenarioFrag === 'do not match') {
           frag = 'do not match';
-        } else if (scenario.kind === 'whitespace' || scenario.kind === 'special' || scenario.kind === 'maxlength') {
+        } else if (scenarioFrag === '') {
           frag = ''; // ambiguous mutation — assert the error surface, not a guessed message
         } else if (/account is locked|locked out|\blocked\b/.test(hay)) {
           frag = 'locked out';
