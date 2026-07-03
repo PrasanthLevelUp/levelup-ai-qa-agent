@@ -15,6 +15,7 @@ import type {
  */
 export class NormalTransformer implements ScenarioTransformer {
   readonly kind = 'normal' as const;
+  readonly priority = 99; // lowest precedence — catch-all fallback
   readonly coverageCategories = [] as const;
 
   /**

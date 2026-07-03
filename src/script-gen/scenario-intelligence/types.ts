@@ -87,6 +87,12 @@ export interface ScenarioTransformer {
   /** The kind this transformer handles (also its registry key). */
   readonly kind: ScenarioKind;
   /**
+   * Detection precedence. Lower values = higher priority (checked first). The
+   * registry sorts transformers by this property, so precedence is explicit and
+   * self-documenting. The most specific, testable mutation should win.
+   */
+  readonly priority: number;
+  /**
    * Self-describing detection. Given a generator-agnostic view of the case and
    * its parsed steps, return this scenario's {@link ScenarioClassification}
    * (including any parameters mined while matching, e.g. a special-char literal

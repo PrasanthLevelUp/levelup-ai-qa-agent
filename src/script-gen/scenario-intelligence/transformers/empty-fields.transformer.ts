@@ -12,6 +12,7 @@ import { buildHaystack } from '../detection';
  */
 export class EmptyFieldsTransformer implements ScenarioTransformer {
   readonly kind = 'empty' as const;
+  readonly priority = 1; // most specific — empty outranks all other negative mutations
   readonly coverageCategories = ['Negative', 'Validation'] as const;
 
   matches(input: ScenarioCaseInput | undefined, steps: string[]): ScenarioClassification | null {

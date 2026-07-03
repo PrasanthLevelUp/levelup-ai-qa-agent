@@ -15,6 +15,7 @@ import { prependSpecialChar } from '../expressions';
  */
 export class SpecialCharactersTransformer implements ScenarioTransformer {
   readonly kind = 'special' as const;
+  readonly priority = 3;
   readonly coverageCategories = ['Negative', 'Boundary'] as const;
 
   matches(input: ScenarioCaseInput | undefined, steps: string[]): ScenarioClassification | null {

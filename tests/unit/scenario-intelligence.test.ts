@@ -84,7 +84,8 @@ function main() {
   console.log('=== Registry shape & completeness ===');
   const kinds: ScenarioKind[] = ['empty', 'whitespace', 'special', 'maxlength', 'invalid', 'normal'];
   ok('registry is an ordered array', Array.isArray(SCENARIO_TRANSFORMERS) && SCENARIO_TRANSFORMERS.length === kinds.length);
-  ok('registry order encodes precedence', SCENARIO_TRANSFORMERS.map((t) => t.kind).join('>') === 'empty>whitespace>special>maxlength>invalid>normal');
+  ok('registry is sorted by priority (ascending)', (() => { for (let i = 1; i < SCENARIO_TRANSFORMERS.length; i++) { if (SCENARIO_TRANSFORMERS[i]!.priority < SCENARIO_TRANSFORMERS[i - 1]!.priority) return false; } return true; })());
+  ok('registry order matches priority-based precedence', SCENARIO_TRANSFORMERS.map((t) => t.kind).join('>') === 'empty>whitespace>special>maxlength>invalid>normal');
   ok('normal is last (guaranteed fallback)', SCENARIO_TRANSFORMERS[SCENARIO_TRANSFORMERS.length - 1]!.kind === 'normal');
   ok('every kind has a transformer', kinds.every((k) => !!getScenarioTransformer(k)));
   ok('each transformer reports its own kind', kinds.every((k) => getScenarioTransformer(k).kind === k));

@@ -15,6 +15,7 @@ import { wrapWhitespace } from '../expressions';
  */
 export class WhitespaceTransformer implements ScenarioTransformer {
   readonly kind = 'whitespace' as const;
+  readonly priority = 2;
   readonly coverageCategories = ['Negative', 'Boundary'] as const;
 
   matches(input: ScenarioCaseInput | undefined, steps: string[]): ScenarioClassification | null {

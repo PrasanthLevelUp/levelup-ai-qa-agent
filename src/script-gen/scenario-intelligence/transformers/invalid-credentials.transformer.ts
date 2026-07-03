@@ -15,6 +15,7 @@ import { buildHaystack } from '../detection';
  */
 export class InvalidCredentialsTransformer implements ScenarioTransformer {
   readonly kind = 'invalid' as const;
+  readonly priority = 5;
   readonly coverageCategories = ['Negative'] as const;
 
   matches(input: ScenarioCaseInput | undefined, steps: string[]): ScenarioClassification | null {

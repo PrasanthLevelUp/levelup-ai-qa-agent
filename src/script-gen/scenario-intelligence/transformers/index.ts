@@ -21,21 +21,24 @@ export {
 };
 
 /**
- * The transformer registry, in DETECTION PRECEDENCE order.
+ * The transformer registry, sorted by detection precedence.
  *
  * The registry does not know anything about individual scenarios: it simply asks
  * each transformer, in order, whether it matches and returns the first that does
- * (the most specific, testable mutation wins):
+ * (the most specific, testable mutation wins). Each transformer declares its own
+ * `priority` (lower = higher precedence), so precedence is self-documenting and
+ * resilient to refactoring:
  *
- *   empty → whitespace → special-char → max-length → invalid → normal
+ *   empty (1) → whitespace (2) → special-char (3) → max-length (4) → invalid (5) → normal (99)
  *
- * `normal` is last and matches unconditionally, so it is the guaranteed fallback.
- * Adding a new scenario type is a single-file change: implement a
- * ScenarioTransformer that owns its own `matches`, and insert it here at the
- * right precedence. Nothing in the generator — and no central classifier — needs
+ * `normal` has the lowest precedence (highest priority number) and matches
+ * unconditionally, so it is the guaranteed fallback. Adding a new scenario type
+ * is a single-file change: implement a ScenarioTransformer that owns its own
+ * `matches` and `priority`, instantiate it here, and the registry will slot it in
+ * the right order. Nothing in the generator — and no central classifier — needs
  * to change.
  */
-export const SCENARIO_TRANSFORMERS: readonly ScenarioTransformer[] = [
+const TRANSFORMERS_UNSORTED: ScenarioTransformer[] = [
   new EmptyFieldsTransformer(),
   new WhitespaceTransformer(),
   new SpecialCharactersTransformer(),
@@ -43,6 +46,9 @@ export const SCENARIO_TRANSFORMERS: readonly ScenarioTransformer[] = [
   new InvalidCredentialsTransformer(),
   new NormalTransformer(),
 ];
+
+export const SCENARIO_TRANSFORMERS: readonly ScenarioTransformer[] =
+  TRANSFORMERS_UNSORTED.slice().sort((a, b) => a.priority - b.priority);
 
 /** By-kind index, derived from the registry, for direct lookup by scenario kind. */
 const BY_KIND: Record<ScenarioKind, ScenarioTransformer> = SCENARIO_TRANSFORMERS.reduce(

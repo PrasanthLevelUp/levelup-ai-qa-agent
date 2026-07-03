@@ -14,6 +14,7 @@ import { buildHaystack } from '../detection';
  */
 export class BoundaryLengthTransformer implements ScenarioTransformer {
   readonly kind = 'maxlength' as const;
+  readonly priority = 4;
   readonly coverageCategories = ['Negative', 'Boundary'] as const;
 
   matches(input: ScenarioCaseInput | undefined, steps: string[]): ScenarioClassification | null {
