@@ -125,6 +125,17 @@ export function createRepoIntelligenceRouter(): Router {
           codeChunks: chunksInserted,
           embedded: result.embed?.embedded,
           scanDurationMs,
+          // Wait & Logging Intelligence
+          waitStyle: profile.codingStyle.waitStyle,
+          waitStyles: profile.codingStyle.waitStyles,
+          usesFixedTimeouts: profile.codingStyle.usesFixedTimeouts,
+          loggingStyle: profile.codingStyle.loggingStyle,
+          loggingStyles: profile.codingStyle.loggingStyles,
+          // Capability Detection
+          hasApiLayer: profile.hasApiLayer,
+          hasCustomFixtures: profile.hasCustomFixtures,
+          hasMocking: profile.hasMocking,
+          hasVisualTesting: profile.hasVisualTesting,
         },
       });
     } catch (err: any) {
