@@ -53,6 +53,7 @@ function meta(over: Partial<OrchestratedIntelligence['metadata']> = {}): Orchest
       domSelectors: 0,
     },
     selected: { repositoryMethods: [], datasets: [], patterns: [] },
+    intelligenceScore: { grounded: 0, aiContribution: 100, bySource: {}, summary: 'No grounding intelligence available — 100% AI-generated.' },
     sourceVersions: {},
     ...over,
   };
@@ -209,6 +210,56 @@ console.log('\n=== Warnings ===');
   assertContains(context, 'App profile not found', 'Second warning');
 }
 
+console.log('\n=== Intelligence Score: computeIntelligenceScore (pure) ===');
+{
+  // High grounding, repository dominant → "grounded in repository intelligence".
+  const s1 = IntelligenceOrchestrator.computeIntelligenceScore(94, {
+    repository: 95,
+    knowledge: 87,
+    patterns: 98,
+    appProfile: 100,
+  });
+  assert(s1.grounded === 94, 'grounded echoes overall confidence (94)');
+  assert(s1.aiContribution === 6, 'aiContribution is inverse of grounded (6)');
+  assert(s1.bySource['App Profile'] === 100, 'bySource carries UI-labelled App Profile');
+  assert(s1.bySource['Repository Match'] === 95, 'bySource carries Repository Match');
+  assert(s1.bySource['Pattern Match'] === 98, 'bySource carries Pattern Match');
+  // Top source is App Profile (100) → phrase reflects it.
+  assertContains(s1.summary, '94% grounded in app profile intelligence. Only 6% AI-generated.', 'Summary one-liner for dominant source');
+
+  // No sources → fully AI-generated.
+  const s2 = IntelligenceOrchestrator.computeIntelligenceScore(0, {});
+  assert(s2.grounded === 0 && s2.aiContribution === 100, 'Empty → 0% grounded / 100% AI');
+  assertContains(s2.summary, '100% AI-generated', 'Empty summary states 100% AI');
+
+  // Clamping: over-100 confidence clamps, negative AI never occurs.
+  const s3 = IntelligenceOrchestrator.computeIntelligenceScore(130, { repository: 95 });
+  assert(s3.grounded === 100 && s3.aiContribution === 0, 'grounded clamps to 100, AI to 0');
+}
+
+console.log('\n=== Intelligence Score: rendered in buildPromptContext ===');
+{
+  const intel: OrchestratedIntelligence = {
+    available: true,
+    intent: 'Login',
+    repositoryGraph: { ...emptyRepoGraph },
+    appProfile: null,
+    testData: { available: false, datasets: [] },
+    knowledge: null,
+    domMemory: { available: false, selectors: [] },
+    similarity: { available: false, similarScripts: [] },
+    learnedPatterns: { available: false, patterns: [] },
+    metadata: meta({
+      sourcesUsed: ['repository-graph'],
+      confidenceScore: 30,
+      confidenceBySource: { repository: 90 },
+      intelligenceScore: IntelligenceOrchestrator.computeIntelligenceScore(30, { repository: 90 }),
+    }),
+  };
+  const context = orchestrator.buildPromptContext(intel);
+  assertContains(context, 'Intelligence Score: 30% grounded / 70% AI-generated', 'Intelligence Score line rendered in prompt');
+}
+
 /* ------------------------------------------------------------------ */
 /*  Tests — gatherIntelligence (mocked pool): sources filter + timing  */
 /* ------------------------------------------------------------------ */
@@ -241,6 +292,12 @@ console.log('\n=== gatherIntelligence: configurable sources filter ===');
   assert(intel.metadata.timingsMs.knowledge === undefined, 'knowledge NOT timed (not requested)');
   assert(intel.metadata.timingsMs.domMemory === undefined, 'domMemory NOT timed (not requested)');
   assert(typeof intel.metadata.timingsMs.total === 'number', 'total timing recorded');
+  // Intelligence Score is always present on the gathered result.
+  assert(intel.metadata.intelligenceScore != null, 'intelligenceScore present on gathered result');
+  assert(
+    intel.metadata.intelligenceScore.grounded + intel.metadata.intelligenceScore.aiContribution === 100,
+    'grounded + aiContribution always sum to 100',
+  );
   // Only the learned_patterns query should have run.
   assert(queries.length === 1 && /learned_patterns/.test(queries[0]), 'Only learned_patterns query executed');
 
