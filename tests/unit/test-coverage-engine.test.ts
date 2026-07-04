@@ -523,18 +523,102 @@ describe('TestCoverageEngine - Enterprise Output Schema (objective + riskArea)',
 });
 
 // ============================================================================
+// Phase 2 — Intelligence Orchestrator integration (Test Case Lab)
+// ============================================================================
+
+// Async test collector — the orchestrated block builder is async and the flag
+// is read at call time, so these run in the async runner below.
+const asyncTests: Array<{ name: string; fn: () => Promise<void> }> = [];
+function itAsync(name: string, fn: () => Promise<void>) {
+  asyncTests.push({ name, fn });
+}
+
+describe('TestCoverageEngine - deriveIntent (Phase 2)', () => {
+  const engine = new TestCoverageEngine();
+
+  it('should derive intent from title + business flow', () => {
+    const intent = (engine as any).deriveIntent({
+      title: 'User Login',
+      businessFlow: 'authenticate with email and password',
+    });
+    expect(intent).toContain('User Login');
+    expect(intent).toContain('authenticate');
+  });
+
+  it('should fall back to acceptance criteria then description', () => {
+    const fromAc = (engine as any).deriveIntent({ title: '', acceptanceCriteria: 'reset password via email' });
+    expect(fromAc).toContain('reset password');
+    const fromDesc = (engine as any).deriveIntent({ title: '', description: 'checkout with saved card' });
+    expect(fromDesc).toContain('checkout');
+  });
+
+  it('should cap the intent to at most 12 words', () => {
+    const long = Array.from({ length: 30 }, (_, i) => `w${i}`).join(' ');
+    const intent = (engine as any).deriveIntent({ title: long });
+    expect(intent.split(/\s+/).length).toBe(12);
+  });
+
+  it('should return empty string when no signals present', () => {
+    const intent = (engine as any).deriveIntent({ title: '' });
+    expect(intent).toBe('');
+  });
+});
+
+describe('TestCoverageEngine - Orchestrated block gating (Phase 2)', () => {
+  const engine = new TestCoverageEngine();
+
+  // With the flag OFF (default in the unit-test env) the orchestrated block must
+  // be empty and carry NO Intelligence Score, so the legacy flat-block path is
+  // byte-for-byte preserved. This is the core "additive / flag-gated" guarantee.
+  itAsync('returns an empty block and no score when the flag is disabled', async () => {
+    delete process.env.ENABLE_INTELLIGENCE_ORCHESTRATOR;
+    const result = await (engine as any).buildOrchestratedIntelligenceBlock(
+      { title: 'User Login', businessFlow: 'authenticate' },
+      { orchestratorScope: { companyId: 1, projectId: 2 } },
+    );
+    expect(result.block).toBe('');
+    expect(result.intelligenceScore).toBe(undefined);
+  });
+
+  // Even with the flag ON, a missing scope (no companyId) must short-circuit to
+  // an empty block — the engine never calls the orchestrator without a scope.
+  itAsync('returns an empty block when no orchestrator scope is provided', async () => {
+    process.env.ENABLE_INTELLIGENCE_ORCHESTRATOR = 'true';
+    const result = await (engine as any).buildOrchestratedIntelligenceBlock(
+      { title: 'User Login', businessFlow: 'authenticate' },
+      {},
+    );
+    expect(result.block).toBe('');
+    expect(result.intelligenceScore).toBe(undefined);
+    delete process.env.ENABLE_INTELLIGENCE_ORCHESTRATOR;
+  });
+});
+
+// ============================================================================
 // Test Runner
 // ============================================================================
 
 console.log('\n🧪 Test Coverage Engine Unit Tests\n');
 console.log('='.repeat(60));
 
-// Run all tests synchronously
-try {
-  // All describe blocks have already executed when this file was loaded
+(async () => {
+  // Run async (Phase 2) tests after the synchronous describe blocks above.
+  for (const t of asyncTests) {
+    testCount++;
+    try {
+      await t.fn();
+      passedCount++;
+      console.log(`  ✓ ${t.name}`);
+    } catch (err: any) {
+      failedCount++;
+      console.log(`  ✗ ${t.name}`);
+      console.log(`    Error: ${err.message}`);
+    }
+  }
+
   console.log('\n' + '='.repeat(60));
   console.log(`\nResults: ${passedCount}/${testCount} tests passed`);
-  
+
   if (failedCount > 0) {
     console.log(`\n❌ ${failedCount} test(s) failed\n`);
     process.exit(1);
@@ -542,7 +626,4 @@ try {
     console.log(`\n✅ All tests passed!\n`);
     process.exit(0);
   }
-} catch (err: any) {
-  console.error('\n❌ Test runner error:', err.message);
-  process.exit(1);
-}
+})();

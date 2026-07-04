@@ -10,6 +10,12 @@ import { ModelSelector } from '../ai/model-selector';
 import { AnthropicClient, resolveAnthropicModel, isAnthropicConfigured } from '../ai/anthropic-client';
 import { CostTracker } from '../ai/cost-tracker';
 import { KnowledgeOptimizer, type KnowledgeItem as OptimizerKnowledgeItem } from '../ai/knowledge-optimizer';
+import {
+  IntelligenceOrchestrator,
+  getIntelligenceOrchestrator,
+  type OrchestratorSource,
+  type IntelligenceScore,
+} from '../services/intelligence-orchestrator';
 
 const MOD = 'test-coverage-engine';
 
@@ -398,6 +404,13 @@ export interface GenerationResult {
   coverageTypeEvaluations: CoverageTypeEvaluation[];
   /** Which mode produced this result. */
   mode: GenerationMode;
+  /**
+   * Signature transparency metric — how much of this generation was grounded in
+   * real intelligence vs produced by the raw model. Present only when the
+   * Intelligence Orchestrator ran (flag on + scope provided); undefined on the
+   * legacy path. Surfaced to the API + dashboard.
+   */
+  intelligenceScore?: IntelligenceScore;
   stats: {
     totalScenarios: number;
     totalTestCases: number;
@@ -493,6 +506,20 @@ export interface KnowledgeContext {
    * checkout_data) instead of inventing placeholder credentials/products.
    */
   testData?: Array<{ name: string; environment: string; recordCount: number; sampleKeys: string[] }>;
+  /**
+   * Optional scope for intent-scoped retrieval via the shared
+   * IntelligenceOrchestrator (Phase 2). When present AND the orchestrator flag
+   * is on, generation uses a single orchestrated intelligence block in place of
+   * the legacy flat repo / app-profile / test-data blocks (the rich enterprise
+   * knowledge block is preserved). Absent / flag-off → legacy behaviour is
+   * byte-for-byte unchanged.
+   */
+  orchestratorScope?: {
+    companyId: number;
+    projectId?: number;
+    repoContextId?: number;
+    targetUrl?: string;
+  };
 }
 
 /** Compact, token-budgeted projection of an application profile for prompts. */
@@ -902,6 +929,86 @@ Return ONLY valid JSON, no markdown fences.`;
     return { analysis, tokensUsed: resp.tokensUsed };
   }
 
+  /**
+   * Derive a short, keyword-friendly intent from the requirement to seed the
+   * orchestrator's intent-scoped retrieval. Title + business flow are the
+   * strongest signals; falls back to acceptance criteria / description.
+   */
+  private deriveIntent(input: RequirementInput): string {
+    const base =
+      [input.title, input.businessFlow].filter(Boolean).join(' ') ||
+      input.acceptanceCriteria ||
+      input.description ||
+      '';
+    return base.split(/\s+/).slice(0, 12).join(' ').trim();
+  }
+
+  /**
+   * Phase 2 — build the intent-scoped orchestrated intelligence block for Test
+   * Case generation, mirroring Script Gen's integration. Gathers reuse
+   * candidates (repository graph), app-profile structure, project datasets and
+   * learned patterns for the requirement's intent, and returns a compact,
+   * confidence-annotated block plus the signature Intelligence Score.
+   *
+   * Knowledge is intentionally NOT requested from the orchestrator here — Test
+   * Case Lab already builds a richer, KnowledgeOptimizer-selected enterprise
+   * knowledge block which is preserved alongside this block.
+   *
+   * Fully gated: returns an empty block unless INTELLIGENCE_ORCHESTRATOR is on
+   * AND an orchestrator scope (companyId) is provided. Any failure degrades to
+   * an empty block so generation is never blocked.
+   */
+  private async buildOrchestratedIntelligenceBlock(
+    input: RequirementInput,
+    knowledge?: KnowledgeContext,
+  ): Promise<{ block: string; intelligenceScore?: IntelligenceScore }> {
+    if (!IntelligenceOrchestrator.isEnabled()) return { block: '' };
+    const scope = knowledge?.orchestratorScope;
+    if (!scope || scope.companyId == null) return { block: '' };
+
+    const intent = this.deriveIntent(input);
+    if (!intent) return { block: '' };
+
+    const sources: OrchestratorSource[] = ['repository', 'appProfile', 'testData', 'patterns'];
+
+    try {
+      const orchestrator = getIntelligenceOrchestrator();
+      const intel = await orchestrator.gatherIntelligence({
+        intent,
+        repoContextId: scope.repoContextId,
+        companyId: scope.companyId,
+        projectId: scope.projectId,
+        targetUrl: scope.targetUrl,
+        caller: 'test-case-lab',
+        sources,
+      });
+
+      if (!intel.available) {
+        return { block: '', intelligenceScore: intel.metadata.intelligenceScore };
+      }
+
+      const promptBlock = orchestrator.buildPromptContext(intel);
+      if (!promptBlock || promptBlock.startsWith('(No intelligence')) {
+        return { block: '', intelligenceScore: intel.metadata.intelligenceScore };
+      }
+
+      logger.info(MOD, 'Injecting orchestrated intelligence into test-case prompt', {
+        intent,
+        sourcesUsed: intel.metadata.sourcesUsed,
+        confidenceScore: intel.metadata.confidenceScore,
+        intelligenceScore: intel.metadata.intelligenceScore,
+      });
+
+      return {
+        block: `\n--- ORCHESTRATED INTELLIGENCE (INTENT-SCOPED) ---\n${promptBlock}\n--- END ORCHESTRATED INTELLIGENCE ---`,
+        intelligenceScore: intel.metadata.intelligenceScore,
+      };
+    } catch (err: any) {
+      logger.warn(MOD, 'Orchestrated intelligence failed (non-blocking)', { error: err?.message });
+      return { block: '' };
+    }
+  }
+
   /* ---- Phase 5: Test Case Generation ---- */
   async generateTestCoverage(
     input: RequirementInput,
@@ -926,6 +1033,8 @@ Return ONLY valid JSON, no markdown fences.`;
      *  (prompt size → output volume → tokens/cost), per the "measure, don't
      *  just keep raising the budget" principle. */
     promptChars: number;
+    /** Intelligence Score from the orchestrator (undefined on the legacy path). */
+    intelligenceScore?: IntelligenceScore;
   }> {
     // GAP-ANALYSIS (expanded) mode only: auto-expand to a comprehensive baseline so
     // the *suggested additional coverage* (assumption-based) bucket is thorough.
@@ -948,9 +1057,16 @@ Return ONLY valid JSON, no markdown fences.`;
       ? `\nExisting test coverage: ${knowledge.existingTestCases.join('; ')}`
       : '';
     const enterpriseBlock = this.buildEnterpriseKnowledgeBlock(knowledge, input);
-    const repoBlock = this.buildRepoIntelligenceBlock(knowledge);
-    const appProfileBlock = this.buildApplicationProfileBlock(knowledge);
-    const testDataBlock = this.buildTestDataBlock(knowledge);
+    // Phase 2 — intent-scoped orchestrated intelligence. When available, it
+    // REPLACES the legacy flat repo / app-profile / test-data blocks (the rich
+    // enterprise-knowledge block is always kept). Fully additive: '' when the
+    // flag is off or no scope/intelligence is present → legacy blocks are used.
+    const orchestrated = await this.buildOrchestratedIntelligenceBlock(input, knowledge);
+    const useOrchestrated = orchestrated.block.length > 0;
+    const orchestratedBlock = orchestrated.block;
+    const repoBlock = useOrchestrated ? '' : this.buildRepoIntelligenceBlock(knowledge);
+    const appProfileBlock = useOrchestrated ? '' : this.buildApplicationProfileBlock(knowledge);
+    const testDataBlock = useOrchestrated ? '' : this.buildTestDataBlock(knowledge);
 
     // ── Per-type coverage objectives ──
     // Each SELECTED coverage type is an INDEPENDENT objective with its own goal and
@@ -991,7 +1107,7 @@ Feature Type: ${analysis.featureType}
 Risk Level: ${analysis.riskLevel}
 Impacted Modules: ${analysis.impactedModules.join(', ')}
 Workflow: ${analysis.workflowSteps.join(' → ')}
-User Roles: ${analysis.userRolesAffected.join(', ')}${knowledgeBugs}${knowledgeTests}${enterpriseBlock}${repoBlock}${appProfileBlock}${testDataBlock}
+User Roles: ${analysis.userRolesAffected.join(', ')}${knowledgeBugs}${knowledgeTests}${enterpriseBlock}${orchestratedBlock}${repoBlock}${appProfileBlock}${testDataBlock}
 
 ${scopeBlock}
 
@@ -1150,7 +1266,7 @@ Return ONLY valid JSON. Address EVERY selected coverage type, organise scenarios
       parsed.coverageTypeEvaluations
     );
 
-    return { scenarios, testCases, suggestedTestCases, missingRequirements, coverageTypeEvaluations, tokensUsed: resp.tokensUsed, promptChars: prompt.length };
+    return { scenarios, testCases, suggestedTestCases, missingRequirements, coverageTypeEvaluations, tokensUsed: resp.tokensUsed, promptChars: prompt.length, intelligenceScore: orchestrated.intelligenceScore };
   }
 
   /**
@@ -1326,7 +1442,7 @@ Return ONLY valid JSON array.`;
       tierCfg.maxOutputTokens, tierCfg.maxPromptChars,
     );
     const generationMs = Date.now() - generationStart;
-    const { scenarios, testCases: rawTestCases, missingRequirements, coverageTypeEvaluations, tokensUsed: t2, promptChars } = gen;
+    const { scenarios, testCases: rawTestCases, missingRequirements, coverageTypeEvaluations, tokensUsed: t2, promptChars, intelligenceScore } = gen;
     let rawSuggested = gen.suggestedTestCases || [];
     logger.info(MOD, 'Test generation complete', {
       scenarios: scenarios.length, testCases: rawTestCases.length,
@@ -1374,6 +1490,7 @@ Return ONLY valid JSON array.`;
       coverageGaps: gaps,
       coverageTypeEvaluations,
       mode,
+      intelligenceScore,
       stats: {
         totalScenarios: scenarios.length,
         totalTestCases: testCases.length,

@@ -225,6 +225,7 @@ export function createTestCoverageRouter(): Router {
       // context. When no profile exists this is a no-op and generation falls back
       // to the previous generic behaviour.
       let appProfileUsed: { id: string; name?: string | null; pageCount?: number; totalElements?: number; totalForms?: number } | null = null;
+      let appTargetUrl: string | undefined;
       try {
         // Profile selection precedence:
         //   1. useAppProfile === false → skip grounding entirely (user opted out)
@@ -257,6 +258,7 @@ export function createTestCoverageRouter(): Router {
             totalElements: profile.total_elements,
             totalForms: profile.total_forms,
           };
+          appTargetUrl = (profile as any).base_url || undefined;
           logger.info(MOD, '🧠 Application profile loaded for generation', {
             profileId: profile.id, pages: profile.page_count, elements: profile.total_elements, forms: profile.total_forms,
           });
@@ -295,6 +297,19 @@ export function createTestCoverageRouter(): Router {
       const input: RequirementInput = {
         title, description, jiraId, businessFlow,
         acceptanceCriteria, apiDocs, releaseNotes, module: mod,
+      };
+
+      // ── Intelligence Orchestrator scope (Phase 2) ──
+      // When the orchestrator flag is enabled, the Test Case Lab engine gathers its
+      // repository/app-profile/test-data grounding through the shared Intelligence
+      // Orchestrator (single brain) and returns an Intelligence Score. We hand it the
+      // resolved scope here; the engine falls back to the legacy flat blocks when the
+      // flag is off or no scope is present, so behaviour is unchanged otherwise.
+      knowledge.orchestratorScope = {
+        companyId,
+        projectId: projectId ?? undefined,
+        repoContextId: repoIntelligenceContributed ? repoId : undefined,
+        targetUrl: appTargetUrl,
       };
 
       logger.info(MOD, 'Calling AI engine for test coverage generation', {
