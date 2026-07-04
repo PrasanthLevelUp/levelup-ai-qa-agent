@@ -41,8 +41,11 @@ import {
   getKnowledgeStats,
   getRepositoryContext,
   listTestDataSets,
+  type MethodSearchHit,
 } from '../db/postgres';
 import { knowledgeGraphService, type IntentQueryResult, type ReusableMethod } from './knowledge-graph-service';
+import { MethodIntelligenceService } from './method-intelligence-service';
+import { getRAGService, type RagExample } from './rag-service';
 import { FEATURE_FLAGS } from '../config/features';
 import { logger } from '../utils/logger';
 
@@ -140,6 +143,24 @@ export interface OrchestratedIntelligence {
       utilities: ReusableMethod[];
     };
     relatedFlows: string[];
+    /**
+     * Phase 3 — Healing evidence. Method-index hits + RAG snippets for the intent,
+     * plus corroboration signals (methodIndexHit, pageObjectHit, etc.) that the
+     * Healing orchestrator uses for repository-aware confidence boosting. Only
+     * populated when caller='healing' and the 'repository' source is requested.
+     */
+    healingEvidence?: {
+      methodHits: MethodSearchHit[];
+      ragExamples: RagExample[];
+      /** Corroboration signals for confidence scoring (same contract as HealingIntelligenceContext). */
+      signals: {
+        methodIndexHit: boolean;
+        pageObjectHit: boolean;
+        usedByTestCount: number;
+        ragHit: boolean;
+        topMethodSimilarity: number;
+      };
+    };
   };
   /** App Profile — UI structure, business flows (from crawl) */
   appProfile: {
@@ -380,6 +401,24 @@ export class IntelligenceOrchestrator {
               query.intent,
               { limit: 5, depth: 2 },
             );
+            
+            // Phase 3 — Healing-specific evidence: method-index + RAG hits for the
+            // failed locator/line. Only gathered when caller='healing', to avoid
+            // needless retrieval for Script Gen / Test Case Lab.
+            if (query.caller === 'healing') {
+              const [methodHits, ragExamples] = await Promise.all([
+                this.loadMethodHitsForHealing(query.repoContextId!, query.intent),
+                this.loadRagExamplesForHealing(query.repoContextId!, query.intent),
+              ]);
+              if (methodHits.length > 0 || ragExamples.length > 0) {
+                (repoGraph as any).healingEvidence = {
+                  methodHits,
+                  ragExamples,
+                  signals: this.deriveHealingSignals(methodHits, ragExamples),
+                };
+              }
+            }
+
             if (repoGraph.available && repoGraph.primaryMethods.length > 0) {
               sourcesUsed.push('repository-graph');
               // Confidence scales with how many primary candidates matched the intent.
@@ -701,6 +740,46 @@ export class IntelligenceOrchestrator {
         lines.push('Test Data Helpers:');
         dataAccess.slice(0, 3).forEach(d => lines.push(`  - ${d.name}()`));
       }
+      
+      // Phase 3 — Healing evidence: method-index + RAG hits for broken locators.
+      // This block is only present when caller='healing' and evidence was gathered.
+      if (intel.repositoryGraph.healingEvidence) {
+        const { methodHits, ragExamples } = intel.repositoryGraph.healingEvidence;
+        if (methodHits.length > 0 || ragExamples.length > 0) {
+          lines.push('Repository context (selectors that ALREADY exist in this codebase).');
+          lines.push('Prefer reusing these real locators/methods over inventing new ones.');
+          
+          if (methodHits.length > 0) {
+            lines.push('', 'Existing page-object / helper methods:');
+            methodHits.slice(0, 4).forEach((m, i) => {
+              const sim = Math.round((m.similarity || 0) * 100);
+              const loc = m.className ? `${m.className}.${m.methodName}` : m.methodName;
+              const body = m.sourceCode && m.sourceCode.length > 600
+                ? `${m.sourceCode.slice(0, 600)}\n// ...(truncated)`
+                : m.sourceCode || '';
+              lines.push(`${i + 1}. ${loc} [${m.methodType}] (${m.filePath}) — ${sim}% match, used by ${m.usageCount} test(s)`);
+              if (body.trim()) {
+                lines.push('```', body.trim(), '```');
+              }
+            });
+          }
+          
+          if (ragExamples.length > 0) {
+            lines.push('', 'Related source / page-object snippets:');
+            ragExamples.slice(0, 2).forEach((ex, i) => {
+              const sim = Math.round((ex.similarity || 0) * 100);
+              const body = ex.content && ex.content.length > 600
+                ? `${ex.content.slice(0, 600)}\n// ...(truncated)`
+                : ex.content || '';
+              lines.push(`${i + 1}. ${ex.chunkName} (${ex.filePath}) — ${sim}% similar`);
+              if (body.trim()) {
+                lines.push('```', body.trim(), '```');
+              }
+            });
+          }
+        }
+      }
+      
       lines.push('');
     }
 
@@ -755,6 +834,73 @@ export class IntelligenceOrchestrator {
     } catch {
       return null;
     }
+  }
+
+  /**
+   * Phase 3 — Healing evidence: method-index search for the failed locator/line.
+   * Guarded by the MethodIntelligenceService's own flag; degrades to [] on failure.
+   */
+  private async loadMethodHitsForHealing(contextId: number, term: string): Promise<MethodSearchHit[]> {
+    if (!MethodIntelligenceService.isEnabled()) return [];
+    try {
+      const svc = new MethodIntelligenceService();
+      return await svc.search(contextId, term, { limit: 5, minSimilarity: 0.3 });
+    } catch (err: any) {
+      logger.debug(MOD, 'Method-index search for healing failed (non-critical)', { error: err?.message });
+      return [];
+    }
+  }
+
+  /**
+   * Phase 3 — Healing evidence: RAG source/page-object retrieval for the failed
+   * locator/line. Guarded by the RAG service's own flag; degrades to [] on failure.
+   */
+  private async loadRagExamplesForHealing(contextId: number, term: string): Promise<RagExample[]> {
+    const rag = getRAGService();
+    if (!rag.isEnabled()) return [];
+    try {
+      return await rag.findSimilarCode(contextId, term, { limit: 3, minSimilarity: 0.3 });
+    } catch (err: any) {
+      logger.debug(MOD, 'RAG retrieval for healing failed (non-critical)', { error: err?.message });
+      return [];
+    }
+  }
+
+  /**
+   * Phase 3 — Derive healing corroboration signals from method-index + RAG hits.
+   * Same logic as HealingIntelligenceContext.deriveEvidence, so the confidence
+   * boost contract is byte-for-byte preserved when Healing switches to the orchestrator.
+   */
+  private deriveHealingSignals(
+    methodHits: MethodSearchHit[],
+    ragExamples: RagExample[],
+  ): {
+    methodIndexHit: boolean;
+    pageObjectHit: boolean;
+    usedByTestCount: number;
+    ragHit: boolean;
+    topMethodSimilarity: number;
+  } {
+    if (methodHits.length === 0 && ragExamples.length === 0) {
+      return {
+        methodIndexHit: false,
+        pageObjectHit: false,
+        usedByTestCount: 0,
+        ragHit: false,
+        topMethodSimilarity: 0,
+      };
+    }
+    const PAGE_OBJECT_TYPES = new Set(['page_object_method', 'helper']);
+    const top = methodHits[0];
+    const pageObjectHit = methodHits.some((m) => PAGE_OBJECT_TYPES.has(m.methodType));
+    const usedByTestCount = methodHits.reduce((max, m) => Math.max(max, m.usageCount || 0), 0);
+    return {
+      methodIndexHit: methodHits.length > 0,
+      pageObjectHit,
+      usedByTestCount,
+      ragHit: ragExamples.length > 0,
+      topMethodSimilarity: top ? top.similarity : 0,
+    };
   }
 }
 

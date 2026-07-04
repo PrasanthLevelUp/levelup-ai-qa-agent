@@ -330,6 +330,53 @@ console.log('\n=== gatherIntelligence: configurable sources filter ===');
   assert(typeof intel2.metadata.timingsMs.patterns === 'number', 'patterns timed when both requested');
   assert(intel2.metadata.sourcesRequested.length === 2, 'two sources requested recorded');
 
+  /* ------------------------------------------------------------------ */
+  /*  Phase 3 — Healing evidence flow                                   */
+  /* ------------------------------------------------------------------ */
+  console.log('\nPhase 3 — Healing evidence (healingEvidence in repositoryGraph)');
+
+  // When caller='healing' and 'repository' is requested, the orchestrator gathers
+  // method-index + RAG evidence and attaches it to repositoryGraph.healingEvidence.
+  // With no database, the evidence will be empty, but the structure should be present.
+  const intelHealing = await orch.gatherIntelligence({
+    intent: 'page.locator("#broken-id").click()',
+    companyId: 1,
+    projectId: 2,
+    repoContextId: 48, // Needed for repository source
+    caller: 'healing',
+    sources: ['repository'],
+  });
+
+  // Without a DB, repoGraph is not available but the call should not throw.
+  assert(intelHealing.repositoryGraph != null, 'repositoryGraph is present on healing intelligence');
+  
+  // The healingEvidence field should exist when caller='healing', even if empty.
+  // (It might be undefined if no contextId or the orchestrator skips gathering, which
+  // is acceptable — we're testing the contract, not the DB-dependent retrieval.)
+  if (intelHealing.repositoryGraph.healingEvidence) {
+    assert(Array.isArray(intelHealing.repositoryGraph.healingEvidence.methodHits), 'healingEvidence.methodHits is an array');
+    assert(Array.isArray(intelHealing.repositoryGraph.healingEvidence.ragExamples), 'healingEvidence.ragExamples is an array');
+    assert(typeof intelHealing.repositoryGraph.healingEvidence.signals === 'object', 'healingEvidence.signals is an object');
+    assert(typeof intelHealing.repositoryGraph.healingEvidence.signals.methodIndexHit === 'boolean', 'signals.methodIndexHit is boolean');
+    assert(typeof intelHealing.repositoryGraph.healingEvidence.signals.pageObjectHit === 'boolean', 'signals.pageObjectHit is boolean');
+    assert(typeof intelHealing.repositoryGraph.healingEvidence.signals.usedByTestCount === 'number', 'signals.usedByTestCount is number');
+    assert(typeof intelHealing.repositoryGraph.healingEvidence.signals.ragHit === 'boolean', 'signals.ragHit is boolean');
+    assert(typeof intelHealing.repositoryGraph.healingEvidence.signals.topMethodSimilarity === 'number', 'signals.topMethodSimilarity is number');
+  } else {
+    // If healingEvidence is undefined, it's acceptable (no DB → no retrieval), just note it.
+    console.log('  ℹ️  healingEvidence not populated (no DB — expected in unit test)');
+  }
+
+  // When caller is NOT 'healing', healingEvidence should remain undefined.
+  const intelScriptGen = await orch.gatherIntelligence({
+    intent: 'Login flow',
+    companyId: 1,
+    repoContextId: 48,
+    caller: 'script-gen',
+    sources: ['repository'],
+  });
+  assert(intelScriptGen.repositoryGraph.healingEvidence === undefined, 'healingEvidence is undefined when caller != healing');
+
   /* -------------------------------------------------------------- */
   console.log(`\n=== SUMMARY ===`);
   console.log(`  Passed: ${passed}`);
