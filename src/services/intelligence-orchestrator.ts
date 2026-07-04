@@ -98,6 +98,34 @@ export interface OrchestratorQuery {
   sources?: OrchestratorSource[];
 }
 
+/**
+ * Intelligence Score — LevelUp's signature transparency metric.
+ *
+ * Surfaces how much of a generation is *grounded in real intelligence*
+ * (repository, knowledge, patterns, app profile, test data, …) versus produced
+ * by the raw model. Powers UI badges like:
+ *
+ *   "94% grounded in repository intelligence. Only 6% AI-generated."
+ *
+ * This directly expresses LevelUp's "Rule-first. Intelligence-first. AI-last."
+ * philosophy and is consumed by every AI feature (Script Gen, Test Case Lab,
+ * Healing) plus the dashboard.
+ */
+export interface IntelligenceScore {
+  /** Overall grounding 0-100 (weighted across the sources that returned data). */
+  grounded: number;
+  /** Share attributed to raw AI generation — the inverse of `grounded`. */
+  aiContribution: number;
+  /**
+   * Per-source grounding breakdown with UI-friendly labels, e.g.
+   * `{ 'Repository Match': 95, 'Knowledge Match': 87, 'Pattern Match': 98 }`.
+   * Only includes sources that returned usable data.
+   */
+  bySource: Record<string, number>;
+  /** Human-readable one-liner for direct UI display. */
+  summary: string;
+}
+
 export interface OrchestratedIntelligence {
   available: boolean;
   intent: string;
@@ -194,6 +222,12 @@ export interface OrchestratedIntelligence {
       patterns: string[];
     };
     /**
+     * Signature transparency metric — grounded vs AI-generated, with a
+     * per-source breakdown. Always present (grounded=0 / aiContribution=100
+     * when no source returned data). Consumed by the API + dashboard.
+     */
+    intelligenceScore: IntelligenceScore;
+    /**
      * Which snapshot of each source was used, so two differing generations can
      * be explained. Lightweight: identifiers/timestamps already on the rows
      * (full numeric versioning of knowledge/datasets is deferred — needs schema).
@@ -226,6 +260,68 @@ export class IntelligenceOrchestrator {
    */
   static isEnabled(): boolean {
     return FEATURE_FLAGS.REPO_INTELLIGENCE.INTELLIGENCE_ORCHESTRATOR;
+  }
+
+  /** UI-friendly labels for the per-source Intelligence Score breakdown. */
+  static readonly SOURCE_LABELS: Record<OrchestratorSource, string> = {
+    repository: 'Repository Match',
+    appProfile: 'App Profile',
+    testData: 'Test Data',
+    knowledge: 'Knowledge Match',
+    domMemory: 'DOM Memory',
+    similarity: 'Similarity Match',
+    patterns: 'Pattern Match',
+  };
+
+  /** Natural-language phrases used in the Intelligence Score one-liner. */
+  static readonly SOURCE_PHRASES: Record<OrchestratorSource, string> = {
+    repository: 'repository intelligence',
+    appProfile: 'app profile intelligence',
+    testData: 'test data intelligence',
+    knowledge: 'knowledge intelligence',
+    domMemory: 'DOM memory',
+    similarity: 'similarity intelligence',
+    patterns: 'pattern intelligence',
+  };
+
+  /**
+   * Compute the signature Intelligence Score from the overall confidence and
+   * per-source confidence already gathered. Pure/deterministic so it is trivial
+   * to unit-test and reuse across callers (API, prompt block, dashboard).
+   *
+   *   grounded        → overall grounding (weighted confidence, 0-100)
+   *   aiContribution  → 100 - grounded (the raw-model share)
+   *   bySource        → per-source match %, UI-labelled
+   *   summary         → "94% grounded in repository intelligence. Only 6% AI-generated."
+   */
+  static computeIntelligenceScore(
+    confidenceScore: number,
+    confidenceBySource: Partial<Record<OrchestratorSource, number>>,
+  ): IntelligenceScore {
+    const grounded = Math.max(0, Math.min(100, Math.round(confidenceScore)));
+    const aiContribution = Math.max(0, Math.min(100, 100 - grounded));
+
+    const bySource: Record<string, number> = {};
+    let topSource: OrchestratorSource | null = null;
+    let topVal = -1;
+    for (const [k, v] of Object.entries(confidenceBySource) as [OrchestratorSource, number][]) {
+      if (v == null) continue;
+      bySource[IntelligenceOrchestrator.SOURCE_LABELS[k] ?? k] = v;
+      if (v > topVal) {
+        topVal = v;
+        topSource = k;
+      }
+    }
+
+    let summary: string;
+    if (grounded <= 0 || topSource == null) {
+      summary = 'No grounding intelligence available — 100% AI-generated.';
+    } else {
+      const phrase = IntelligenceOrchestrator.SOURCE_PHRASES[topSource] ?? 'repository intelligence';
+      summary = `${grounded}% grounded in ${phrase}. Only ${aiContribution}% AI-generated.`;
+    }
+
+    return { grounded, aiContribution, bySource, summary };
   }
 
   /**
@@ -470,6 +566,12 @@ export class IntelligenceOrchestrator {
       confidenceScore += (weights as any)[src] ?? 0;
     }
 
+    // ── Intelligence Score — signature "grounded vs AI" transparency metric.
+    const intelligenceScore = IntelligenceOrchestrator.computeIntelligenceScore(
+      confidenceScore,
+      confidenceBySource,
+    );
+
     const durationMs = Date.now() - start;
     timingsMs.total = durationMs;
 
@@ -504,6 +606,7 @@ export class IntelligenceOrchestrator {
       sourcesUsed,
       confidenceScore,
       confidenceBySource,
+      intelligenceScore,
       timingsMs,
       durationMs,
       retrievalMetrics,
@@ -533,6 +636,7 @@ export class IntelligenceOrchestrator {
         warnings,
         confidenceScore,
         confidenceBySource,
+        intelligenceScore,
         timingsMs,
         retrievalMetrics,
         selected,
@@ -562,6 +666,11 @@ export class IntelligenceOrchestrator {
 
     lines.push(`=== INTELLIGENCE FOR: ${intel.intent.toUpperCase()} ===`);
     lines.push(`Overall Confidence: ${intel.metadata.confidenceScore}%`);
+    // Signature transparency line — grounded vs raw-model contribution.
+    const score = intel.metadata.intelligenceScore;
+    if (score) {
+      lines.push(`Intelligence Score: ${score.grounded}% grounded / ${score.aiContribution}% AI-generated`);
+    }
     // Surface per-source confidence so the model trusts concrete signals (test
     // data, repository) more than advisory ones (patterns).
     const cbsEntries = Object.entries(cbs);
