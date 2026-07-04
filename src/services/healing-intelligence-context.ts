@@ -1,16 +1,20 @@
 /**
- * Healing Intelligence Context — Sprint 2 (Healing Intelligence).
+ * Healing Intelligence Context — Phase 3 adapter.
  *
- * Builds a repository-grounded evidence bundle for a single healing attempt:
- *   • Method-index hits for the failed locator / failed line (METHOD_INTELLIGENCE)
- *   • RAG-retrieved page-object / source snippets    (RAG_ENABLED + VECTOR_SEARCH)
+ * Thin wrapper that routes Healing's intelligence needs through the shared
+ * Intelligence Orchestrator (the single "brain") instead of directly calling
+ * MethodIntelligenceService / RAGService. The orchestrator gathers method-index
+ * hits + RAG snippets for the failed locator/line and returns them along with
+ * corroboration signals (methodIndexHit, pageObjectHit, usedByTestCount, etc.).
  *
- * The bundle is consumed in two places (both flag-gated, default-OFF):
- *   1. Repository-grounded AI healing — `promptBlock` is injected into the
- *      OpenAI locator-suggestion prompt so the model can prefer selectors that
- *      already exist in the repository's page objects / helpers.
- *   2. Repository-aware confidence — `evidence` lets the orchestrator boost the
- *      confidence of a proposed locator that the repository corroborates.
+ * This adapter preserves the existing `HealingContextResult` contract so the
+ * Healing Orchestrator (healing-orchestrator.ts) and the healing worker (server.ts)
+ * require zero changes — they consume `promptBlock` + `evidence` as before.
+ *
+ * The orchestrator path is used when BOTH flags are ON:
+ *   - ENABLE_INTELLIGENCE_ORCHESTRATOR (master gate)
+ *   - ENABLE_HEALING_INTELLIGENCE (healing-specific gate)
+ * When either is OFF, this degrades to the legacy direct-retrieval path.
  *
  * Hard contract: when `HEALING_INTELLIGENCE` is OFF this class performs ZERO
  * work and ZERO database calls — `load()` returns an empty, inert context so
@@ -24,6 +28,7 @@ import { logger } from '../utils/logger';
 import { getRepositoryContextIdByRepo, type MethodSearchHit } from '../db/postgres';
 import { MethodIntelligenceService } from './method-intelligence-service';
 import { getRAGService, type RagExample } from './rag-service';
+import { IntelligenceOrchestrator, getIntelligenceOrchestrator } from './intelligence-orchestrator';
 import type { FailureDetails } from '../core/failure-analyzer';
 
 const MOD = 'healing-intelligence-context';
@@ -116,6 +121,10 @@ export class HealingIntelligenceContext {
   /**
    * Resolve repo context + gather grounding evidence. Cheap no-op when the
    * feature flag is OFF. Never throws — degrades to an empty context.
+   *
+   * Phase 3 — Routes through the Intelligence Orchestrator when both flags are ON
+   * (ENABLE_INTELLIGENCE_ORCHESTRATOR + ENABLE_HEALING_INTELLIGENCE). Otherwise
+   * falls back to the legacy direct-retrieval path (preserved for safety).
    */
   async load(input: HealingContextInput): Promise<HealingContextResult> {
     if (!HealingIntelligenceContext.isEnabled()) return emptyHealingContext();
@@ -135,8 +144,55 @@ export class HealingIntelligenceContext {
         return { ...emptyHealingContext(), contextId };
       }
 
-      // Gather method-index hits and RAG examples in parallel; each is
-      // independently flag-gated inside its own service and guarded here.
+      // Phase 3 — Orchestrator path: when both flags are ON, route through the
+      // shared Intelligence Orchestrator (single brain) instead of calling
+      // MethodIntelligenceService + RAGService directly.
+      if (IntelligenceOrchestrator.isEnabled()) {
+        try {
+          const orchestrator = getIntelligenceOrchestrator();
+          const intel = await orchestrator.gatherIntelligence({
+            intent: term,
+            repoContextId: contextId,
+            companyId: companyId ?? 0,
+            projectId,
+            caller: 'healing',
+            sources: ['repository'], // Only repository source needed for healing
+          });
+
+          // Extract healing evidence from the orchestrator's repositoryGraph.
+          const healingEv = intel.repositoryGraph.healingEvidence;
+          if (healingEv) {
+            const { methodHits, ragExamples, signals } = healingEv;
+            // Build the prompt block using the orchestrator's formatted output.
+            const promptBlock = orchestrator.buildPromptContext(intel);
+            const hasEvidence = methodHits.length > 0 || ragExamples.length > 0;
+            
+            if (hasEvidence) {
+              logger.info(MOD, 'Repository grounding assembled via orchestrator', {
+                contextId,
+                methodHits: methodHits.length,
+                ragExamples: ragExamples.length,
+                methodIndexHit: signals.methodIndexHit,
+                pageObjectHit: signals.pageObjectHit,
+                usedByTestCount: signals.usedByTestCount,
+              });
+            }
+
+            return { contextId, hasEvidence, methodHits, ragExamples, evidence: signals, promptBlock };
+          } else {
+            // Orchestrator returned no healing evidence — same as empty.
+            return { ...emptyHealingContext(), contextId };
+          }
+        } catch (orchErr: any) {
+          logger.warn(MOD, 'Orchestrator path failed — falling back to legacy retrieval', {
+            error: orchErr?.message,
+          });
+          // Fall through to legacy path on orchestrator failure.
+        }
+      }
+
+      // Legacy path — direct retrieval from MethodIntelligenceService + RAGService.
+      // Used when the orchestrator flag is OFF or when the orchestrator call failed.
       const [methodHits, ragExamples] = await Promise.all([
         this.loadMethodHits(contextId, term),
         this.loadRagExamples(contextId, term),
@@ -147,7 +203,7 @@ export class HealingIntelligenceContext {
       const hasEvidence = methodHits.length > 0 || ragExamples.length > 0;
 
       if (hasEvidence) {
-        logger.info(MOD, 'Repository grounding assembled', {
+        logger.info(MOD, 'Repository grounding assembled (legacy path)', {
           contextId,
           methodHits: methodHits.length,
           ragExamples: ragExamples.length,
