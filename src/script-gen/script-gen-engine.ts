@@ -809,7 +809,10 @@ export class ScriptGenEngine {
       const m = s.match(/\bhttps?:\/\/[^\s'")]+/i);
       if (/navigat|go to|open|launch|visit/i.test(s) && m) { baseUrl = m[0]; break; }
     }
-    if (!/\/$/.test(baseUrl) && !/\.\w+$/.test(baseUrl)) baseUrl += '/';
+    // Only normalise a BARE ORIGIN ("https://host") to a trailing slash. A URL
+    // that already has a path segment (e.g. .../login) must be left untouched —
+    // appending "/" turned "/login" into "/login/", which some apps redirect.
+    if (/^https?:\/\/[^/]+$/.test(baseUrl)) baseUrl += '/';
 
     const creds = this.parseTestData(tc.test_data);
 
@@ -1202,6 +1205,18 @@ ${combined.map(l => (l ? `    ${l}` : '')).join('\n')}
     // matches whatever folder the connected repo uses (defaults to tests/data).
     const sharedDataModulePath = resolveTestDataModulePath(this.resolveConventions(config));
 
+    // ── Consolidation by PAGE (user request: coverage over file count) ──
+    // Instead of emitting one spec file per test case, group every case by the
+    // primary page it exercises (all auth cases → "login", etc.) and merge each
+    // group into ONE spec file with many `test(...)` blocks. Shared data-module
+    // files are still emitted exactly once. We preserve per-case grounding /
+    // flow / assertion stats so the reported metrics stay honest.
+    const conv = this.resolveConventions(config);
+    const groups = new Map<string, {
+      label: string;
+      specs: Array<{ content: string; tc: NonNullable<GenerationConfig['testCase']> }>;
+    }>();
+
     for (const tc of cases) {
       try {
         // Reuse the single-case translator by scoping config to this case.
@@ -1212,6 +1227,8 @@ ${combined.map(l => (l ? `    ${l}` : '')).join('\n')}
         }
         if (single.locatorGrounding) groundingReports.push(single.locatorGrounding);
         if (single.repositoryIntelligence) repoIntelReports.push(single.repositoryIntelligence);
+
+        const { key, label } = this.primaryPageKey(tc);
         for (const f of single.generatedFiles) {
           // The shared test-data module is identical across cases — emit it
           // once, never rename it (specs import a fixed relative path to it).
@@ -1222,20 +1239,39 @@ ${combined.map(l => (l ? `    ${l}` : '')).join('\n')}
             }
             continue;
           }
-          // De-duplicate spec file names within the batch (e.g. similar titles).
-          let path = f.path;
-          if (usedNames.has(path)) {
-            const idTag = tc.id != null ? `-tc${tc.id}` : `-${usedNames.size + 1}`;
-            path = path.replace(/\.spec\.ts$/, `${idTag}.spec.ts`);
+          // Bucket spec files by page. Non-spec artefacts (rare) pass through.
+          if (f.type === 'test') {
+            let g = groups.get(key);
+            if (!g) { g = { label, specs: [] }; groups.set(key, g); }
+            g.specs.push({ content: f.content, tc });
+          } else {
+            let path = f.path;
+            if (usedNames.has(path)) {
+              const idTag = tc.id != null ? `-tc${tc.id}` : `-${usedNames.size + 1}`;
+              path = path.replace(/\.(spec|ts)$/, `${idTag}.$1`);
+            }
+            usedNames.add(path);
+            generatedFiles.push({ ...f, path });
           }
-          usedNames.add(path);
-          generatedFiles.push({ ...f, path });
         }
         totalAssertions += single.stats.totalAssertions;
         totalTests += single.stats.totalTests;
         if (single.testPlan.flows[0]) flows.push(single.testPlan.flows[0]);
       } catch (err: any) {
         errors.push(`Test case ${tc.id ?? tc.title ?? '?'}: ${err?.message}`);
+      }
+    }
+
+    // Emit one consolidated spec file per page group.
+    for (const [key, g] of groups) {
+      let fileName = `${key}.spec.ts`;
+      if (usedNames.has(`${conv.testFolder}/${fileName}`)) fileName = `${key}-${groups.size}.spec.ts`;
+      usedNames.add(`${conv.testFolder}/${fileName}`);
+      if (g.specs.length === 1) {
+        // Single scenario for this page — keep the original single-case file as-is.
+        generatedFiles.push({ path: `${conv.testFolder}/${fileName}`, content: g.specs[0].content, type: 'test' });
+      } else {
+        generatedFiles.push(this.mergeCaseSpecs(g.specs, g.label, fileName, conv.testFolder));
       }
     }
 
@@ -1253,8 +1289,8 @@ ${combined.map(l => (l ? `    ${l}` : '')).join('\n')}
 
     const reqLabel = cases[0]?.requirement_id ? `requirement ${cases[0].requirement_id}` : 'requirement';
     const testPlan: TestPlan = {
-      name: `Test Plan: ${reqLabel} (${generatedFiles.length} cases)`,
-      description: `Deterministic requirement-based automation — ${generatedFiles.length} test cases`,
+      name: `Test Plan: ${reqLabel} (${cases.length} cases)`,
+      description: `Deterministic requirement-based automation — ${cases.length} test cases across ${generatedFiles.filter(f => f.type === 'test').length} page spec${generatedFiles.filter(f => f.type === 'test').length > 1 ? 's' : ''}`,
       baseUrl: config.url,
       pageType: crawl.pageType,
       flows,
@@ -1287,6 +1323,138 @@ ${combined.map(l => (l ? `    ${l}` : '')).join('\n')}
       ...(locatorGrounding.total > 0 ? { locatorGrounding } : {}),
       ...(repositoryIntelligence ? { repositoryIntelligence } : {}),
     };
+  }
+
+  /**
+   * Derive the PRIMARY page a test case exercises, used to consolidate many
+   * scenarios that live on the same page into ONE spec file (coverage over file
+   * count — a user request). Authentication cases all collapse to a single
+   * "login" bucket even when their Expected Result mentions the post-login home
+   * URL, so "log in successfully" and "redirected home after login" land in the
+   * same file. Otherwise we bucket by the first navigated URL's path.
+   */
+  private primaryPageKey(tc: NonNullable<GenerationConfig['testCase']>): { key: string; label: string } {
+    const steps = this.parseTestCaseSteps(tc);
+    const hay = `${steps.join(' ')} ${tc.title ?? ''} ${tc.scenario ?? ''} ${tc.preconditions ?? ''}`.toLowerCase();
+
+    // Auth/login scenarios → one shared bucket regardless of destination URL.
+    const isAuth = /\blog ?in\b|\bsign ?in\b|\blogin\b|\bsignin\b|credential|username|password|\/login|\/signin/.test(hay);
+    if (isAuth) return { key: 'login', label: 'Login' };
+
+    // Otherwise bucket by the first navigate URL's path segment.
+    for (const s of steps) {
+      if (!/navigat|go to|open|launch|visit/i.test(s)) continue;
+      const m = s.match(/\bhttps?:\/\/[^\s'")]+/i);
+      if (m) {
+        try {
+          const p = new URL(m[0]).pathname.replace(/\/+$/, '');
+          const seg = p.split('/').filter(Boolean)[0];
+          if (seg) return { key: seg.toLowerCase(), label: this.titleCase(seg) };
+        } catch { /* ignore malformed URL */ }
+      }
+    }
+    // Signup / register / cart / search keyword buckets as a last resort.
+    for (const [re, key, label] of [
+      [/sign ?up|register|create account/, 'signup', 'Signup'],
+      [/\bcart\b|checkout|basket/, 'cart', 'Cart'],
+      [/search/, 'search', 'Search'],
+      [/product|catalog|inventory/, 'products', 'Products'],
+    ] as Array<[RegExp, string, string]>) {
+      if (re.test(hay)) return { key, label };
+    }
+    return { key: 'app', label: 'Application' };
+  }
+
+  private titleCase(s: string): string {
+    return s.replace(/[-_]+/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+  }
+
+  /**
+   * Merge several single-case spec files (each a full describe→test) that belong
+   * to the SAME page into ONE spec: a single import header (unioned + de-duped),
+   * a single `test.describe('<Page> — N scenarios')`, and every case as its own
+   * `test(...)` block inside it. This is what turns "9 login cases → 9 files"
+   * into "9 login cases → login.spec.ts with 9 tests".
+   */
+  private mergeCaseSpecs(
+    specs: Array<{ content: string; tc: NonNullable<GenerationConfig['testCase']> }>,
+    label: string,
+    fileName: string,
+    testFolder: string,
+  ): GeneratedFile {
+    const importSet = new Set<string>();
+    const testBlocks: string[] = [];
+
+    for (const { content } of specs) {
+      const lines = content.split('\n');
+      for (const l of lines) if (/^import\s.+;$/.test(l.trim())) importSet.add(l.trim());
+
+      // Locate the top-level test construct. Most cases are wrapped in a
+      // `test.describe(...)`; a few paths (e.g. the concurrent-session case)
+      // emit a bare `test.fixme(...)` / `test(...)` at the top level instead.
+      const describeIdx = lines.findIndex(l => /^test\.describe\(/.test(l.trim()));
+      const anchorIdx = describeIdx !== -1
+        ? describeIdx
+        : lines.findIndex(l => /^test(\.(fixme|skip|only))?\(/.test(l.trim()));
+      if (anchorIdx === -1) continue; // no recognisable test — nothing to merge
+
+      // The doc comment that precedes the construct (per-case traceability block).
+      let docStart = -1;
+      for (let i = anchorIdx - 1; i >= 0; i--) {
+        const t = lines[i].trim();
+        if (t === '') continue;
+        if (t.endsWith('*/')) { // walk up to the matching /**
+          let j = i;
+          while (j >= 0 && !lines[j].trim().startsWith('/**')) j--;
+          docStart = j;
+        }
+        break;
+      }
+      const doc = docStart !== -1 ? lines.slice(docStart, anchorIdx).filter(l => l.trim() !== '') : [];
+
+      let bodyLines: string[];
+      if (describeIdx !== -1) {
+        // Unwrap the describe body (drop the final `});` that closes it). Inner
+        // lines are already indented 2 spaces.
+        const bodyEnd = (() => {
+          for (let i = lines.length - 1; i > describeIdx; i--) {
+            if (lines[i].trim() === '});') return i;
+          }
+          return lines.length - 1;
+        })();
+        bodyLines = lines.slice(describeIdx + 1, bodyEnd);
+      } else {
+        // Bare top-level test — keep the whole construct, re-indented by 2 so it
+        // nests cleanly inside the consolidated describe.
+        bodyLines = lines.slice(anchorIdx).map(l => (l.trim() === '' ? '' : '  ' + l));
+      }
+
+      const block = [...doc.map(l => '  ' + l.trim()), ...bodyLines].join('\n');
+      testBlocks.push(block.replace(/\n{3,}/g, '\n\n').trimEnd());
+    }
+
+    // Keep the Playwright import first, then the rest sorted for stability.
+    const pwImport = `import { test, expect } from '@playwright/test';`;
+    importSet.delete(pwImport);
+    const imports = [pwImport, ...Array.from(importSet).sort()].join('\n');
+
+    const describeTitle = `${label} — ${specs.length} scenario${specs.length > 1 ? 's' : ''}`;
+    const content = `${imports}
+
+/**
+ * ${escapeStr(describeTitle)}
+ *
+ * Consolidated spec — every scenario below exercises the ${label} page.
+ * Files are organised by PAGE (coverage), not one-file-per-test-case.
+ *
+ * Generated by LevelUp AI QA Engine (deterministic test-case build)
+ */
+
+test.describe('${escapeStr(describeTitle)}', () => {
+${testBlocks.join('\n\n')}
+});
+`;
+    return { path: `${testFolder}/${fileName}`, content, type: 'test' };
   }
 
   /** Parse test-case steps into a clean ordered list of step strings. */
@@ -2063,21 +2231,70 @@ export default datasets;
       return false;
     };
 
+    // App-aware fallbacks: SauceDemo contract selectors are used ONLY when the
+    // crawl/URL says the target is SauceDemo. For every other app we fall back
+    // to portable, role/attribute-based locators so an ungrounded selector is
+    // still plausibly correct instead of a dead SauceDemo id.
+    const sauce = this.isSauceLikeApp(crawl.url, crawl);
+    const fb = {
+      username: sauce ? `page.locator('#user-name')` : `page.locator('input[type="email"], input[name="email"], input[name="username"], input[name="user"]').first()`,
+      password: sauce ? `page.locator('#password')` : `page.locator('input[type="password"]').first()`,
+      login: sauce ? `page.locator('#login-button')` : `page.getByRole('button', { name: /log ?in|sign ?in|submit|continue/i })`,
+      error: sauce ? `page.locator('[data-test="error"]')` : `page.locator('[role="alert"], .alert, .error, .error-message, [class*="error"]').first()`,
+      title: sauce ? `page.locator('[data-test="title"]')` : `page.locator('h1, h2, [class*="title"]').first()`,
+      product: sauce ? `page.locator('.inventory_item_name')` : `page.locator('.product-image-wrapper, .productinfo, [class*="product"]').first()`,
+      cart: sauce ? `page.locator('.shopping_cart_link')` : `page.getByRole('link', { name: /cart/i }).first()`,
+      inventoryItem: sauce ? `page.locator('.inventory_item')` : `page.locator('.product-image-wrapper, .single-products, [class*="product"]').first()`,
+    };
     const tracked = {
-      username: t(['username', 'user name', 'user-name', 'login'], `page.locator('#user-name')`, 'input'),
-      password: t(['password'], `page.locator('#password')`, 'input'),
-      login: t(['login button', 'login', 'sign in', 'submit'], `page.locator('#login-button')`, 'button'),
-      error: t(['error', 'error message'], `page.locator('[data-test="error"]')`, 'any', rejectError),
-      menu: t(['menu', 'burger menu', 'hamburger', 'open menu'], `page.locator('#react-burger-menu-btn')`, 'button'),
-      logout: t(['logout', 'log out', 'sign out'], `page.locator('#logout_sidebar_link')`, 'any'),
-      title: t(['title', 'page title', 'products', 'header'], `page.locator('[data-test="title"]')`, 'any', rejectTitle),
-      product: t(['product', 'item name', 'product name'], `page.locator('.inventory_item_name')`, 'any'),
-      cart: t(['cart', 'shopping cart', 'cart icon', 'basket'], `page.locator('.shopping_cart_link')`, 'any'),
-      inventoryItem: t(['inventory item', 'product card', 'item'], `page.locator('.inventory_item')`, 'any', rejectInventoryItem),
+      username: t(['username', 'user name', 'user-name', 'email', 'login'], fb.username, 'input'),
+      password: t(['password'], fb.password, 'input'),
+      login: t(['login button', 'login', 'sign in', 'submit'], fb.login, 'button'),
+      error: t(['error', 'error message'], fb.error, 'any', rejectError),
+      menu: t(['menu', 'burger menu', 'hamburger', 'open menu'], sauce ? `page.locator('#react-burger-menu-btn')` : `page.getByRole('button', { name: /menu/i })`, 'button'),
+      logout: t(['logout', 'log out', 'sign out'], sauce ? `page.locator('#logout_sidebar_link')` : `page.getByRole('link', { name: /log ?out|sign ?out/i })`, 'any'),
+      title: t(['title', 'page title', 'products', 'header'], fb.title, 'any', rejectTitle),
+      product: t(['product', 'item name', 'product name'], fb.product, 'any'),
+      cart: t(['cart', 'shopping cart', 'cart icon', 'basket'], fb.cart, 'any'),
+      inventoryItem: t(['inventory item', 'product card', 'item'], fb.inventoryItem, 'any', rejectInventoryItem),
     };
     const sel: Record<string, string> = {};
     for (const [k, v] of Object.entries(tracked)) sel[k] = v.selector;
     return { sel, tracked };
+  }
+
+  /**
+   * App-awareness guard. The deterministic path historically shipped SauceDemo
+   * contract selectors (#user-name, #login-button, [data-test="title"],
+   * [data-test="error"]) and SauceDemo assertions (inventory.html, "Products",
+   * "do not match", "locked out") as FALLBACKS. That is correct only for
+   * SauceDemo — for every other app those literals resolve to nothing, which is
+   * exactly why grounded scripts against sites like automationexercise.com came
+   * out with dead locators. This detects a SauceDemo-shaped app (by URL or by
+   * the presence of its signature ids / data-test hooks in the crawl) so those
+   * SauceDemo-only fallbacks are used ONLY when the target really is SauceDemo.
+   */
+  private isSauceLikeApp(url?: string, crawl?: CrawlResult): boolean {
+    const u = (url || '').toLowerCase();
+    if (/saucedemo|inventory\.html/.test(u)) return true;
+    const els = crawl?.elements || [];
+    return els.some((e: any) => {
+      const id = `${e?.id ?? ''}`.toLowerCase();
+      const dt = `${e?.attributes?.['data-test'] ?? e?.dataTestId ?? ''}`.toLowerCase();
+      return id === 'user-name' || id === 'login-button' || dt === 'username' || dt === 'login-button';
+    });
+  }
+
+  /**
+   * Derive the concrete post-action URL an Expected Result names, e.g.
+   * "User is redirected to Home page (https://automationexercise.com/)" →
+   * "https://automationexercise.com/". Returns null when the Expected Result
+   * carries no explicit URL, so callers can fall back to an app-agnostic
+   * assertion instead of a SauceDemo-specific one.
+   */
+  private deriveSuccessUrl(expected: string): string | null {
+    const m = `${expected || ''}`.match(/\bhttps?:\/\/[^\s'")]+/i);
+    return m ? m[0].replace(/[.,;]+$/, '') : null;
   }
 
   /**
@@ -2672,7 +2889,7 @@ ${gotoB}${sessionLogin('pageB')}
 
     // Does the body already perform a login? If so, don't double up.
     const stepText = steps.join('\n').toLowerCase();
-    const stepsHaveLogin = /log ?in with|sign in with/.test(stepText)
+    const stepsHaveLogin = /(log ?in|sign ?in)\b.*credential|log ?in with|sign in with|(log ?in|sign ?in)\s+successfully/.test(stepText)
       || (/(user( ?name)?)/.test(stepText) && /(click|submit|press).*(login|log in|sign in|submit)/.test(stepText));
     if (stepsHaveLogin) return { lines: [], used };
 
@@ -2713,12 +2930,22 @@ ${gotoB}${sessionLogin('pageB')}
     // three identical toHaveURL checks stacking from precondition + body + assertions).
     const expected = `${tc.expected_result || ''}`.toLowerCase();
     const alreadyChecksInventoryUrl = /inventory|navigate.*inventory|redirect.*inventory|url.*inventory/i.test(expected);
-    
+
+    // App-aware post-login confirmation. SauceDemo lands on /inventory.html; other
+    // apps land wherever their (crawled) app takes them, so we must NOT assert
+    // SauceDemo's URL against, say, automationexercise.com. When the app isn't
+    // SauceDemo we confirm the precondition succeeded by asserting we left the
+    // login page (a portable, app-agnostic signal) instead.
+    const sauce = this.isSauceLikeApp(ctx.url);
+    const confirmLogin = (): void => {
+      if (alreadyChecksInventoryUrl) return; // body/final assertions already verify it
+      if (sauce) lines.push(`await expect(page).toHaveURL(/inventory\\.html/);`);
+      else lines.push(`await expect(page).not.toHaveURL('${escapeStr(ctx.url)}');`);
+    };
+
     if (loginPO && loginMethod) {
       lines.push(`await ${loginPO.varName}.${loginMethod}(${unameExpr}, ${pwdExpr});`);
-      if (!alreadyChecksInventoryUrl) {
-        lines.push(`await expect(page).toHaveURL(/inventory\\.html/);`);
-      }
+      confirmLogin();
       lines.push('');
       used.add(loginPO.varName);
       return { lines, used };
@@ -2730,9 +2957,7 @@ ${gotoB}${sessionLogin('pageB')}
     lines.push(`await ${ctx.sel.password}.fill(${pwdExpr});`);
     lines.push(`await ${ctx.sel.login}.click();`);
     lines.push(`await page.waitForLoadState('domcontentloaded');`);
-    if (!alreadyChecksInventoryUrl) {
-      lines.push(`await expect(page).toHaveURL(/inventory\\.html/);`);
-    }
+    confirmLogin();
     lines.push('');
     return { lines, used };
   }
@@ -2835,12 +3060,22 @@ ${gotoB}${sessionLogin('pageB')}
 
       // ── attempt to navigate back to products / access products page ──
       if (/attempt.*navigate|navigate back|access.*product|back to the product/.test(t)) {
-        push(raw, [`await page.goto('${escapeStr(ctx.url)}inventory.html');`], false);
+        // App-aware target. If the step names an explicit URL, honour it. Else
+        // for SauceDemo the products page is inventory.html; for other apps we
+        // cannot assume that path, so navigate to the crawled base URL instead
+        // of manufacturing a bogus "/logininventory.html".
+        const navUrl = urlM ? urlM[0]
+          : this.isSauceLikeApp(ctx.url) ? `${ctx.url}inventory.html`
+          : ctx.url;
+        push(raw, [`await page.goto('${escapeStr(navUrl)}');`], false);
         continue;
       }
 
-      // ── "log in with valid credentials" — expand to fill+fill+click ──
-      if (/log ?in with (valid )?credential|sign in with (valid )?credential/.test(t)) {
+      // ── "log in with/using valid credentials" — expand to fill+fill+click ──
+      // Accept "with", "using", or any connector before "credentials" (and the
+      // bare "log in successfully" phrasing) so authored preconditions written as
+      // a single high-level step are expanded instead of left un-mapped.
+      if (/(log ?in|sign ?in)\b.*credential/.test(t) || /(log ?in|sign ?in)\s+successfully/.test(t)) {
         push(raw, [
           `await ${ctx.sel.username}.fill(${fieldExpr('username', raw, t)});`,
           `await ${ctx.sel.password}.fill(${fieldExpr('password', raw, t)});`,
@@ -3029,13 +3264,25 @@ ${gotoB}${sessionLogin('pageB')}
     const isCart = /cart (icon|is|should)|shopping cart|cart is visible|cart badge/.test(lc);
     const isSuccess = /products page|inventory|remains logged in|access all product|redirected to the products/.test(lc);
 
+    const sauce = this.isSauceLikeApp(ctx.url);
+    const successUrl = this.deriveSuccessUrl(exp);
+
     if (isConditional) {
       // Boundary/condition case: the provided values may or may not be accepted.
-      // Assert deterministically on whichever state the app lands in.
+      // Assert deterministically on whichever state the app lands in. The
+      // "accepted" branch is app-aware: SauceDemo lands on /inventory.html with a
+      // Products title; other apps land on whatever URL the Expected Result names
+      // (or simply leave the login page).
       lines.push(`// Expected outcome depends on whether the supplied values are valid credentials.`);
-      lines.push(`if (page.url().includes('/inventory.html')) {`);
-      lines.push(`  await expect(page).toHaveURL(/inventory\\.html/);`);
-      lines.push(`  await expect(${ctx.sel.title}).toHaveText(/Products/i);`);
+      if (sauce) {
+        lines.push(`if (page.url().includes('/inventory.html')) {`);
+        lines.push(`  await expect(page).toHaveURL(/inventory\\.html/);`);
+        lines.push(`  await expect(${ctx.sel.title}).toHaveText(/Products/i);`);
+      } else {
+        lines.push(`if (!page.url().includes('/login')) {`);
+        if (successUrl) lines.push(`  await expect(page).toHaveURL('${escapeStr(successUrl)}');`);
+        else lines.push(`  await expect(page).not.toHaveURL('${escapeStr(ctx.url)}');`);
+      }
       lines.push(`} else {`);
       lines.push(`  await expect(${errorRef()}).toBeVisible();`);
       lines.push(`  await expect(page).toHaveURL('${escapeStr(ctx.url)}');`);
@@ -3057,7 +3304,12 @@ ${gotoB}${sessionLogin('pageB')}
       // guessed text — we assert the error surface + that we stayed on the login
       // page, which is the reliable, scenario-faithful expectation.
       let frag = messageFrag;
-      if (!frag) {
+      // Guessed canned message text ("do not match", "locked out", "is required")
+      // is SauceDemo's copy — only guess it for a SauceDemo-shaped app. For other
+      // apps we never invent message text (it would assert a string the app never
+      // renders); we assert the error surface + that we stayed on the login page,
+      // unless the Expected Result itself quoted the message (messageFrag).
+      if (!frag && this.isSauceLikeApp(ctx.url)) {
         // The transformer for the classified scenario supplies the deterministic
         // fragment: a string to assert, '' to assert the error surface only, or
         // null when the scenario dictates nothing (defer to Expected-Result text).
@@ -3101,14 +3353,25 @@ ${gotoB}${sessionLogin('pageB')}
     }
 
     if (isSuccess) {
-      lines.push(`await expect(page).toHaveURL(/inventory\\.html/);`);
-      lines.push(`await expect(${ctx.sel.title}).toHaveText(/Products/i);`);
+      if (sauce) {
+        lines.push(`await expect(page).toHaveURL(/inventory\\.html/);`);
+        lines.push(`await expect(${ctx.sel.title}).toHaveText(/Products/i);`);
+      } else if (successUrl) {
+        // The Expected Result named the destination (e.g. the home page) — assert
+        // exactly that URL rather than SauceDemo's inventory.html.
+        lines.push(`await expect(page).toHaveURL('${escapeStr(successUrl)}');`);
+        lines.push(`await expect(${ctx.sel.title}).toBeVisible();`);
+      } else {
+        // App-agnostic success signal: we are no longer on the login page.
+        lines.push(`await expect(page).not.toHaveURL('${escapeStr(ctx.url)}');`);
+        lines.push(`await expect(${ctx.sel.title}).toBeVisible();`);
+      }
       return lines;
     }
 
-    // Fallback — never emit a no-op and never a meaningless not.toHaveURL.
-    // Assert the app reached the post-login Products page, which is the
-    // intended end-state for any non-error login flow.
+    // Fallback — never emit a no-op. Prefer the Expected Result's named URL,
+    // else assert the (app-aware) landmark element is visible.
+    if (successUrl) lines.push(`await expect(page).toHaveURL('${escapeStr(successUrl)}');`);
     lines.push(`await expect(${ctx.sel.title}).toBeVisible();`);
     return lines;
   }

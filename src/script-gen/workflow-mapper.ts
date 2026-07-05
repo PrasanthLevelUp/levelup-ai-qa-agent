@@ -334,7 +334,22 @@ const FLOW_PATTERNS: FlowPattern[] = [
     detect: (pages) => {
       if (pages.length === 0) return null;
       const mainPage = pages[0]!;
-      const internalLinks = mainPage.navigationLinks.filter(l => l.isInternal).slice(0, 5);
+      // Only build nav steps for links that carry REAL, human-visible text.
+      // A link with empty/whitespace text (logo anchors, icon-only links) used
+      // to produce a garbage locator like getByRole('link', { name: /link: ""/i })
+      // that matches nothing. Normalise + drop those, and de-duplicate by text.
+      const seenText = new Set<string>();
+      const internalLinks = mainPage.navigationLinks
+        .filter(l => l.isInternal)
+        .map(l => ({ ...l, text: (l.text || '').replace(/\s+/g, ' ').trim() }))
+        .filter(l => {
+          if (!l.text) return false;               // no visible label → un-locatable
+          const key = l.text.toLowerCase();
+          if (seenText.has(key)) return false;      // avoid duplicate nav entries
+          seenText.add(key);
+          return true;
+        })
+        .slice(0, 5);
 
       if (internalLinks.length < 2) return null;
 
