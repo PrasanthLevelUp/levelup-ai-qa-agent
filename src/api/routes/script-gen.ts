@@ -715,11 +715,28 @@ export function createScriptGenRouter(): Router {
         // real locators; per-locator `validated` still distinguishes DOM-verified
         // (grounded) from known-good for full transparency.
         const realCount = engineGrounding.realCount ?? engineGrounding.groundedCount;
+        // App-Profile-grounding KPI (customer proof point). Surfaced per spec so
+        // the UI can show e.g. "22 locators · 20 from App Profile · 2 healed by
+        // AI · 91% Repository Grounded · 9% AI". North-star: grow App-Profile %,
+        // shrink AI % as the App Profile improves.
+        const appProfileCount = engineGrounding.fromAppProfile ?? engineGrounding.groundedCount;
+        const fallbackCount = engineGrounding.fromFallback ?? Math.max(0, realCount - appProfileCount);
+        const aiCount = engineGrounding.fromAI ?? 0;
+        const appProfilePct = engineGrounding.appProfilePct ?? (engineGrounding.total ? Math.round((appProfileCount / engineGrounding.total) * 100) : 0);
+        const aiPct = engineGrounding.aiPct ?? (engineGrounding.total ? Math.round((aiCount / engineGrounding.total) * 100) : 0);
         locatorReport = {
           totalLocators: engineGrounding.total,
           validatedCount: realCount,
           avgConfidence: engineGrounding.avgConfidence,
           todoCount: Math.max(0, engineGrounding.total - realCount),
+          // Provenance KPI buckets (App Profile vs curated fallback vs AI).
+          appProfileCount,
+          fallbackCount,
+          aiCount,
+          appProfilePct,
+          aiPct,
+          groundedPct: engineGrounding.groundedPct,
+          provenanceSummary: `${engineGrounding.total} locators · ${appProfileCount} from App Profile · ${aiCount} healed by AI · ${appProfilePct}% Repository Grounded · ${aiPct}% AI`,
           locators: engineGrounding.entries.map((e) => ({
             element: e.name,
             selector: e.selector,
