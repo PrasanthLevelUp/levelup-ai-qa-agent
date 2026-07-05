@@ -841,7 +841,14 @@ export class ScriptGenEngine {
     const title = tc.title || 'Generated test';
     const tags = this.tcTags(tc);
     const idMarker = tc.id != null ? `\n  // @tc:TC${tc.id}` : '';
-    const stepComments = steps.map((s, i) => `   *   ${i + 1}. ${this.escapeBlockComment(s)}`).join('\n');
+    // Locator-consistency fix: correct any hallucinated test-hook attribute in
+    // the prose steps (e.g. `data-testid`) to the attribute the crawled DOM
+    // actually uses (e.g. SauceDemo's `data-test`), so the human-readable steps
+    // never contradict the grounded selectors the executable code resolves.
+    const realTestHookAttr = this.detectTestHookAttr(crawl);
+    const stepComments = steps
+      .map((s, i) => `   *   ${i + 1}. ${this.escapeBlockComment(this.normalizeStepSelectors(s, realTestHookAttr))}`)
+      .join('\n');
 
     // ── Repository Intelligence: match ALL relevant existing Page Objects ──
     // (login / inventory / cart / checkout) with real methods + repo-derived
@@ -1333,6 +1340,70 @@ ${combined.map(l => (l ? `    ${l}` : '')).join('\n')}
       .replace(/\[[^\]]*\]/g, ' ')               // [data-testid='username']
       .replace(/[\w-]+\s*=\s*(['"]).*?\1/g, ' ')  // data-testid='username'
       .replace(/[#.][a-z][\w-]*/gi, ' ');         // #login-button .btn-primary
+  }
+
+  /**
+   * Known test-hook attribute synonyms an LLM tends to hallucinate in prose
+   * step descriptions. The Test Case Lab frequently writes "…in
+   * [data-testid='username'] field" even when the real app exposes the hook as
+   * `data-test`. Left uncorrected, the generated spec's HUMAN-READABLE steps
+   * contradict the EXECUTABLE code (which correctly resolves `data-test` from
+   * the crawl) — eroding user trust in the locators. These are normalized to
+   * the attribute actually observed in the crawled DOM.
+   */
+  private static readonly TEST_HOOK_ATTR_SYNONYMS = [
+    'data-testid', 'data-test-id', 'data-test', 'data-qa', 'data-cy',
+    'data-test-selector', 'data-automation-id', 'data-automationid', 'data-auto',
+  ];
+
+  /**
+   * Detect the dominant test-hook attribute ACTUALLY present in the crawled DOM
+   * (App Profile). Returns e.g. `data-test` for SauceDemo. Returns undefined
+   * when the crawl exposes no test-hook attribute, in which case prose is left
+   * untouched (we never rewrite to an unverified attribute).
+   */
+  private detectTestHookAttr(crawl?: CrawlResult): string | undefined {
+    const counts = new Map<string, number>();
+    for (const el of (crawl?.elements || [])) {
+      const attrs = (el as any).attributes as Record<string, string> | undefined;
+      if (!attrs) continue;
+      for (const key of Object.keys(attrs)) {
+        const k = key.toLowerCase();
+        if (ScriptGenEngine.TEST_HOOK_ATTR_SYNONYMS.includes(k)) {
+          counts.set(k, (counts.get(k) || 0) + 1);
+        }
+      }
+    }
+    let best: string | undefined;
+    let bestCount = 0;
+    for (const [k, c] of counts) {
+      if (c > bestCount) { best = k; bestCount = c; }
+    }
+    return best;
+  }
+
+  /**
+   * Rewrite hallucinated test-hook attribute names inside a prose step
+   * description so they match the attribute the app really uses. Only the
+   * attribute NAME is changed — the value and surrounding text are preserved —
+   * and only when `realAttr` is known AND differs from what was written.
+   * Handles both bracketed (`[data-testid='x']`) and bare
+   * (`data-testid="x"`) forms.
+   *
+   * Deterministic and side-effect free — safe to unit test in isolation.
+   */
+  private normalizeStepSelectors(step: string, realAttr?: string): string {
+    if (!realAttr) return step;
+    let out = String(step);
+    for (const synonym of ScriptGenEngine.TEST_HOOK_ATTR_SYNONYMS) {
+      if (synonym === realAttr) continue;
+      // Match the attribute name only when immediately followed by `=` (an
+      // actual selector reference), with an optional leading `[`. Word-boundary
+      // guarded so `data-test` never partially clobbers `data-testid`.
+      const re = new RegExp(`(\\[?)${synonym}(?=\\s*=)`, 'gi');
+      out = out.replace(re, `$1${realAttr}`);
+    }
+    return out;
   }
 
   /**
