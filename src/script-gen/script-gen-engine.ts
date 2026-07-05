@@ -496,10 +496,14 @@ export class ScriptGenEngine {
       };
     } else {
       // SLOW PATH: Full crawl
+      // Ensure the page budget can hold the entry page PLUS every extra page a
+      // test case needs to visit — otherwise the multi-page crawl could stop
+      // before reaching (and grounding) the /login page.
+      const extraUrlCount = config.additionalUrls?.length ?? 0;
       const crawlConfig: CrawlConfig = {
         url: config.url,
         followLinks: config.followLinks ?? false,
-        maxPages: config.maxPages ?? 3,
+        maxPages: Math.max(config.maxPages ?? 3, 1 + extraUrlCount),
         captureScreenshot: true,
         authConfig: config.authConfig,
         additionalUrls: config.additionalUrls,
@@ -547,6 +551,27 @@ export class ScriptGenEngine {
           });
           const multiResult = await crawler.crawlAuthenticatedMultiPage();
           crawlResult = multiResult.pages[0]!;
+          authResult = crawlResult.authResult;
+          for (let i = 1; i < multiResult.pages.length; i++) {
+            const extra = multiResult.pages[i]!;
+            crawlResult.elements.push(...(extra.elements || []));
+            crawlResult.forms.push(...(extra.forms || []));
+            crawlResult.buttons.push(...(extra.buttons || []));
+            crawlResult.inputs.push(...(extra.inputs || []));
+            crawlResult.navigationLinks.push(...(extra.navigationLinks || []));
+            crawlResult.errors.push(...(extra.errors || []));
+          }
+        } else if (config.additionalUrls && config.additionalUrls.length > 0) {
+          // Non-authenticated, but the caller supplied extra pages to cover
+          // (e.g. the /login page a login test case navigates to). Use the
+          // multi-page crawl so those pages are captured too — otherwise
+          // grounding for those pages' elements silently falls back.
+          logger.info(MOD, 'Using multi-page crawl to cover test-case target pages', {
+            primaryUrl: config.url,
+            additionalUrls: config.additionalUrls.length,
+          });
+          const multiResult = await crawler.crawlMultiPage();
+          crawlResult = multiResult.pages[0] || (await crawler.crawl());
           authResult = crawlResult.authResult;
           for (let i = 1; i < multiResult.pages.length; i++) {
             const extra = multiResult.pages[i]!;
