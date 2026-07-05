@@ -110,7 +110,9 @@ const crawl: any = {
   });
   const nmCode = noMethod.generatedFiles[0].content;
   check('no hallucinated loginPage.login() when method absent', !nmCode.includes('loginPage.login('));
-  check('falls back to raw locators when method absent', nmCode.includes("page.locator('#user-name').fill("));
+  // Element Intelligence grounds the field via its data-test contract, so the raw
+  // fallback (no reusable PO method) now targets [data-test="username"], not #user-name.
+  check('falls back to raw locators when method absent', nmCode.includes("page.locator('[data-test=\"username\"]').fill("));
   check('LoginPage NOT imported when unused', !nmCode.includes('import { LoginPage }'));
 
   /* ───────────────────────── CART ───────────────────────── */
@@ -204,7 +206,7 @@ const crawl: any = {
   });
   const rawCode = noPO.generatedFiles[0].content;
   check('no PO import without profile', !rawCode.includes('LoginPage'));
-  check('raw locators emitted as fallback', rawCode.includes("page.locator('#user-name').fill("));
+  check('raw locators emitted as fallback', rawCode.includes("page.locator('[data-test=\"username\"]').fill("));
 
   /* ──────────────── Repository Intelligence metadata exposure ──────────────── */
   console.log('\n=== Repository Intelligence metadata (PR #142 completion) ===');

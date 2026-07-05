@@ -35,6 +35,7 @@ import { normalizeBaseUrl } from '../utils/url-normalize';
 import { logger } from '../utils/logger';
 import type { FailureDetails } from '../core/failure-analyzer';
 import { resolveProfileForHealing } from './app-profile-healing-resolver';
+import { rankLocatorCandidates, type ElementLike } from '../intelligence/element-intelligence';
 
 const MOD = 'app-profile-healing';
 
@@ -495,47 +496,22 @@ function esc(v: string): string {
  * Build ordered, grounded candidate locators for a concrete matched element,
  * strongest/most-stable first. Every candidate is sourced from a real crawled
  * attribute/value — nothing is invented.
+ *
+ * This now delegates to the canonical {@link rankLocatorCandidates} in the
+ * Element Intelligence layer, so Healing and Script Generation share ONE
+ * locator-ranking brain (data-test → ARIA role → id → name → …). The result is
+ * adapted into the healing-specific {@link AppProfileCandidate} shape
+ * (source/validated flags) that the orchestrator + trail expect.
  */
 export function buildGroundedCandidates(el: CrawledElement, description: string): AppProfileCandidate[] {
-  const out: AppProfileCandidate[] = [];
-  const seen = new Set<string>();
-  const add = (locator: string, confidence: number, why: string) => {
-    const norm = locator.trim();
-    if (!norm || seen.has(norm)) return;
-    seen.add(norm);
-    out.push({ locator: norm, confidence: Math.max(0, Math.min(1, confidence)), source: 'app_profile', reasoning: why, validated: true });
-  };
-
-  const a = el.attributes || {};
-  const text = (el.textContent || el.ariaLabel || el.nearbyLabel || '').trim();
-  const role = inferRole(el);
-
-  // 1. data-test (SauceDemo & many apps) — exact attribute selector.
-  if (a['data-test']) add(`page.locator('[data-test="${esc(a['data-test'])}"]')`, 0.96, `Grounded: data-test="${a['data-test']}" from crawl (matched "${description}")`);
-  // 2. data-testid — getByTestId targets data-testid by default; also give the explicit attr alt.
-  if (a['data-testid']) {
-    const v = a['data-testid'];
-    add(`page.getByTestId('${esc(v)}')`, 0.95, `Grounded: data-testid="${v}" from crawl`);
-    add(`page.locator('[data-testid="${esc(v)}"]')`, 0.9, `Grounded: data-testid attribute from crawl`);
-  }
-  // 3. data-cy / data-qa.
-  if (a['data-cy']) add(`page.locator('[data-cy="${esc(a['data-cy'])}"]')`, 0.93, `Grounded: data-cy="${a['data-cy']}" from crawl`);
-  if (a['data-qa']) add(`page.locator('[data-qa="${esc(a['data-qa'])}"]')`, 0.92, `Grounded: data-qa="${a['data-qa']}" from crawl`);
-
-  // 4. Accessible role + name (resilient, semantic).
-  if (role && text) add(`page.getByRole('${role}', { name: '${esc(text)}' })`, 0.9, `Grounded: ${role} with accessible name "${text}" from crawl`);
-
-  // 5. Stable id.
-  if (el.id && !isDynamicId(el.id)) add(`page.locator('#${esc(el.id)}')`, 0.85, `Grounded: stable id #${el.id} from crawl`);
-
-  // 6. name attribute (forms).
-  if (el.name) add(`page.locator('[name="${esc(el.name)}"]')`, 0.83, `Grounded: name="${el.name}" from crawl`);
-
-  // 7. Placeholder / label / text fallbacks.
-  if (el.placeholder) add(`page.getByPlaceholder('${esc(el.placeholder)}')`, 0.8, `Grounded: placeholder "${el.placeholder}" from crawl`);
-  if (el.nearbyLabel || el.ariaLabel) add(`page.getByLabel('${esc((el.nearbyLabel || el.ariaLabel)!)}')`, 0.8, `Grounded: label "${el.nearbyLabel || el.ariaLabel}" from crawl`);
-  if (text && !role) add(`page.getByText('${esc(text)}')`, 0.75, `Grounded: text "${text}" from crawl`);
-
-  // Keep the top few for resilience without flooding the retry loop.
-  return out.slice(0, 4);
+  return rankLocatorCandidates(el as ElementLike, description)
+    .map((c) => ({
+      locator: c.locator,
+      confidence: c.confidence,
+      source: 'app_profile' as const,
+      reasoning: `Grounded: ${c.reasoning} from crawl`,
+      validated: true,
+    }))
+    // Keep the top few for resilience without flooding the retry loop.
+    .slice(0, 4);
 }
