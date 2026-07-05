@@ -135,6 +135,12 @@ export function createScriptGenRouter(): Router {
         testCaseId,
         // ── Sprint 4: Enterprise Script Generation Enhancement ──
         requirementId,
+        // Inline structured test cases from a CSV/Excel upload (no DB row). When
+        // provided WITHOUT a testCaseId/requirementId these are normalized and
+        // run through the SAME deterministic, grounded batch engine as
+        // requirement-linked test cases — instead of the ungrounded LLM
+        // discovery fallback that flattened scenario strings used to trigger.
+        testCases: inlineTestCasesRaw,
         generationSource: rawGenerationSource,
         locatorStrategy,
         folderStrategy,
@@ -237,6 +243,50 @@ export function createScriptGenRouter(): Router {
         } catch (reqErr: any) {
           console.warn(`[ScriptGen] Could not load requirement test cases (non-blocking): ${reqErr?.message}`);
         }
+      }
+
+      // ── Inline uploaded test cases (CSV/Excel upload) ────────────────────
+      // When the caller supplies structured test cases inline (no DB row) and we
+      // did NOT resolve a single testCase or requirement-linked batch, normalize
+      // them into the engine's snake_case shape and treat them exactly like a
+      // requirement batch. This routes an "Upload Test Cases" generation through
+      // the deterministic, grounded engine (real locators, page-consolidated)
+      // instead of the LLM discovery fallback (0% grounded) it used to hit.
+      if (
+        !testCase &&
+        requirementTestCases.length === 0 &&
+        Array.isArray(inlineTestCasesRaw) &&
+        inlineTestCasesRaw.length > 0
+      ) {
+        requirementTestCases = inlineTestCasesRaw
+          .filter((tc: any) => tc && typeof tc === 'object')
+          .map((tc: any, i: number) => {
+            // Accept both camelCase (from the upload parser) and snake_case.
+            const expected = tc.expected_result ?? tc.expectedResult ?? '';
+            const title =
+              (typeof tc.title === 'string' && tc.title.trim())
+                ? tc.title.trim()
+                : (typeof tc.scenario === 'string' && tc.scenario.trim())
+                  ? tc.scenario.trim()
+                  : `Test case ${i + 1}`;
+            return {
+              // Stable numeric-ish id for downstream keying; keep original too.
+              id: tc.id ?? `upload-${i + 1}`,
+              title,
+              // Engine's parseTestCaseSteps handles a newline string OR an array.
+              steps: tc.steps ?? tc.scenario ?? '',
+              expected_result: expected,
+              preconditions: tc.preconditions ?? '',
+              priority: tc.priority ?? '',
+              module: tc.module ?? '',
+              scenario: tc.scenario ?? title,
+              requirement_id: tc.requirement_id ?? null,
+              test_data: tc.test_data ?? tc.testData ?? null,
+              // Mark provenance so downstream logging is honest.
+              source: 'uploaded',
+            };
+          });
+        console.log(`[ScriptGen] 📥 ${requirementTestCases.length} inline uploaded test case(s) normalized → deterministic batch generation`);
       }
 
       // ── Test-case page coverage ──────────────────────────────────────────
@@ -555,12 +605,16 @@ export function createScriptGenRouter(): Router {
       };
 
       // Log which generation path will run (no credentials ever logged).
+      const usedInlineUploaded =
+        !testCase && requirementTestCases.length > 0 && !requirementId &&
+        Array.isArray(inlineTestCasesRaw) && inlineTestCasesRaw.length > 0;
       console.log('[ScriptGen] Generation mode:', JSON.stringify({
         requirementId: requirementId ?? null,
         testCaseId: testCaseId ?? null,
         requirementTestCaseCount: requirementTestCases.length,
+        inlineUploadedTestCases: usedInlineUploaded ? requirementTestCases.length : 0,
         path: requirementTestCases.length > 0
-          ? 'requirement-batch-deterministic'
+          ? (usedInlineUploaded ? 'uploaded-batch-deterministic' : 'requirement-batch-deterministic')
           : testCase
             ? 'testcase-deterministic'
             : 'llm-fallback',
