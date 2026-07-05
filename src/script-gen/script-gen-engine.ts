@@ -178,6 +178,42 @@ export interface LocatorGroundingReport {
   realPct: number;
   /** Average confidence across all reported entries, 0–100. */
   avgConfidence: number;
+
+  /* ── App-Profile-grounding KPI (customer proof point) ──────────────────────
+   * Breaks the locators into WHERE they came from so the UI can show, per spec:
+   *   "22 locators · ✓ 20 from App Profile · ✓ 2 healed by AI · 91% Repository
+   *    Grounded · 9% AI". The north-star is to grow `fromAppProfile` and shrink
+   *   `fromAI` as the App Profile improves. `fromFallback` are curated
+   *   app-contract selectors (neither DOM-verified nor AI) — reported honestly
+   *   as a third bucket so the App-Profile % is never inflated. */
+  /** Locators resolved directly from the crawled App Profile DOM (grounded). */
+  fromAppProfile: number;
+  /** Curated/known-good fallback selectors (not DOM-verified, not AI). */
+  fromFallback: number;
+  /** Locators produced/repaired by AI (LLM or healing suggestions). */
+  fromAI: number;
+  /** % of locators sourced from the App Profile = round(fromAppProfile/total*100). */
+  appProfilePct: number;
+  /** % of locators sourced from AI = round(fromAI/total*100). */
+  aiPct: number;
+}
+
+/**
+ * Classify a grounding entry's `source`/flags into ONE provenance bucket for
+ * the App-Profile KPI. Kept as a free function so both the engine and any
+ * reporting layer categorize identically.
+ *   - 'app-profile' — DOM-verified against the crawl (id/name/data-attr/css/role)
+ *   - 'ai'          — produced or healed by the LLM/healing engine
+ *   - 'fallback'    — curated known-good app-contract selector (neither of above)
+ */
+export function classifyLocatorProvenance(e: {
+  grounded: boolean;
+  source?: string;
+}): 'app-profile' | 'ai' | 'fallback' {
+  const src = (e.source || '').toLowerCase();
+  if (src === 'ai' || src === 'ai-healed' || src === 'llm' || src === 'healed') return 'ai';
+  if (e.grounded) return 'app-profile';
+  return 'fallback';
 }
 
 export interface GenerationResult {
@@ -914,7 +950,12 @@ export class ScriptGenEngine {
       return this.buildTcResult(tc, title, baseUrl, crawl, tags, generatedFiles, 0, startTime, grounding, matchedPOs);
     }
 
-    const ctx = { url: baseUrl, creds, sel, data: dataRef };
+    // `stepTracked` collects the PER-STEP locators grounded against the crawl
+    // (the qualifier-aware resolution). These are merged into the grounding
+    // report below so the KPI reflects the locators the spec ACTUALLY uses —
+    // not just the fixed semantic vocabulary.
+    const stepTracked: LocatorGroundingEntry[] = [];
+    const ctx = { url: baseUrl, creds, sel, data: dataRef, crawl, stepTracked };
 
     // ── Precondition materialization (review TC2/TC5 fix) ──
     // If the case assumes an authenticated session ("user is logged in") but its
@@ -1078,7 +1119,7 @@ ${combined.map(l => (l ? `    ${l}` : '')).join('\n')}
     if (moduleFile && usesModule) generatedFiles.push(moduleFile);
 
     const totalAssertions = combined.filter(a => /\bexpect\s*\(/.test(a)).length;
-    const grounding = this.buildLocatorGroundingReport(tracked, content);
+    const grounding = this.buildLocatorGroundingReport(tracked, content, stepTracked);
     return this.buildTcResult(tc, title, baseUrl, crawl, tags, generatedFiles, totalAssertions, startTime, grounding, matchedPOs, usedPOVars);
   }
 
@@ -1533,7 +1574,13 @@ ${testBlocks.join('\n\n')}
     return String(raw)
       .replace(/\[[^\]]*\]/g, ' ')               // [data-testid='username']
       .replace(/[\w-]+\s*=\s*(['"]).*?\1/g, ' ')  // data-testid='username'
-      .replace(/[#.][a-z][\w-]*/gi, ' ');         // #login-button .btn-primary
+      // Strip #id / .class selector tokens ONLY when they stand alone (start of
+      // string, or preceded by whitespace / an opening paren). Previously this
+      // matched the `.com` inside an email/domain literal (e.g.
+      // "test@example.com" → "test@example"), silently truncating credential
+      // values. Requiring a boundary before the token keeps `example.com`,
+      // `v1.2`, etc. intact while still removing real `.btn-primary`/`#id` hooks.
+      .replace(/(^|[\s(])([#.][a-z][\w-]*)/gi, '$1 ');
   }
 
   /**
@@ -2307,13 +2354,27 @@ export default datasets;
   private buildLocatorGroundingReport(
     tracked: Record<string, { selector: string; grounded: boolean; knownGood: boolean; confidence: number; source: string }>,
     content: string,
+    stepEntries: LocatorGroundingEntry[] = [],
   ): LocatorGroundingReport {
     const entries: LocatorGroundingEntry[] = [];
-    const seen = new Set<string>();
+    // De-duplicate by SELECTOR (not name): each distinct locator the spec uses
+    // is counted once, so the fixed-vocabulary entry and a per-step entry that
+    // resolved to the SAME selector don't inflate the total.
+    const seenSelectors = new Set<string>();
+    // Per-step, crawl-grounded locators are AUTHORITATIVE — they are what the
+    // spec actually emits for each interaction — so add them first.
+    for (const e of stepEntries) {
+      if (!content.includes(e.selector)) continue;
+      if (seenSelectors.has(e.selector)) continue;
+      seenSelectors.add(e.selector);
+      entries.push(e);
+    }
+    // Then add any fixed-vocabulary semantic selectors the spec still references
+    // (e.g. assertion-only locators) that weren't already covered per-step.
     for (const [name, info] of Object.entries(tracked)) {
       if (!content.includes(info.selector)) continue; // only elements the spec uses
-      if (seen.has(name)) continue;
-      seen.add(name);
+      if (seenSelectors.has(info.selector)) continue;
+      seenSelectors.add(info.selector);
       entries.push({ name, selector: info.selector, grounded: info.grounded, knownGood: info.knownGood, confidence: info.confidence, source: info.source });
     }
     return this.summarizeGrounding(entries);
@@ -2329,7 +2390,20 @@ export default datasets;
       : 0;
     const groundedPct = total ? Math.round((groundedCount / total) * 100) : 0;
     const realPct = total ? Math.round((realCount / total) * 100) : 0;
-    return { entries, total, groundedCount, groundedPct, realCount, realPct, avgConfidence };
+    // App-Profile KPI buckets — every entry falls into exactly one provenance.
+    let fromAppProfile = 0, fromFallback = 0, fromAI = 0;
+    for (const e of entries) {
+      const bucket = classifyLocatorProvenance(e);
+      if (bucket === 'app-profile') fromAppProfile++;
+      else if (bucket === 'ai') fromAI++;
+      else fromFallback++;
+    }
+    const appProfilePct = total ? Math.round((fromAppProfile / total) * 100) : 0;
+    const aiPct = total ? Math.round((fromAI / total) * 100) : 0;
+    return {
+      entries, total, groundedCount, groundedPct, realCount, realPct, avgConfidence,
+      fromAppProfile, fromFallback, fromAI, appProfilePct, aiPct,
+    };
   }
 
   /** Merge several per-case grounding reports into one (dedupe by element name). */
@@ -2963,15 +3037,121 @@ ${gotoB}${sessionLogin('pageB')}
   }
 
   /**
+   * Extract the CONTROL PHRASE a step targets — the words that name the field or
+   * button to act on — with any disambiguating qualifier PRESERVED. This is what
+   * lets "login email field" resolve to the login form's email input while
+   * "signup email field" resolves to the signup form's, instead of collapsing
+   * both onto a single pre-resolved `sel.username`. We strip the leading action
+   * verb, any quoted value literal, selector noise and generic filler words
+   * (the/a/into/field/button…) but KEEP domain words like login/signup/search/
+   * billing so `matchElement` can score the right element.
+   */
+  private extractControlPhrase(step: string): string {
+    let s = this.stripSelectorNoise(String(step));
+    // Remove quoted value literals ('John Doe', "test@x.com") — they are data,
+    // not part of the control's name.
+    s = s.replace(/'[^']*'|"[^"]*"/g, ' ');
+    // Drop a leading action verb and common lead-ins.
+    s = s.replace(/^\s*(?:please\s+)?(?:the\s+)?(enter|type|fill(?:\s+in)?|input|provide|key\s+in|click(?:\s+on)?|press|tap|select|choose|set|check|toggle)\b/i, ' ');
+    // Remove generic filler / structural words that add no matching signal.
+    s = s.replace(/\b(the|a|an|into|in|on|to|with|value|values|text|for|of|and|then|please|field|fields|input|inputs|box|textbox|button|buttons|link|links|icon|element|section|form|area|its|your|my)\b/gi, ' ');
+    return s.replace(/[^a-z0-9@._\s-]/gi, ' ').replace(/\s+/g, ' ').trim();
+  }
+
+  /**
+   * Resolve ONE step's control to a grounded Playwright locator from the crawled
+   * App Profile using the step's own phrase (qualifier-aware). Records the
+   * outcome into `tracked` for the Locator Grounding Report / App-Profile KPI.
+   * Returns the grounded selector when a real element matched, otherwise the
+   * supplied `fallback` (already a real/curated selector) with grounded=false —
+   * so behaviour degrades gracefully and the KPI stays honest.
+   */
+  private resolveStepControl(
+    phrase: string,
+    crawl: CrawlResult | undefined,
+    kind: 'input' | 'button' | 'any',
+    fallback: string,
+    name: string,
+    tracked?: LocatorGroundingEntry[],
+  ): string {
+    if (!crawl || !phrase) return fallback;
+    const r = this.resolveGroundedSelectorTracked([phrase], crawl, fallback, kind);
+    if (tracked) {
+      tracked.push({
+        name, selector: r.selector, grounded: r.grounded,
+        knownGood: r.knownGood, confidence: r.confidence, source: r.source,
+      });
+    }
+    return r.selector;
+  }
+
+  /**
+   * JS expression for the value to fill into a GENERIC (non-credential) field,
+   * e.g. name / phone / address / subject. Prefers an authored quoted literal,
+   * emits '' for an intentionally-empty negative step, and otherwise a readable
+   * placeholder derived from the field phrase (never a silent empty fill).
+   */
+  private genericFillValue(step: string, phrase: string): string {
+    const prose = this.stripSelectorNoise(String(step));
+    const t = prose.toLowerCase();
+    if (/\b(empty|blank|without|leave.*(blank|empty)|no\s+value)\b/.test(t)) return `''`;
+    const quoted = prose.match(/'([^']*)'|"([^"]*)"/);
+    if (quoted) {
+      const lit = (quoted[1] ?? quoted[2] ?? '').trim();
+      if (lit && !/^<.*>$/.test(lit)) return `'${escapeStr(lit)}'`;
+    }
+    // Value written after a colon: "Subject: Order query".
+    const afterColon = prose.match(/:\s*([^,.;]+?)\s*$/);
+    if (afterColon && afterColon[1] && afterColon[1].trim().length <= 60) {
+      return `'${escapeStr(afterColon[1].trim())}'`;
+    }
+    const key = (phrase || 'value').split(/\s+/).slice(0, 2).join(' ') || 'value';
+    return `'Test ${escapeStr(key)}'`;
+  }
+
+  /**
    * Convert ordered step strings into grounded Playwright statements. Handles
    * navigate / fill (with explicit or test-data values, empty fields, char
    * limits) / click (login, menu, logout, product) / back-navigation and the
    * "repeat N times" throttling pattern.
+   *
+   * Every fill/click resolves its locator PER-STEP against the crawled App
+   * Profile using the step's own control phrase (qualifier-aware) so a step that
+   * names the "signup" form no longer collapses onto the "login" form's fields.
    */
   private tcStepsToCode(
     steps: string[],
-    ctx: { url: string; creds: { username: string; password: string }; sel: Record<string, string>; data?: { varName: string; ref: string; hasUsername: boolean; hasPassword: boolean } },
+    ctx: { url: string; creds: { username: string; password: string }; sel: Record<string, string>; data?: { varName: string; ref: string; hasUsername: boolean; hasPassword: boolean }; crawl?: CrawlResult; stepTracked?: LocatorGroundingEntry[] },
   ): { lines: string[] } {
+    // Per-step grounded resolver bound to this case's crawl + tracking sink.
+    const ground = (phrase: string, kind: 'input' | 'button' | 'any', fallback: string, name: string): string =>
+      this.resolveStepControl(phrase, ctx.crawl, kind, fallback, name, ctx.stepTracked);
+
+    // Click-specific resolver: a click phrase is often a short generic qualifier
+    // ("signup", "continue") that partial-matches several controls' test hooks
+    // (e.g. `data-qa="signup-name"` AND `data-qa="signup-button"`). Resolve
+    // against buttons/links/submit FIRST so a click never lands on an input, and
+    // only fall back to any clickable element when no button-like match exists
+    // (real links/cards/checkboxes). Tracks exactly once.
+    const groundClick = (phrase: string, fallback: string, name: string): string => {
+      const crawl = ctx.crawl;
+      let r = crawl && phrase
+        ? this.resolveGroundedSelectorTracked([phrase], crawl, fallback, 'button')
+        : undefined;
+      if ((!r || !r.grounded) && crawl && phrase) {
+        const rAny = this.resolveGroundedSelectorTracked([phrase], crawl, fallback, 'any');
+        if (rAny.grounded) r = rAny;
+        else r = r ?? rAny;
+      }
+      if (!r) r = { selector: fallback, grounded: false, knownGood: true, confidence: 40, source: 'fallback' };
+      if (ctx.stepTracked) {
+        ctx.stepTracked.push({
+          name, selector: r.selector, grounded: r.grounded,
+          knownGood: r.knownGood, confidence: r.confidence, source: r.source,
+        });
+      }
+      return r.selector;
+    };
     const out: string[] = [];
     let attemptBlock: string[] = []; // statements since the last navigate (for "repeat N times")
 
@@ -3077,9 +3257,9 @@ ${gotoB}${sessionLogin('pageB')}
       // a single high-level step are expanded instead of left un-mapped.
       if (/(log ?in|sign ?in)\b.*credential/.test(t) || /(log ?in|sign ?in)\s+successfully/.test(t)) {
         push(raw, [
-          `await ${ctx.sel.username}.fill(${fieldExpr('username', raw, t)});`,
-          `await ${ctx.sel.password}.fill(${fieldExpr('password', raw, t)});`,
-          `await ${ctx.sel.login}.click();`,
+          `await ${ground('login username email', 'input', ctx.sel.username, 'username')}.fill(${fieldExpr('username', raw, t)});`,
+          `await ${ground('login password', 'input', ctx.sel.password, 'password')}.fill(${fieldExpr('password', raw, t)});`,
+          `await ${ground('login sign in', 'button', ctx.sel.login, 'login')}.click();`,
           `await page.waitForLoadState('domcontentloaded');`,
         ], false);
         continue;
@@ -3090,16 +3270,38 @@ ${gotoB}${sessionLogin('pageB')}
       // valid_users" contain the substring "user" (in the dataset name) and would
       // otherwise be mis-mapped to the username field. Password is unambiguous.
       if (/pass( ?word)?|\bpwd\b/.test(t) && !/click|button/.test(t)) {
-        push(raw, [`await ${ctx.sel.password}.fill(${fieldExpr('password', raw, t)});`], false);
+        // Ground the SPECIFIC password field this step names (e.g. "login
+        // password" vs "confirm password" vs "signup password") against the
+        // crawl, falling back to the pre-resolved password selector.
+        const sel = ground(this.extractControlPhrase(raw) || 'password', 'input', ctx.sel.password, 'password');
+        push(raw, [`await ${sel}.fill(${fieldExpr('password', raw, t)});`], false);
         continue;
       }
 
-      // ── username field ──
+      // ── username / email field ──
       // Guard against the dataset-name false positive: don't treat a "password"
       // step as username even if the dataset name embeds "user".
       if (/user( ?name)?|email|login id/.test(t) && !/pass( ?word)?|\bpwd\b/.test(t) && !/click|button/.test(t)) {
-        push(raw, [`await ${ctx.sel.username}.fill(${fieldExpr('username', raw, t)});`], false);
+        // Qualifier-aware: "login email" → the login form's email input,
+        // "signup email" → the signup form's — no longer both collapsing onto
+        // one pre-resolved field.
+        const sel = ground(this.extractControlPhrase(raw) || 'username email', 'input', ctx.sel.username, 'username');
+        push(raw, [`await ${sel}.fill(${fieldExpr('username', raw, t)});`], false);
         continue;
+      }
+
+      // ── generic input field (name / phone / address / subject / …) ──
+      // Any "enter/type/fill/input/provide/set" step that is NOT a credential
+      // field. Previously these were dropped as "not auto-mapped", so signup /
+      // contact / checkout forms lost most of their steps. We ground the named
+      // field against the crawl and fill an authored or sensible value.
+      if (/^(enter|type|fill|input|provide|key in|set|choose|select)\b/.test(t) && !/pass( ?word)?|\bpwd\b/.test(t)) {
+        const phrase = this.extractControlPhrase(raw);
+        if (phrase) {
+          const sel = ground(phrase, 'input', `page.getByLabel(/${escapeRegex(phrase)}/i)`, `field:${phrase}`);
+          push(raw, [`await ${sel}.fill(${this.genericFillValue(raw, phrase)});`], false);
+          continue;
+        }
       }
 
       // ── logout ──
@@ -3116,7 +3318,11 @@ ${gotoB}${sessionLogin('pageB')}
 
       // ── click login / submit ──
       if (/click.*(login|log in|sign in|submit)|press.*(login|enter)|submit/.test(t)) {
-        push(raw, [`await ${ctx.sel.login}.click();`, `await page.waitForLoadState('domcontentloaded');`], false);
+        // Ground the ACTUAL button named (e.g. "Signup button" ≠ "Login
+        // button"). Falls back to the pre-resolved login button only when no
+        // matching control is found in the crawl.
+        const sel = ground(this.extractControlPhrase(raw) || 'login sign in submit', 'button', ctx.sel.login, 'submit');
+        push(raw, [`await ${sel}.click();`, `await page.waitForLoadState('domcontentloaded');`], false);
         continue;
       }
 
@@ -3146,8 +3352,13 @@ ${gotoB}${sessionLogin('pageB')}
       }
 
       // ── generic click ──
+      // Ground the named control instead of always clicking the login button.
+      // "Click the Signup button", "Click Add to cart", "Tap Continue" now
+      // resolve to their real element in the crawl.
       if (/^click|^press|^tap|^select/.test(t)) {
-        push(raw, [`await ${ctx.sel.login}.click();`], false);
+        const phrase = this.extractControlPhrase(raw);
+        const sel = groundClick(phrase || 'submit', ctx.sel.login, phrase ? `click:${phrase}` : 'submit');
+        push(raw, [`await ${sel}.click();`], false);
         continue;
       }
 
@@ -4009,11 +4220,18 @@ ${config.testCase
       const rawAttrs = (el as any).attributes as Record<string, string> | undefined;
       const dataTestAttr =
         rawAttrs?.['data-test'] ?? rawAttrs?.['data-testid'] ?? rawAttrs?.['data-test-id'];
+      // Other widely-used test hooks the crawler keeps only in the raw
+      // attributes map (AutomationExercise uses `data-qa`, Cypress apps use
+      // `data-cy`). Score them too so qualifier tokens like "signup"/"login"
+      // in `data-qa="signup-email"` disambiguate otherwise-identical inputs
+      // (both `name="email"`) instead of silently taking the first match.
+      const dataQaAttr = rawAttrs?.['data-qa'] ?? rawAttrs?.['data-cy'] ?? rawAttrs?.['data-test-hook'];
 
       // Attributes ordered by selector quality / signal strength.
       const attrs: { label: string; value: string | undefined; weight: number }[] = [
         { label: 'data-testid', value: el.dataTestId, weight: 100 },
         { label: 'data-test', value: dataTestAttr, weight: 100 },
+        { label: 'data-qa', value: dataQaAttr, weight: 100 },
         { label: 'id', value: el.id, weight: 95 },
         { label: 'name', value: el.name, weight: 90 },
         { label: 'aria-label', value: el.ariaLabel, weight: 85 },

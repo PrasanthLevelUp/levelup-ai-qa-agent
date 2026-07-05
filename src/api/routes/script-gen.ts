@@ -135,6 +135,12 @@ export function createScriptGenRouter(): Router {
         testCaseId,
         // ── Sprint 4: Enterprise Script Generation Enhancement ──
         requirementId,
+        // Inline structured test cases from a CSV/Excel upload (no DB row). When
+        // provided WITHOUT a testCaseId/requirementId these are normalized and
+        // run through the SAME deterministic, grounded batch engine as
+        // requirement-linked test cases — instead of the ungrounded LLM
+        // discovery fallback that flattened scenario strings used to trigger.
+        testCases: inlineTestCasesRaw,
         generationSource: rawGenerationSource,
         locatorStrategy,
         folderStrategy,
@@ -237,6 +243,50 @@ export function createScriptGenRouter(): Router {
         } catch (reqErr: any) {
           console.warn(`[ScriptGen] Could not load requirement test cases (non-blocking): ${reqErr?.message}`);
         }
+      }
+
+      // ── Inline uploaded test cases (CSV/Excel upload) ────────────────────
+      // When the caller supplies structured test cases inline (no DB row) and we
+      // did NOT resolve a single testCase or requirement-linked batch, normalize
+      // them into the engine's snake_case shape and treat them exactly like a
+      // requirement batch. This routes an "Upload Test Cases" generation through
+      // the deterministic, grounded engine (real locators, page-consolidated)
+      // instead of the LLM discovery fallback (0% grounded) it used to hit.
+      if (
+        !testCase &&
+        requirementTestCases.length === 0 &&
+        Array.isArray(inlineTestCasesRaw) &&
+        inlineTestCasesRaw.length > 0
+      ) {
+        requirementTestCases = inlineTestCasesRaw
+          .filter((tc: any) => tc && typeof tc === 'object')
+          .map((tc: any, i: number) => {
+            // Accept both camelCase (from the upload parser) and snake_case.
+            const expected = tc.expected_result ?? tc.expectedResult ?? '';
+            const title =
+              (typeof tc.title === 'string' && tc.title.trim())
+                ? tc.title.trim()
+                : (typeof tc.scenario === 'string' && tc.scenario.trim())
+                  ? tc.scenario.trim()
+                  : `Test case ${i + 1}`;
+            return {
+              // Stable numeric-ish id for downstream keying; keep original too.
+              id: tc.id ?? `upload-${i + 1}`,
+              title,
+              // Engine's parseTestCaseSteps handles a newline string OR an array.
+              steps: tc.steps ?? tc.scenario ?? '',
+              expected_result: expected,
+              preconditions: tc.preconditions ?? '',
+              priority: tc.priority ?? '',
+              module: tc.module ?? '',
+              scenario: tc.scenario ?? title,
+              requirement_id: tc.requirement_id ?? null,
+              test_data: tc.test_data ?? tc.testData ?? null,
+              // Mark provenance so downstream logging is honest.
+              source: 'uploaded',
+            };
+          });
+        console.log(`[ScriptGen] 📥 ${requirementTestCases.length} inline uploaded test case(s) normalized → deterministic batch generation`);
       }
 
       // ── Test-case page coverage ──────────────────────────────────────────
@@ -555,12 +605,16 @@ export function createScriptGenRouter(): Router {
       };
 
       // Log which generation path will run (no credentials ever logged).
+      const usedInlineUploaded =
+        !testCase && requirementTestCases.length > 0 && !requirementId &&
+        Array.isArray(inlineTestCasesRaw) && inlineTestCasesRaw.length > 0;
       console.log('[ScriptGen] Generation mode:', JSON.stringify({
         requirementId: requirementId ?? null,
         testCaseId: testCaseId ?? null,
         requirementTestCaseCount: requirementTestCases.length,
+        inlineUploadedTestCases: usedInlineUploaded ? requirementTestCases.length : 0,
         path: requirementTestCases.length > 0
-          ? 'requirement-batch-deterministic'
+          ? (usedInlineUploaded ? 'uploaded-batch-deterministic' : 'requirement-batch-deterministic')
           : testCase
             ? 'testcase-deterministic'
             : 'llm-fallback',
@@ -661,11 +715,28 @@ export function createScriptGenRouter(): Router {
         // real locators; per-locator `validated` still distinguishes DOM-verified
         // (grounded) from known-good for full transparency.
         const realCount = engineGrounding.realCount ?? engineGrounding.groundedCount;
+        // App-Profile-grounding KPI (customer proof point). Surfaced per spec so
+        // the UI can show e.g. "22 locators · 20 from App Profile · 2 healed by
+        // AI · 91% Repository Grounded · 9% AI". North-star: grow App-Profile %,
+        // shrink AI % as the App Profile improves.
+        const appProfileCount = engineGrounding.fromAppProfile ?? engineGrounding.groundedCount;
+        const fallbackCount = engineGrounding.fromFallback ?? Math.max(0, realCount - appProfileCount);
+        const aiCount = engineGrounding.fromAI ?? 0;
+        const appProfilePct = engineGrounding.appProfilePct ?? (engineGrounding.total ? Math.round((appProfileCount / engineGrounding.total) * 100) : 0);
+        const aiPct = engineGrounding.aiPct ?? (engineGrounding.total ? Math.round((aiCount / engineGrounding.total) * 100) : 0);
         locatorReport = {
           totalLocators: engineGrounding.total,
           validatedCount: realCount,
           avgConfidence: engineGrounding.avgConfidence,
           todoCount: Math.max(0, engineGrounding.total - realCount),
+          // Provenance KPI buckets (App Profile vs curated fallback vs AI).
+          appProfileCount,
+          fallbackCount,
+          aiCount,
+          appProfilePct,
+          aiPct,
+          groundedPct: engineGrounding.groundedPct,
+          provenanceSummary: `${engineGrounding.total} locators · ${appProfileCount} from App Profile · ${aiCount} healed by AI · ${appProfilePct}% Repository Grounded · ${aiPct}% AI`,
           locators: engineGrounding.entries.map((e) => ({
             element: e.name,
             selector: e.selector,
