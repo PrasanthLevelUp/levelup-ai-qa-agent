@@ -1254,6 +1254,14 @@ export class PageCrawler {
     const queue: { url: string; depth: number; fromUrl?: string; linkText?: string }[] = [
       { url: this.config.url, depth: 0 },
     ];
+    // Seed caller-provided URLs (e.g. the pages a test case navigates to, such
+    // as /login) so grounding has the real DOM for them — not just the entry
+    // page. Without this the queue only ever expands via followLinks.
+    for (const extra of this.config.additionalUrls || []) {
+      if (typeof extra === 'string' && extra) {
+        queue.push({ url: extra, depth: 0, fromUrl: this.config.url, linkText: 'seed' });
+      }
+    }
 
     while (queue.length > 0 && pages.length < this.config.maxPages) {
       const item = queue.shift()!;

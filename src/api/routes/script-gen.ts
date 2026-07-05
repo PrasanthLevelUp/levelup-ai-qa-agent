@@ -51,6 +51,7 @@ import { parseScriptContent } from '../../services/script-file-parser';
 import { LocatorResolver, type CrawlDataLike, type LocatorReport } from '../../services/locator-resolver';
 import { FolderStructureAnalyzer } from '../../services/folder-analyzer';
 import { ScriptGenEngine, type GenerationConfig, type GenerationResult, type GeneratedFile } from '../../script-gen/script-gen-engine';
+import { deriveTestCaseTargetUrls, profileCoversTargets } from '../../script-gen/test-case-coverage';
 import { getRepositoryContext } from '../../db/postgres';
 import { KnowledgeOptimizer, type KnowledgeItem } from '../../ai/knowledge-optimizer';
 import { AIReviewEngine } from '../../script-gen/ai-review-engine';
@@ -222,10 +223,47 @@ export function createScriptGenRouter(): Router {
         try {
           requirementTestCases = await getTestCasesForRequirement(String(requirementId), companyId);
           console.log(`[ScriptGen] 📋 Requirement ${requirementId} → ${requirementTestCases.length} test case(s) loaded for deterministic batch generation`);
+          if (requirementTestCases.length === 0) {
+            // Honesty signal: a "requirement based" generation with NO linked
+            // test cases will silently fall through to generic flow templates
+            // (smoke/search/navigation/form) — that is why users see "many
+            // scenarios, few/generic scripts". Make it loud so it is diagnosable
+            // instead of a mystery.
+            console.warn(
+              `[ScriptGen] ⚠️ Requirement ${requirementId} has 0 LINKED test cases — deterministic per-test-case generation is NOT possible. ` +
+                `Generation will fall back to generic flow templates. Link the requirement's test cases (generated_test_cases.requirement_id) to generate one grounded script per scenario.`,
+            );
+          }
         } catch (reqErr: any) {
           console.warn(`[ScriptGen] Could not load requirement test cases (non-blocking): ${reqErr?.message}`);
         }
       }
+
+      // ── Test-case page coverage ──────────────────────────────────────────
+      // A test case grounds its selectors against the crawled DOM of the page
+      // it operates on. If the crawl only captured the entry page, a login test
+      // case that navigates to /login grounds 0 selectors ("14 not found in
+      // crawl") even though the profile says "cached real DOM". Derive the pages
+      // the in-scope test cases actually visit so we can (a) crawl them and
+      // (b) reject a cache that doesn't cover them.
+      const coverageCases: any[] = [
+        ...(testCase ? [testCase] : []),
+        ...requirementTestCases,
+      ];
+      const testCaseTargetUrls = coverageCases.length > 0
+        ? deriveTestCaseTargetUrls(coverageCases, url)
+        : [];
+      if (testCaseTargetUrls.length > 0) {
+        console.log(`[ScriptGen] 🎯 Test cases navigate to ${testCaseTargetUrls.length} page(s) beyond the entry URL: ${testCaseTargetUrls.join(', ')}`);
+      }
+      // Merge request-provided additionalUrls with the test-case target pages
+      // (deduped) — this is what the crawl will actually cover.
+      const requestAdditionalUrls = Array.isArray(additionalUrls)
+        ? additionalUrls.filter((u: any) => typeof u === 'string')
+        : [];
+      const effectiveAdditionalUrls = Array.from(
+        new Set<string>([...requestAdditionalUrls, ...testCaseTargetUrls]),
+      ).slice(0, 10);
 
       // ── Test Data → Script traceability: load REAL dataset records ──
       // For each test case in scope, load the datasets explicitly linked to it
@@ -441,6 +479,26 @@ export function createScriptGenRouter(): Router {
         crawlDecision.reason = `${crawlDecision.reason}; overridden — cached DOM was empty, re-crawling for real grounding`;
       }
 
+      // ── Page-coverage cache guard ──
+      // A cached profile can be non-empty yet still miss the pages the in-scope
+      // test cases actually operate on (e.g. it captured only the home page but
+      // the login test cases navigate to /login). Grounding those selectors then
+      // fails silently → "REAL LOCATORS 0/N · not found in crawl" under a
+      // "cached real DOM" banner. If the cache doesn't cover every target page,
+      // re-crawl (the fresh crawl now seeds those pages via additionalUrls) so
+      // grounding has the real DOM for them.
+      if (crawlDecision.usedCache && crawlDecision.crawlData && testCaseTargetUrls.length > 0) {
+        const { missing } = profileCoversTargets(crawlDecision.crawlData, testCaseTargetUrls);
+        if (missing.length > 0) {
+          console.warn(
+            `[ScriptGen] ⚠️ Cached profile does not cover ${missing.length} test-case page(s) [${missing.join(', ')}] — ignoring cache and performing a fresh crawl that visits them so their locators can ground.`,
+          );
+          crawlDecision.usedCache = false;
+          crawlDecision.crawlData = null;
+          crawlDecision.reason = `${crawlDecision.reason}; overridden — cached DOM missing test-case pages (${missing.join(', ')}), re-crawling for real grounding`;
+        }
+      }
+
       // ── Multi-Intelligence Fusion: gather ALL intelligence sources + compute confidence ──
       let fusion: import('../../services/intelligence-fusion-service').FusedIntelligence | undefined;
       let fusionContext: string | undefined;
@@ -478,8 +536,8 @@ export function createScriptGenRouter(): Router {
         ...(fusionContext ? { fusionContext } : {}),
         ...(repoProfile ? { repoProfile } : {}),
         ...(sanitizedAuthConfig ? { authConfig: sanitizedAuthConfig } : {}),
-        ...(Array.isArray(additionalUrls) && additionalUrls.length > 0
-          ? { additionalUrls: additionalUrls.filter((u: any) => typeof u === 'string').slice(0, 10) }
+        ...(effectiveAdditionalUrls.length > 0
+          ? { additionalUrls: effectiveAdditionalUrls }
           : {}),
         // Pass cached crawl data to engine if available
         ...(crawlDecision.usedCache && crawlDecision.crawlData

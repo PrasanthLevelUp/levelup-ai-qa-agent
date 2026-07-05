@@ -92,14 +92,40 @@ async function main() {
   const engine = new ScriptGenEngine();
   const result = await engine.generate({ url: 'https://www.saucedemo.com', cachedCrawlData, repoProfile, testCases } as any);
   const byPath = new Map(result.generatedFiles.map(f => [f.path, f.content]));
-  const get = (frag: string) => [...byPath.entries()].find(([p]) => p.includes(frag))?.[1] ?? '';
 
-  const validLocked = get('with-valid-credentials');
-  const invalid = get('with-invalid-credentials');
-  const whitespace = get('with-leading-trailing-whitespace');
-  const special = get('with-special-characters');
-  const empty = get('with-empty-fields');
-  const maxlen = get('with-maximum-length-username');
+  // Scenarios are CONSOLIDATED by page: all six locked-login cases live inside a
+  // single login.spec.ts as separate `test(...)` blocks (coverage over file
+  // count — a product requirement). Extract one scenario's block (incl. its doc
+  // comment) by title using brace-depth matching.
+  const scenario = (titleFrag: string): string => {
+    for (const content of byPath.values()) {
+      const lines = content.split('\n');
+      const start = lines.findIndex(l =>
+        /^\s*test(\.(fixme|skip|only))?\(/.test(l) && l.includes(titleFrag));
+      if (start === -1) continue;
+      let docStart = start;
+      for (let i = start - 1; i >= 0; i--) {
+        const t = lines[i].trim();
+        if (t === '') { docStart = i; continue; }
+        if (t.endsWith('*/')) { while (i >= 0 && !lines[i].trim().startsWith('/**')) i--; docStart = i; }
+        break;
+      }
+      let depth = 0, seen = false, end = lines.length - 1;
+      for (let i = start; i < lines.length; i++) {
+        for (const ch of lines[i]) { if (ch === '{') { depth++; seen = true; } else if (ch === '}') depth--; }
+        if (seen && depth <= 0) { end = i; break; }
+      }
+      return lines.slice(docStart, end + 1).join('\n');
+    }
+    return '';
+  };
+
+  const validLocked = scenario('Locked user login attempt with valid credentials');
+  const invalid = scenario('Locked user login attempt with invalid credentials');
+  const whitespace = scenario('Locked user login attempt with leading/trailing whitespace');
+  const special = scenario('Locked user login attempt with special characters');
+  const empty = scenario('Locked user login attempt with empty fields');
+  const maxlen = scenario('Locked user login attempt with maximum length username');
 
   console.log('=== P1: Scenario Intent Fidelity (each spec implements its OWN scenario) ===');
   ok('whitespace wraps the username with leading/trailing spaces', /\.login\(`\s\$\{user\.username \?\? ''\}\s`,/.test(whitespace));

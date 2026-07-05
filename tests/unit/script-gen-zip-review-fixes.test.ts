@@ -89,12 +89,48 @@ async function main() {
   const byPath = new Map(result.generatedFiles.map(f => [f.path, f.content]));
   const get = (frag: string) => [...byPath.entries()].find(([p]) => p.includes(frag))?.[1] ?? '';
 
-  const success = get('verify-successful-login');
-  const invalid = get('verify-login-attempt-with-invalid');
-  const locked = get('verify-login-attempt-with-locked');
-  const empty = get('verify-login-with-empty');
-  const nav = get('verify-navigation-to-inventory');
-  const concurrent = get('verify-concurrent-login-sessions');
+  // Scenarios are now CONSOLIDATED by page: all auth cases live inside one
+  // login.spec.ts as separate `test(...)` blocks (coverage over file count — a
+  // product requirement). Extract a single scenario's body by its title from
+  // whichever generated spec file contains it, using brace-depth matching so we
+  // capture exactly that `test(...)`/`test.fixme(...)` block and nothing else.
+  const scenario = (titleFrag: string): string => {
+    for (const content of byPath.values()) {
+      const lines = content.split('\n');
+      const start = lines.findIndex(l =>
+        /^\s*test(\.(fixme|skip|only))?\(/.test(l) && l.includes(titleFrag));
+      if (start === -1) continue;
+      // Include the doc comment immediately above the test, if present.
+      let docStart = start;
+      for (let i = start - 1; i >= 0; i--) {
+        const t = lines[i].trim();
+        if (t === '') { docStart = i; continue; }
+        if (t.endsWith('*/')) { while (i >= 0 && !lines[i].trim().startsWith('/**')) i--; docStart = i; }
+        break;
+      }
+      let depth = 0, seen = false, end = lines.length - 1;
+      for (let i = start; i < lines.length; i++) {
+        for (const ch of lines[i]) { if (ch === '{') { depth++; seen = true; } else if (ch === '}') depth--; }
+        if (seen && depth <= 0) { end = i; break; }
+      }
+      return lines.slice(docStart, end + 1).join('\n');
+    }
+    return '';
+  };
+
+  // Full file content that CONTAINS a given scenario (imports are hoisted to the
+  // top of the consolidated spec, so import-level assertions must look here).
+  const fileFor = (titleFrag: string): string => {
+    for (const content of byPath.values()) if (content.includes(titleFrag)) return content;
+    return '';
+  };
+
+  const success = scenario('successful login with valid credentials');
+  const invalid = scenario('login attempt with invalid username');
+  const locked = scenario('login attempt with locked user account');
+  const empty = scenario('login with empty username and password');
+  const nav = scenario('navigation to Inventory page after successful login');
+  const concurrent = scenario('concurrent login sessions in two browsers');
   const dataModule = get('data/test-data.ts');
 
   console.log('=== Issue 5: Dataset Intelligence (test-data module + getRecord) ===');
@@ -102,7 +138,7 @@ async function main() {
   ok('module declares the valid_users dataset', /valid_users/.test(dataModule));
   ok('module contains standard_user + locked_out_user records', /standard_user/.test(dataModule) && /locked_out_user/.test(dataModule));
   ok('password field is visible (null, not undefined)', /"password":\s*null/.test(dataModule));
-  ok('successful login imports getRecord', /import\s*\{\s*getRecord\s*\}\s*from\s*'\.\/data\/test-data'/.test(success));
+  ok('successful login imports getRecord', /import\s*\{\s*getRecord\s*\}\s*from\s*'\.\/data\/test-data'/.test(fileFor('successful login with valid credentials')));
   ok('successful login binds const user = getRecord("valid_users")', /const user = getRecord\("valid_users"\)/.test(success));
   ok('login() reads user.username', /\.login\(user\.username/.test(success));
   ok('locked case pins getRecord("valid_users", "locked_out_user")', /getRecord\("valid_users", "locked_out_user"\)/.test(locked));
@@ -155,7 +191,7 @@ async function main() {
 
   console.log('=== Final review #4: concurrent spec reuses LoginPage ===');
   ok('concurrent spec generated', !!concurrent);
-  ok('concurrent imports LoginPage', /import\s*\{\s*LoginPage\s*\}/.test(concurrent));
+  ok('concurrent imports LoginPage', /import\s*\{\s*LoginPage\s*\}/.test(fileFor('concurrent login sessions in two browsers')));
   ok('concurrent uses loginPageA.login(...)', /const loginPageA = new LoginPage\(pageA\)/.test(concurrent) && /loginPageA\.login\(/.test(concurrent));
   ok('concurrent uses loginPageB.login(...)', /const loginPageB = new LoginPage\(pageB\)/.test(concurrent) && /loginPageB\.login\(/.test(concurrent));
   ok('concurrent does NOT use raw pageA #user-name fills', !/pageA\.locator\('#user-name'\)/.test(concurrent));
