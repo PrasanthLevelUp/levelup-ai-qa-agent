@@ -25,8 +25,9 @@ import { ProfileService } from '../../intelligence/profile-service';
 import { CrawlOrchestrator } from '../../intelligence/crawl-orchestrator';
 import { SelectorHealingEngine } from '../../intelligence/healing-engine';
 import { PatternMatcher } from '../../intelligence/pattern-matcher';
-import { findMatchingPatterns, migrateDataToDefaultProjects, getProjectStats, listProfiles, listRepositories, getKnowledgeStats, upsertProfile, getPool, getProfileById, updateProfileAuth, updateProfileStatus, getProfileVersions, getProfileChanges, getLatestSnapshots } from '../../db/postgres';
+import { findMatchingPatterns, migrateDataToDefaultProjects, getProjectStats, listProfiles, listRepositories, getKnowledgeStats, upsertProfile, getPool, getProfileById, updateProfileAuth, updateProfileStatus, getProfileVersions, getProfileChanges, getLatestSnapshots, listTestCaseStepsForProject } from '../../db/postgres';
 import { PageCrawler } from '../../script-gen/page-crawler';
+import { deriveTestCaseTargetUrls, profileCoversTargets, collectCrawledUrls } from '../../script-gen/test-case-coverage';
 import { IntelligenceHealthService } from '../../services/intelligence-health-service';
 import { healingOutcomeService, HealingResult } from '../../services/healing-outcome-service';
 import { healingVerificationService } from '../../services/healing-verification-service';
@@ -114,6 +115,17 @@ function resolveCrawlUrls(raw: unknown, baseUrl: string): string[] {
   return out;
 }
 
+/** Parse a JSON string, returning null on any error (never throws). */
+function safeJsonParse(raw: unknown): any {
+  if (raw == null) return null;
+  if (typeof raw !== 'string') return raw;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
 function sanitizeProfileAuth(profile: any): any {
   if (!profile) return profile;
   const ac = profile.auth_config
@@ -138,6 +150,70 @@ export function createIntelligenceRouter(): Router {
   const crawlOrchestrator = new CrawlOrchestrator(profileService);
   const healingEngine = new SelectorHealingEngine(profileService);
   const patternMatcher = new PatternMatcher();
+
+  /**
+   * Kick off a background deep crawl for a profile, optionally seeding
+   * user-specified `additionalUrls` (pages behind buttons/forms the link
+   * crawler can't discover). Marks the profile 'crawling', streams progress
+   * into the crawl-log store, saves the result and clears status. Shared by
+   * POST /profiles/:id/crawl and POST /profiles/:id/page-coverage/apply so the
+   * crawl behaviour stays identical no matter which entry point triggers it.
+   */
+  function startProfileCrawl(opts: {
+    id: string;
+    baseUrl: string;
+    authConfig?: any;
+    companyId?: number;
+    projectId?: number;
+    additionalUrls: string[];
+    maxPages: number;
+    maxDepth: number;
+  }): void {
+    const { id, baseUrl, authConfig, companyId, projectId, additionalUrls, maxPages, maxDepth } = opts;
+    // Mark crawling immediately so the UI reflects progress.
+    void updateProfileStatus(id, 'crawling');
+    startCrawlLog(id, baseUrl);
+
+    // Fire-and-forget: run the deep crawl in the background.
+    (async () => {
+      const t0 = Date.now();
+      try {
+        console.log(`[intelligence] 🕷️  Deep crawl started for ${baseUrl} (profile=${id}, auth=${!!authConfig}, maxPages=${maxPages}, maxDepth=${maxDepth}, extraPages=${additionalUrls.length})`);
+        if (additionalUrls.length > 0) {
+          appendCrawlLog(id, `Seeding ${additionalUrls.length} page(s): ${additionalUrls.join(', ')}`);
+        }
+        const crawler = new PageCrawler({
+          url: baseUrl,
+          authConfig,
+          maxPages: Math.max(maxPages, additionalUrls.length + 2),
+          maxDepth,
+          captureScreenshot: true,
+          // Pages behind buttons/forms (Cart, Checkout, /login, etc.) — crawled
+          // in the SAME authenticated session so any login carries over.
+          additionalUrls,
+          onLog: (msg: string) => appendCrawlLog(id, msg),
+        });
+        const result = await crawler.crawlDeepAuthenticated();
+        await crawlOrchestrator.saveDeepCrawlResult(
+          baseUrl,
+          result,
+          companyId,
+          { authConfig },
+          projectId ?? undefined,
+        );
+        // Self-heal: explicitly clear the ORIGINAL row's 'crawling' status.
+        await updateProfileStatus(id, 'fresh').catch(() => {});
+        const totalElements = result.pages.reduce((s, p) => s + p.elements.length, 0);
+        appendCrawlLog(id, `Saved crawl: ${result.pages.length} page(s), ${totalElements} elements`);
+        finishCrawlLog(id, 'success');
+        console.log(`[intelligence] ✅ Deep crawl finished for ${baseUrl}: pages=${result.pages.length}, elements=${totalElements}, authed=${result.authenticated}, ${Date.now() - t0}ms`);
+      } catch (crawlErr: any) {
+        console.error(`[intelligence] ❌ Deep crawl failed for ${baseUrl}: ${crawlErr.message}`);
+        finishCrawlLog(id, 'error', crawlErr.message);
+        await updateProfileStatus(id, 'error', crawlErr.message).catch(() => {});
+      }
+    })();
+  }
 
   /* ══════════════════════════════════════════════════════════════════
    *  PROFILE MANAGEMENT (project-scoped via x-project-id header)
@@ -474,61 +550,191 @@ export function createIntelligenceRouter(): Router {
             : []);
       const additionalUrls = resolveCrawlUrls(rawExtraUrls, baseUrl);
 
-      // Mark crawling immediately so the UI reflects progress.
-      await updateProfileStatus(id, 'crawling');
-      startCrawlLog(id, baseUrl);
-
-      // Fire-and-forget: run the deep crawl in the background.
-      (async () => {
-        const t0 = Date.now();
-        try {
-          console.log(`[intelligence] 🕷️  Manual deep crawl started for ${baseUrl} (profile=${id}, auth=${!!authConfig}, maxPages=${maxPages}, maxDepth=${maxDepth}, extraPages=${additionalUrls.length})`);
-          if (additionalUrls.length > 0) {
-            appendCrawlLog(id, `Seeding ${additionalUrls.length} user-specified page(s): ${additionalUrls.join(', ')}`);
-          }
-          const crawler = new PageCrawler({
-            url: baseUrl,
-            authConfig,
-            maxPages: Math.max(maxPages, additionalUrls.length + 2),
-            maxDepth,
-            captureScreenshot: true,
-            // User-specified pages behind buttons/forms (Cart, Checkout, etc.) —
-            // crawled in the SAME authenticated session so the login carries over.
-            additionalUrls,
-            // Stream progress lines into the crawl-log store for the diagnostics endpoint.
-            onLog: (msg: string) => appendCrawlLog(id, msg),
-          });
-          const result = await crawler.crawlDeepAuthenticated();
-          await crawlOrchestrator.saveDeepCrawlResult(
-            baseUrl,
-            result,
-            companyId,
-            { authConfig },
-            projectId ?? profile.project_id ?? undefined,
-          );
-          // Self-heal: explicitly clear the ORIGINAL row's 'crawling' status.
-          // saveDeepCrawlResult upserts on the normalized base_url; for profiles
-          // created after the normalization fix this is the SAME row (already set
-          // to 'fresh'), so this is a harmless idempotent confirm. For LEGACY rows
-          // whose stored base_url was never normalized, the upsert may land on a
-          // different row — without this line the original row would stay stuck in
-          // 'crawling' forever (the exact bug we are fixing).
-          await updateProfileStatus(id, 'fresh').catch(() => {});
-          const totalElements = result.pages.reduce((s, p) => s + p.elements.length, 0);
-          appendCrawlLog(id, `Saved crawl: ${result.pages.length} page(s), ${totalElements} elements`);
-          finishCrawlLog(id, 'success');
-          console.log(`[intelligence] ✅ Manual deep crawl finished for ${baseUrl}: pages=${result.pages.length}, elements=${totalElements}, authed=${result.authenticated}, ${Date.now() - t0}ms`);
-        } catch (crawlErr: any) {
-          console.error(`[intelligence] ❌ Manual deep crawl failed for ${baseUrl}: ${crawlErr.message}`);
-          finishCrawlLog(id, 'error', crawlErr.message);
-          await updateProfileStatus(id, 'error', crawlErr.message).catch(() => {});
-        }
-      })();
+      // Kick off the shared background crawl (marks 'crawling', logs, saves).
+      startProfileCrawl({
+        id,
+        baseUrl,
+        authConfig,
+        companyId,
+        projectId: projectId ?? profile.project_id ?? undefined,
+        additionalUrls,
+        maxPages,
+        maxDepth,
+      });
 
       res.status(202).json({
         success: true,
         message: 'Crawl started — poll GET /profiles/:id for status',
         data: { id, status: 'crawling', baseUrl, authenticated: !!authConfig, maxPages, maxDepth, additionalPages: additionalUrls.length },
+      });
+    } catch (err) {
+      res.status(500).json({ success: false, error: (err as Error).message });
+    }
+  });
+
+  /**
+   * GET /profiles/:id/page-coverage
+   * ────────────────────────────────────────────────────────────────────────
+   * The "intelligence layer" that stops users from having to guess which pages
+   * to crawl. It reads every test case in the profile's project, derives the
+   * page URLs those cases actually exercise (from steps/preconditions/expected
+   * results), and compares them against the pages this profile has already
+   * crawled. Returns which target pages are COVERED and which are MISSING —
+   * the missing set is what the UI surfaces as "these pages were referenced by
+   * your test cases but never crawled" with a one-click add-&-crawl action.
+   *
+   * Locator grounding only works when the crawl contains the DOM of the page a
+   * test case operates on; this endpoint makes that gap visible instead of
+   * silently grounding /login selectors against a home-page-only profile.
+   */
+  router.get('/profiles/:id/page-coverage', async (req: Request, res: Response) => {
+    try {
+      const companyId = (req as any).companyId;
+      const projectId = (req as any).projectId as number | undefined;
+      const profile = await getProfileById(String(req.params.id), companyId, projectId); // SECURITY: tenant-scope (IDOR guard)
+      if (!profile) return res.status(404).json({ success: false, error: 'Profile not found' });
+
+      const effectiveProjectId = projectId ?? profile.project_id ?? undefined;
+      const testCases = await listTestCaseStepsForProject(companyId, effectiveProjectId);
+      const referencedUrls = deriveTestCaseTargetUrls(testCases as any, profile.base_url);
+
+      const crawlData = typeof profile.crawl_data === 'string'
+        ? safeJsonParse(profile.crawl_data)
+        : profile.crawl_data;
+      const crawledUrls = collectCrawledUrls(crawlData);
+      const { covered, missing } = profileCoversTargets(crawlData, referencedUrls);
+
+      // Pages the user has already queued for the NEXT crawl (custom_metadata).
+      const customMetadata = typeof profile.custom_metadata === 'string'
+        ? safeJsonParse(profile.custom_metadata)
+        : profile.custom_metadata;
+      const queued: string[] = Array.isArray(customMetadata?.additionalCrawlUrls)
+        ? customMetadata.additionalCrawlUrls.map((u: any) => String(u))
+        : [];
+      const queuedPaths = new Set(
+        queued.map((u) => { try { return new URL(u, profile.base_url).pathname.replace(/\/+$/, '') || '/'; } catch { return u; } }),
+      );
+      // Missing pages that are NOT yet queued — the ones the user still needs to add.
+      const missingNotQueued = missing.filter((u) => {
+        let p = u;
+        try { p = new URL(u, profile.base_url).pathname.replace(/\/+$/, '') || '/'; } catch { /* keep */ }
+        return !queuedPaths.has(p);
+      });
+
+      return res.json({
+        success: true,
+        data: {
+          profileId: profile.id,
+          baseUrl: profile.base_url,
+          projectId: effectiveProjectId ?? null,
+          testCaseCount: testCases.length,
+          crawledPageCount: crawledUrls.length,
+          referencedUrls,
+          covered,
+          missing,
+          missingNotQueued,
+          alreadyQueued: queued,
+          fullyCovered: missing.length === 0,
+        },
+      });
+    } catch (err) {
+      res.status(500).json({ success: false, error: (err as Error).message });
+    }
+  });
+
+  /**
+   * POST /profiles/:id/page-coverage/apply
+   * ────────────────────────────────────────────────────────────────────────
+   * The one-click "Add missing pages & crawl" action. Persists the referenced-
+   * but-missing pages onto the profile (custom_metadata.additionalCrawlUrls) so
+   * they survive and are re-used by every future crawl, then (unless
+   * `crawl: false`) immediately kicks off a background crawl that captures their
+   * real DOM — giving Element Intelligence the pages it needs to actually ground
+   * the test-case locators.
+   *
+   * Body (all optional):
+   *   urls?: string[]   — explicit pages to add; when omitted the endpoint
+   *                       auto-derives the missing pages from the project's test
+   *                       cases (the "AI does it for you" path).
+   *   crawl?: boolean   — default true; set false to only queue without crawling.
+   */
+  router.post('/profiles/:id/page-coverage/apply', async (req: Request, res: Response) => {
+    try {
+      const companyId = (req as any).companyId;
+      const projectId = (req as any).projectId as number | undefined;
+      const b = req.body || {};
+      const profile = await getProfileById(String(req.params.id), companyId, projectId); // SECURITY: tenant-scope (IDOR guard)
+      if (!profile) return res.status(404).json({ success: false, error: 'Profile not found' });
+
+      const effectiveProjectId = projectId ?? profile.project_id ?? undefined;
+
+      // Determine which pages to add: explicit body.urls, else auto-derive the
+      // missing pages from the project's test cases.
+      let pagesToAdd: string[];
+      if (Array.isArray(b.urls) && b.urls.length > 0) {
+        pagesToAdd = b.urls.map((u: any) => String(u));
+      } else {
+        const testCases = await listTestCaseStepsForProject(companyId, effectiveProjectId);
+        const referencedUrls = deriveTestCaseTargetUrls(testCases as any, profile.base_url);
+        const crawlData = typeof profile.crawl_data === 'string'
+          ? safeJsonParse(profile.crawl_data)
+          : profile.crawl_data;
+        pagesToAdd = profileCoversTargets(crawlData, referencedUrls).missing;
+      }
+
+      if (pagesToAdd.length === 0) {
+        return res.json({
+          success: true,
+          data: { id: profile.id, added: [], additionalCrawlUrls: [], crawlStarted: false, message: 'No missing pages to add — the profile already covers every page the test cases reference.' },
+        });
+      }
+
+      // Merge with any already-queued pages, then normalize/dedupe/same-origin.
+      const customMetadata = (typeof profile.custom_metadata === 'string'
+        ? safeJsonParse(profile.custom_metadata)
+        : profile.custom_metadata) || {};
+      const existing: string[] = Array.isArray(customMetadata.additionalCrawlUrls)
+        ? customMetadata.additionalCrawlUrls.map((u: any) => String(u))
+        : [];
+      const mergedRaw = [...existing, ...pagesToAdd];
+      const additionalCrawlUrls = resolveCrawlUrls(mergedRaw, profile.base_url);
+      const added = additionalCrawlUrls.filter((u) => !existing.includes(u));
+
+      // Persist onto the profile so future crawls re-use these pages.
+      const newMetadata = { ...customMetadata, additionalCrawlUrls };
+      await profileService.updateProfile(profile.id, companyId, { customMetadata: newMetadata });
+
+      // Kick off the crawl unless the caller explicitly opted out.
+      const shouldCrawl = b.crawl !== false;
+      if (shouldCrawl) {
+        const authConfig = profile.auth_config
+          ? (typeof profile.auth_config === 'string' ? safeJsonParse(profile.auth_config) : profile.auth_config)
+          : undefined;
+        startProfileCrawl({
+          id: profile.id,
+          baseUrl: profile.base_url,
+          authConfig,
+          companyId,
+          projectId: effectiveProjectId,
+          additionalUrls: additionalCrawlUrls,
+          maxPages: Math.max(12, additionalCrawlUrls.length + 2),
+          maxDepth: 2,
+        });
+      }
+
+      return res.status(shouldCrawl ? 202 : 200).json({
+        success: true,
+        data: {
+          id: profile.id,
+          baseUrl: profile.base_url,
+          added,
+          additionalCrawlUrls,
+          crawlStarted: shouldCrawl,
+          status: shouldCrawl ? 'crawling' : profile.status,
+          message: shouldCrawl
+            ? `Added ${added.length} page(s) and started a crawl — poll GET /profiles/:id for status.`
+            : `Added ${added.length} page(s). Trigger a crawl to capture their DOM.`,
+        },
       });
     } catch (err) {
       res.status(500).json({ success: false, error: (err as Error).message });

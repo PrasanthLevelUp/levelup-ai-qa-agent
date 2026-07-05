@@ -132,6 +132,46 @@ console.log('\n🧪 collectCrawledUrls (shape-agnostic)');
   check('multi-page shape',
     collectCrawledUrls({ pages: [{ url: 'a' }, { finalUrl: 'b' }] }).length === 2);
   check('null → []', collectCrawledUrls(null).length === 0);
+  // Multi-page profile blobs store the entry page under `entryUrl` (not `url`).
+  check('entryUrl multi-page blob is collected',
+    collectCrawledUrls({ entryUrl: BASE, pages: [{ url: 'https://automationexercise.com/login' }] })
+      .includes(BASE));
+}
+
+console.log('\n🧪 end-to-end: intelligence-layer page-coverage scenario');
+{
+  // Simulates what GET /profiles/:id/page-coverage does: derive referenced
+  // pages from a project's test cases, compare against a homepage-only profile.
+  const projectTestCases = [
+    { title: 'Valid login', steps: ['Navigate to https://automationexercise.com/login',
+      "Fill input[name='email']", "Click text=Login"] },
+    { title: 'Add to cart', steps: ['Go to /products', 'Click Add to cart', 'Open /view_cart'],
+      expected_result: 'Item appears on /view_cart' },
+    { title: 'Homepage smoke', steps: ['Open https://automationexercise.com/'] },
+  ];
+  const referenced = deriveTestCaseTargetUrls(projectTestCases as any, BASE);
+  check('derives /login, /products, /view_cart (homepage excluded)',
+    referenced.length === 3
+    && referenced.some(u => u.endsWith('/login'))
+    && referenced.some(u => u.endsWith('/products'))
+    && referenced.some(u => u.endsWith('/view_cart')),
+    JSON.stringify(referenced));
+
+  // Multi-page profile that only captured the homepage → all 3 missing.
+  const homepageOnlyProfile = { entryUrl: BASE, pages: [{ url: BASE, elements: [] }] };
+  const cov = profileCoversTargets(homepageOnlyProfile, referenced);
+  check('homepage-only profile → all 3 referenced pages missing',
+    cov.missing.length === 3 && cov.covered.length === 0, JSON.stringify(cov));
+
+  // After crawling the added pages → fully covered.
+  const crawledProfile = { entryUrl: BASE, pages: [
+    { url: BASE }, { url: 'https://automationexercise.com/login' },
+    { url: 'https://automationexercise.com/products' },
+    { url: 'https://automationexercise.com/view_cart' },
+  ] };
+  const cov2 = profileCoversTargets(crawledProfile, referenced);
+  check('after crawl → fully covered, nothing missing',
+    cov2.missing.length === 0 && cov2.covered.length === 3, JSON.stringify(cov2));
 }
 
 console.log(`\n${failed === 0 ? '✅' : '❌'} test-case-coverage: ${passed} passed, ${failed} failed`);

@@ -165,6 +165,10 @@ export function collectCrawledUrls(crawlData: any): string[] {
   };
   push(crawlData.url);
   push(crawlData.finalUrl);
+  // Multi-page profile blobs record the entry page under `entryUrl` (see
+  // CrawlOrchestrator.saveDeepCrawlResult) rather than `url`.
+  push(crawlData.entryUrl);
+  push(crawlData.baseUrl);
   if (Array.isArray(crawlData.pages)) {
     for (const p of crawlData.pages) {
       push(p?.url);

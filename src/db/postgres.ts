@@ -8893,6 +8893,55 @@ export async function listTestCasesForProject(
   }));
 }
 
+/**
+ * Fetch every test case for a project WITH the raw fields needed to derive the
+ * page URLs each case exercises: `steps`, `preconditions`, `expected_result`
+ * and `test_data`. Powers the App-Profile "page coverage" intelligence layer
+ * (GET /profiles/:id/page-coverage) which compares the pages test cases
+ * reference against the pages the crawl actually captured.
+ *
+ * Joined through generated_test_scenarios → test_requirements so the project
+ * filter matches the same path getTestCoverageStats / listTestCasesForProject
+ * use. Company scoping mirrors listTestCasesForProject (company match OR NULL).
+ */
+export async function listTestCaseStepsForProject(
+  companyId: number,
+  projectId?: number,
+): Promise<Array<{
+  id: number;
+  title: string;
+  steps: any;
+  preconditions: string | null;
+  expected_result: string | null;
+  test_data: string | null;
+}>> {
+  const pool = getPool();
+  const conds: string[] = ['(tc.company_id = $1 OR tc.company_id IS NULL)'];
+  const params: any[] = [companyId];
+  if (projectId != null) {
+    params.push(projectId);
+    conds.push(`req.project_id = $${params.length}`);
+  }
+  const { rows } = await pool.query(
+    `SELECT tc.id, tc.title, tc.steps, tc.preconditions,
+            tc.expected_result, tc.test_data
+     FROM generated_test_cases tc
+     JOIN generated_test_scenarios ts ON ts.id = tc.scenario_id
+     JOIN test_requirements req ON req.id = ts.requirement_id
+     WHERE ${conds.join(' AND ')}
+     ORDER BY tc.id`,
+    params,
+  );
+  return rows.map(r => ({
+    id: r.id,
+    title: r.title,
+    steps: r.steps ?? null,
+    preconditions: r.preconditions ?? null,
+    expected_result: r.expected_result ?? null,
+    test_data: r.test_data ?? null,
+  }));
+}
+
 // ---- Coverage Stats ----
 export async function getTestCoverageStats(companyId?: number, projectId?: number): Promise<{
   totalRequirements: number; totalScenarios: number; totalTestCases: number;
