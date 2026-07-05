@@ -49,6 +49,7 @@ import {
   type ProjectConventionProfile,
 } from '../intelligence/project-convention-profile';
 import { analyzeRepoPatterns } from './repo-pattern-analyzer';
+import { rankLocatorCandidates, type ElementLike } from '../intelligence/element-intelligence';
 import { adaptiveGenerateFiles } from './adaptive-codegen';
 import { getRAGService } from '../services/rag-service';
 import { TrueReuseEngine } from '../services/true-reuse-engine';
@@ -1972,17 +1973,17 @@ export default datasets;
         if (reject && reject(el)) continue;
         // Normalize matchElement's raw score (≈50–150) to a 0–100 confidence.
         const confidence = Math.max(1, Math.min(99, Math.round(match.score / 1.5)));
-        // Prefer a stable id selector when present.
-        if (el.id) return { selector: `page.locator('#${el.id}')`, grounded: true, knownGood: true, confidence, source: 'id' };
-        // SauceDemo (and many apps) expose the test hook as `data-test` rather
-        // than `data-testid`. Playwright's getByTestId() defaults to
-        // `data-testid`, so emit an explicit attribute locator for `data-test`.
-        const attrs = (el as any).attributes as Record<string, string> | undefined;
-        const dataTest = attrs?.['data-test'];
-        if (dataTest) return { selector: `page.locator('[data-test="${dataTest}"]')`, grounded: true, knownGood: true, confidence, source: 'data-test' };
-        const dataTestId = attrs?.['data-testid'] || attrs?.['data-test-id'] || el.dataTestId;
-        if (dataTestId) return { selector: `page.getByTestId('${dataTestId}')`, grounded: true, knownGood: true, confidence, source: 'data-testid' };
-        if (el.name) return { selector: `page.locator('[name="${el.name}"]')`, grounded: true, knownGood: true, confidence, source: 'name' };
+        // Element Intelligence: consult the SINGLE shared locator-ranking brain
+        // (data-test → ARIA role → stable id → name → …) so Script Generation
+        // and Healing always resolve to the IDENTICAL grounded locator. There is
+        // deliberately no bespoke id-first cascade here anymore — the App Profile
+        // decides the best locator, generation never invents or reorders it.
+        const ranked = rankLocatorCandidates(el as ElementLike);
+        if (ranked.length) {
+          return { selector: ranked[0].locator, grounded: true, knownGood: true, confidence, source: ranked[0].strategy };
+        }
+        // Only when NO grounded strategy exists, fall back to a computed CSS
+        // selector (still a real selector for this element, not a hallucination).
         const best = this.selectorEngine.getBestPlaywrightSelector(el);
         if (best) return { selector: best, grounded: true, knownGood: true, confidence, source: 'css' };
       }
@@ -2384,9 +2385,14 @@ ${gotoB}${sessionLogin('pageB')}
        comments, then prepend a single high-level call. Only when login() exists. */
     if (loginPO) {
       const loginMethod = this.findPoMethod(loginPO.methods, /^log[_]?in$/i);
-      const userFillLine = work.find((l) => /#user-name|username|login.*input/i.test(l) && /\.fill\(/i.test(l));
-      const passFillLine = work.find((l) => /#password|\bpwd\b|\bpass\b/i.test(l) && /\.fill\(/i.test(l));
-      const hasLoginClick = work.some((l) => /login.*button|#login-button/i.test(l) && /\.click\(/i.test(l));
+      // Detect the login triad by SEMANTIC token, not selector format. Since
+      // Element Intelligence now grounds these fields via `data-test` (e.g.
+      // `[data-test="password"]`) rather than an id (`#password`), the matchers
+      // must recognise the field regardless of whether the emitted selector is
+      // a data-test attribute, an id, or a role — the semantic word is the hook.
+      const userFillLine = work.find((l) => /user-?name|username|login.*input/i.test(l) && /\.fill\(/i.test(l));
+      const passFillLine = work.find((l) => /password|\bpwd\b|\bpass\b/i.test(l) && /\.fill\(/i.test(l));
+      const hasLoginClick = work.some((l) => /login[-_]?button|login.*button|sign[-_ ]?in/i.test(l) && /\.click\(/i.test(l));
       if (loginMethod && userFillLine && passFillLine && hasLoginClick) {
         // ── Scenario Intent Fidelity (review Priority #1 & #2) ──
         // The deterministic builder must IMPLEMENT the exact scenario the case
@@ -2514,12 +2520,14 @@ ${gotoB}${sessionLogin('pageB')}
           if (/^\s*\/\/\s*(enter|type|input|fill).*(user|email|login|password|pwd|credential)/i.test(l)) continue;
           if (/^\s*\/\/\s*(click|press|tap|submit).*(login|log in|sign in)/i.test(l)) continue;
           // Drop the credential fills (and remember where the triad started).
-          if (/\.fill\(/i.test(l) && /#user-name|username|#password|\bpwd\b|\bpass\b/i.test(l)) {
+          // Match on the semantic token so data-test selectors (e.g.
+          // `[data-test="password"]`) are recognised just like ids (`#password`).
+          if (/\.fill\(/i.test(l) && /user-?name|username|password|\bpwd\b|\bpass\b/i.test(l)) {
             if (loginInsertIdx === -1) loginInsertIdx = filtered.length;
             continue;
           }
           // Drop the login click and its trailing waitForLoadState.
-          if (/login.*button|#login-button/i.test(l) && /\.click\(/i.test(l)) {
+          if (/login[-_]?button|login.*button|sign[-_ ]?in/i.test(l) && /\.click\(/i.test(l)) {
             if (loginInsertIdx === -1) loginInsertIdx = filtered.length;
             if (/page\.waitForLoadState/i.test(work[i + 1] || '')) i++;
             continue;

@@ -41,10 +41,14 @@ const { tracked } = engine.buildGroundedSelectors(crawl);
 
 console.log('\n=== Locator grounding (data-test) ===');
 
-// Elements with an id still ground via id.
-check('username grounds via id', tracked.username.grounded && tracked.username.source === 'id');
-check('password grounds via id', tracked.password.grounded && tracked.password.source === 'id');
-check('login grounds via id', tracked.login.grounded && tracked.login.source === 'id');
+// Element Intelligence unification: Script Generation now consults the SAME
+// ranked-locator brain as Healing (src/intelligence/element-intelligence.ts),
+// where `data-test` outranks `id`. So elements that expose BOTH `data-test`
+// and `id` ground via `data-test` (the app's real test contract), identical to
+// how the healing engine resolves them — one source of truth, no divergence.
+check('username grounds via data-test', tracked.username.grounded && tracked.username.source === 'data-test');
+check('password grounds via data-test', tracked.password.grounded && tracked.password.source === 'data-test');
+check('login grounds via data-test', tracked.login.grounded && tracked.login.source === 'data-test');
 
 // Elements that expose ONLY data-test (no id) must ground via data-test.
 check('title grounds via data-test', tracked.title.grounded && tracked.title.source === 'data-test', JSON.stringify(tracked.title));

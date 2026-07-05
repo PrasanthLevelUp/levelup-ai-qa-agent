@@ -57,7 +57,10 @@ const config: any = {
   check('grounding report is present', !!g, JSON.stringify(g));
   check('elements were flattened from pages (grounded > 0)', !!g && g.groundedCount > 0,
     g ? `${g.groundedCount}/${g.total}` : 'none');
-  check('id-based locators ground (not fallback)', !!g && g.entries.some((e: any) => e.name === 'username' && e.grounded && e.source === 'id'));
+  // Element Intelligence unification: username exposes BOTH data-test and id;
+  // Script Gen now shares Healing's ranked-locator brain where data-test outranks
+  // id, so it grounds via the app's real test contract (data-test), not id.
+  check('primary locator grounds (not fallback)', !!g && g.entries.some((e: any) => e.name === 'username' && e.grounded && e.source === 'data-test'));
   check('data-test locator from a SECOND page grounds', !!g && g.entries.some((e: any) => e.name === 'title' && e.grounded && e.source === 'data-test'));
   check('grounded percentage is 100% for this flow', !!g && g.groundedPct === 100, g ? `${g.groundedPct}%` : 'none');
 
