@@ -289,6 +289,38 @@ export function createScriptGenRouter(): Router {
         console.log(`[ScriptGen] 📥 ${requirementTestCases.length} inline uploaded test case(s) normalized → deterministic batch generation`);
       }
 
+      // ── Honesty guard: requirement intent with NO resolvable cases ───────
+      // If the caller explicitly asked for requirement-based generation (a
+      // requirementId, no single testCase, no inline uploaded cases) but we
+      // could not resolve a SINGLE linked test case — even after the
+      // FK→traceability fallback in getTestCasesForRequirement — then the ONLY
+      // thing the engine can do is drop to the generic URL-discovery flow
+      // (smoke/search/navigation/form) and stamp it with a meaningless 100%
+      // reliability score. That is exactly the "many scenarios, 4 generic
+      // 0%-grounded scripts" symptom. Fail LOUD and actionable instead of
+      // silently shipping garbage. URL-based generation (no requirementId) is
+      // unaffected and still uses the LLM discovery path as designed.
+      if (
+        requirementId != null &&
+        !testCase &&
+        requirementTestCases.length === 0 &&
+        !(Array.isArray(inlineTestCasesRaw) && inlineTestCasesRaw.length > 0)
+      ) {
+        console.warn(
+          `[ScriptGen] ❌ Requirement ${requirementId} resolved 0 test cases (FK + traceability fallback both empty). ` +
+            `Refusing to emit generic ungrounded scripts.`,
+        );
+        return res.status(422).json({
+          success: false,
+          error:
+            'This requirement has no linked test cases, so grounded per-test-case scripts cannot be generated. ' +
+            'Link the requirement’s test cases first (Test Case Lab → link to requirement), or generate from a URL / uploaded CSV instead.',
+          code: 'REQUIREMENT_HAS_NO_TEST_CASES',
+          requirementId: String(requirementId),
+          resolvedTestCaseCount: 0,
+        });
+      }
+
       // ── Test-case page coverage ──────────────────────────────────────────
       // A test case grounds its selectors against the crawled DOM of the page
       // it operates on. If the crawl only captured the entry page, a login test

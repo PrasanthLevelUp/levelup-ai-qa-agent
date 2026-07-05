@@ -8331,14 +8331,10 @@ export async function getTestCasesForRequirement(
   companyId?: number | null,
 ): Promise<any[]> {
   const pool = getPool();
-  const conds = ['tc.requirement_id = $1'];
-  const vals: any[] = [requirementId];
-  if (companyId !== undefined && companyId !== null) {
-    conds.push(`(tc.company_id = $${vals.length + 1} OR tc.company_id IS NULL)`);
-    vals.push(companyId);
-  }
-  const r = await pool.query(
-    `SELECT
+
+  // The SELECT list is identical for the primary (FK) and fallback (traceability)
+  // paths — factor it out so both return the exact same row shape.
+  const SELECT_COLS = `
         tc.id,
         tc.title,
         tc.priority,
@@ -8358,18 +8354,89 @@ export async function getTestCasesForRequirement(
         CASE
           WHEN COALESCE(sc.script_count, 0) > 0 OR tc.is_automated = true THEN 'automated'
           ELSE 'not_automated'
-        END AS automation_status
-     FROM generated_test_cases tc
+        END AS automation_status`;
+  const SCRIPT_COUNT_JOIN = `
      LEFT JOIN (
        SELECT test_case_id, COUNT(*)::int AS script_count
        FROM generated_scripts
        WHERE deleted_at IS NULL
        GROUP BY test_case_id
-     ) sc ON sc.test_case_id = tc.id
+     ) sc ON sc.test_case_id = tc.id`;
+
+  // ── Primary path: the RTM foreign key on the test case itself ──────────
+  const conds = ['tc.requirement_id = $1'];
+  const vals: any[] = [requirementId];
+  if (companyId !== undefined && companyId !== null) {
+    conds.push(`(tc.company_id = $${vals.length + 1} OR tc.company_id IS NULL)`);
+    vals.push(companyId);
+  }
+  const r = await pool.query(
+    `SELECT ${SELECT_COLS}
+     FROM generated_test_cases tc${SCRIPT_COUNT_JOIN}
      WHERE ${conds.join(' AND ')}
      ORDER BY tc.priority, tc.id`,
     vals,
   );
+  if (r.rows.length > 0) return r.rows;
+
+  // ── Fallback path: resolve via the traceability_links audit table ──────
+  // A requirement can be linked to its test cases through TWO representations:
+  //   (a) generated_test_cases.requirement_id  (the FK queried above), and
+  //   (b) traceability_links(requirement_to_testcase)  (denormalised audit).
+  // These are normally written together, but drift is possible (e.g. a case
+  // linked by an older code path that only wrote the audit row, or a FK cleared
+  // by a partial delete). When the FK query finds NOTHING, fall back to the
+  // audit table so requirement-based script generation still discovers the
+  // linked cases instead of silently dropping to the generic LLM flow
+  // (smoke/search/navigation/form) with 0%-grounded locators. Best-effort:
+  // any error here degrades to "no cases" exactly like before.
+  try {
+    const linkConds = [
+      `tl.link_type = 'requirement_to_testcase'`,
+      'tl.requirement_id = $1',
+      'tl.test_case_id IS NOT NULL',
+    ];
+    const linkVals: any[] = [requirementId];
+    if (companyId !== undefined && companyId !== null) {
+      linkConds.push(`(tc.company_id = $${linkVals.length + 1} OR tc.company_id IS NULL)`);
+      linkVals.push(companyId);
+    }
+    const viaLinks = await pool.query(
+      `SELECT ${SELECT_COLS}
+       FROM traceability_links tl
+       JOIN generated_test_cases tc ON tc.id = tl.test_case_id${SCRIPT_COUNT_JOIN}
+       WHERE ${linkConds.join(' AND ')}
+       ORDER BY tc.priority, tc.id`,
+      linkVals,
+    );
+    if (viaLinks.rows.length > 0) {
+      console.warn(
+        `[postgres] getTestCasesForRequirement: FK query returned 0 for requirement ${requirementId}, ` +
+          `recovered ${viaLinks.rows.length} case(s) via traceability_links. Self-healing the requirement_id FK.`,
+      );
+      // Self-heal: backfill the FK so the fast path (and the coverage triggers)
+      // work next time. Company-scoped, best-effort — never blocks the read.
+      const ids = viaLinks.rows.map((row) => row.id);
+      try {
+        const healConds = ['id = ANY($2)'];
+        const healVals: any[] = [requirementId, ids];
+        if (companyId !== undefined && companyId !== null) {
+          healConds.push(`(company_id = $3 OR company_id IS NULL)`);
+          healVals.push(companyId);
+        }
+        await pool.query(
+          `UPDATE generated_test_cases SET requirement_id = $1 WHERE ${healConds.join(' AND ')}`,
+          healVals,
+        );
+      } catch (healErr: any) {
+        console.warn(`[postgres] getTestCasesForRequirement: FK self-heal failed (non-blocking): ${healErr?.message}`);
+      }
+      return viaLinks.rows;
+    }
+  } catch (linkErr: any) {
+    console.warn(`[postgres] getTestCasesForRequirement: traceability fallback failed (non-blocking): ${linkErr?.message}`);
+  }
+
   return r.rows;
 }
 
