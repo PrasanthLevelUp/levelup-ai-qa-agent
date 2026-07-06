@@ -92,9 +92,39 @@ function ecommerceProfile() {
   };
 }
 
+// A LARGE enterprise crawl — the case the user described ("695 elements every
+// time"). Keeps the real login surface, then adds dozens of unrelated pages/
+// forms/elements (admin, reporting, catalog, CMS...) so we can SEE retrieval
+// scope the prompt down to just the login-relevant slice. Enable with
+// GEN_DIAG_LARGE=true.
+function largeEnterpriseProfile() {
+  const base = ecommerceProfile();
+  const noise = ['dashboard', 'reports', 'analytics', 'admin', 'users', 'roles', 'permissions',
+    'settings', 'billing', 'invoices', 'catalog', 'inventory', 'orders', 'shipments', 'returns',
+    'suppliers', 'categories', 'promotions', 'coupons', 'reviews', 'wishlist', 'blog', 'faq',
+    'support', 'tickets', 'notifications', 'audit-log', 'exports', 'imports', 'integrations',
+    'webhooks', 'api-keys', 'themes', 'pages-cms', 'menus', 'banners', 'taxes', 'currencies',
+    'languages', 'stores'];
+  const pages = [...base.pages];
+  const forms = [...base.forms];
+  const keyElements = [...base.keyElements];
+  for (const n of noise) {
+    pages.push({ url: `/${n}`, title: n.replace(/-/g, ' '), pageType: n, elementCount: 15, formCount: 1 });
+    forms.push({ page: `/${n}`, action: `/${n}`, method: 'POST', submitSelector: `#${n}-save`,
+      fields: [{ name: `${n}_name`, type: 'text', required: true, selector: `#${n}-name`, label: `${n} name` },
+               { name: `${n}_value`, type: 'text', required: false, selector: `#${n}-val`, label: `${n} value` }] });
+    keyElements.push({ label: `${n} save`, tag: 'button', selector: `#${n}-save`, role: 'button' });
+    keyElements.push({ label: `${n} filter`, tag: 'input', selector: `#${n}-filter`, role: 'textbox' });
+  }
+  return { ...base, pageCount: pages.length, totalForms: forms.length,
+    totalElements: keyElements.length, pages, forms, keyElements };
+}
+
+const USE_LARGE = (process.env['GEN_DIAG_LARGE'] || 'false').toLowerCase() === 'true';
+
 function knowledge(): KnowledgeContext {
   return {
-    applicationProfile: ecommerceProfile(),
+    applicationProfile: USE_LARGE ? largeEnterpriseProfile() : ecommerceProfile(),
     testData: [
       { name: 'valid_users', environment: 'staging', recordCount: 20, sampleKeys: ['email', 'password', 'role'] },
       { name: 'locked_users', environment: 'staging', recordCount: 5, sampleKeys: ['email', 'password', 'status'] },

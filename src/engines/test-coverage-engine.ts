@@ -33,7 +33,7 @@ const MOD = 'test-coverage-engine';
  * Tracked in every generation so we can correlate quality with prompt evolution and
  * quickly diagnose "last week was better" reports by identifying which version ran.
  */
-const PROMPT_VERSION = 'v3.5-compressed-instructions';
+const PROMPT_VERSION = 'v3.6-scenario-aware-retrieval';
 
 /**
  * Engine architecture version — increment when the pipeline or core algorithm changes
@@ -1201,24 +1201,55 @@ Return ONLY valid JSON, no markdown fences.`;
       coverageTypes = ['positive'];
     }
 
-    // ── Prompt Optimizer (QA-first, ZERO tokens) ──
-    // Trim the grounding context (app profile pages/forms/elements + test-data
-    // sets) to what the requirement's QA category actually needs BEFORE any
-    // block is assembled. The INPUT prompt — not the output — is the dominant
-    // token cost, and shipping the entire crawled app profile for a "User
-    // Login" requirement is pure waste. Fail-open: generic/low-confidence
+    // ── Deterministic Scenario Plan (QA-first) — computed FIRST ──
+    // The plan decides WHAT to test (zero tokens) BEFORE we retrieve context, so
+    // its scenario titles/objectives/risk-areas can steer retrieval toward the
+    // pages/forms/fields/datasets the planned scenarios actually reference. The
+    // rendered block is injected into the prompt later (as a set to EXPAND).
+    let scenarioPlanBlock = '';
+    let scenarioPlan: ScenarioPlan | undefined;
+    if (SCENARIO_PLANNER_ENABLED) {
+      scenarioPlan = planScenarios(input, coverageTypes, analysis.featureType);
+      scenarioPlanBlock = buildScenarioPlanBlock(scenarioPlan);
+      logger.info(MOD, 'Scenario plan built', {
+        category: scenarioPlan.classification.category,
+        confidence: scenarioPlan.classification.confidence,
+        planned: scenarioPlan.scenarios.length,
+        grounded: scenarioPlan.groundedCount,
+        conditional: scenarioPlan.conditionalCount,
+        knowledgeVersion: scenarioPlan.knowledgeVersion,
+        applied: scenarioPlanBlock.length > 0,
+      });
+    }
+
+    // ── Prompt Optimizer (QA-first, ZERO tokens) — scenario-aware retrieval ──
+    // Retrieve the grounding context (app profile pages/forms/elements + test-
+    // data sets) relevant to WHAT the planned scenarios test, BEFORE any block is
+    // assembled. The INPUT prompt — not the output — is the dominant token cost,
+    // and shipping the entire crawled app profile for a "User Login" requirement
+    // is pure waste. This is real top-K retrieval: items are ranked by relevance
+    // to the requirement + the scenario plan, and only the most relevant are kept
+    // (see GEN_RETRIEVE_MAX_* caps). Fail-open: generic/low-confidence
     // requirements pass through unchanged (byte-for-byte legacy prompt). Only
-    // trims the LEGACY grounding blocks; the orchestrated path already scopes by
-    // intent and is left untouched.
+    // scopes the LEGACY grounding blocks; the orchestrated path already scopes by
+    // intent and is left untouched. Coverage/scenario count is NEVER affected.
     let genKnowledge = knowledge;
     let optimizeStats: OptimizeStats | undefined;
     if (PROMPT_OPTIMIZER_ENABLED && knowledge) {
       const cls = classifyQACategory(input, analysis.featureType);
       const reqText = `${input.title} ${input.description} ${input.acceptanceCriteria || ''} ${input.businessFlow || ''}`;
+      // Scenario-aware query: fold the planned scenario titles/objectives/risk
+      // areas into the retrieval query so ranking targets what will be tested.
+      const planQuery = scenarioPlan
+        ? scenarioPlan.scenarios
+            .map(s => `${s.title || ''} ${s.objective || ''} ${s.riskArea || ''}`)
+            .join(' ')
+        : '';
       const optimized = optimizeKnowledgeForCategory(knowledge, reqText, {
         category: cls.category,
         confidence: cls.confidence,
         minConfidence: PROMPT_OPTIMIZER_MIN_CONFIDENCE,
+        queryText: planQuery,
       });
       genKnowledge = optimized.knowledge;
       optimizeStats = optimized.stats;
@@ -1226,6 +1257,7 @@ Return ONLY valid JSON, no markdown fences.`;
         applied: optimizeStats.applied,
         category: optimizeStats.category,
         confidence: optimizeStats.confidence,
+        scenarioAware: planQuery.length > 0,
         pages: `${optimizeStats.pages.before}→${optimizeStats.pages.after}`,
         forms: `${optimizeStats.forms.before}→${optimizeStats.forms.after}`,
         elements: `${optimizeStats.elements.before}→${optimizeStats.elements.after}`,
@@ -1263,28 +1295,8 @@ Return ONLY valid JSON, no markdown fences.`;
       return `  ${i + 1}. ${g.label}  (use coverageType: "${ct}")\n       Goal: ${g.goal}\n       Look for: ${g.lookFor}`;
     }).join('\n');
 
-    // ── Deterministic Scenario Plan (QA-first) ──
-    // Before the LLM runs, plan the baseline scenarios this feature category
-    // implies (zero tokens). The plan is injected into the prompt as a set of
-    // scenarios to EXPAND, so the LLM enriches known-good QA obligations instead
-    // of re-deriving them. Filtered to the user's selected coverage types and
-    // never overrides grounding. Empty block ('') for unknown categories → the
-    // prompt is byte-for-byte the legacy prompt (safe fallback).
-    let scenarioPlanBlock = '';
-    let scenarioPlan: ScenarioPlan | undefined;
-    if (SCENARIO_PLANNER_ENABLED) {
-      scenarioPlan = planScenarios(input, coverageTypes, analysis.featureType);
-      scenarioPlanBlock = buildScenarioPlanBlock(scenarioPlan);
-      logger.info(MOD, 'Scenario plan built', {
-        category: scenarioPlan.classification.category,
-        confidence: scenarioPlan.classification.confidence,
-        planned: scenarioPlan.scenarios.length,
-        grounded: scenarioPlan.groundedCount,
-        conditional: scenarioPlan.conditionalCount,
-        knowledgeVersion: scenarioPlan.knowledgeVersion,
-        applied: scenarioPlanBlock.length > 0,
-      });
-    }
+    // (Scenario Plan was computed earlier so it could steer scenario-aware
+    // retrieval; scenarioPlanBlock is injected into the prompt below.)
 
     // ── Mode-specific scope guidance ──
     // STANDARD (default): committed coverage grounded in requirement + context
