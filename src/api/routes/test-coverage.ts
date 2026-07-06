@@ -89,6 +89,7 @@ export function createTestCoverageRouter(): Router {
         useTestData,     // optional: explicitly disable (false) the test-data grounding
         testDataIds,     // optional: pin specific dataset IDs instead of all project datasets
         deduplicate,     // optional: set false to skip the semantic duplicate-removal pass (default on)
+        aiCoverageExpansion, // optional: explicit opt-in to broaden committed coverage beyond the selected types (default off — respect user selection)
       } = req.body;
 
       if (!title || !description) {
@@ -322,6 +323,7 @@ export function createTestCoverageRouter(): Router {
       const result = await getEngine().generateFullCoverage(input, selectedTypes, knowledge, {
         includeCoverageGaps: includeCoverageGaps !== false,
         deduplicate: deduplicate !== false, // default on — semantic near-duplicate removal
+        aiCoverageExpansion: aiCoverageExpansion === true, // default off — respect the user's coverage-type selection
       });
       logger.info(MOD, 'AI engine returned', {
         mode: result.mode,
