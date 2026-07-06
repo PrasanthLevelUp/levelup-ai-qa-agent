@@ -11,7 +11,7 @@
  * Run with:  npx tsx tests/unit/reliability-breakdown.test.ts
  */
 
-import { computeReliabilityBreakdown } from '../../src/script-gen/validation-runner';
+import { computeReliabilityBreakdown, toPublicReliability } from '../../src/script-gen/validation-runner';
 
 let passed = 0;
 let failed = 0;
@@ -97,6 +97,44 @@ function main() {
     });
     assert(b.codeQuality === 100, 'clamp: code quality clamped to 100');
     assert(b.groundingQuality === 33, 'round: 1/3 grounding rounds to 33%');
+  }
+
+  /* ── Public API projection: only 4 headline fields, no internals ───────── */
+  {
+    const full = computeReliabilityBreakdown({
+      codeQuality: 100,
+      grounding: { grounded: 0, total: 14 },
+      intendedTestCaseCount: 5,
+      usedRealTestCases: false,
+    });
+    const pub = toPublicReliability(full);
+    const keys = Object.keys(pub).sort();
+    assert(
+      JSON.stringify(keys) === JSON.stringify(['codeQuality', 'coverage', 'executionReadiness', 'grounding']),
+      'public: exposes exactly {executionReadiness, grounding, coverage, codeQuality}',
+    );
+    assert(!('headline' in (pub as any)), 'public: internal headline is NOT exposed');
+    assert(!('dimensions' in (pub as any)), 'public: internal dimensions[] is NOT exposed');
+    assert(!('groundingQuality' in (pub as any)), 'public: verbose groundingQuality key is renamed to grounding');
+    assert(!('businessCoverage' in (pub as any)), 'public: verbose businessCoverage key is renamed to coverage');
+    assert(pub.executionReadiness === 0, 'public: execution readiness collapses to 0 (0% grounding)');
+    assert(pub.codeQuality === 100, 'public: code quality preserved');
+    assert(pub.grounding === 0, 'public: grounding = 0 (0/14)');
+    assert(pub.coverage === 0, 'public: coverage = 0 (fallback ran on intended cases)');
+  }
+
+  /* ── Public API: null dimensions survive the projection ────────────────── */
+  {
+    const full = computeReliabilityBreakdown({
+      codeQuality: 90,
+      grounding: null,
+      intendedTestCaseCount: 0,
+      usedRealTestCases: false,
+    });
+    const pub = toPublicReliability(full);
+    assert(pub.grounding === null, 'public: grounding stays null when nothing to ground');
+    assert(pub.coverage === null, 'public: coverage stays null when no intended cases');
+    assert(pub.executionReadiness === 90, 'public: readiness = code quality when only that applies');
   }
 
   console.log(`\n${passed} passed, ${failed} failed`);

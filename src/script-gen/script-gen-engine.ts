@@ -383,6 +383,42 @@ export interface GenerationConfig {
 }
 
 /* -------------------------------------------------------------------------- */
+/*  Deterministic-intent failure                                               */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Thrown when a generation carried explicit test-case / requirement intent
+ * (config.testCase or config.testCases) but the deterministic, grounded engine
+ * produced nothing (empty output or an internal error).
+ *
+ * Historically this situation SILENTLY dropped through to the generic LLM
+ * "workflow generator" (path 2), which emitted 4 unrelated smoke/search/nav/form
+ * specs with 0%-grounded locators and then reported a misleading 100% score.
+ * That second generation path is the root of the whole class of bugs the user
+ * flagged. Requirement / test-case intent must therefore NEVER fall back to the
+ * generic generator — we raise this typed error instead so the API layer can
+ * return an honest, actionable failure (route the user to review/regenerate the
+ * test cases) rather than dressing up ungrounded output as a success.
+ */
+export class DeterministicGenerationEmptyError extends Error {
+  readonly code = 'DETERMINISTIC_GENERATION_EMPTY';
+  /** How many cases the deterministic path was asked to generate from. */
+  readonly intendedCaseCount: number;
+  /** Per-case reasons collected by the batch generator (best-effort). */
+  readonly caseErrors: string[];
+  constructor(intendedCaseCount: number, caseErrors: string[] = [], cause?: string) {
+    super(
+      `Deterministic generation from ${intendedCaseCount} test case(s) produced no grounded script` +
+        (cause ? `: ${cause}` : '') +
+        '. Refusing to fall back to the generic workflow generator.',
+    );
+    this.name = 'DeterministicGenerationEmptyError';
+    this.intendedCaseCount = intendedCaseCount;
+    this.caseErrors = caseErrors;
+  }
+}
+
+/* -------------------------------------------------------------------------- */
 /*  Script Generation Engine                                                   */
 /* -------------------------------------------------------------------------- */
 
@@ -661,42 +697,59 @@ export class ScriptGenEngine {
     // real crawled DOM. This is reliable, reproducible and needs no API key.
     // Requirement-based batch: one grounded spec per test case (no LLM).
     if (Array.isArray(config.testCases) && config.testCases.length > 0) {
+      // NO SILENT FALLBACK. When the caller supplied real test cases the ONLY
+      // acceptable output is grounded, per-case scripts. If the deterministic
+      // engine produces nothing (or throws), we raise a typed error instead of
+      // dropping to the generic workflow generator (path 2). The generic path
+      // is what emitted 4 unrelated 0%-grounded specs and a fake 100% score.
+      let batch: GenerationResult | null = null;
       try {
-        const batch = this.generateFromTestCases(config, crawlResult);
-        if (batch && batch.generatedFiles.length > 0) {
-          const batchResult: GenerationResult = {
-            ...batch,
-            ...(authResult ? { authResult } : {}),
-            ...(!config.cachedCrawlData ? { rawCrawlData: crawlResult } : {}),
-          };
-          logger.info(MOD, 'Script generation complete (deterministic requirement-batch path)', batchResult.stats);
-          return batchResult;
-        }
-        logger.warn(MOD, 'Deterministic requirement-batch generation produced nothing — falling back');
+        batch = this.generateFromTestCases(config, crawlResult);
       } catch (batchErr: any) {
-        logger.warn(MOD, `Deterministic requirement-batch generation failed (${batchErr?.message}) — falling back`);
+        logger.error(MOD, `Deterministic requirement-batch generation failed (${batchErr?.message}) — refusing generic fallback`);
+        throw new DeterministicGenerationEmptyError(config.testCases.length, [], batchErr?.message);
       }
+      if (batch && batch.generatedFiles.length > 0) {
+        const batchResult: GenerationResult = {
+          ...batch,
+          ...(authResult ? { authResult } : {}),
+          ...(!config.cachedCrawlData ? { rawCrawlData: crawlResult } : {}),
+        };
+        logger.info(MOD, 'Script generation complete (deterministic requirement-batch path)', batchResult.stats);
+        return batchResult;
+      }
+      logger.error(MOD, 'Deterministic requirement-batch generation produced nothing — refusing generic fallback');
+      throw new DeterministicGenerationEmptyError(config.testCases.length, batch?.errors ?? []);
     }
 
     if (config.testCase) {
+      // Same contract for a single Test Case Lab case: deterministic or honest
+      // failure, never the generic LLM path.
+      let deterministic: GenerationResult | null = null;
       try {
-        const deterministic = this.generateFromTestCase(config, crawlResult);
-        if (deterministic && deterministic.generatedFiles.length > 0) {
-          const tcResult: GenerationResult = {
-            ...deterministic,
-            ...(authResult ? { authResult } : {}),
-            ...(!config.cachedCrawlData ? { rawCrawlData: crawlResult } : {}),
-          };
-          logger.info(MOD, 'Script generation complete (deterministic test-case path)', tcResult.stats);
-          return tcResult;
-        }
-        logger.warn(MOD, 'Deterministic test-case generation produced nothing — falling back to LLM path');
+        deterministic = this.generateFromTestCase(config, crawlResult);
       } catch (tcErr: any) {
-        logger.warn(MOD, `Deterministic test-case generation failed (${tcErr?.message}) — falling back to LLM path`);
+        logger.error(MOD, `Deterministic test-case generation failed (${tcErr?.message}) — refusing generic fallback`);
+        throw new DeterministicGenerationEmptyError(1, [], tcErr?.message);
       }
+      if (deterministic && deterministic.generatedFiles.length > 0) {
+        const tcResult: GenerationResult = {
+          ...deterministic,
+          ...(authResult ? { authResult } : {}),
+          ...(!config.cachedCrawlData ? { rawCrawlData: crawlResult } : {}),
+        };
+        logger.info(MOD, 'Script generation complete (deterministic test-case path)', tcResult.stats);
+        return tcResult;
+      }
+      logger.error(MOD, 'Deterministic test-case generation produced nothing — refusing generic fallback');
+      throw new DeterministicGenerationEmptyError(1, deterministic?.errors ?? []);
     }
 
-    // ─── Step 2: Build workflow map ───────────────────────────────
+    // ─── Step 2: Build workflow map (URL / plain-English generation ONLY) ──
+    // Reaching here means NO test-case / requirement intent was supplied — this
+    // is a pure URL or free-text scenario run, the ONE remaining legitimate use
+    // of the workflow generator. Requirement/test-case intent can never arrive
+    // here (it returns above or throws DeterministicGenerationEmptyError).
     const workflowMap = this.workflowMapper.buildWorkflowMap([crawlResult]);
 
     logger.info(MOD, 'Workflow map built', {
