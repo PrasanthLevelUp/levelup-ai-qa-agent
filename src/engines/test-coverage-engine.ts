@@ -23,8 +23,11 @@ import {
   buildFormatterPrompt,
   buildDeterministicOutput,
   buildScenariosFromDrafts,
+  applyPolish,
   type DraftTestCase,
+  type FormatterTestCase,
 } from './scenario-builder';
+import { validateCanonicalTestCases } from './canonical-validator';
 import { classifyQACategory } from './qa-knowledge-engine';
 import {
   optimizeKnowledgeForCategory,
@@ -41,7 +44,7 @@ const MOD = 'test-coverage-engine';
  * Tracked in every generation so we can correlate quality with prompt evolution and
  * quickly diagnose "last week was better" reports by identifying which version ran.
  */
-const PROMPT_VERSION = 'v3.9-formatter-mode';
+const PROMPT_VERSION = 'v4.0-canonical-validator';
 
 /**
  * Engine architecture version — increment when the pipeline or core algorithm changes
@@ -252,6 +255,15 @@ const SCENARIO_BUILDER_ENABLED = (process.env.GEN_SCENARIO_BUILDER || 'true').to
  * Default ON; set GEN_FORMATTER_MODE=false to keep the full reasoning prompt.
  */
 const FORMATTER_MODE_ENABLED = (process.env.GEN_FORMATTER_MODE || 'true').toLowerCase() !== 'false';
+
+/**
+ * Canonical Validator — asserts + deterministically repairs the canonical test
+ * cases (unique scenarioId, non-empty expected, no duplicate steps, real
+ * selectors/datasets/pages) BEFORE the LLM formatter is called, so the model
+ * cannot break structurally-sound objects. Never drops a case (coverage is
+ * sacred). Default ON; set GEN_CANONICAL_VALIDATOR=false to bypass.
+ */
+const CANONICAL_VALIDATOR_ENABLED = (process.env.GEN_CANONICAL_VALIDATOR || 'true').toLowerCase() !== 'false';
 
 /** Signals used to classify requirement complexity — all cheap to compute, ZERO LLM calls. */
 export interface ComplexitySignals {
@@ -1354,12 +1366,38 @@ Return ONLY valid JSON, no markdown fences.`;
     const allSelectedTypesCovered = coverageTypes.every(ct => draftCoverageTypes.has(ct));
     const formatterMode =
       FORMATTER_MODE_ENABLED && !expand && draftDrafts.length > 0 && allSelectedTypesCovered;
-    const deterministicOutput = formatterMode ? buildDeterministicOutput(draftDrafts) : undefined;
     if (FORMATTER_MODE_ENABLED && !expand && draftDrafts.length > 0 && !allSelectedTypesCovered) {
       logger.info(MOD, 'Formatter mode skipped — drafts do not cover all selected types', {
         selected: coverageTypes.join(','),
         draftTypes: Array.from(draftCoverageTypes).join(','),
       });
+    }
+
+    // ── Canonical Validator (QA-first, ZERO tokens) ──
+    // Before the LLM ever sees the drafts, assert + deterministically repair the
+    // canonical invariants (unique scenarioId, non-empty expected, no duplicate
+    // steps, real selectors/datasets/pages). This runs on the VALIDATED cases so
+    // the formatter can only ever touch wording — the structure is already sound.
+    // Never drops a case; coverage stays exactly what the builder produced.
+    let deterministicOutput:
+      | { scenarios: ReturnType<typeof buildScenariosFromDrafts>; testCases: FormatterTestCase[] }
+      | undefined;
+    if (formatterMode) {
+      const built = buildDeterministicOutput(draftDrafts);
+      let cases = built.testCases;
+      if (CANONICAL_VALIDATOR_ENABLED) {
+        const validated = validateCanonicalTestCases(cases, genKnowledge);
+        cases = validated.cases;
+        logger.info(MOD, 'Canonical validator', {
+          checked: validated.report.checked,
+          ok: validated.report.ok,
+          errors: validated.report.errors,
+          warnings: validated.report.warnings,
+          repaired: validated.report.repaired,
+          checks: validated.report.issues.slice(0, 8).map(i => `${i.scenarioId}:${i.check}`).join(' '),
+        });
+      }
+      deterministicOutput = { scenarios: built.scenarios, testCases: cases };
     }
 
     const knowledgeBugs = genKnowledge?.historicalBugs?.length
@@ -1516,10 +1554,17 @@ Return ONLY valid JSON. Address EVERY selected coverage type, organise scenarios
     // polish instruction — this is what makes the reduction visible in History.
     let promptBreakdown: PromptSectionBreakdown;
     if (formatterMode && deterministicOutput) {
-      const draftsPayloadChars = JSON.stringify(deterministicOutput.testCases).length;
+      // Measure the ACTUAL editable-only payload as it appears in the prompt
+      // (the canonical formatter sends only the wording fields, not the full
+      // 16-field objects), so the breakdown reflects the real, smaller payload.
+      const marker = 'TEST CASES TO POLISH:\n';
+      const idx = prompt.lastIndexOf(marker);
+      const draftsPayloadChars = idx >= 0
+        ? prompt.length - (idx + marker.length)
+        : JSON.stringify(deterministicOutput.testCases).length;
       const formatterInstructionChars = Math.max(0, prompt.length - draftsPayloadChars);
       promptBreakdown = buildPromptBreakdown([
-        { key: 'draftTestCases', label: 'Draft Test Cases (payload)', text: 'x'.repeat(draftsPayloadChars) },
+        { key: 'draftTestCases', label: 'Canonical Cases (editable payload)', text: 'x'.repeat(draftsPayloadChars) },
         { key: 'instructions', label: 'Formatter Instructions', text: 'x'.repeat(formatterInstructionChars) },
       ]);
     } else {
@@ -1582,33 +1627,22 @@ Return ONLY valid JSON. Address EVERY selected coverage type, organise scenarios
     // deterministic test cases unchanged. Either way coverage == the builder's
     // output — it never depends on the model.
     if (formatterMode && deterministicOutput) {
-      scenarios = buildScenariosFromDrafts(draftDrafts) as unknown as TestScenario[];
-      const polished = Array.isArray(parsed.testCases) ? parsed.testCases : [];
-      const contractOk = polished.length === deterministicOutput.testCases.length;
+      scenarios = deterministicOutput.scenarios as unknown as TestScenario[];
+      // The formatter returns ONLY the editable wording fields (keyed by
+      // canonical id). applyPolish overlays that wording onto the deterministic
+      // (already-validated) canonical objects — invariants are preserved by
+      // construction because the model never received them. If the model broke
+      // the contract (wrong count), the validated deterministic cases ship as-is.
+      const { cases: reconciled, contractOk } = applyPolish(deterministicOutput.testCases, parsed);
+      testCases = reconciled as unknown as TestCase[];
       if (contractOk) {
-        // Trust the wording, but RE-STAMP the deterministic invariants the model
-        // must not have changed (scenarioIndex/priority/source/selectors live in
-        // steps). We keep the polished English fields and restore the rest.
-        testCases = deterministicOutput.testCases.map((det, i) => {
-          const p: any = polished[i] || {};
-          return {
-            ...det,
-            title: typeof p.title === 'string' && p.title.trim() ? p.title : det.title,
-            objective: typeof p.objective === 'string' && p.objective.trim() ? p.objective : det.objective,
-            preconditions: typeof p.preconditions === 'string' && p.preconditions.trim() ? p.preconditions : det.preconditions,
-            expectedResult: typeof p.expectedResult === 'string' && p.expectedResult.trim() ? p.expectedResult : det.expectedResult,
-            steps: Array.isArray(p.steps) && p.steps.length === det.steps.length
-              && p.steps.every((s: unknown) => typeof s === 'string' && (s as string).trim().length > 0)
-              ? p.steps : det.steps,
-          };
-        }) as unknown as TestCase[];
         logger.info(MOD, 'Formatter mode applied (polished wording, deterministic logic)', {
           cases: testCases.length,
         });
       } else {
-        testCases = deterministicOutput.testCases as unknown as TestCase[];
-        logger.warn(MOD, 'Formatter contract violated — shipping deterministic drafts', {
-          expected: deterministicOutput.testCases.length, got: polished.length,
+        logger.warn(MOD, 'Formatter contract violated — shipping validated deterministic cases', {
+          expected: deterministicOutput.testCases.length,
+          got: Array.isArray((parsed as any)?.cases) ? (parsed as any).cases.length : 0,
         });
       }
     }

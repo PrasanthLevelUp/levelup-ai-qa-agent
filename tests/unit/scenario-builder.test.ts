@@ -19,6 +19,7 @@ import {
   buildScenariosFromDrafts,
   draftToTestCase,
   buildFormatterPrompt,
+  applyPolish,
 } from '../../src/engines/scenario-builder';
 import type { CoverageType } from '../../src/engines/test-coverage-engine';
 
@@ -243,12 +244,107 @@ describe('Formatter mode — minimal prompt', () => {
     expect(formatterPrompt).not.toContain('Acceptance Criteria');
   });
 
-  it('emits compact (whitespace-free) JSON for the payload', () => {
+  it('sends ONLY the editable wording fields — invariants are withheld from the model', () => {
     const plan = planScenarios(LOGIN_REQ, COVERAGE, 'authentication');
     const { drafts } = buildDraftTestCases(plan, LOGIN_KNOWLEDGE, LOGIN_REQ);
     const out = buildDeterministicOutput(drafts);
     const formatterPrompt = buildFormatterPrompt(out.testCases);
-    // The compact array serialization appears verbatim in the prompt.
-    expect(formatterPrompt).toContain(JSON.stringify(out.testCases));
+    // The editable payload carries the canonical id + wording fields...
+    expect(formatterPrompt).toContain('"id":');
+    expect(formatterPrompt).toContain('"expected":');
+    // ...but NOT the deterministic invariants (the model never sees them, so it
+    // literally cannot change them). This is what cuts the OUTPUT tokens too.
+    expect(formatterPrompt).not.toContain('"severity"');
+    expect(formatterPrompt).not.toContain('"sourceEvidence"');
+    expect(formatterPrompt).not.toContain('"automationComplexity"');
+    expect(formatterPrompt).not.toContain('"selectorAvailability"');
+    // The payload is compact (whitespace-free array joins).
+    expect(formatterPrompt).toContain('},{');
+  });
+});
+
+describe('Canonical object — stable id + typed selectors', () => {
+  it('every draft and test case carries a stable canonical scenarioId', () => {
+    const plan = planScenarios(LOGIN_REQ, COVERAGE, 'authentication');
+    const { drafts } = buildDraftTestCases(plan, LOGIN_KNOWLEDGE, LOGIN_REQ);
+    const out = buildDeterministicOutput(drafts);
+    drafts.forEach(d => expect(typeof d.scenarioId).toBe('string'));
+    // scenarioId comes from the KB scenario id (e.g. auth-*), and is unique.
+    const ids = out.testCases.map(tc => tc.scenarioId);
+    expect(ids.every(id => id.length > 0)).toBe(true);
+    expect(new Set(ids).size).toBe(ids.length);
+    expect(ids.some(id => id.startsWith('auth-'))).toBe(true);
+  });
+
+  it('exposes the real selectors as a typed field extracted from the steps', () => {
+    const plan = planScenarios(LOGIN_REQ, COVERAGE, 'authentication');
+    const { drafts } = buildDraftTestCases(plan, LOGIN_KNOWLEDGE, LOGIN_REQ);
+    const out = buildDeterministicOutput(drafts);
+    const first = out.testCases[0];
+    expect(first.selectors).toEqual(expect.arrayContaining(['#email', '#password', '#login-btn']));
+  });
+});
+
+describe('applyPolish — canonical reconciliation', () => {
+  it('overlays polished wording but preserves EVERY deterministic invariant', () => {
+    const plan = planScenarios(LOGIN_REQ, COVERAGE, 'authentication');
+    const { drafts } = buildDraftTestCases(plan, LOGIN_KNOWLEDGE, LOGIN_REQ);
+    const det = buildDeterministicOutput(drafts).testCases;
+    const polished = {
+      cases: det.map(tc => ({
+        id: tc.scenarioId,
+        title: `Polished: ${tc.title}`,
+        objective: `Polished objective`,
+        preconditions: tc.preconditions,
+        steps: tc.steps.map(s => `Polished ${s}`),
+        expected: `Polished expected`,
+      })),
+    };
+    const { cases, contractOk } = applyPolish(det, polished);
+    expect(contractOk).toBe(true);
+    cases.forEach((c, i) => {
+      // wording taken from the model
+      expect(c.title.startsWith('Polished:')).toBe(true);
+      expect(c.expectedResult).toBe('Polished expected');
+      // invariants preserved verbatim
+      expect(c.priority).toBe(det[i].priority);
+      expect(c.severity).toBe(det[i].severity);
+      expect(c.source).toBe(det[i].source);
+      expect(c.scenarioId).toBe(det[i].scenarioId);
+      expect(c.selectors).toEqual(det[i].selectors);
+      expect(c.steps.length).toBe(det[i].steps.length);
+    });
+  });
+
+  it('ships the deterministic cases unchanged when the model breaks the count contract', () => {
+    const plan = planScenarios(LOGIN_REQ, COVERAGE, 'authentication');
+    const { drafts } = buildDraftTestCases(plan, LOGIN_KNOWLEDGE, LOGIN_REQ);
+    const det = buildDeterministicOutput(drafts).testCases;
+    const { cases, contractOk } = applyPolish(det, { cases: [{ id: det[0].scenarioId, title: 'only one' }] });
+    expect(contractOk).toBe(false);
+    expect(cases.length).toBe(det.length);
+    expect(cases[0].title).toBe(det[0].title); // unchanged
+  });
+
+  it('falls back to deterministic wording when the model omits or blanks a field', () => {
+    const plan = planScenarios(LOGIN_REQ, COVERAGE, 'authentication');
+    const { drafts } = buildDraftTestCases(plan, LOGIN_KNOWLEDGE, LOGIN_REQ);
+    const det = buildDeterministicOutput(drafts).testCases;
+    const polished = { cases: det.map(tc => ({ id: tc.scenarioId, title: '   ' })) };
+    const { cases } = applyPolish(det, polished);
+    cases.forEach((c, i) => expect(c.title).toBe(det[i].title)); // blank ignored
+  });
+});
+
+describe('Coverage floor — authentication baseline', () => {
+  it('a standard login yields 8+ grounded scenarios (raised KB baseline)', () => {
+    const plan = planScenarios(LOGIN_REQ, ['positive', 'negative', 'edge_cases', 'security'], 'authentication');
+    const { drafts } = buildDraftTestCases(plan, LOGIN_KNOWLEDGE, LOGIN_REQ);
+    expect(drafts.length).toBeGreaterThanOrEqual(8);
+    // The new universal login scenarios are present.
+    const ids = drafts.map(d => d.scenarioId);
+    expect(ids).toEqual(expect.arrayContaining([
+      'auth-sec-injection', 'auth-neg-invalid-identifier-format', 'auth-edge-password-masking',
+    ]));
   });
 });

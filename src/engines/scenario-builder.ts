@@ -59,6 +59,14 @@ interface RequirementLike { title?: string; description?: string; acceptanceCrit
 export interface DraftTestCase {
   /** 0-based index of the planned scenario this draft expands. */
   scenarioIndex: number;
+  /**
+   * Stable canonical id, inherited from the KB PlannedScenario.id (e.g.
+   * "auth-sec-injection"). Unlike scenarioIndex (a positional pointer), this is
+   * a durable identity for the scenario — it survives reordering, lets the
+   * validator assert uniqueness, and is what the formatter round-trips so the
+   * LLM can never silently re-map a case onto the wrong logic.
+   */
+  scenarioId: string;
   title: string;
   objective: string;
   coverageType: string;
@@ -109,11 +117,20 @@ export interface FormatterTestCase {
   title: string;
   objective: string;
   scenarioIndex: number;
+  /** Stable canonical id (from the KB scenario) — see DraftTestCase.scenarioId. */
+  scenarioId: string;
   riskArea: string;
   preconditions: string;
   steps: string[];
   expectedResult: string;
   testData: string;
+  /**
+   * Selectors referenced by the steps, extracted DETERMINISTICALLY (the tokens
+   * in parentheses like "#email"). Surfaced as a typed field so the Validator
+   * can assert every selector is real BEFORE the LLM is ever called, and so
+   * traceability does not depend on re-parsing prose.
+   */
+  selectors: string[];
   priority: 'P0' | 'P1' | 'P2' | 'P3';
   severity: 'critical' | 'major' | 'minor' | 'trivial';
   tags: string[];
@@ -129,6 +146,25 @@ export interface FormatterTestCase {
 /* ------------------------------------------------------------------ */
 
 const lc = (s?: string) => (s || '').toLowerCase();
+
+/**
+ * Extract the selector tokens the steps reference — the parenthesised tokens
+ * that look like CSS/XPath/attribute selectors (start with # . [ / or contain
+ * "="). Pure and deterministic; used to expose a typed `selectors` field so the
+ * Validator can check them against the App Profile without re-parsing prose.
+ */
+function extractSelectors(steps: string[]): string[] {
+  const out = new Set<string>();
+  const paren = /\(([^)]+)\)/g;
+  for (const step of steps) {
+    let m: RegExpExecArray | null;
+    while ((m = paren.exec(step)) !== null) {
+      const tok = m[1].trim();
+      if (/^[#.\[/]/.test(tok) || tok.includes('=') || /^[a-z]+\[/.test(tok)) out.add(tok);
+    }
+  }
+  return Array.from(out);
+}
 
 function haystackFromRequirement(input?: RequirementLike): string {
   if (!input) return '';
@@ -336,6 +372,7 @@ export function buildDraftTestCases(
 
     drafts.push({
       scenarioIndex: index,
+      scenarioId: scenario.id,
       title: scenario.title,
       objective: scenario.objective,
       coverageType: scenario.coverageType,
@@ -415,15 +452,18 @@ const SEVERITY_FOR_PRIORITY: Record<DraftTestCase['priority'], FormatterTestCase
  * lines up with the deterministically-derived scenarios array.
  */
 export function draftToTestCase(draft: DraftTestCase, scenarioIndex: number): FormatterTestCase {
+  const steps = draft.steps.slice();
   return {
     title: draft.title,
     objective: draft.objective,
     scenarioIndex,
+    scenarioId: draft.scenarioId,
     riskArea: draft.riskArea,
     preconditions: draft.preconditions,
-    steps: draft.steps.slice(),
+    steps,
     expectedResult: draft.expectedResult,
     testData: draft.testData,
+    selectors: extractSelectors(steps),
     priority: draft.priority,
     severity: SEVERITY_FOR_PRIORITY[draft.priority] || 'major',
     tags: draft.tags.slice(),
@@ -458,30 +498,109 @@ export function buildDeterministicOutput(drafts: DraftTestCase[]): {
 }
 
 /**
- * Build the MINIMAL formatter prompt. This is the whole point of the redesign:
- * the model receives ONLY the finished test-case objects and a short "polish the
- * wording, do not change logic or count" instruction — NO requirement, NO app
- * profile, NO knowledge, NO test-data block, NO coverage essay, NO reasoning
- * scaffold. The deterministic layer already did the thinking; the model only
- * edits English. This is what actually cuts the input tokens (the previous
- * approach ADDED a draft block on top of the full prompt — this REPLACES it).
+ * The ONLY fields the LLM formatter is allowed to touch — the human-readable
+ * English. Everything else (priority, severity, coverage, source, selectors,
+ * dataset, automation flags, scenarioIndex) is a deterministic INVARIANT and is
+ * never sent to the model, so it can never be changed. `id` is the canonical
+ * scenarioId, round-tripped so we can re-attach the polished wording to the
+ * right invariant object regardless of order.
+ */
+export interface EditablePolishFields {
+  id: string;
+  title: string;
+  objective: string;
+  preconditions: string;
+  steps: string[];
+  expected: string;
+}
+
+/** Project a canonical test case down to only its editable (wording) fields. */
+function toEditable(tc: FormatterTestCase): EditablePolishFields {
+  return {
+    id: tc.scenarioId,
+    title: tc.title,
+    objective: tc.objective,
+    preconditions: tc.preconditions,
+    steps: tc.steps.slice(),
+    expected: tc.expectedResult,
+  };
+}
+
+/**
+ * Build the MINIMAL, CANONICAL formatter prompt.
+ *
+ * This is the next evolution of Formatter Mode: instead of sending the WHOLE
+ * test-case object (16 fields) and asking the model to echo it back, we send
+ * ONLY the editable wording fields (`id`, title, objective, preconditions,
+ * steps, expected). The deterministic invariants are withheld entirely — the
+ * model literally cannot change them because it never sees them. This cuts BOTH
+ * the input payload AND (crucially) the OUTPUT: the model re-serialises ~6 short
+ * fields per case, not ~16. All withheld fields are re-attached deterministically
+ * by `id` after the call. The model edits English; it cannot touch logic.
  */
 export function buildFormatterPrompt(testCases: FormatterTestCase[]): string {
-  // Compact, whitespace-free JSON keeps the payload as small as possible.
-  const payload = JSON.stringify(testCases);
-  return `You are a senior QA technical editor. Below are ${testCases.length} test cases that were assembled DETERMINISTICALLY from the real application (real selectors, URLs and datasets). The logic is FINAL and correct.
+  // Compact, whitespace-free JSON of the editable fields only.
+  const payload = JSON.stringify(testCases.map(toEditable));
+  return `You are a senior QA technical editor. Below are ${testCases.length} test cases that were assembled DETERMINISTICALLY from the real application. The logic, selectors, data and coverage are FINAL — only the English needs polishing.
 
-YOUR ONLY JOB: improve the ENGLISH wording so each reads like a polished, professional test case — sharpen the "title", "objective", "preconditions", "expectedResult" and re-phrase each step for clarity.
+YOUR ONLY JOB: sharpen the wording of "title", "objective", "preconditions", "expected" and re-phrase each step for clarity.
 
-STRICT RULES (violating any of these is a failure):
-  • Return EXACTLY ${testCases.length} test cases, in the SAME order. Do NOT add, remove, split or merge cases.
-  • Do NOT change any: "scenarioIndex", "priority", "severity", "coverageType" tags, "source", "sourceEvidence", "automationReady", "automationComplexity", "selectorAvailability".
-  • Preserve every SELECTOR and URL exactly (anything in parentheses like "(#email)", and any http URL) and preserve every dataset name in "testData".
-  • Keep the same NUMBER of steps and the same action per step — reword for clarity only. Never invent steps, selectors, pages or datasets.
+STRICT RULES (violating any is a failure):
+  • Return EXACTLY ${testCases.length} objects in the SAME order, each with the SAME "id". Never add, remove, split, merge or reorder.
+  • Keep the SAME number of steps per case and the SAME action per step — reword only. Preserve every selector/URL token in parentheses (e.g. "(#email)") and any http URL EXACTLY.
+  • Do not add fields. Do not invent steps, selectors, pages or data.
 
-Return ONLY valid JSON in this exact shape (no prose):
-{ "testCases": ${'[{ "title": string, "objective": string, "scenarioIndex": number, "riskArea": string, "preconditions": string, "steps": string[], "expectedResult": string, "testData": string, "priority": string, "severity": string, "tags": string[], "automationReady": boolean, "automationComplexity": string, "selectorAvailability": string, "source": string, "sourceEvidence": string }]'} }
+Return ONLY valid JSON (no prose):
+{ "cases": ${'[{ "id": string, "title": string, "objective": string, "preconditions": string, "steps": string[], "expected": string }]'} }
 
 TEST CASES TO POLISH:
 ${payload}`;
+}
+
+/**
+ * Re-attach the LLM's polished wording to the deterministic canonical objects.
+ *
+ * Coverage/logic NEVER depend on the model: we start from the deterministic
+ * cases (the source of truth) and overlay ONLY the wording fields, matched by
+ * canonical `id` (falling back to positional order when ids are absent). Any
+ * field the model omitted, blanked, or returned with a changed step-count is
+ * kept from the deterministic object. If the model broke the contract (wrong
+ * count), the caller ships the deterministic output unchanged.
+ */
+export function applyPolish(
+  deterministic: FormatterTestCase[],
+  polished: unknown,
+): { cases: FormatterTestCase[]; contractOk: boolean } {
+  const arr = Array.isArray((polished as any)?.cases)
+    ? (polished as any).cases
+    : Array.isArray(polished)
+    ? (polished as any[])
+    : [];
+  const contractOk = arr.length === deterministic.length;
+  if (!contractOk) return { cases: deterministic.slice(), contractOk: false };
+
+  // Index polished by canonical id; fall back to positional matching.
+  const byId = new Map<string, any>();
+  for (const p of arr) if (p && typeof p.id === 'string') byId.set(p.id, p);
+
+  const cases = deterministic.map((det, i) => {
+    const p: any = byId.get(det.scenarioId) ?? arr[i] ?? {};
+    const str = (v: unknown, fallback: string) =>
+      typeof v === 'string' && v.trim() ? v : fallback;
+    const steps =
+      Array.isArray(p.steps) &&
+      p.steps.length === det.steps.length &&
+      p.steps.every((s: unknown) => typeof s === 'string' && (s as string).trim().length > 0)
+        ? (p.steps as string[])
+        : det.steps;
+    return {
+      ...det, // all deterministic invariants preserved verbatim
+      title: str(p.title, det.title),
+      objective: str(p.objective, det.objective),
+      preconditions: str(p.preconditions, det.preconditions),
+      expectedResult: str(p.expected, det.expectedResult),
+      steps,
+    };
+  });
+  return { cases, contractOk: true };
 }
