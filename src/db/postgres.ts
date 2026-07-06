@@ -199,6 +199,8 @@ const REQUIRED_TABLES = [
   'repository_contexts', 'code_chunks',
   // Test coverage
   'test_requirements', 'generated_test_scenarios', 'generated_test_cases',
+  // Persistent Scenario Graph (the one intelligence source, reused across modules)
+  'scenario_graphs',
   // Knowledge
   'application_knowledge', 'knowledge_items', 'knowledge_relationships',
   // Healing settings (admin-tunable confidence thresholds + cost caps)
@@ -2526,6 +2528,42 @@ async function migrateDefaultCompany(client: PoolClient): Promise<void> {
   )`);
   await safeExec(client, 'idx_export_history_company',
     `CREATE INDEX IF NOT EXISTS idx_export_history_company ON test_case_export_history(company_id, project_id)`);
+
+  // ── Persistent Scenario Graph (the ONE intelligence source) ──
+  // A requirement is parsed into a canonical scenario graph ONCE and stored
+  // here; every module (Test Case Lab, Script Gen, Healing, RTM, Impact
+  // Analysis) reads it instead of re-deriving scenarios. One row per
+  // (requirement, coverage-selection) fingerprint; rebuilt only when the
+  // fingerprint changes. Nodes + edges are stored as JSONB on the graph row so
+  // the whole graph loads in a single read (they are always used together).
+  await safeExec(client, 'scenario_graphs', `CREATE TABLE IF NOT EXISTS scenario_graphs (
+    id SERIAL PRIMARY KEY,
+    requirement_id INTEGER REFERENCES test_requirements(id) ON DELETE CASCADE,
+    company_id INTEGER REFERENCES companies(id),
+    project_id INTEGER REFERENCES projects(id) ON DELETE SET NULL,
+    -- Stable content fingerprint (requirement text + coverage + KB version +
+    -- node ids). The unique key for "store once / reuse everywhere".
+    fingerprint VARCHAR(64) NOT NULL,
+    schema_version VARCHAR(20) NOT NULL DEFAULT '1.0.0',
+    knowledge_version VARCHAR(20),
+    category VARCHAR(50),
+    coverage_types JSONB NOT NULL DEFAULT '[]',
+    node_count INTEGER NOT NULL DEFAULT 0,
+    edge_count INTEGER NOT NULL DEFAULT 0,
+    -- Full canonical graph: { schemaVersion, knowledgeVersion, category,
+    -- coverageTypes, requirement, nodes[], edges[], fingerprint, builtAt }.
+    graph JSONB NOT NULL,
+    built_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+  )`);
+  // One live graph per (requirement, fingerprint) — upsert target for reuse.
+  await safeExec(client, 'uq_scenario_graphs_req_fp',
+    `CREATE UNIQUE INDEX IF NOT EXISTS uq_scenario_graphs_req_fp
+       ON scenario_graphs(COALESCE(requirement_id, 0), fingerprint)`);
+  await safeExec(client, 'idx_scenario_graphs_req',
+    `CREATE INDEX IF NOT EXISTS idx_scenario_graphs_req ON scenario_graphs(requirement_id)`);
+  await safeExec(client, 'idx_scenario_graphs_company',
+    `CREATE INDEX IF NOT EXISTS idx_scenario_graphs_company ON scenario_graphs(company_id, project_id)`);
 
   await safeExec(client, 'application_knowledge', `CREATE TABLE IF NOT EXISTS application_knowledge (
     id SERIAL PRIMARY KEY,
@@ -13861,4 +13899,118 @@ export async function getTraceabilityForRequirement(
     [companyId, requirementId],
   );
   return { requirement_id: requirementId, links: links.rows };
+}
+
+
+
+/* ==================================================================== */
+/*  Persistent Scenario Graph repository                                 */
+/*  "Store once, reuse everywhere" — the persistence for the one         */
+/*  intelligence source. All functions are fail-open at the callsite     */
+/*  (the service catches errors and falls back to an in-memory build).   */
+/* ==================================================================== */
+
+/** Minimal structural shape of a scenario graph (decoupled from src/graph). */
+interface PersistableScenarioGraph {
+  schemaVersion: string;
+  knowledgeVersion?: string;
+  category?: string;
+  coverageTypes: string[];
+  fingerprint: string;
+  nodes: unknown[];
+  edges: unknown[];
+  requirement?: { requirementId?: number };
+  [k: string]: unknown;
+}
+
+export interface StoredScenarioGraph {
+  id: number;
+  requirementId: number | null;
+  fingerprint: string;
+  graph: PersistableScenarioGraph;
+  builtAt: string;
+  updatedAt: string;
+}
+
+/**
+ * Upsert a scenario graph for a requirement, keyed by (requirement, fingerprint).
+ * If an identical fingerprint already exists it is refreshed in place (idempotent
+ * "store once"); a changed fingerprint inserts a new row. Returns the stored row.
+ */
+export async function saveScenarioGraph(
+  graph: PersistableScenarioGraph,
+  scope?: { requirementId?: number; companyId?: number; projectId?: number },
+): Promise<StoredScenarioGraph> {
+  const requirementId = scope?.requirementId ?? graph.requirement?.requirementId ?? null;
+  const { rows } = await getPool().query(
+    `INSERT INTO scenario_graphs
+       (requirement_id, company_id, project_id, fingerprint, schema_version,
+        knowledge_version, category, coverage_types, node_count, edge_count, graph)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,$10,$11::jsonb)
+     ON CONFLICT (COALESCE(requirement_id, 0), fingerprint)
+     DO UPDATE SET
+       schema_version = EXCLUDED.schema_version,
+       knowledge_version = EXCLUDED.knowledge_version,
+       category = EXCLUDED.category,
+       coverage_types = EXCLUDED.coverage_types,
+       node_count = EXCLUDED.node_count,
+       edge_count = EXCLUDED.edge_count,
+       graph = EXCLUDED.graph,
+       updated_at = NOW()
+     RETURNING id, requirement_id, fingerprint, graph, built_at, updated_at`,
+    [
+      requirementId,
+      scope?.companyId ?? null,
+      scope?.projectId ?? null,
+      graph.fingerprint,
+      graph.schemaVersion,
+      graph.knowledgeVersion ?? null,
+      graph.category ?? null,
+      JSON.stringify(graph.coverageTypes ?? []),
+      Array.isArray(graph.nodes) ? graph.nodes.length : 0,
+      Array.isArray(graph.edges) ? graph.edges.length : 0,
+      JSON.stringify(graph),
+    ],
+  );
+  const r = rows[0];
+  return {
+    id: r.id,
+    requirementId: r.requirement_id,
+    fingerprint: r.fingerprint,
+    graph: r.graph,
+    builtAt: r.built_at,
+    updatedAt: r.updated_at,
+  };
+}
+
+/** Fetch the stored graph for a requirement + fingerprint, if present. */
+export async function getScenarioGraph(
+  requirementId: number,
+  fingerprint: string,
+): Promise<StoredScenarioGraph | null> {
+  const { rows } = await getPool().query(
+    `SELECT id, requirement_id, fingerprint, graph, built_at, updated_at
+       FROM scenario_graphs
+      WHERE COALESCE(requirement_id, 0) = $1 AND fingerprint = $2
+      LIMIT 1`,
+    [requirementId, fingerprint],
+  );
+  if (!rows.length) return null;
+  const r = rows[0];
+  return { id: r.id, requirementId: r.requirement_id, fingerprint: r.fingerprint, graph: r.graph, builtAt: r.built_at, updatedAt: r.updated_at };
+}
+
+/** Fetch the most recently built graph for a requirement (any fingerprint). */
+export async function getLatestScenarioGraph(requirementId: number): Promise<StoredScenarioGraph | null> {
+  const { rows } = await getPool().query(
+    `SELECT id, requirement_id, fingerprint, graph, built_at, updated_at
+       FROM scenario_graphs
+      WHERE requirement_id = $1
+      ORDER BY updated_at DESC
+      LIMIT 1`,
+    [requirementId],
+  );
+  if (!rows.length) return null;
+  const r = rows[0];
+  return { id: r.id, requirementId: r.requirement_id, fingerprint: r.fingerprint, graph: r.graph, builtAt: r.built_at, updatedAt: r.updated_at };
 }

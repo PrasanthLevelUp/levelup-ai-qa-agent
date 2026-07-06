@@ -28,6 +28,9 @@ import {
   type FormatterTestCase,
 } from './scenario-builder';
 import { validateCanonicalTestCases } from './canonical-validator';
+import { assembleScenarioGraph } from '../graph/scenario-graph-builder';
+import { toTestCaseLab } from '../graph/scenario-graph-adapters';
+import type { ScenarioGraph } from '../graph/scenario-graph';
 import { classifyQACategory } from './qa-knowledge-engine';
 import {
   optimizeKnowledgeForCategory,
@@ -264,6 +267,18 @@ const FORMATTER_MODE_ENABLED = (process.env.GEN_FORMATTER_MODE || 'true').toLowe
  * sacred). Default ON; set GEN_CANONICAL_VALIDATOR=false to bypass.
  */
 const CANONICAL_VALIDATOR_ENABLED = (process.env.GEN_CANONICAL_VALIDATOR || 'true').toLowerCase() !== 'false';
+
+/**
+ * Persistent Scenario Graph — the ONE intelligence source. When ON (default),
+ * Test Case Lab sources its deterministic output FROM the canonical scenario
+ * graph (assembled from the same validated cases), rather than treating the
+ * validated case list as an ad-hoc artifact. This makes Test Case Lab the
+ * reference consumer of the shared graph that Script Gen / Healing / RTM /
+ * Impact Analysis also read (via the graph service + adapters). The output is
+ * identical — the graph is assembled from the SAME cases — so this is a
+ * zero-risk seam. Set GEN_SCENARIO_GRAPH=false to bypass.
+ */
+const SCENARIO_GRAPH_ENABLED = (process.env.GEN_SCENARIO_GRAPH || 'true').toLowerCase() !== 'false';
 
 /** Signals used to classify requirement complexity — all cheap to compute, ZERO LLM calls. */
 export interface ComplexitySignals {
@@ -1382,6 +1397,7 @@ Return ONLY valid JSON, no markdown fences.`;
     let deterministicOutput:
       | { scenarios: ReturnType<typeof buildScenariosFromDrafts>; testCases: FormatterTestCase[] }
       | undefined;
+    let scenarioGraph: ScenarioGraph | undefined;
     if (formatterMode) {
       const built = buildDeterministicOutput(draftDrafts);
       let cases = built.testCases;
@@ -1397,7 +1413,40 @@ Return ONLY valid JSON, no markdown fences.`;
           checks: validated.report.issues.slice(0, 8).map(i => `${i.scenarioId}:${i.check}`).join(' '),
         });
       }
-      deterministicOutput = { scenarios: built.scenarios, testCases: cases };
+
+      // ── Persistent Scenario Graph (the one intelligence source) ──
+      // Assemble the canonical graph from the SAME validated cases and source
+      // Test Case Lab's deterministic output from it. This makes Test Case Lab
+      // the reference consumer of the shared graph (Script Gen / Healing / RTM /
+      // Impact Analysis read the same structure via the graph service). Output
+      // is identical — assembled from the same cases — so it is zero-risk.
+      if (SCENARIO_GRAPH_ENABLED) {
+        scenarioGraph = assembleScenarioGraph({
+          input,
+          coverageTypes,
+          cases,
+          meta: draftDrafts.map((d, i) => ({
+            coverageType: built.scenarios[i]?.coverageType ?? d.coverageType,
+            grounded: d.grounded,
+            objective: d.objective,
+          })),
+          knowledgeVersion: scenarioPlan?.knowledgeVersion ?? '',
+          category: scenarioPlan?.classification.category ?? 'generic',
+        });
+        const projection = toTestCaseLab(scenarioGraph);
+        logger.info(MOD, 'Scenario graph assembled (Test Case Lab consuming)', {
+          nodes: scenarioGraph.nodes.length,
+          edges: scenarioGraph.edges.length,
+          category: scenarioGraph.category,
+          fingerprint: scenarioGraph.fingerprint.slice(0, 12),
+        });
+        deterministicOutput = {
+          scenarios: projection.scenarios as ReturnType<typeof buildScenariosFromDrafts>,
+          testCases: projection.testCases as unknown as FormatterTestCase[],
+        };
+      } else {
+        deterministicOutput = { scenarios: built.scenarios, testCases: cases };
+      }
     }
 
     const knowledgeBugs = genKnowledge?.historicalBugs?.length
