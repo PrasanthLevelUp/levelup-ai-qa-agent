@@ -17,6 +17,7 @@ import {
   type IntelligenceScore,
 } from '../services/intelligence-orchestrator';
 import { planScenarios, buildScenarioPlanBlock, type ScenarioPlan } from './scenario-planner';
+import { buildDraftTestCases, buildDraftBlock, type DraftTestCase } from './scenario-builder';
 import { classifyQACategory } from './qa-knowledge-engine';
 import {
   optimizeKnowledgeForCategory,
@@ -33,7 +34,7 @@ const MOD = 'test-coverage-engine';
  * Tracked in every generation so we can correlate quality with prompt evolution and
  * quickly diagnose "last week was better" reports by identifying which version ran.
  */
-const PROMPT_VERSION = 'v3.7-element-level-retrieval';
+const PROMPT_VERSION = 'v3.8-deterministic-scenario-builder';
 
 /**
  * Engine architecture version — increment when the pipeline or core algorithm changes
@@ -210,6 +211,20 @@ const SCENARIO_PLANNER_ENABLED = (process.env.GEN_SCENARIO_PLANNER || 'true').to
 const PROMPT_OPTIMIZER_ENABLED = (process.env.GEN_PROMPT_OPTIMIZER || 'true').toLowerCase() !== 'false';
 /** Minimum classification confidence before the optimizer trims context. */
 const PROMPT_OPTIMIZER_MIN_CONFIDENCE = parseFloat(process.env.GEN_PROMPT_OPTIMIZER_MIN_CONFIDENCE || '0.5');
+
+/**
+ * Deterministic Scenario Builder (Phase 2 of the QA-first architecture). When
+ * enabled, after the planner decides WHAT to test and the retriever scopes the
+ * context, the builder (see scenario-builder.ts) ASSEMBLES a concrete, grounded
+ * DRAFT test case for every planned scenario — real selectors from the App
+ * Profile, real dataset references from Test Data, concrete steps — so the LLM
+ * only REFINES the wording instead of re-inventing coverage from scratch. This
+ * both raises the scenario/case COUNT off the weak "5 scenarios" floor (drafts
+ * are a floor, never a ceiling) and makes generation deterministic + grounded.
+ * Default ON; set GEN_SCENARIO_BUILDER=false to fall back to the plan-only
+ * prompt (LLM expands the plan itself). Requires the planner to be enabled.
+ */
+const SCENARIO_BUILDER_ENABLED = (process.env.GEN_SCENARIO_BUILDER || 'true').toLowerCase() !== 'false';
 
 /** Signals used to classify requirement complexity — all cheap to compute, ZERO LLM calls. */
 export interface ComplexitySignals {
@@ -1271,6 +1286,29 @@ Return ONLY valid JSON, no markdown fences.`;
       });
     }
 
+    // ── Deterministic Scenario Builder (QA-first, ZERO tokens) ──
+    // The plan decided WHAT to test; the retriever produced the SCOPED context
+    // (real selectors/URLs/datasets). Instead of asking the LLM to re-discover
+    // all of that and (as observed) under-generate to a weak 5-scenario floor,
+    // we ASSEMBLE a concrete, grounded DRAFT test case for every planned
+    // scenario — plus conditional ones the requirement/context supports — from
+    // the real App Profile + Test Data. The LLM then only REFINES the wording.
+    // Pure/deterministic/fail-open: no drafts ⇒ empty block ⇒ legacy behaviour.
+    let draftBlock = '';
+    let draftDrafts: DraftTestCase[] = [];
+    if (SCENARIO_BUILDER_ENABLED && SCENARIO_PLANNER_ENABLED && scenarioPlan) {
+      const built = buildDraftTestCases(scenarioPlan, genKnowledge, input);
+      draftDrafts = built.drafts;
+      draftBlock = buildDraftBlock(built.drafts);
+      logger.info(MOD, 'Scenario builder', {
+        planned: scenarioPlan.scenarios.length,
+        drafts: built.drafts.length,
+        grounded: built.groundedCount,
+        conditionalKept: built.conditionalKept,
+        applied: draftBlock.length > 0,
+      });
+    }
+
     const knowledgeBugs = genKnowledge?.historicalBugs?.length
       ? `\nHistorical bugs to consider: ${genKnowledge.historicalBugs.join('; ')}`
       : '';
@@ -1327,7 +1365,13 @@ Return ONLY valid JSON, no markdown fences.`;
     // model does the full enumeration itself. Either way the block is a few
     // hundred chars, not the ~1.4K-char phase essay it replaces.
     const hasPlan = scenarioPlanBlock.trim().length > 0;
-    const reasoningBlock = hasPlan
+    const hasDrafts = draftBlock.trim().length > 0;
+    const reasoningBlock = hasDrafts
+      ? `REASONING (do this INTERNALLY; output ONLY the final JSON):
+  1. Extract every obligation from the Acceptance Criteria as precondition → action → expected → risk. EACH obligation must be verified by ≥1 test case (missing one is the worst failure).
+  2. REFINE THE PRE-BUILT DRAFTS below — they were assembled DETERMINISTICALLY from the scenario plan and the REAL app structure (selectors/URLs/datasets). Do NOT re-derive coverage or re-discover the app: produce one polished test case per draft (keeping its scenarioIndex, real selectors, dataset references, priority, riskArea and source), then ADD any further cases the requirement/context clearly implies. The drafts are a FLOOR — never emit fewer cases than drafts.
+  3. Cover EVERY selected coverage type on its own — never collapse to a single happy path, never merge types into one scenario. No upper cap; the requirement + context decide depth. Never pad with reworded repetition or ungrounded guesses, and never invent selectors/pages/datasets absent from the drafts/context.`
+      : hasPlan
       ? `REASONING (do this INTERNALLY; output ONLY the final JSON):
   1. Extract every obligation from the Acceptance Criteria as precondition → action → expected → risk. EACH obligation must be verified by ≥1 test case (missing one is the worst failure).
   2. EXPAND THE SCENARIO PLAN above — it is the baseline set of scenarios this feature category requires. Keep every planned scenario that applies, then ADD any further scenarios the requirement, business flow, App Knowledge, App Profile or Test Data imply. Do NOT re-derive what the plan already lists; enrich and ground it.
@@ -1376,6 +1420,7 @@ ${scopeBlock}
 COVERAGE OBJECTIVES — the user explicitly selected these. Treat EACH as a separate, independent objective; every one MUST be addressed in the output:
 ${coverageObjectives}
 ${scenarioPlanBlock}
+${draftBlock}
 ${reasoningBlock}
 
 OUTPUT RULES:
@@ -1414,7 +1459,7 @@ Return ONLY valid JSON. Address EVERY selected coverage type, organise scenarios
     const accountedChars =
       requirementSectionChars + knowledgeSectionChars + appProfileBlock.length +
       testDataBlock.length + coverageObjectives.length + scopeBlock.length +
-      scenarioPlanBlock.length + outputSchema.length;
+      scenarioPlanBlock.length + draftBlock.length + outputSchema.length;
     // "instructions" = the static reasoning/rules scaffold (everything not
     // attributed to a grounding block or the JSON schema). Schema is measured on
     // its own so the two big FIXED-overhead sections are visible separately.
@@ -1426,6 +1471,7 @@ Return ONLY valid JSON. Address EVERY selected coverage type, organise scenarios
       { key: 'testData', label: 'Test Data', text: testDataBlock },
       { key: 'coverageObjectives', label: 'Coverage Objectives', text: coverageObjectives },
       { key: 'scenarioPlan', label: 'Scenario Plan', text: scenarioPlanBlock },
+      { key: 'draftTestCases', label: 'Draft Test Cases', text: draftBlock },
       { key: 'instructions', label: 'Instructions', text: 'x'.repeat(instructionsChars) },
       { key: 'schema', label: 'Output Schema', text: outputSchema },
     ]);
