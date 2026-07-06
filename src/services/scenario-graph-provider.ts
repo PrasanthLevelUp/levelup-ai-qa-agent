@@ -11,10 +11,26 @@
  * means we can completely redesign the graph internals without breaking
  * consumers.
  *
+ * ── Composable context (Phase 2 review) ──────────────────────────────────────
+ * Instead of one ever-growing `ScenarioContext`, the graph exposes small,
+ * composable slices:
+ *   • ScenarioContext          — identity + scenario summaries (everyone)
+ *   • ScenarioExecutionContext — dependencies + precedence   (Script Gen)
+ *   • ScenarioCoverageContext  — variants + coverage-by-type (Test Case Lab/RTM)
+ *   • ScenarioImpactContext    — affected modules            (Impact Analysis)
+ * These are bundled into `ScenarioContextBundle`; a consumer destructures only
+ * the slice it needs, and new needs add a new slice rather than bloating one type.
+ *
+ * ── Confidence (Phase 2 review) ──────────────────────────────────────────────
+ * This provider does NOT compute confidence. It emits raw `signals`
+ * (`scenarioCount`, `groundedCount`); the centralized scorer
+ * (`intelligence-confidence.ts`) turns them into a number. That keeps scoring
+ * consistent across all sources.
+ *
  * Discipline:
  *   • Fail-open: errors return `available: false`, never throw.
- *   • Feature-flagged: `SCENARIO_GRAPH_PROVIDER` (default false).
- *   • Weight 0 in grounding initially — advisory context only.
+ *   • Feature-flagged: `SCENARIO_GRAPH_PROVIDER` (default false) via `enabled()`.
+ *   • Advisory only initially — weight 0 in grounding.
  */
 
 import { logger } from '../utils/logger';
@@ -28,8 +44,15 @@ import type { ScenarioGraph } from '../graph/scenario-graph';
 
 const MOD = 'ScenarioGraphProvider';
 
+/**
+ * Priority for the Scenario Graph source. Higher than foundational sources
+ * (repository, app profile) because it's a derived, advisory layer that ideally
+ * runs after primary context is available. See ProviderRegistry ordering.
+ */
+const SCENARIO_GRAPH_PRIORITY = 70;
+
 /* ================================================================== */
-/*  Scenario Context — the public interface consumers receive          */
+/*  Scenario Context — composable slices consumers receive             */
 /* ================================================================== */
 
 /**
@@ -72,8 +95,7 @@ export interface ScenarioVariant {
 }
 
 /**
- * Scenario Context — the domain-friendly view the Orchestrator provides.
- * Consumers never see the raw graph (nodes/edges/fingerprint).
+ * Base context — scenario identity and summaries. The slice every consumer gets.
  */
 export interface ScenarioContext {
   available: boolean;
@@ -83,15 +105,51 @@ export interface ScenarioContext {
   groundedCount: number;
   /** Simplified scenario summaries. */
   scenarios: ScenarioSummary[];
+}
+
+/**
+ * Execution slice — for Script Generation ordering (advisory `test.order.json`).
+ */
+export interface ScenarioExecutionContext {
   /** Execution dependencies (precedes edges). */
   dependencies: ScenarioDependency[];
-  /** Variant relationships (variant_of edges). */
-  variants: ScenarioVariant[];
   /**
    * Suggested execution order (topologically sorted scenario IDs).
-   * Empty if no dependencies exist.
+   * Falls back to original order if there are no dependencies / a cycle.
    */
   precedence: string[];
+}
+
+/**
+ * Coverage slice — for Test Case Lab / RTM to understand coverage shape.
+ */
+export interface ScenarioCoverageContext {
+  /** Variant relationships (variant_of edges). */
+  variants: ScenarioVariant[];
+  /** Count of scenarios per coverage type (positive/negative/edge_cases/…). */
+  coverageByType: Record<string, number>;
+}
+
+/**
+ * Impact slice — for Impact Analysis. Placeholder for now (populated once the
+ * graph carries module/selector-sharing signals); kept as its own type so it
+ * can grow without touching the others.
+ */
+export interface ScenarioImpactContext {
+  /** Modules/areas potentially affected (empty until wired). */
+  affectedModules: string[];
+}
+
+/**
+ * Composite the provider returns. Consumers destructure only the slice they
+ * need (`bundle.execution`, `bundle.coverage`, …) so adding a future slice never
+ * breaks existing consumers.
+ */
+export interface ScenarioContextBundle {
+  base: ScenarioContext;
+  execution: ScenarioExecutionContext;
+  coverage: ScenarioCoverageContext;
+  impact: ScenarioImpactContext;
 }
 
 /* ================================================================== */
@@ -99,47 +157,34 @@ export interface ScenarioContext {
 /* ================================================================== */
 
 /**
- * Feature flag — default false for backwards compatibility.
- */
-function isEnabled(): boolean {
-  return process.env.SCENARIO_GRAPH_PROVIDER === 'true';
-}
-
-/**
  * ScenarioGraphProvider — gathers canonical scenario intelligence for a
- * requirement and returns it as ScenarioContext.
+ * requirement and returns it as a ScenarioContextBundle.
  */
-export class ScenarioGraphProvider implements IntelligenceProvider<ScenarioContext> {
+export class ScenarioGraphProvider implements IntelligenceProvider<ScenarioContextBundle> {
   readonly name = 'scenarioGraph';
+  readonly priority = SCENARIO_GRAPH_PRIORITY;
 
-  async gather(query: IntelligenceQuery): Promise<IntelligenceResult<ScenarioContext>> {
+  /** Feature flag — default false for backwards compatibility. */
+  enabled(): boolean {
+    return process.env.SCENARIO_GRAPH_PROVIDER === 'true';
+  }
+
+  async gather(query: IntelligenceQuery): Promise<IntelligenceResult<ScenarioContextBundle>> {
     const startMs = Date.now();
     const warnings: string[] = [];
 
-    // Guard: feature flag off → return unavailable immediately
-    if (!isEnabled()) {
-      return {
-        available: false,
-        context: null,
-        metadata: {
-          timingMs: 0,
-          confidence: 0,
-          warnings: ['Feature flag SCENARIO_GRAPH_PROVIDER is off'],
-        },
-      };
+    // Guard: feature flag off → unavailable immediately.
+    // (Registry also checks enabled(); this keeps the provider safe if called directly.)
+    if (!this.enabled()) {
+      return this.unavailable('Feature flag SCENARIO_GRAPH_PROVIDER is off', 0);
     }
 
     // Guard: no requirementId → can't build/fetch a graph
     if (!query.requirementId) {
-      return {
-        available: false,
-        context: null,
-        metadata: {
-          timingMs: Date.now() - startMs,
-          confidence: 0,
-          warnings: ['No requirementId provided — Scenario Graph unavailable'],
-        },
-      };
+      return this.unavailable(
+        'No requirementId provided — Scenario Graph unavailable',
+        Date.now() - startMs,
+      );
     }
 
     try {
@@ -155,16 +200,10 @@ export class ScenarioGraphProvider implements IntelligenceProvider<ScenarioConte
       );
 
       if (!graph || graph.nodes.length === 0) {
-        warnings.push('Scenario Graph returned no scenarios for this requirement');
-        return {
-          available: false,
-          context: null,
-          metadata: {
-            timingMs: Date.now() - startMs,
-            confidence: 0,
-            warnings,
-          },
-        };
+        return this.unavailable(
+          'Scenario Graph returned no scenarios for this requirement',
+          Date.now() - startMs,
+        );
       }
 
       logger.info(MOD, `Scenario Graph ${origin}`, {
@@ -174,46 +213,57 @@ export class ScenarioGraphProvider implements IntelligenceProvider<ScenarioConte
         fingerprint: graph.fingerprint,
       });
 
-      // Project the internal graph into the public ScenarioContext
-      const context = this.projectToContext(graph);
-
-      // Confidence scales with grounded scenario count (grounded = real data)
-      const confidence = context.groundedCount > 0
-        ? Math.min(100, 60 + context.groundedCount * 5)
-        : 0;
+      // Project the internal graph into the public bundle
+      const bundle = this.projectToBundle(graph);
+      const { scenarioCount, groundedCount } = bundle.base;
 
       return {
         available: true,
-        context,
+        context: bundle,
+        // NOTE: no `confidence` here — the registry fills it from `signals`.
         metadata: {
-          timingMs: Date.now() - startMs,
-          confidence,
+          provider: this.name,
+          durationMs: Date.now() - startMs,
+          cacheHit: origin === 'reused',
+          items: scenarioCount,
+          warnings,
+          signals: { scenarioCount, groundedCount },
           version: {
             fingerprint: graph.fingerprint,
             timestamp: graph.builtAt,
           },
-          warnings,
         },
       };
     } catch (err: any) {
       logger.warn(MOD, 'Scenario Graph gather failed (fail-open)', { error: err?.message });
-      return {
-        available: false,
-        context: null,
-        metadata: {
-          timingMs: Date.now() - startMs,
-          confidence: 0,
-          warnings: [`Scenario Graph provider error: ${err?.message || 'unknown'}`],
-        },
-      };
+      return this.unavailable(
+        `Scenario Graph provider error: ${err?.message || 'unknown'}`,
+        Date.now() - startMs,
+      );
     }
   }
 
+  /** Build a standardized unavailable result with consistent, empty signals. */
+  private unavailable(warning: string, durationMs: number): IntelligenceResult<ScenarioContextBundle> {
+    return {
+      available: false,
+      context: null,
+      metadata: {
+        provider: this.name,
+        durationMs,
+        cacheHit: false,
+        items: 0,
+        warnings: [warning],
+        signals: {},
+      },
+    };
+  }
+
   /**
-   * Project the internal ScenarioGraph into the public ScenarioContext.
+   * Project the internal ScenarioGraph into the public ScenarioContextBundle.
    * This is the isolation layer: consumers never see nodes/edges/fingerprint.
    */
-  private projectToContext(graph: ScenarioGraph): ScenarioContext {
+  private projectToBundle(graph: ScenarioGraph): ScenarioContextBundle {
     // Scenarios (simplified)
     const scenarios: ScenarioSummary[] = graph.nodes.map(n => ({
       id: n.id,
@@ -254,17 +304,33 @@ export class ScenarioGraphProvider implements IntelligenceProvider<ScenarioConte
         reason: e.reason,
       }));
 
+    // Coverage-by-type histogram
+    const coverageByType: Record<string, number> = {};
+    for (const s of scenarios) {
+      coverageByType[s.coverageType] = (coverageByType[s.coverageType] || 0) + 1;
+    }
+
     // Precedence (topological sort of dependencies)
     const precedence = this.topologicalSort(graph.nodes.map(n => n.id), dependencies);
 
     return {
-      available: true,
-      scenarioCount: scenarios.length,
-      groundedCount,
-      scenarios,
-      dependencies,
-      variants,
-      precedence,
+      base: {
+        available: true,
+        scenarioCount: scenarios.length,
+        groundedCount,
+        scenarios,
+      },
+      execution: {
+        dependencies,
+        precedence,
+      },
+      coverage: {
+        variants,
+        coverageByType,
+      },
+      impact: {
+        affectedModules: [], // populated in a future PR once the graph carries this
+      },
     };
   }
 

@@ -198,6 +198,58 @@ describe('Architecture Contract: Intelligence Module Isolation', () => {
   });
 });
 
+describe('Architecture Contract: Scenario Graph build/storage isolation', () => {
+  // Import-level isolation blocks `import … from '../graph/…'`. But the graph is
+  // also reachable via build/storage FUNCTIONS. This defends against a module
+  // building a graph or hitting graph storage directly (e.g. through the shared
+  // db module) instead of going through the provider.
+  //
+  // Only ScenarioGraphProvider (build) and the graph module + db layer
+  // (definitions/storage) may reference these symbols.
+  const FORBIDDEN_CALLS = [
+    'getOrBuildScenarioGraph',
+    'buildScenarioGraph',
+    'new ScenarioGraph(', // defensive: if ScenarioGraph ever becomes a class
+    'saveScenarioGraph',
+    'getLatestScenarioGraph',
+  ];
+
+  it('enforces that ONLY the provider builds graphs / touches graph storage', () => {
+    const allFiles = findTsFiles(SRC_ROOT);
+    const violations: Array<{ file: string; symbols: string[] }> = [];
+
+    for (const file of allFiles) {
+      const relativePath = path.relative(SRC_ROOT, file);
+
+      // The provider is the sanctioned builder/consumer.
+      if (relativePath.includes('services/scenario-graph-provider.ts')) continue;
+      // The graph module defines build + graph logic.
+      if (relativePath.startsWith('graph/')) continue;
+      // The db layer defines the storage functions themselves.
+      if (relativePath.startsWith('db/')) continue;
+      // Phase 1 Test Case Lab consumer — exempt until refactored to the provider.
+      if (relativePath.includes('engines/test-coverage-engine.ts')) continue;
+
+      const content = fs.readFileSync(file, 'utf-8');
+      const hits = FORBIDDEN_CALLS.filter(sym => content.includes(sym));
+      if (hits.length > 0) violations.push({ file: relativePath, symbols: hits });
+    }
+
+    if (violations.length > 0) {
+      const report = violations
+        .map(v => `  - ${v.file}\n    references: ${v.symbols.join(', ')}`)
+        .join('\n');
+      throw new Error(
+        `❌ Architecture violation: modules building graphs or accessing graph storage directly:\n\n${report}\n\n` +
+          `Only src/services/scenario-graph-provider.ts may build/read the Scenario Graph.\n` +
+          `Everyone else must consume ScenarioContext from the Intelligence Bundle.`,
+      );
+    }
+
+    expect(violations).toEqual([]);
+  });
+});
+
 describe('Architecture Contract: Provider Pattern', () => {
   it('ensures ScenarioGraphProvider implements IntelligenceProvider interface', () => {
     const providerPath = path.join(SRC_ROOT, 'services/scenario-graph-provider.ts');
@@ -207,19 +259,44 @@ describe('Architecture Contract: Provider Pattern', () => {
     expect(content).toContain('IntelligenceProvider');
     expect(content).toContain('implements IntelligenceProvider');
 
-    // Check that it has the required methods
-    expect(content).toContain('async gather(');
+    // Check that it satisfies the FULL contract: name, priority, enabled(), gather()
     expect(content).toContain('readonly name =');
+    expect(content).toContain('readonly priority =');
+    expect(content).toContain('enabled(): boolean');
+    expect(content).toContain('async gather(');
   });
 
-  it('ensures ScenarioContext is the exported interface (not raw ScenarioGraph)', () => {
+  it('ensures the provider returns ScenarioContext slices (not the raw ScenarioGraph)', () => {
     const providerPath = path.join(SRC_ROOT, 'services/scenario-graph-provider.ts');
     const content = fs.readFileSync(providerPath, 'utf-8');
 
-    // ScenarioContext should be exported
+    // Composable context slices should be exported
     expect(content).toContain('export interface ScenarioContext');
+    expect(content).toContain('export interface ScenarioExecutionContext');
+    expect(content).toContain('export interface ScenarioCoverageContext');
+    expect(content).toContain('export interface ScenarioImpactContext');
 
-    // The gather return type should be ScenarioContext, not ScenarioGraph
-    expect(content).toContain('IntelligenceProvider<ScenarioContext>');
+    // The gather return type should be the composed bundle, not ScenarioGraph
+    expect(content).toContain('IntelligenceProvider<ScenarioContextBundle>');
+  });
+
+  it('ensures providers do NOT compute confidence (centralized in the scorer)', () => {
+    const providerPath = path.join(SRC_ROOT, 'services/scenario-graph-provider.ts');
+    const content = fs.readFileSync(providerPath, 'utf-8');
+
+    // The provider must emit raw signals for the centralized scorer…
+    expect(content).toContain('signals:');
+    // …and must NOT assign a confidence itself (that's the orchestration layer's job).
+    expect(content).not.toMatch(/confidence\s*[:=]/);
+  });
+
+  it('ensures the Provider Registry registers the Scenario Graph provider', () => {
+    const registryPath = path.join(SRC_ROOT, 'services/provider-registry.ts');
+    const content = fs.readFileSync(registryPath, 'utf-8');
+
+    expect(content).toContain('class ProviderRegistry');
+    expect(content).toContain('register(');
+    expect(content).toContain('gatherAll(');
+    expect(content).toContain('getScenarioGraphProvider');
   });
 });
