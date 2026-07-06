@@ -27,6 +27,7 @@ import {
   describeStageOneFailure,
   type NormalizationDiagnostics,
 } from './canonical-test-case';
+import { normalizeResolvedTestData } from './canonical-test-data';
 import type { AuthConfig, AuthResult } from './auth-engine';
 import { WorkflowMapper, type WorkflowMap, type WorkflowFlow, type WorkflowStep, type WorkflowAction } from './workflow-mapper';
 import { SelectorQualityEngine, type ScoredSelector } from './selector-quality-engine';
@@ -308,6 +309,18 @@ export interface GenerationResult {
    * count dropped to zero (canonicalization / parsing / grounding / emit).
    */
   pipeline?: PipelineSummary;
+  /**
+   * Non-fatal Test Data warnings (review issue #1) — e.g. a dataset stored
+   * field-per-record that was reshaped into entities at read time. The store
+   * should be re-materialized so it persists canonically.
+   */
+  testDataWarnings?: string[];
+  /**
+   * Steps the deterministic engine could not map to a grounded action (review
+   * issue #3). Surfaced so the API/UI can show a warning (or, under
+   * unmappedStepPolicy='error', the generation fails instead).
+   */
+  unmappedSteps?: Array<{ testCaseId?: number; step: string }>;
 }
 
 /** Page Object metadata exposed for transparency and debugging. */
@@ -440,6 +453,19 @@ export interface GenerationConfig {
     /** Records keyed by their dataset key (e.g. 'standard_user'). */
     records: Array<{ key: string; value: any }>;
   }>;
+  /**
+   * How to treat a test-case STEP that the deterministic engine cannot map to a
+   * grounded action (review issue #3). Historically these emitted a silent
+   * `// NOTE: step not auto-mapped — review manually.` comment that was easy to
+   * miss. This makes the behaviour configurable:
+   *   - 'comment' → inline review comment only (legacy behaviour).
+   *   - 'warn'    → inline `@warning` marker + collected into the result's
+   *                 `unmappedSteps` so the API/UI can surface a warning (default).
+   *   - 'error'   → collect and, after generation, throw
+   *                 DeterministicGenerationEmptyError so the caller must fix the
+   *                 test cases rather than ship specs with unmapped steps.
+   */
+  unmappedStepPolicy?: 'comment' | 'warn' | 'error';
 }
 
 /* -------------------------------------------------------------------------- */
@@ -506,6 +532,21 @@ export class ScriptGenEngine {
   // Owns all scenario-specific credential mutation, assertion hints and coverage
   // categories; keeps the generator free of embedded per-scenario branching.
   private readonly scenario = new ScenarioIntelligence();
+  /**
+   * Non-fatal Test Data warnings collected during a generation (e.g. a dataset
+   * that was stored field-per-record and had to be reshaped into entities at
+   * read time). Surfaced to the API so the store can be re-materialized
+   * canonically. Reset per generate() call.
+   */
+  private testDataWarnings: string[] = [];
+  /**
+   * Steps the deterministic engine could not map to a grounded action during the
+   * current generation (review issue #3). Populated by tcStepsToCode and
+   * surfaced to the API. Reset per generate() call.
+   */
+  private unmappedSteps: Array<{ testCaseId?: number; step: string }> = [];
+  /** Active unmapped-step policy for the current generation (see config). */
+  private unmappedStepPolicy: 'comment' | 'warn' | 'error' = 'warn';
 
   constructor(config?: { apiKey?: string; model?: string }) {
     // Lazy/optional API key: url-based generation still needs the LLM to infer a
@@ -591,6 +632,13 @@ export class ScriptGenEngine {
     const startTime = Date.now();
     const errors: string[] = [];
     let tokensUsed = 0;
+
+    // Reset per-generation diagnostic collectors and resolve the unmapped-step
+    // policy (review issues #1/#3). Defaults preserve prior behaviour when the
+    // caller doesn't set a policy.
+    this.testDataWarnings = [];
+    this.unmappedSteps = [];
+    this.unmappedStepPolicy = config.unmappedStepPolicy ?? 'warn';
 
     logger.info(MOD, 'Starting script generation', { url: config.url, useCachedCrawl: !!config.cachedCrawlData });
 
@@ -777,10 +825,12 @@ export class ScriptGenEngine {
         throw new DeterministicGenerationEmptyError(config.testCases.length, [], batchErr?.message);
       }
       if (batch && batch.generatedFiles.length > 0) {
+        this.enforceUnmappedStepPolicy(config.testCases.length);
         const batchResult: GenerationResult = {
           ...batch,
           ...(authResult ? { authResult } : {}),
           ...(!config.cachedCrawlData ? { rawCrawlData: crawlResult } : {}),
+          ...this.buildDiagnosticsPatch(),
         };
         logger.info(MOD, 'Script generation complete (deterministic requirement-batch path)', batchResult.stats);
         return batchResult;
@@ -800,10 +850,12 @@ export class ScriptGenEngine {
         throw new DeterministicGenerationEmptyError(1, [], tcErr?.message);
       }
       if (deterministic && deterministic.generatedFiles.length > 0) {
+        this.enforceUnmappedStepPolicy(1);
         const tcResult: GenerationResult = {
           ...deterministic,
           ...(authResult ? { authResult } : {}),
           ...(!config.cachedCrawlData ? { rawCrawlData: crawlResult } : {}),
+          ...this.buildDiagnosticsPatch(),
         };
         logger.info(MOD, 'Script generation complete (deterministic test-case path)', tcResult.stats);
         return tcResult;
@@ -1101,7 +1153,7 @@ export class ScriptGenEngine {
     const preLines = preResult.lines;
     preResult.used.forEach((v) => usedPOVars.add(v));
 
-    const { lines } = this.tcStepsToCode(steps, ctx);
+    const { lines } = this.tcStepsToCode(steps, { ...ctx, testCaseId: tc.id });
 
     // ── Rewrite raw locator steps to reuse high-level Page Object methods ──
     // Only collapses when the method GENUINELY exists in scanned metadata; other
@@ -1155,11 +1207,23 @@ export class ScriptGenEngine {
         ),
     );
     if (bodyTouchesPage && !bodyNavigates) {
-      navLines.push(
-        `await page.goto('${escapeStr(baseUrl)}');`,
-        `await page.waitForLoadState('domcontentloaded');`,
-        '',
-      );
+      // Navigation centralization (review issue #2): prefer the repo Page
+      // Object's OWN navigation method (open/goto/navigate/load/visit) over a
+      // raw page.goto + waitForLoadState duplicated inline in every test. This
+      // keeps entry navigation defined once, in the Page Object, so specs stay
+      // DRY and the URL/wait strategy lives in a single place. We only fall back
+      // to the literal goto when no PO exposes such a method (no hallucination).
+      const navPO = this.findNavigationPageObject(matchedPOs);
+      if (navPO) {
+        navLines.push(`await ${navPO.varName}.${navPO.method}();`, '');
+        usedPOVars.add(navPO.varName);
+      } else {
+        navLines.push(
+          `await page.goto('${escapeStr(baseUrl)}');`,
+          `await page.waitForLoadState('domcontentloaded');`,
+          '',
+        );
+      }
     }
 
     // Declare the resolved record once at the top of the test body so step code
@@ -2053,8 +2117,19 @@ ${testBlocks.join('\n\n')}
     config: GenerationConfig,
   ): Map<string, Map<string, any>> {
     const index = new Map<string, Map<string, any>>();
-    for (const ds of config.resolvedTestData || []) {
-      if (!ds?.name || !Array.isArray(ds.records)) continue;
+    // ── Canonical Test Data normalization (read-side) ──────────────────────
+    // Datasets must represent COMPLETE business entities (one record per user
+    // carrying username/password/email/…), not field-per-record scalar rows.
+    // Legacy datasets persisted a "user" as separate {key:"email"} /
+    // {key:"password"} rows, which made getRecord("valid_users") return only the
+    // first field and forced generated scripts to fall back to process.env.
+    // normalizeResolvedTestData() collapses that anti-pattern into entity records
+    // (and aliases email→username for email-authenticated apps) so the index —
+    // and every consumer (resolveCaseData, resolveValidUserRecord, the emitted
+    // test-data.ts) — sees clean entities. See canonical-test-data.ts.
+    const { datasets: canonical, warnings } = normalizeResolvedTestData(config.resolvedTestData);
+    for (const w of warnings) this.testDataWarnings.push(w);
+    for (const ds of canonical) {
       const recMap = new Map<string, any>();
       for (const rec of ds.records) {
         if (rec?.key == null) continue;
@@ -2886,6 +2961,56 @@ ${gotoB}${sessionLogin('pageB')}
   }
 
   /**
+   * Navigation centralization (review issue #2): pick the Page Object whose OWN
+   * navigation method (open/goto/navigate/load/visit) should drive entry
+   * navigation, so we never duplicate a raw `page.goto(...)` + waitForLoadState
+   * inline in every test. Prefers the login PO (the usual entry point), then any
+   * matched PO exposing such a method. Returns null when none exists — the
+   * caller then keeps the literal goto (no hallucinated method calls).
+   */
+  private findNavigationPageObject(
+    matchedPOs: Array<{ varName: string; methods: string[]; kind: string }>,
+  ): { varName: string; method: string } | null {
+    const navPattern = /^(open|goto|navigate|load|visit)$/i;
+    const ordered = [...matchedPOs].sort((a, b) => {
+      const ra = a.kind === 'login' ? 0 : 1;
+      const rb = b.kind === 'login' ? 0 : 1;
+      return ra - rb;
+    });
+    for (const po of ordered) {
+      const method = this.findPoMethod(po.methods, navPattern);
+      if (method) return { varName: po.varName, method };
+    }
+    return null;
+  }
+
+  /**
+   * Build the per-generation diagnostics patch (review issues #1/#3) attached to
+   * successful deterministic results: reshaped-dataset warnings and any steps
+   * that could not be mapped to a grounded action.
+   */
+  private buildDiagnosticsPatch(): Partial<GenerationResult> {
+    const patch: Partial<GenerationResult> = {};
+    if (this.testDataWarnings.length) patch.testDataWarnings = [...this.testDataWarnings];
+    if (this.unmappedSteps.length) patch.unmappedSteps = [...this.unmappedSteps];
+    return patch;
+  }
+
+  /**
+   * Enforce the configured unmapped-step policy (review issue #3). Under
+   * 'error', any step that could not be grounded fails the whole generation with
+   * a typed error (never ships specs containing unmapped steps). Under 'warn'
+   * (default) / 'comment' the steps are only reported via the result.
+   */
+  private enforceUnmappedStepPolicy(intendedCaseCount: number): void {
+    if (this.unmappedStepPolicy !== 'error' || this.unmappedSteps.length === 0) return;
+    const caseErrors = this.unmappedSteps.map(
+      (u) => `Test case ${u.testCaseId ?? '?'}: step could not be mapped to a grounded action — "${u.step}"`,
+    );
+    throw new DeterministicGenerationEmptyError(intendedCaseCount, caseErrors);
+  }
+
+  /**
    * Match a test case to ALL relevant existing Page Objects (login, inventory,
    * cart, checkout) via simple keyword matching. Returns one entry per matched
    * PO with its real methods + a repo-derived import path. Empty array when no
@@ -3184,6 +3309,32 @@ ${gotoB}${sessionLogin('pageB')}
       }
     }
 
+    // ── Navigation centralization (review issue #2) ─────────────────────────
+    // Any inline `page.goto(...)` (+ its trailing waitForLoadState) that survived
+    // the login/checkout collapses is rewritten to the repo Page Object's OWN
+    // navigation method (open/goto/navigate/load/visit) when one exists — so the
+    // URL + wait strategy is defined ONCE in the Page Object instead of being
+    // duplicated inline across every generated spec. Strictly method-gated: with
+    // no such PO method we keep the literal goto (no hallucinated calls).
+    const navPO = this.findNavigationPageObject(pos);
+    if (navPO) {
+      const centralized: string[] = [];
+      for (let i = 0; i < work.length; i++) {
+        const l = work[i];
+        if (/\bpage\.goto\s*\(/.test(l) && !new RegExp(`\\b${navPO.varName}\\.`).test(l)) {
+          const indent = (l.match(/^\s*/)?.[0]) ?? '';
+          centralized.push(`${indent}await ${navPO.varName}.${navPO.method}();`);
+          used.add(navPO.varName);
+          // Absorb an immediately-following waitForLoadState — the PO nav method
+          // owns the wait strategy, so the inline wait is now redundant.
+          if (/page\.waitForLoadState/i.test(work[i + 1] || '')) i++;
+          continue;
+        }
+        centralized.push(l);
+      }
+      work = centralized;
+    }
+
     return { lines: work, used };
   }
 
@@ -3383,7 +3534,7 @@ ${gotoB}${sessionLogin('pageB')}
    */
   private tcStepsToCode(
     steps: string[],
-    ctx: { url: string; creds: { username: string; password: string }; sel: Record<string, string>; data?: { varName: string; ref: string; hasUsername: boolean; hasPassword: boolean }; crawl?: CrawlResult; stepTracked?: LocatorGroundingEntry[] },
+    ctx: { url: string; creds: { username: string; password: string }; sel: Record<string, string>; data?: { varName: string; ref: string; hasUsername: boolean; hasPassword: boolean }; crawl?: CrawlResult; stepTracked?: LocatorGroundingEntry[]; testCaseId?: number },
   ): { lines: string[] } {
     // Per-step grounded resolver bound to this case's crawl + tracking sink.
     const ground = (phrase: string, kind: 'input' | 'button' | 'any', fallback: string, name: string): string =>
@@ -3486,6 +3637,30 @@ ${gotoB}${sessionLogin('pageB')}
           out.push(`}`);
           out.push('');
         }
+        continue;
+      }
+
+      // ── verification / assertion steps (checked FIRST) ──────────────────────
+      // A step like "Verify Logged in as username is displayed" contains the
+      // substring "username" and would otherwise be mis-routed to the username
+      // FILL branch below (producing `fill('displayed')`). Detecting verification
+      // intent up front guarantees such steps become ASSERTIONS. We prefer an
+      // App-Profile-grounded verification locator (Issue #4) over a generic
+      // assertion, then fall back to the structured assertion mapper, and — when
+      // nothing specific can be grounded — to the honest unmapped-step policy
+      // (never a misleading action).
+      if (this.isVerificationStep(t)) {
+        const grounded = this.deriveGroundedVerification(raw, {
+          crawl: ctx.crawl, stepTracked: ctx.stepTracked, sel: ctx.sel,
+        });
+        const asserted = grounded ? [grounded] : this.mapAssertionStep(raw, t, ctx);
+        out.push(`// ${raw}`);
+        if (asserted.length) {
+          for (const s of asserted) out.push(s);
+          out.push('');
+          continue;
+        }
+        this.emitUnmappedStep(out, raw, ctx.testCaseId);
         continue;
       }
 
@@ -3600,18 +3775,8 @@ ${gotoB}${sessionLogin('pageB')}
         continue;
       }
 
-      // ── assertion-style steps (verify / check / confirm / ensure / should) ──
-      // These appear inline in the body (distinct from the Expected Result).
-      // Map them to real assertions instead of leaving an unmapped note.
-      if (/^(verify|check|confirm|ensure|assert|validate|should|the .* should|it should)/.test(t) || /\bis displayed\b|\bare displayed\b|\bis visible\b|\bis present\b|\bshould be\b/.test(t)) {
-        const asserted = this.mapAssertionStep(raw, t, ctx);
-        if (asserted.length) {
-          out.push(`// ${raw}`);
-          for (const s of asserted) out.push(s);
-          out.push('');
-          continue;
-        }
-      }
+      // (Verification / assertion steps are handled by the early guard at the
+      // top of the loop so they can never be mis-routed to an action branch.)
 
       // ── generic click ──
       // Ground the named control instead of always clicking the login button.
@@ -3624,15 +3789,52 @@ ${gotoB}${sessionLogin('pageB')}
         continue;
       }
 
-      // Unrecognized step → keep as an explicit note (no silent no-op).
+      // Unrecognized step → configurable warning/error (review issue #3).
       out.push(`// ${raw}`);
-      out.push(`// NOTE: step not auto-mapped — review manually.`);
-      out.push('');
+      this.emitUnmappedStep(out, raw, ctx.testCaseId);
     }
 
     // Trim trailing blank line.
     while (out.length && out[out.length - 1] === '') out.pop();
     return { lines: out };
+  }
+
+  /**
+   * True when a step expresses a VERIFICATION / ASSERTION intent rather than an
+   * action. Checked before any action branch so a step such as "Verify Logged in
+   * as username is displayed" (which contains "username") is asserted, never
+   * mis-routed to a username FILL. `t` is the lower-cased step text.
+   */
+  private isVerificationStep(t: string): boolean {
+    return (
+      /^(verify|check|confirm|ensure|assert|validate|expect|observe|see that|the .* should|it should)\b/.test(t) ||
+      /\bshould\s+(see|show|display|contain|be|not)\b/.test(t) ||
+      /\b(is|are|should be)\s+(displayed|visible|shown|present|correct|hidden|not\s+visible)\b/.test(t)
+    );
+  }
+
+  /**
+   * Emit an unmapped step under the active policy (review issue #3). Always
+   * records the step to `this.unmappedSteps` so the API can surface an honest
+   * count; the inline marker severity follows `unmappedStepPolicy`:
+   *   - 'error'  → throw in the generated code (fail fast, forces a fix)
+   *   - 'comment'→ legacy silent "review manually" note
+   *   - 'warn'   → greppable @warning marker + a soft runtime annotation (default)
+   */
+  private emitUnmappedStep(out: string[], raw: string, testCaseId?: number): void {
+    this.unmappedSteps.push({ testCaseId, step: raw });
+    if (this.unmappedStepPolicy === 'error') {
+      out.push(`// @error: step could not be mapped to a grounded action — generation policy=error.`);
+      out.push(`throw new Error(${JSON.stringify(`Unmapped test step (fix the test case): ${raw}`)});`);
+    } else if (this.unmappedStepPolicy === 'comment') {
+      out.push(`// NOTE: step not auto-mapped — review manually.`);
+    } else {
+      // 'warn' (default): explicit, greppable warning marker + a soft runtime
+      // annotation so the gap is visible in reports and test output.
+      out.push(`// @warning: step not auto-mapped — review manually (unmappedStepPolicy=warn).`);
+      out.push(`test.info().annotations.push({ type: 'warning', description: ${JSON.stringify(`Unmapped step: ${raw}`)} });`);
+    }
+    out.push('');
   }
 
   /**
@@ -3701,7 +3903,7 @@ ${gotoB}${sessionLogin('pageB')}
    */
   private buildTcAssertions(
     expected: string,
-    ctx: { url: string; creds: { username: string; password: string }; sel: Record<string, string>; data?: { varName: string; ref: string; hasUsername: boolean; hasPassword: boolean } },
+    ctx: { url: string; creds: { username: string; password: string }; sel: Record<string, string>; data?: { varName: string; ref: string; hasUsername: boolean; hasPassword: boolean }; crawl?: CrawlResult; stepTracked?: LocatorGroundingEntry[] },
     _tc: NonNullable<GenerationConfig['testCase']>,
     pos: Array<{ name: string; varName: string; methods: string[]; kind: string }> = [],
     usedPOVars?: Set<string>,
@@ -3825,6 +4027,14 @@ ${gotoB}${sessionLogin('pageB')}
       return lines;
     }
 
+    // App Profile verification (review issue #4): when the Expected Result names
+    // a SPECIFIC element/text to verify (e.g. "Username is displayed in the
+    // navigation header", "'Logged in as' is shown"), ground THAT element in the
+    // crawled App Profile and assert it, instead of always falling back to the
+    // generic landmark (ctx.sel.title). Returns null when nothing specific can
+    // be grounded, so we keep the app-aware landmark as a safety net.
+    const groundedVerify = this.deriveGroundedVerification(exp, ctx);
+
     if (isSuccess) {
       if (sauce) {
         lines.push(`await expect(page).toHaveURL(/inventory\\.html/);`);
@@ -3833,20 +4043,94 @@ ${gotoB}${sessionLogin('pageB')}
         // The Expected Result named the destination (e.g. the home page) — assert
         // exactly that URL rather than SauceDemo's inventory.html.
         lines.push(`await expect(page).toHaveURL('${escapeStr(successUrl)}');`);
-        lines.push(`await expect(${ctx.sel.title}).toBeVisible();`);
+        lines.push(groundedVerify ?? `await expect(${ctx.sel.title}).toBeVisible();`);
       } else {
         // App-agnostic success signal: we are no longer on the login page.
         lines.push(`await expect(page).not.toHaveURL('${escapeStr(ctx.url)}');`);
-        lines.push(`await expect(${ctx.sel.title}).toBeVisible();`);
+        lines.push(groundedVerify ?? `await expect(${ctx.sel.title}).toBeVisible();`);
       }
       return lines;
     }
 
-    // Fallback — never emit a no-op. Prefer the Expected Result's named URL,
-    // else assert the (app-aware) landmark element is visible.
+    // Fallback — never emit a no-op. Prefer a grounded App-Profile verification
+    // for the named element, then the Expected Result's URL, then the app-aware
+    // landmark as a last resort.
+    if (groundedVerify) {
+      if (successUrl) lines.push(`await expect(page).toHaveURL('${escapeStr(successUrl)}');`);
+      lines.push(groundedVerify);
+      return lines;
+    }
     if (successUrl) lines.push(`await expect(page).toHaveURL('${escapeStr(successUrl)}');`);
     lines.push(`await expect(${ctx.sel.title}).toBeVisible();`);
     return lines;
+  }
+
+  /**
+   * Derive a grounded verification assertion from an Expected Result using App
+   * Profile intelligence (review issue #4). Two strategies, most specific first:
+   *   1. A quoted literal ("'Logged in as'") → assert the app renders that text
+   *      via getByText — content-anchored, never a guessed selector.
+   *   2. "<element> is displayed/visible/shown/present" → ground the named
+   *      element against the crawled DOM and assert the REAL locator.
+   * Returns null when nothing specific can be grounded, so the caller keeps its
+   * app-aware landmark fallback (no hallucinated selectors).
+   */
+  private deriveGroundedVerification(
+    expected: string,
+    ctx: { crawl?: CrawlResult; stepTracked?: LocatorGroundingEntry[]; sel: Record<string, string> },
+  ): string | null {
+    const exp = (expected || '').trim();
+    if (!exp || !ctx.crawl) return null;
+
+    // 1) Quoted literal text the app should render.
+    const quoted = exp.match(/'([^']+)'|"([^"]+)"/);
+    const literal = quoted ? (quoted[1] ?? quoted[2] ?? '').trim() : '';
+    if (literal && literal.length >= 2 && !/^https?:\/\//i.test(literal)) {
+      return `await expect(page.getByText(${JSON.stringify(literal)}).first()).toBeVisible();`;
+    }
+
+    // 2) Greeting / confirmation copy the app renders after an action, e.g.
+    //    "sees Logged in as username", "shows Welcome back", "displays the
+    //    Order placed! message". The literal token (a username/id) is variable,
+    //    so we anchor on the STABLE prefix as a case-insensitive text regex —
+    //    content-anchored to the App Profile's copy, never a guessed selector.
+    const greet = exp.match(
+      /\b(?:sees?|shows?|showing|displays?|displaying|says?|reads?|greeted with|message)\s+(?:the\s+|a\s+|an\s+)?["']?([A-Za-z][\w '!.\-]{2,40}?)["']?(?:\s+(?:message|text|banner|notification|greeting|username|name))?\s*$/i,
+    );
+    // Common canonical greeting explicitly present in the copy (handles phrasing
+    // where the verb isn't the immediate lead-in, e.g. "and sees Logged in as").
+    const canonicalGreet = /\blogged in as\b/i.test(exp)
+      ? 'Logged in as'
+      : /\bwelcome\b/i.test(exp)
+      ? 'Welcome'
+      : '';
+    const greetText = (greet?.[1]?.trim() || canonicalGreet).replace(/\s+(username|name)$/i, '').trim();
+    if (greetText && greetText.length >= 3 && /[a-z]/i.test(greetText)) {
+      return `await expect(page.getByText(/${escapeRegex(greetText)}/i).first()).toBeVisible();`;
+    }
+
+    // 3) "<phrase> is displayed/visible/shown/present" → ground the element.
+    const m = exp.match(
+      /\b(?:the\s+)?([a-z][\w '\-]{2,40}?)\s+(?:is|are|should be)\s+(?:displayed|visible|shown|present)\b/i,
+    );
+    const phrase = m ? m[1].trim().replace(/\b(in|on|at|the|a|an)\b\s*$/i, '').trim() : '';
+    if (phrase) {
+      const r = this.resolveGroundedSelectorTracked([phrase], ctx.crawl, '', 'any');
+      if (r.grounded && r.selector) {
+        if (ctx.stepTracked) {
+          ctx.stepTracked.push({
+            name: `verify:${phrase}`,
+            selector: r.selector,
+            grounded: r.grounded,
+            knownGood: r.knownGood,
+            confidence: r.confidence,
+            source: r.source,
+          });
+        }
+        return `await expect(${r.selector}).toBeVisible();`;
+      }
+    }
+    return null;
   }
 
   /**
