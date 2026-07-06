@@ -36,6 +36,118 @@ export interface ValidationReport {
 }
 
 /* -------------------------------------------------------------------------- */
+/*  Honest reliability breakdown                                              */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The single `overallScore` from ValidationRunner ONLY measures code quality —
+ * syntax, imports, structure, assertions, wait strategies. It says NOTHING about
+ * whether the generated locators are grounded in the real app, nor whether the
+ * script actually reflects the intended business test cases. Surfacing that one
+ * number as "reliability" produced the dangerous, misleading situation the user
+ * flagged: a script reported "100%" while 0 of 14 locators were grounded and the
+ * output was 4 unrelated generic files.
+ *
+ * `computeReliabilityBreakdown` decomposes reliability into the dimensions that
+ * actually matter, then combines them with a WEAKEST-LINK (multiplicative) rule
+ * so a perfect code score can never mask zero grounding or zero coverage:
+ *
+ *   • codeQuality        — ValidationRunner.overallScore (syntax/structure).
+ *   • groundingQuality   — % of locators grounded in the real app DOM/profile.
+ *   • businessCoverage   — % of the intended test cases that actually drove
+ *                          generation (0 when the run fell back to the generic
+ *                          workflow generator instead of the real cases).
+ *   • executionReadiness — combined, honest "can this actually run & pass"
+ *                          score = product of the applicable dimensions.
+ *
+ * Dimensions that don't apply to a given generation (e.g. business coverage for
+ * a pure URL / plain-English run with no predefined cases) are reported as
+ * `null` and excluded from the product rather than counted as 0.
+ */
+export interface ReliabilityBreakdown {
+  codeQuality: number;                 // 0-100
+  groundingQuality: number | null;     // 0-100, null when no locators were expected
+  businessCoverage: number | null;     // 0-100, null when there were no intended cases
+  executionReadiness: number;          // 0-100, weakest-link combined
+  headline: string;
+  dimensions: Array<{ key: string; label: string; score: number | null; description: string }>;
+}
+
+export function computeReliabilityBreakdown(input: {
+  /** ValidationRunner.overallScore — pure code quality. */
+  codeQuality: number;
+  /** Real locator grounding, if any interactive locators were resolved. */
+  grounding?: { grounded: number; total: number } | null;
+  /** How many test cases the user intended this generation to cover. */
+  intendedTestCaseCount?: number;
+  /**
+   * Whether those intended cases ACTUALLY drove generation (deterministic
+   * engine consumed them) vs. the run dropping to the generic fallback
+   * generator. When false with intended cases > 0, business coverage is 0.
+   */
+  usedRealTestCases?: boolean;
+}): ReliabilityBreakdown {
+  const clamp = (n: number) => Math.max(0, Math.min(100, Math.round(n)));
+  const codeQuality = clamp(input.codeQuality ?? 0);
+
+  const groundingQuality =
+    input.grounding && input.grounding.total > 0
+      ? clamp((input.grounding.grounded / input.grounding.total) * 100)
+      : null;
+
+  const businessCoverage =
+    input.intendedTestCaseCount && input.intendedTestCaseCount > 0
+      ? (input.usedRealTestCases ? 100 : 0)
+      : null;
+
+  // Weakest-link combination: multiply the applicable dimension fractions so a
+  // single zeroed dimension (e.g. 0% grounding) collapses execution readiness
+  // to 0 — exactly the honesty the previous single score lacked.
+  const factors = [codeQuality / 100];
+  if (groundingQuality !== null) factors.push(groundingQuality / 100);
+  if (businessCoverage !== null) factors.push(businessCoverage / 100);
+  const executionReadiness = clamp(factors.reduce((a, b) => a * b, 1) * 100);
+
+  const fmt = (n: number | null) => (n === null ? 'n/a' : `${n}%`);
+
+  return {
+    codeQuality,
+    groundingQuality,
+    businessCoverage,
+    executionReadiness,
+    headline:
+      `Execution readiness ${executionReadiness}% ` +
+      `(code ${fmt(codeQuality)}, grounding ${fmt(groundingQuality)}, business coverage ${fmt(businessCoverage)})`,
+    dimensions: [
+      {
+        key: 'codeQuality',
+        label: 'Code Quality',
+        score: codeQuality,
+        description: 'Syntax, imports, structure, assertions and wait strategies of the generated code.',
+      },
+      {
+        key: 'groundingQuality',
+        label: 'Grounding Quality',
+        score: groundingQuality,
+        description: 'Share of locators grounded in the real application DOM / App Profile (not guessed from prose).',
+      },
+      {
+        key: 'businessCoverage',
+        label: 'Business Coverage',
+        score: businessCoverage,
+        description: 'Share of the intended test cases that actually drove generation (0 if the generic fallback ran instead).',
+      },
+      {
+        key: 'executionReadiness',
+        label: 'Execution Readiness',
+        score: executionReadiness,
+        description: 'Combined, weakest-link estimate of whether the script can actually run and pass against the real app.',
+      },
+    ],
+  };
+}
+
+/* -------------------------------------------------------------------------- */
 /*  Engine                                                                    */
 /* -------------------------------------------------------------------------- */
 
