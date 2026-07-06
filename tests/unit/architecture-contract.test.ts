@@ -336,3 +336,53 @@ describe('Architecture Contract: Provider Pattern', () => {
     expect(content).not.toMatch(/confidence\s*[:=]/);
   });
 });
+
+describe('Architecture Contract: Migration Discipline (one provider at a time)', () => {
+  // The migration loop is: Provider → Register → Dual Path → Compare → Delete
+  // Legacy → Merge → Next Provider. We must NOT accumulate providers with no
+  // consumers. Until RepositoryProvider completes its dual-path cycle and legacy
+  // is deleted, NO further provider (Knowledge, Similarity, Patterns, App
+  // Profile, DOM) may be introduced/registered. This test fails loudly if
+  // someone adds the next provider prematurely.
+  const ALLOWED_PROVIDERS = new Set(['scenario-graph-provider', 'repository-provider']);
+
+  it('does not add a new *-provider module before Repository migration completes', () => {
+    const serviceFiles = findTsFiles(path.join(SRC_ROOT, 'services'));
+    // A "provider" here means a concrete implementation of the contract — i.e. a
+    // module that `implements IntelligenceProvider`. The interface/infra modules
+    // (intelligence-provider.ts, provider-registry.ts) are NOT implementations.
+    const providerModules = serviceFiles
+      .filter(f => fs.readFileSync(f, 'utf-8').includes('implements IntelligenceProvider'))
+      .map(f => path.basename(f, '.ts'));
+
+    const unexpected = providerModules.filter(name => !ALLOWED_PROVIDERS.has(name));
+    if (unexpected.length > 0) {
+      throw new Error(
+        `❌ Migration discipline violation: unexpected provider module(s) added:\n` +
+          `  ${unexpected.join(', ')}\n\n` +
+          `Do NOT introduce another provider until RepositoryProvider has completed a full\n` +
+          `dual-path migration cycle (compare → prove equivalence → delete legacy → merge).\n` +
+          `If Repository migration is genuinely done, update ALLOWED_PROVIDERS in this test.`,
+      );
+    }
+    expect(unexpected).toEqual([]);
+  });
+
+  it('registry registers exactly the two migrated/infra providers (no premature additions)', () => {
+    const registryPath = path.join(SRC_ROOT, 'services/provider-registry.ts');
+    const content = fs.readFileSync(registryPath, 'utf-8');
+    const registerCalls = (content.match(/registry\.register\(/g) || []).length;
+    expect(registerCalls).toBe(2); // ScenarioGraph + Repository only
+  });
+
+  it('runs the RepositoryProvider in shadow via gatherForDualPath (legacy stays source of truth)', () => {
+    const orchestratorPath = path.join(SRC_ROOT, 'services/intelligence-orchestrator.ts');
+    const content = fs.readFileSync(orchestratorPath, 'utf-8');
+    // Dual-path must invoke the provider through the shadow entrypoint...
+    expect(content).toContain('gatherForDualPath');
+    expect(content).toContain('evaluateRepositoryEquivalence');
+    // ...and must NOT consume the provider's output into the returned bundle yet
+    // (repositoryGraph is still built from the legacy repoGraph).
+    expect(content).toContain('available: repoGraph.available');
+  });
+});

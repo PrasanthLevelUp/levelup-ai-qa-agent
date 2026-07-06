@@ -48,6 +48,8 @@ import { MethodIntelligenceService } from './method-intelligence-service';
 import { getRAGService, type RagExample } from './rag-service';
 import { FEATURE_FLAGS } from '../config/features';
 import { logger } from '../utils/logger';
+import { getRepositoryProvider } from './repository-provider';
+import { evaluateRepositoryEquivalence } from './repository-equivalence';
 
 const MOD = 'intelligence-orchestrator';
 
@@ -432,6 +434,15 @@ export class IntelligenceOrchestrator {
             warnings.push('Repository graph query failed');
           }
         });
+
+        // ── Dual-path migration validation (shadow) ──────────────────────────
+        // Run the RepositoryProvider ALONGSIDE the legacy path above, normalize
+        // both, and compare them for semantic equivalence. The legacy result
+        // (`repoGraph`) remains the SOLE source of truth consumed downstream —
+        // the provider output is observed, never trusted, until the match rate
+        // proves equivalence and legacy can be deleted. Fully fail-open: any
+        // error here can never affect the production (legacy) result.
+        await this.runRepositoryDualPathShadow(query, repoGraph);
       } else {
         missingCritical.push('repository-context-id');
       }
@@ -833,6 +844,51 @@ export class IntelligenceOrchestrator {
       return new URL(url).origin;
     } catch {
       return null;
+    }
+  }
+
+  /**
+   * Dual-path migration validation for Repository intelligence.
+   *
+   * Gated by `REPOSITORY_DUAL_PATH` (default off). When on, runs the
+   * RepositoryProvider in SHADOW — its output is compared against the legacy
+   * inline path (`legacyRepoGraph`) that production actually consumed — and the
+   * running match rate is logged. This is how we earn the right to delete the
+   * legacy path: only once the shadow provider matches legacy for enough real
+   * traffic (target ≥ 99.9%) do we flip `REPOSITORY_PROVIDER` on and remove the
+   * inline code.
+   *
+   * Guarantees:
+   *   • The provider is invoked via `gatherForDualPath` so it runs even while
+   *     `REPOSITORY_PROVIDER` is off (shadow precedes production enablement).
+   *   • FULLY fail-open — wrapped in try/catch; a bug here never touches the
+   *     legacy `repoGraph` that downstream generation depends on.
+   *   • Zero effect on the returned bundle: comparison only logs + counts.
+   */
+  private async runRepositoryDualPathShadow(
+    query: OrchestratorQuery,
+    legacyRepoGraph: IntentQueryResult,
+  ): Promise<void> {
+    if (process.env.REPOSITORY_DUAL_PATH !== 'true') return;
+    try {
+      const providerResult = await getRepositoryProvider().gatherForDualPath({
+        intent: query.intent,
+        companyId: query.companyId,
+        projectId: query.projectId,
+        repoContextId: query.repoContextId,
+        targetUrl: query.targetUrl,
+        caller: query.caller,
+      });
+      evaluateRepositoryEquivalence(
+        legacyRepoGraph as IntentQueryResult & { healingEvidence?: { signals?: any } },
+        providerResult.context,
+        { intent: query.intent, caller: query.caller },
+      );
+    } catch (err: any) {
+      // Shadow comparison must never affect production. Log and move on.
+      logger.warn(MOD, 'Repository dual-path shadow failed (non-critical)', {
+        error: err?.message,
+      });
     }
   }
 

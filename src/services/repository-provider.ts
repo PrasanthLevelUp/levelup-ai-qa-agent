@@ -158,12 +158,36 @@ export class RepositoryProvider implements IntelligenceProvider<RepositoryContex
   }
 
   async gather(query: IntelligenceQuery): Promise<IntelligenceResult<RepositoryContext>> {
-    const startMs = Date.now();
-
     // Guard: feature flag off → unavailable immediately.
     if (!this.enabled()) {
       return this.unavailable('Feature flag REPOSITORY_PROVIDER is off', 0);
     }
+    return this.doGather(query);
+  }
+
+  /**
+   * Run the provider's real gathering logic, **bypassing the `enabled()` gate**.
+   *
+   * This exists solely for the **dual-path migration validator**: the
+   * orchestrator runs the provider in shadow (comparing its output against the
+   * legacy inline path) BEFORE `REPOSITORY_PROVIDER` is switched on for
+   * production consumption. Without this, shadow comparison would always see an
+   * `available: false` provider result and report false mismatches.
+   *
+   * Consumers must NEVER call this — they read the unified bundle. Only the
+   * orchestrator's dual-path shadow uses it, and only for comparison/logging.
+   */
+  async gatherForDualPath(
+    query: IntelligenceQuery,
+  ): Promise<IntelligenceResult<RepositoryContext>> {
+    return this.doGather(query);
+  }
+
+  /** Core gathering logic shared by `gather()` (gated) and `gatherForDualPath()`. */
+  private async doGather(
+    query: IntelligenceQuery,
+  ): Promise<IntelligenceResult<RepositoryContext>> {
+    const startMs = Date.now();
 
     // Guard: no repoContextId → can't query the knowledge graph
     if (!query.repoContextId) {
