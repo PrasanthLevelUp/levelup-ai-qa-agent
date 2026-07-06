@@ -56,6 +56,18 @@ function expect(value: any) {
         throw new Error(`Expected ${value} to be >= ${expected}`);
       }
     },
+    toBeLessThan(expected: number) {
+      if (value >= expected) {
+        throw new Error(`Expected ${value} to be less than ${expected}`);
+      }
+    },
+    not: {
+      toBe(expected: any) {
+        if (value === expected) {
+          throw new Error(`Expected value NOT to be ${JSON.stringify(expected)}`);
+        }
+      },
+    },
   };
 }
 
@@ -90,73 +102,98 @@ describe('Adaptive Generation - FAST tier (small on every axis)', () => {
   });
 });
 
-describe('Adaptive Generation - STANDARD tier (medium)', () => {
-  it('classifies a medium requirement (3 types + 3 AC) as STANDARD', () => {
-    const input: RequirementInput = {
-      title: 'Password reset flow',
-      description: 'User requests a reset link by email and sets a new password.',
-      acceptanceCriteria: 'AC1\nAC2\nAC3',
-    };
-    const est = engine.estimateComplexity(input, ['positive', 'negative', 'edge_cases'], undefined);
-    expect(est.tier).toBe('STANDARD');
-  });
-
-  it('stays STANDARD when score is in the middle range (25-40)', () => {
-    const input: RequirementInput = {
-      title: 'Small req',
-      description: 'Short.',
-      acceptanceCriteria: 'AC1\nAC2', // 2 AC = 33% of cap (6) → 33 * 0.40 = 13.2
-    };
-    const est = engine.estimateComplexity(
-      input,
-      ['positive', 'negative'], // 2 types = 50% of cap (4) → 50 * 0.40 = 20
-      undefined,
-    );
-    // Total ≈ 13.2 + 20 + minimal chars ≈ 33-35 → STANDARD
-    expect(est.tier).toBe('STANDARD');
-  });
-});
-
-describe('Adaptive Generation - COMPREHENSIVE tier (high score)', () => {
-  it('escalates to COMPREHENSIVE on 9 coverage types (even small requirement)', () => {
-    // This is the KEY scenario from the review: "Generate test cases for Login"
-    // with 9 coverage types is objectively harder than a 1500-char req with 1 type.
-    // The weighted scoring reflects the ACTUAL WORK requested (coverage types + AC),
-    // not just verbose prose.
+describe('Adaptive Generation - intent vs. complexity (KEY philosophy)', () => {
+  it('does NOT escalate a tiny requirement to COMPREHENSIVE just because many coverage types are selected', () => {
+    // The review scenario: "Generate test cases for Login" with 9 coverage types.
+    // Coverage-type count expresses USER INTENT, not intrinsic complexity. A one-line
+    // requirement must stay cheap regardless of how many types are ticked — coverage
+    // only carries a 0.10 weight, so it can nudge but never dominate the tier.
     const input: RequirementInput = {
       title: 'Generate test cases for Login',
       description: '',
     };
     const types: CoverageType[] = ['positive', 'negative', 'boundary', 'security', 'accessibility', 'performance', 'api', 'localization', 'cross_browser'];
     const est = engine.estimateComplexity(input, types, undefined);
-    expect(est.tier).toBe('COMPREHENSIVE');
+    expect(est.tier).not.toBe('COMPREHENSIVE');
+    expect(est.tier).toBe('FAST');
     expect(est.signals.coverageTypeCount).toBe(9);
-    // With coverage weight = 0.40, 9 types (normalized to 100) → 40 points, hits threshold
-    expect(est.signals.complexityScore).toBeGreaterThanOrEqual(40);
+    // Even at the cap, coverage contributes only 0.10 * 100 = 10 points.
+    expect(est.signals.complexityScore).toBeLessThan(25);
   });
 
-  it('escalates to COMPREHENSIVE on high AC count (7+ criteria)', () => {
+  it('classifies a simple "User Login" (default 3 types) as FAST', () => {
     const input: RequirementInput = {
-      title: 'Auth',
-      description: 'Login feature.',
-      acceptanceCriteria: Array.from({ length: 7 }, (_, i) => `AC${i + 1}`).join('\n'),
+      title: 'User Login',
+      description: 'User logs in with email and password.',
     };
-    const est = engine.estimateComplexity(input, ['positive'], undefined);
-    expect(est.tier).toBe('COMPREHENSIVE');
-    expect(est.signals.acceptanceCriteriaCount).toBe(7);
+    const est = engine.estimateComplexity(input, ['positive', 'negative', 'edge_cases'], undefined);
+    expect(est.tier).toBe('FAST');
+    expect(est.signals.complexityScore).toBeLessThan(25);
+  });
+});
+
+describe('Adaptive Generation - STANDARD tier (medium, size-driven)', () => {
+  it('classifies a realistic single-feature login (fuller prose + 3 AC + grounding) as STANDARD', () => {
+    // ~287 chars of real prose, 3 acceptance criteria, three intelligence sources.
+    // Size + AC density carry the score into the STANDARD band (25-45).
+    const input: RequirementInput = {
+      title: 'User Login',
+      description:
+        'As a registered user, I can log in with my email and password so that I can access my account. Invalid credentials show an error. After 5 failed attempts the account is locked for 15 minutes.',
+      acceptanceCriteria: 'Valid credentials log in\nInvalid credentials show error\nAccount locks after 5 attempts',
+    };
+    const knowledge: KnowledgeContext = {
+      applicationProfile: {} as any,
+      testData: [{}] as any,
+      modules: [{}] as any,
+    };
+    const est = engine.estimateComplexity(input, ['positive', 'negative', 'edge_cases'], knowledge);
+    expect(est.tier).toBe('STANDARD');
+    expect(est.signals.complexityScore).toBeGreaterThanOrEqual(25);
+    expect(est.signals.complexityScore).toBeLessThan(45);
   });
 
-  it('escalates to COMPREHENSIVE on combined signals (4 types + 4 AC)', () => {
-    // This validates that the weighted composite works: neither signal alone
-    // would hit COMPREHENSIVE, but together they do.
+  it('classifies a medium password-reset requirement (fuller prose + 4 AC) as STANDARD', () => {
     const input: RequirementInput = {
-      title: 'Checkout epic',
-      description: 'Multi-step checkout flow with payment, shipping, tax.',
-      acceptanceCriteria: Array.from({ length: 4 }, (_, i) => `AC${i + 1}`).join('\n'),
+      title: 'Password reset flow',
+      description:
+        'User requests a password reset link via email, clicks the emailed link, and sets a new password. The link expires after 24 hours and can only be used once. Password must meet complexity rules.',
+      acceptanceCriteria: 'AC1\nAC2\nAC3\nAC4',
+    };
+    const est = engine.estimateComplexity(input, ['positive', 'negative', 'edge_cases'], undefined);
+    expect(est.tier).toBe('STANDARD');
+    expect(est.signals.complexityScore).toBeGreaterThanOrEqual(25);
+    expect(est.signals.complexityScore).toBeLessThan(45);
+  });
+});
+
+describe('Adaptive Generation - COMPREHENSIVE tier (genuinely large requirements)', () => {
+  it('escalates a detailed multi-step checkout flow (long prose + 6 AC + 6 flow steps)', () => {
+    // COMPREHENSIVE now requires real testable surface: lots of prose, many AC,
+    // and a multi-step business flow — NOT just many coverage types.
+    const input: RequirementInput = {
+      title: 'Checkout flow',
+      description:
+        'Multi-step checkout: cart review, shipping address entry, shipping method selection, payment via card or wallet, tax calculation, order confirmation, and email receipt. Handles out-of-stock, expired cards, and promo codes.'.repeat(3),
+      acceptanceCriteria: Array.from({ length: 6 }, (_, i) => `AC${i + 1} detailed criteria text here`).join('\n'),
+      businessFlow: 'Review cart. Enter shipping. Choose method. Enter payment. Confirm order. Receive receipt.',
     };
     const est = engine.estimateComplexity(input, ['positive', 'negative', 'edge_cases', 'boundary'], undefined);
     expect(est.tier).toBe('COMPREHENSIVE');
-    // 4 types (100%) * 0.40 = 40, 4 AC (67%) * 0.40 = 26.8, chars ~5 → 40+26.8+5 ≈ 72
+    expect(est.signals.complexityScore).toBeGreaterThanOrEqual(45);
+  });
+
+  it('escalates an epic requirement (1500+ chars, 8 AC, 6 flow steps)', () => {
+    const input: RequirementInput = {
+      title: 'Insurance claim processing epic',
+      description: 'x'.repeat(1500),
+      acceptanceCriteria: Array.from({ length: 8 }, (_, i) => `AC${i + 1}`).join('\n'),
+      businessFlow: Array.from({ length: 6 }, (_, i) => `Step ${i + 1}`).join('\n'),
+    };
+    const est = engine.estimateComplexity(input, ['positive', 'negative', 'edge_cases', 'boundary', 'security'], undefined);
+    expect(est.tier).toBe('COMPREHENSIVE');
+    expect(est.signals.acceptanceCriteriaCount).toBe(8);
+    expect(est.signals.complexityScore).toBeGreaterThanOrEqual(45);
   });
 });
 
