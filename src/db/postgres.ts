@@ -6,6 +6,7 @@
 import { Pool, type PoolClient } from 'pg';
 import { logger } from '../utils/logger';
 import { normalizeBaseUrl } from '../utils/url-normalize';
+import { normalizeSteps } from '../script-gen/canonical-test-case';
 import { RTM_STATEMENTS, RTM_TABLES, applyRtmSchema } from './rtm-schema';
 import {
   ENV_SPRINT_STATEMENTS,
@@ -8151,13 +8152,24 @@ export async function insertTestCases(scenarioId: number, cases: Array<{
   const pool = getPool();
   const ids: number[] = [];
   for (const c of cases) {
+    // ── Write-side normalization ───────────────────────────────────────────
+    // Normalize the `steps` payload BEFORE persisting so all new rows are
+    // stored in the canonical string[] shape, regardless of what the caller
+    // passed (string[], object[], keyed-object, JSON string, foreign schema).
+    // This closes the shape drift at the source — the read-side normalizer
+    // becomes a migration layer only, eventually removable once legacy data
+    // is migrated. (User direction: "I also want Write → Normalize → Database
+    // so new data is always stored canonically. Then the read-side normalizer
+    // becomes a migration layer only. Eventually you can delete it.")
+    const canonicalSteps = normalizeSteps(c.steps).steps;
+
     const r = await pool.query(
       `INSERT INTO generated_test_cases
          (scenario_id, title, preconditions, steps, expected_result, test_data,
           priority, severity, tags, automation_ready, automation_complexity,
           selector_availability, source, source_evidence, ai_metadata, company_id)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) RETURNING id`,
-      [scenarioId, c.title, c.preconditions, JSON.stringify(c.steps),
+      [scenarioId, c.title, c.preconditions, JSON.stringify(canonicalSteps),
        c.expectedResult, c.testData, c.priority, c.severity,
        JSON.stringify(c.tags), c.automationReady, c.automationComplexity,
        c.selectorAvailability, c.source || null, c.sourceEvidence || null,
