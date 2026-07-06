@@ -16,6 +16,7 @@ import {
   type OrchestratorSource,
   type IntelligenceScore,
 } from '../services/intelligence-orchestrator';
+import { planScenarios, buildScenarioPlanBlock, type ScenarioPlan } from './scenario-planner';
 
 const MOD = 'test-coverage-engine';
 
@@ -24,7 +25,7 @@ const MOD = 'test-coverage-engine';
  * Tracked in every generation so we can correlate quality with prompt evolution and
  * quickly diagnose "last week was better" reports by identifying which version ran.
  */
-const PROMPT_VERSION = 'v3.2-senior-qa';
+const PROMPT_VERSION = 'v3.3-scenario-plan';
 
 /**
  * Engine architecture version — increment when the pipeline or core algorithm changes
@@ -71,7 +72,11 @@ const TIER_CONFIGS: Record<ComplexityTier, TierConfig> = {
     runAnalysis: false,
   },
   STANDARD: {
-    maxOutputTokens: intEnv('GEN_STANDARD_MAX_TOKENS', 5000),
+    // Lowered 5000 → 3500. A medium requirement (e.g. a login with the default
+    // positive/negative/edge selection) needs ~6–8 focused, high-quality cases,
+    // not 13. 3500 output tokens comfortably fits that while cutting cost/latency.
+    // Genuinely large requirements escalate to COMPREHENSIVE and get the full budget.
+    maxOutputTokens: intEnv('GEN_STANDARD_MAX_TOKENS', 3500),
     maxPromptChars: intEnv('GEN_STANDARD_MAX_PROMPT_CHARS', 40000),
     runAnalysis: false,
   },
@@ -84,9 +89,10 @@ const TIER_CONFIGS: Record<ComplexityTier, TierConfig> = {
 
 /** Complexity scoring weights — env-overridable so they can be tuned from telemetry.
  *  These define how much each signal contributes to the composite complexity score.
- *  Sum should ideally be 1.0 but code normalizes if not. Default weights favor
- *  coverage types + acceptance criteria (the actual work requested) over requirement
- *  length (which may just be verbose prose). */
+ *  Sum should ideally be 1.0 but code normalizes if not. Default weights favor the
+ *  INTRINSIC size of the requirement (text length, acceptance criteria, business
+ *  flow) over coverage-type count, because the number of coverage types the user
+ *  selected reflects INTENT, not how complex the underlying feature is. */
 interface ComplexityWeights {
   requirementChars: number;
   acceptanceCriteria: number;
@@ -100,17 +106,31 @@ const floatEnv = (name: string, fallback: number): number => {
   return Number.isFinite(v) && v >= 0 ? v : fallback;
 };
 
+// Complexity is driven by INTRINSIC requirement characteristics (how much real
+// product surface the requirement describes), NOT by how many coverage types the
+// user ticked. Selecting positive/negative/edge is USER INTENT — it does not make
+// a login as complex as an enterprise banking flow. So requirement SIZE and the
+// number of ACCEPTANCE CRITERIA / BUSINESS-FLOW steps dominate the score, while
+// coverage-type count and intelligence-source count contribute only lightly.
+//   Requirement size    40%  — the strongest signal of intrinsic scope
+//   Acceptance criteria  25%  — each criterion is a distinct obligation to test
+//   Business flow        15%  — multi-step flows are genuinely harder
+//   Coverage types       10%  — user INTENT, not complexity (deliberately light)
+//   Intelligence sources 10%  — richer grounding, only a nudge
 const COMPLEXITY_WEIGHTS: ComplexityWeights = {
-  requirementChars: floatEnv('GEN_WEIGHT_REQ_CHARS', 0.10),
-  acceptanceCriteria: floatEnv('GEN_WEIGHT_AC', 0.40),
-  coverageTypes: floatEnv('GEN_WEIGHT_COVERAGE_TYPES', 0.40),
-  businessFlow: floatEnv('GEN_WEIGHT_FLOW', 0.05),
-  intelligenceSources: floatEnv('GEN_WEIGHT_SOURCES', 0.05),
+  requirementChars: floatEnv('GEN_WEIGHT_REQ_CHARS', 0.40),
+  acceptanceCriteria: floatEnv('GEN_WEIGHT_AC', 0.25),
+  businessFlow: floatEnv('GEN_WEIGHT_FLOW', 0.15),
+  coverageTypes: floatEnv('GEN_WEIGHT_COVERAGE_TYPES', 0.10),
+  intelligenceSources: floatEnv('GEN_WEIGHT_SOURCES', 0.10),
 };
 
 /** Composite score ranges for tier classification — env-overridable. */
 const FAST_THRESHOLD = floatEnv('GEN_FAST_THRESHOLD', 25);
-const STANDARD_THRESHOLD = floatEnv('GEN_STANDARD_THRESHOLD', 40);
+// Raised 40 → 45 so only genuinely large requirements (long text, many AC,
+// multi-step flows) reach COMPREHENSIVE. A simple login (short text, a few AC,
+// default coverage types) now lands in STANDARD, keeping it on the lean budget.
+const STANDARD_THRESHOLD = floatEnv('GEN_STANDARD_THRESHOLD', 45);
 
 /**
  * Gap-analysis complexity gate (Test Case Lab fix — Priority 3 / "D").
@@ -121,6 +141,18 @@ const STANDARD_THRESHOLD = floatEnv('GEN_STANDARD_THRESHOLD', 40);
  * multi-step checkout, approval workflows). Env-overridable.
  */
 const GAP_ANALYSIS_MIN_COMPLEXITY = floatEnv('GEN_GAP_ANALYSIS_MIN_COMPLEXITY', 35);
+
+/**
+ * Scenario Planner (QA-first architecture). When enabled, a deterministic,
+ * LLM-free planner (see scenario-planner.ts + qa-knowledge-engine.ts) decides
+ * the baseline scenarios a requirement should cover and injects them into the
+ * generation prompt as a plan to EXPAND. The LLM becomes the enrichment step,
+ * not the inventor — improving consistency and letting us run a tighter output
+ * budget. Default ON; set GEN_SCENARIO_PLANNER=false to fall back to the legacy
+ * plan-free prompt. Grounding is never overridden — planned scenarios are
+ * candidates the LLM keeps only if the requirement/context supports them.
+ */
+const SCENARIO_PLANNER_ENABLED = (process.env.GEN_SCENARIO_PLANNER || 'true').toLowerCase() !== 'false';
 
 /** Signals used to classify requirement complexity — all cheap to compute, ZERO LLM calls. */
 export interface ComplexitySignals {
@@ -735,13 +767,24 @@ Do NOT invent placeholder data (john@test.com, password123, ABC Product) when a 
    * observable signals — never spend model tokens deciding whether to spend model
    * tokens. The budget then becomes proportional to the work requested.
    *
-   * Promotion rules (any single "large" trigger wins):
-   *   COMPREHENSIVE — requirement > 1500 chars, OR ≥9 acceptance criteria, OR ≥7
-   *                   business-flow steps, OR ≥6 coverage types, OR ≥3 intelligence
-   *                   sources (rich grounding context deserves the full budget).
-   *   FAST          — small on every axis: <500 chars, ≤3 AC, ≤2 flow steps,
-   *                   ≤2 coverage types, ≤1 intelligence source.
-   *   STANDARD      — everything in between.
+   * Philosophy: complexity is an INTRINSIC property of the requirement (how much
+   * real testable surface it describes), NOT of how many coverage types the user
+   * happened to tick. Requirement size and acceptance-criteria density dominate the
+   * score; coverage-type count and intelligence-source count are minor signals (they
+   * express user intent / available grounding, not inherent complexity).
+   *
+   * The score is a WEIGHTED COMPOSITE (not single-trigger promotion): each signal is
+   * normalized to 0-100, multiplied by its weight (see COMPLEXITY_WEIGHTS), and summed.
+   * Default weights: requirementChars 0.40, acceptanceCriteria 0.25, businessFlow 0.15,
+   * coverageTypes 0.10, intelligenceSources 0.10.
+   *
+   * Tier thresholds (env-overridable):
+   *   FAST          — composite < 25   (e.g. "User Login", small password reset)
+   *   STANDARD      — 25 ≤ composite < 45 (typical single-feature requirement)
+   *   COMPREHENSIVE — composite ≥ 45   (large multi-step flows: detailed checkout,
+   *                   epic requirements with many AC / flow steps)
+   * A short requirement can no longer be forced to COMPREHENSIVE just by selecting
+   * many coverage types — those only nudge the score by up to 10%.
    */
   estimateComplexity(
     input: RequirementInput,
@@ -781,9 +824,11 @@ Do NOT invent placeholder data (john@test.com, password123, ABC Product) when a 
     //   • coverage types: 5 types ≈ comprehensive testing (positive+negative+edge+boundary+security)
     //   • flow steps: 6 steps ≈ multi-step workflow
     //   • sources: 4 ≈ heavy intelligence use (modules + enterprise + profile + testData)
-    // With these caps + weights (0.40 coverage, 0.40 AC), a requirement hits
-    // COMPREHENSIVE when it requests significant testing work (4-5+ types OR 6+ AC)
-    // even if the prose is short. Tune from telemetry after collecting data.
+    // With these caps + the size-driven weights (0.40 chars, 0.25 AC, 0.15 flow,
+    // 0.10 coverage, 0.10 sources), the tier is dominated by how much the requirement
+    // actually describes. A short requirement stays FAST/STANDARD even with many
+    // coverage types selected; only genuinely large/detailed requirements (long prose,
+    // many AC, multi-step flows) reach COMPREHENSIVE. Tune from telemetry over time.
     const charScore = Math.min(100, (requirementChars / 1200) * 100);
     const acScore = Math.min(100, (acceptanceCriteriaCount / 8) * 100);
     const coverageScore = Math.min(100, (coverageTypeCount / 5) * 100);
@@ -1101,6 +1146,29 @@ Return ONLY valid JSON, no markdown fences.`;
       return `  ${i + 1}. ${g.label}  (use coverageType: "${ct}")\n       Goal: ${g.goal}\n       Look for: ${g.lookFor}`;
     }).join('\n');
 
+    // ── Deterministic Scenario Plan (QA-first) ──
+    // Before the LLM runs, plan the baseline scenarios this feature category
+    // implies (zero tokens). The plan is injected into the prompt as a set of
+    // scenarios to EXPAND, so the LLM enriches known-good QA obligations instead
+    // of re-deriving them. Filtered to the user's selected coverage types and
+    // never overrides grounding. Empty block ('') for unknown categories → the
+    // prompt is byte-for-byte the legacy prompt (safe fallback).
+    let scenarioPlanBlock = '';
+    let scenarioPlan: ScenarioPlan | undefined;
+    if (SCENARIO_PLANNER_ENABLED) {
+      scenarioPlan = planScenarios(input, coverageTypes, analysis.featureType);
+      scenarioPlanBlock = buildScenarioPlanBlock(scenarioPlan);
+      logger.info(MOD, 'Scenario plan built', {
+        category: scenarioPlan.classification.category,
+        confidence: scenarioPlan.classification.confidence,
+        planned: scenarioPlan.scenarios.length,
+        grounded: scenarioPlan.groundedCount,
+        conditional: scenarioPlan.conditionalCount,
+        knowledgeVersion: scenarioPlan.knowledgeVersion,
+        applied: scenarioPlanBlock.length > 0,
+      });
+    }
+
     // ── Mode-specific scope guidance ──
     // STANDARD (default): committed coverage grounded in requirement + context
     //   (App Knowledge, App Profile, Test Data). No assumptions.
@@ -1135,7 +1203,7 @@ ${scopeBlock}
 
 COVERAGE OBJECTIVES — the user explicitly selected these. Treat EACH as a separate, independent objective; every one MUST be addressed in the output:
 ${coverageObjectives}
-
+${scenarioPlanBlock}
 HOW A SENIOR QA ENGINEER REASONS — follow these phases INTERNALLY before you emit JSON (do NOT output your reasoning, only the final JSON):
 
   PHASE 1 — EXTRACT TEST OBLIGATIONS from the Acceptance Criteria.
