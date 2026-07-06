@@ -2,7 +2,7 @@
  * Unit tests for the Intelligence Provider Registry.
  *
  * Locks: dupe-safe register, priority ordering, enabled() filtering, fail-open
- * gatherAll, and centralized confidence attachment.
+ * gatherAll, and centralized (generic) confidence attachment.
  *
  * Run with: npx jest tests/unit/provider-registry.test.ts
  */
@@ -10,9 +10,9 @@
 import { ProviderRegistry } from '../../src/services/provider-registry';
 import type {
   IntelligenceProvider,
-  IntelligenceQuery,
   IntelligenceResult,
 } from '../../src/services/intelligence-provider';
+import type { IntelligenceQuery } from '../../src/services/intelligence-provider';
 
 const query: IntelligenceQuery = {
   intent: 'Login',
@@ -24,14 +24,17 @@ const query: IntelligenceQuery = {
 function fakeProvider(
   name: string,
   opts: {
+    version?: number;
     priority?: number;
     enabled?: boolean;
     result?: Partial<IntelligenceResult>;
     throwOnGather?: boolean;
   } = {},
 ): IntelligenceProvider {
+  const version = opts.version ?? 1;
   return {
     name,
+    version,
     priority: opts.priority ?? 50,
     enabled: () => opts.enabled ?? true,
     async gather(): Promise<IntelligenceResult> {
@@ -41,6 +44,7 @@ function fakeProvider(
         context: { name },
         metadata: {
           provider: name,
+          providerVersion: version,
           durationMs: 1,
           cacheHit: false,
           items: 1,
@@ -97,9 +101,16 @@ describe('ProviderRegistry — ordering', () => {
     const r = new ProviderRegistry();
     const bad: IntelligenceProvider = {
       name: 'bad',
+      version: 1,
       priority: 1,
       enabled: () => { throw new Error('nope'); },
-      async gather() { return { available: true, context: {}, metadata: { provider: 'bad', durationMs: 0, cacheHit: false, items: 0, warnings: [], signals: {} } }; },
+      async gather() {
+        return {
+          available: true,
+          context: {},
+          metadata: { provider: 'bad', providerVersion: 1, durationMs: 0, cacheHit: false, items: 0, warnings: [], signals: {} },
+        };
+      },
     };
     r.register(bad);
     expect(r.listEnabled()).toEqual([]);
@@ -117,11 +128,12 @@ describe('ProviderRegistry — gatherAll', () => {
           context: { ok: true },
           metadata: {
             provider: 'scenarioGraph',
+            providerVersion: 1,
             durationMs: 1,
             cacheHit: false,
             items: 2,
             warnings: [],
-            signals: { groundedCount: 2 },
+            signals: { grounding: 1, coverage: 0.5 },
           },
         },
       }),
@@ -131,14 +143,14 @@ describe('ProviderRegistry — gatherAll', () => {
 
     // Disabled provider skipped
     expect(results.has('off')).toBe(false);
-    // Confidence computed centrally from signals (60 + 2*5 = 70)
-    expect(results.get('scenarioGraph')!.confidence).toBe(70);
+    // Confidence computed centrally & generically from signals: avg(1, 0.5)*100 = 75
+    expect(results.get('scenarioGraph')!.confidence).toBe(75);
   });
 
   it('is fail-open: a throwing provider yields an unavailable result, not a crash', async () => {
     const r = new ProviderRegistry();
     r.register(fakeProvider('good'));
-    r.register(fakeProvider('bad', { throwOnGather: true }));
+    r.register(fakeProvider('bad', { throwOnGather: true, version: 3 }));
 
     const results = await r.gatherAll(query);
 
@@ -146,13 +158,13 @@ describe('ProviderRegistry — gatherAll', () => {
     const bad = results.get('bad')!;
     expect(bad.available).toBe(false);
     expect(bad.confidence).toBe(0);
+    expect(bad.metadata.providerVersion).toBe(3); // version preserved in the fail-open result
     expect(bad.metadata.warnings.join(' ')).toMatch(/boom/);
   });
 });
 
 describe('ProviderRegistry — default singleton', () => {
   it('registers the Scenario Graph provider by default', () => {
-    // Fresh require to exercise registerDefaultProviders
     jest.isolateModules(() => {
       const { getProviderRegistry } = require('../../src/services/provider-registry');
       const registry = getProviderRegistry();

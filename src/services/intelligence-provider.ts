@@ -17,20 +17,27 @@
  *    Providers declare when they should run relative to others; the registry
  *    orders execution. No source-specific ordering baked into the orchestrator.
  *
- * 2. Metadata is STANDARDIZED (`provider`, `durationMs`, `cacheHit`, `items`,
- *    `warnings`, `signals`). Every provider reports the same diagnostics, so the
- *    dashboard can render provider telemetry uniformly without special-casing.
+ * 2. `version` lives on the provider. Bump it when a provider's behavior /
+ *    signal shape changes. It's echoed into metadata so production diagnostics
+ *    can attribute results to a specific provider revision.
  *
- * 3. Confidence is NOT computed by the provider. Providers emit raw `signals`
- *    (facts: counts, grounded ratios, freshness). The orchestration layer
- *    computes a single, consistent confidence from those signals
- *    (see `intelligence-confidence.ts`). This prevents every provider from
- *    inventing its own scoring model that drifts over time.
+ * 3. Metadata is STANDARDIZED (`provider`, `providerVersion`, `durationMs`,
+ *    `cacheHit`, `items`, `warnings`, `signals`). Every provider reports the
+ *    same diagnostics, so the dashboard can render provider telemetry uniformly.
+ *
+ * 4. Confidence is NOT computed by the provider. Providers emit standardized,
+ *    NORMALIZED quality `signals` (grounding, coverage, freshness … each 0-1).
+ *    The orchestration layer computes a single confidence from those signals
+ *    *generically* (see `intelligence-confidence.ts`) — it does NOT branch per
+ *    provider. Providers own their domain facts (only Scenario Graph knows what
+ *    "grounded" means); the orchestrator owns how quality → confidence, so
+ *    scoring stays consistent and the orchestrator never becomes a per-source
+ *    scoring engine.
  *
  * Discipline:
  *   • Pure interface — no implementation here.
  *   • Providers return domain-specific context types (RepositoryContext,
- *     ScenarioContextBundle, etc.) — NOT raw internal structures.
+ *     ScenarioContext, etc.) — NOT raw internal structures.
  *   • Consumers (Script Gen, Healing, RTM) never import providers directly;
  *     they only read the unified Intelligence Bundle the Orchestrator produces.
  */
@@ -66,14 +73,30 @@ export interface IntelligenceVersion {
 }
 
 /**
- * Raw, provider-emitted facts used by the centralized confidence scorer.
+ * Standardized, NORMALIZED quality signals a provider emits about its result.
  *
- * Providers put *facts* here (e.g., `{ scenarioCount: 8, groundedCount: 5 }`),
- * NOT scores. The orchestration layer turns signals into a confidence number.
- * Keep keys stable — the scorer switches on `metadata.provider` + these keys.
+ * These are *facts about quality*, each in the range **0-1**, NOT a confidence
+ * score. The centralized scorer combines whichever dimensions are present into
+ * a final confidence — generically, without knowing which provider produced
+ * them. Providers set only the dimensions they can honestly measure; the rest
+ * stay `undefined` and are simply ignored by the scorer.
+ *
+ * Standard dimensions (extend deliberately, keep them normalized 0-1):
+ *   • grounding    — fraction of the result backed by real evidence
+ *                    (e.g., scenarios grounded in App Profile / Test Data).
+ *   • coverage     — how completely the result covers the requested space.
+ *   • freshness    — how recent the underlying data is (1 = just built).
+ *   • completeness — how fully the source answered (vs. partial/degraded).
+ *
+ * The index signature allows a provider to attach extra normalized dimensions
+ * without a contract change; the scorer only scores known weighted dimensions.
  */
-export interface IntelligenceSignals {
-  [key: string]: number | boolean | string | null | undefined;
+export interface QualitySignals {
+  grounding?: number;
+  coverage?: number;
+  freshness?: number;
+  completeness?: number;
+  [dimension: string]: number | undefined;
 }
 
 /**
@@ -86,16 +109,18 @@ export interface IntelligenceSignals {
 export interface IntelligenceMetadata {
   /** Provider name (mirrors `IntelligenceProvider.name`). */
   provider: string;
+  /** Provider revision (mirrors `IntelligenceProvider.version`). */
+  providerVersion: number;
   /** Wall-clock time to gather this source (ms). */
   durationMs: number;
-  /** Whether the result was served from cache / reused (vs. freshly built). */
+  /** Whether the result was served from cache / reused (operational telemetry). */
   cacheHit: boolean;
   /** Number of items gathered (scenarios, elements, patterns, …). */
   items: number;
   /** Non-fatal issues encountered during gathering. */
   warnings: string[];
-  /** Raw facts for centralized confidence scoring (NOT a score). */
-  signals: IntelligenceSignals;
+  /** Standardized normalized quality signals for the centralized scorer. */
+  signals: QualitySignals;
   /** Which snapshot of the source was used (fingerprint, crawledAt, etc.). */
   version?: IntelligenceVersion;
 }
@@ -107,7 +132,7 @@ export interface IntelligenceMetadata {
 export interface IntelligenceResult<TContext = unknown> {
   /** Whether this source returned usable data. */
   available: boolean;
-  /** Domain-specific context (RepositoryContext, ScenarioContextBundle, …). */
+  /** Domain-specific context (RepositoryContext, ScenarioContext, …). */
   context: TContext | null;
   /** Standardized per-gather diagnostics. */
   metadata: IntelligenceMetadata;
@@ -134,6 +159,12 @@ export interface IntelligenceProvider<TContext = unknown> {
   readonly name: string;
 
   /**
+   * Provider revision. Bump when behavior or emitted signal shape changes.
+   * Surfaced in metadata for production diagnostics / A-B attribution.
+   */
+  readonly version: number;
+
+  /**
    * Execution priority. **Lower runs first.** Lets the registry order sources
    * deterministically without the orchestrator hardcoding sequence.
    * Convention: foundational/context sources (repository, app profile) use
@@ -150,17 +181,19 @@ export interface IntelligenceProvider<TContext = unknown> {
   /**
    * Gather intelligence for the given query. Fail-open: errors are caught and
    * returned as `available: false` with a warning — never thrown. Providers
-   * populate `metadata.signals` with facts but do NOT compute `confidence`.
+   * populate `metadata.signals` with normalized quality facts but do NOT
+   * compute `confidence`.
    */
   gather(query: IntelligenceQuery): Promise<IntelligenceResult<TContext>>;
 }
 
 /**
- * Small helper for providers to build a standardized "unavailable" result with
- * consistent metadata — avoids each provider hand-rolling the empty shape.
+ * Small helper for providers/registry to build a standardized "unavailable"
+ * result with consistent metadata — avoids hand-rolling the empty shape.
  */
 export function unavailableResult(
   provider: string,
+  providerVersion: number,
   warning: string,
   durationMs = 0,
 ): IntelligenceResult<never> {
@@ -169,6 +202,7 @@ export function unavailableResult(
     context: null,
     metadata: {
       provider,
+      providerVersion,
       durationMs,
       cacheHit: false,
       items: 0,

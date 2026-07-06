@@ -259,25 +259,23 @@ describe('Architecture Contract: Provider Pattern', () => {
     expect(content).toContain('IntelligenceProvider');
     expect(content).toContain('implements IntelligenceProvider');
 
-    // Check that it satisfies the FULL contract: name, priority, enabled(), gather()
+    // Check that it satisfies the FULL contract: name, version, priority, enabled(), gather()
     expect(content).toContain('readonly name =');
+    expect(content).toContain('readonly version =');
     expect(content).toContain('readonly priority =');
     expect(content).toContain('enabled(): boolean');
     expect(content).toContain('async gather(');
   });
 
-  it('ensures the provider returns ScenarioContext slices (not the raw ScenarioGraph)', () => {
+  it('ensures the provider returns ScenarioContext (not the raw ScenarioGraph)', () => {
     const providerPath = path.join(SRC_ROOT, 'services/scenario-graph-provider.ts');
     const content = fs.readFileSync(providerPath, 'utf-8');
 
-    // Composable context slices should be exported
+    // ScenarioContext should be exported (single flat type — not split yet, YAGNI)
     expect(content).toContain('export interface ScenarioContext');
-    expect(content).toContain('export interface ScenarioExecutionContext');
-    expect(content).toContain('export interface ScenarioCoverageContext');
-    expect(content).toContain('export interface ScenarioImpactContext');
 
-    // The gather return type should be the composed bundle, not ScenarioGraph
-    expect(content).toContain('IntelligenceProvider<ScenarioContextBundle>');
+    // The gather return type should be ScenarioContext, not ScenarioGraph
+    expect(content).toContain('IntelligenceProvider<ScenarioContext>');
   });
 
   it('ensures providers do NOT compute confidence (centralized in the scorer)', () => {

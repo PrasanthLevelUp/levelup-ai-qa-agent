@@ -129,6 +129,7 @@ export class ProviderRegistry {
         });
         result = unavailableResult(
           provider.name,
+          provider.version,
           `Provider error: ${err?.message || 'unknown'}`,
           Date.now() - startMs,
         );

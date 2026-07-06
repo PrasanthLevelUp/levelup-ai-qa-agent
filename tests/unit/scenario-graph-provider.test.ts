@@ -2,8 +2,9 @@
  * Unit tests for Scenario Graph Intelligence Provider.
  *
  * These tests lock the provider contract: fail-open, feature-gated via
- * enabled(), returns a ScenarioContextBundle (NOT raw graph), emits raw signals
- * (NOT confidence — that's centralized), and topological sort.
+ * enabled(), returns a flat ScenarioContext (NOT raw graph), carries a version,
+ * and emits standardized normalized quality signals (grounding/coverage) —
+ * NOT confidence (that's centralized).
  *
  * Run with: npx jest tests/unit/scenario-graph-provider.test.ts
  */
@@ -48,8 +49,9 @@ describe('ScenarioGraphProvider', () => {
   /*  Contract shape                                                     */
   /* ================================================================== */
 
-  it('satisfies the IntelligenceProvider contract (name, priority, enabled)', () => {
+  it('satisfies the IntelligenceProvider contract (name, version, priority, enabled)', () => {
     expect(provider.name).toBe('scenarioGraph');
+    expect(typeof provider.version).toBe('number');
     expect(typeof provider.priority).toBe('number');
     expect(typeof provider.enabled).toBe('function');
   });
@@ -75,6 +77,7 @@ describe('ScenarioGraphProvider', () => {
     expect(result.available).toBe(false);
     expect(result.context).toBeNull();
     expect(result.metadata.provider).toBe('scenarioGraph');
+    expect(result.metadata.providerVersion).toBe(provider.version);
     expect(result.metadata.signals).toEqual({});
     expect(result.metadata.warnings).toContain('Feature flag SCENARIO_GRAPH_PROVIDER is off');
     expect(mockGetOrBuildScenarioGraph).not.toHaveBeenCalled();
@@ -111,7 +114,7 @@ describe('ScenarioGraphProvider', () => {
   /*  Successful gather                                                  */
   /* ================================================================== */
 
-  it('returns a ScenarioContextBundle (not raw graph) when graph is available', async () => {
+  it('returns a flat ScenarioContext (not raw graph) when graph is available', async () => {
     process.env.SCENARIO_GRAPH_PROVIDER = 'true';
 
     const mockGraph = {
@@ -154,13 +157,11 @@ describe('ScenarioGraphProvider', () => {
     expect(result.available).toBe(true);
     expect(result.context).not.toBeNull();
 
-    const { base, execution, coverage, impact } = result.context!;
-
-    // Base slice
-    expect(base.scenarioCount).toBe(2);
-    expect(base.groundedCount).toBe(2);
-    expect(base.scenarios).toHaveLength(2);
-    expect(base.scenarios[0]).toEqual({
+    const ctx = result.context!;
+    expect(ctx.scenarioCount).toBe(2);
+    expect(ctx.groundedCount).toBe(2);
+    expect(ctx.scenarios).toHaveLength(2);
+    expect(ctx.scenarios[0]).toEqual({
       id: 'TC1',
       title: 'Login Success',
       objective: 'authenticate',
@@ -173,32 +174,28 @@ describe('ScenarioGraphProvider', () => {
       grounded: true,
     });
 
-    // Coverage slice — variants + coverageByType histogram
-    expect(coverage.variants).toHaveLength(1);
-    expect(coverage.variants[0]).toEqual({
+    // Variants extracted
+    expect(ctx.variants).toHaveLength(1);
+    expect(ctx.variants[0]).toEqual({
       scenarioId: 'TC2',
       variantOf: 'TC1',
       reason: 'negative variant',
     });
-    expect(coverage.coverageByType).toEqual({ positive: 1, negative: 1 });
 
-    // Execution + impact slices present
-    expect(execution.dependencies).toEqual([]);
-    expect(impact.affectedModules).toEqual([]);
+    // No raw graph fields leaked
+    expect((ctx as any).nodes).toBeUndefined();
+    expect((ctx as any).edges).toBeUndefined();
+    expect((ctx as any).fingerprint).toBeUndefined();
 
-    // No raw graph fields leaked anywhere in the bundle
-    expect((base as any).nodes).toBeUndefined();
-    expect((base as any).edges).toBeUndefined();
-    expect((result.context as any).fingerprint).toBeUndefined();
-
-    // Metadata: standardized shape, signals (not confidence)
+    // Metadata: standardized shape, version, normalized quality signals (not confidence)
     expect(result.metadata.provider).toBe('scenarioGraph');
+    expect(result.metadata.providerVersion).toBe(provider.version);
     expect(result.metadata.items).toBe(2);
     expect(result.metadata.cacheHit).toBe(false); // origin was 'built'
-    expect(result.metadata.signals).toEqual({ scenarioCount: 2, groundedCount: 2 });
+    // grounding = 2/2 = 1; coverage = 2 distinct types / 4 requested = 0.5
+    expect(result.metadata.signals).toEqual({ grounding: 1, coverage: 0.5 });
     expect(result.metadata.version?.fingerprint).toBe('abc123');
     expect(result.metadata.durationMs).toBeGreaterThanOrEqual(0);
-    // Provider does not compute confidence
     expect(result.confidence).toBeUndefined();
   });
 
@@ -227,7 +224,7 @@ describe('ScenarioGraphProvider', () => {
   });
 
   /* ================================================================== */
-  /*  Dependencies & topological sort (execution slice)                  */
+  /*  Dependencies & topological sort                                    */
   /* ================================================================== */
 
   it('extracts dependencies and computes precedence order', async () => {
@@ -279,21 +276,21 @@ describe('ScenarioGraphProvider', () => {
     const result = await provider.gather(baseQuery);
 
     expect(result.available).toBe(true);
-    const { execution } = result.context!;
-    expect(execution.dependencies).toHaveLength(2);
-    expect(execution.dependencies).toContainEqual({
+    const ctx = result.context!;
+    expect(ctx.dependencies).toHaveLength(2);
+    expect(ctx.dependencies).toContainEqual({
       scenarioId: 'TC2',
       dependsOn: ['TC1'],
       reason: 'requires login first',
     });
-    expect(execution.dependencies).toContainEqual({
+    expect(ctx.dependencies).toContainEqual({
       scenarioId: 'TC3',
       dependsOn: ['TC1'],
       reason: 'requires login first',
     });
 
     // Precedence: TC1 must come before TC2 and TC3
-    expect(execution.precedence).toEqual(['TC1', 'TC2', 'TC3']);
+    expect(ctx.precedence).toEqual(['TC1', 'TC2', 'TC3']);
   });
 
   it('returns original order when no dependencies exist', async () => {
@@ -335,8 +332,8 @@ describe('ScenarioGraphProvider', () => {
     const result = await provider.gather(baseQuery);
 
     expect(result.available).toBe(true);
-    expect(result.context!.execution.dependencies).toHaveLength(0);
-    expect(result.context!.execution.precedence).toEqual(['TC1', 'TC2']); // Original order
+    expect(result.context!.dependencies).toHaveLength(0);
+    expect(result.context!.precedence).toEqual(['TC1', 'TC2']); // Original order
   });
 
   /* ================================================================== */
@@ -383,10 +380,10 @@ describe('ScenarioGraphProvider', () => {
   });
 
   /* ================================================================== */
-  /*  Signals for centralized scoring                                    */
+  /*  Standardized quality signals for centralized scoring               */
   /* ================================================================== */
 
-  it('emits grounded/scenario signals for the centralized scorer', async () => {
+  it('emits normalized grounding/coverage signals (not confidence)', async () => {
     process.env.SCENARIO_GRAPH_PROVIDER = 'true';
 
     const mockGraph = {
@@ -425,7 +422,10 @@ describe('ScenarioGraphProvider', () => {
     const result = await provider.gather(baseQuery);
 
     expect(result.available).toBe(true);
-    expect(result.context!.base.groundedCount).toBe(1);
-    expect(result.metadata.signals).toEqual({ scenarioCount: 2, groundedCount: 1 });
+    expect(result.context!.groundedCount).toBe(1);
+    // grounding = 1/2 = 0.5; coverage = 1 distinct type / 4 requested = 0.25
+    expect(result.metadata.signals).toEqual({ grounding: 0.5, coverage: 0.25 });
+    // Provider does not compute confidence
+    expect(result.confidence).toBeUndefined();
   });
 });

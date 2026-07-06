@@ -2,65 +2,73 @@
  * Centralized Intelligence Confidence Scorer
  * ============================================================================
  *
- * Confidence is computed HERE — in the orchestration layer — NOT inside each
- * provider. Providers emit raw `signals` (facts); this module turns those facts
- * into a single, consistent confidence number.
+ * Confidence is computed HERE — in the orchestration layer — from the
+ * standardized quality `signals` each provider emits. It is **generic**: it
+ * does NOT branch on provider name. Providers own their domain facts and
+ * normalize them into standard 0-1 quality dimensions (grounding, coverage,
+ * freshness, completeness); this scorer combines whatever dimensions are
+ * present into a single 0-100 confidence.
  *
- * Why centralize?
- *   • Consistency: one place defines what "80% confident" means. If every
- *     provider invented its own formula, scores would drift and become
- *     incomparable across sources.
- *   • Evolvability: tuning the scoring model (or making it data-driven) is a
- *     single-file change, not a sweep across every provider.
- *   • Testability: the scorer is a pure function of (provider, signals).
- *
- * Adding a new provider's scoring is a small, isolated switch branch here.
+ * Why this shape (Phase 2 review)?
+ *   • Providers keep the knowledge only they have (what "grounded" means for a
+ *     scenario graph, "embedding distance" for a repo, "pages crawled" for an
+ *     app profile) — they express it as normalized quality signals.
+ *   • The orchestrator stays a THIN, consistent combiner. It never grows a
+ *     giant per-source scoring switch, so scores remain comparable across
+ *     sources and tuning is a one-file change.
+ *   • Testable: pure function of `signals`.
  */
 
-import type { IntelligenceMetadata, IntelligenceResult } from './intelligence-provider';
+import type { IntelligenceResult, QualitySignals } from './intelligence-provider';
 
-/** Clamp a number into the inclusive 0-100 range. */
-function clamp0to100(n: number): number {
+/**
+ * Relative weights for the standard quality dimensions. Unknown dimensions in
+ * `signals` are ignored (a provider may attach extras, but only weighted ones
+ * affect the score). Tuning confidence = editing this map, nothing else.
+ */
+export const QUALITY_WEIGHTS: Record<string, number> = {
+  grounding: 1,
+  coverage: 1,
+  freshness: 1,
+  completeness: 1,
+};
+
+/** Clamp into the inclusive 0-1 range; non-finite → 0. */
+function clamp01(n: number): number {
   if (!Number.isFinite(n)) return 0;
-  return Math.max(0, Math.min(100, Math.round(n)));
+  return Math.max(0, Math.min(1, n));
 }
 
 /**
- * Read a numeric signal safely (missing / non-numeric → 0).
- */
-function num(signals: IntelligenceMetadata['signals'], key: string): number {
-  const v = signals[key];
-  return typeof v === 'number' && Number.isFinite(v) ? v : 0;
-}
-
-/**
- * Compute confidence (0-100) for a gather result from its provider name and
- * raw signals. Unknown providers or unavailable results score 0.
+ * Compute confidence (0-100) generically from normalized quality signals.
  *
- * Scoring models per source (kept explicit so it's auditable):
- *
- *   scenarioGraph:
- *     - Ungrounded (no scenario backed by real App Profile / Test Data) → 0.
- *       Advisory-only context should never claim confidence.
- *     - Otherwise 60 base + 5 per grounded scenario, capped at 100.
- *       (Identical to the previous provider-local formula — relocated, not changed.)
+ * Rules (provider-agnostic):
+ *   • If no weighted quality dimension is present → 0 (advisory only; we don't
+ *     invent confidence from nothing).
+ *   • Hard floor: if `grounding` is present and 0 → 0. A source with zero
+ *     grounding is never confident, regardless of other dimensions.
+ *   • Otherwise: weighted average of the present dimensions, scaled to 0-100.
  */
-export function computeConfidence(metadata: IntelligenceMetadata): number {
-  const { provider, signals } = metadata;
+export function computeConfidence(signals: QualitySignals | undefined | null): number {
+  if (!signals) return 0;
 
-  switch (provider) {
-    case 'scenarioGraph': {
-      const grounded = num(signals, 'groundedCount');
-      if (grounded <= 0) return 0;
-      return clamp0to100(60 + grounded * 5);
-    }
-
-    // Future providers register their scoring model here. Until then, a source
-    // that emits no known signals is treated as advisory (0) rather than
-    // guessing a number.
-    default:
-      return 0;
+  // A source that explicitly measured zero grounding is not confident.
+  if (typeof signals.grounding === 'number' && clamp01(signals.grounding) <= 0) {
+    return 0;
   }
+
+  let weightedSum = 0;
+  let weightTotal = 0;
+  for (const [dimension, weight] of Object.entries(QUALITY_WEIGHTS)) {
+    const raw = signals[dimension];
+    if (typeof raw === 'number' && Number.isFinite(raw)) {
+      weightedSum += clamp01(raw) * weight;
+      weightTotal += weight;
+    }
+  }
+
+  if (weightTotal === 0) return 0; // no recognized quality dimensions
+  return Math.round((weightedSum / weightTotal) * 100);
 }
 
 /**
@@ -69,6 +77,6 @@ export function computeConfidence(metadata: IntelligenceMetadata): number {
  * the registry uses so providers never set confidence themselves.
  */
 export function scoreResult<T>(result: IntelligenceResult<T>): IntelligenceResult<T> {
-  result.confidence = result.available ? computeConfidence(result.metadata) : 0;
+  result.confidence = result.available ? computeConfidence(result.metadata.signals) : 0;
   return result;
 }
