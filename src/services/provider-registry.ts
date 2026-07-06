@@ -160,13 +160,15 @@ export function getProviderRegistry(): ProviderRegistry {
 }
 
 /**
- * Wire up the built-in providers. Kept intentionally tiny: this PR registers
- * ONLY the Scenario Graph provider. Future PRs add Repository, App Profile,
- * Knowledge, DOM Memory, etc. — one provider per PR to bound regression risk.
+ * Wire up the built-in providers. This PR (#241/#2.5) registers Scenario Graph
+ * and Repository. Future PRs add Knowledge, Similarity, Patterns, App Profile,
+ * DOM Memory, etc. — one provider per PR to bound regression risk.
  */
 function registerDefaultProviders(registry: ProviderRegistry): void {
   // Lazy import avoids a static import cycle (provider → registry → provider).
   const { getScenarioGraphProvider } = require('./scenario-graph-provider');
+  const { getRepositoryProvider } = require('./repository-provider');
+  registry.register(getRepositoryProvider());
   registry.register(getScenarioGraphProvider());
 }
 

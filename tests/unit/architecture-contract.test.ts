@@ -288,7 +288,7 @@ describe('Architecture Contract: Provider Pattern', () => {
     expect(content).not.toMatch(/confidence\s*[:=]/);
   });
 
-  it('ensures the Provider Registry registers the Scenario Graph provider', () => {
+  it('ensures the Provider Registry registers the Scenario Graph and Repository providers', () => {
     const registryPath = path.join(SRC_ROOT, 'services/provider-registry.ts');
     const content = fs.readFileSync(registryPath, 'utf-8');
 
@@ -296,5 +296,43 @@ describe('Architecture Contract: Provider Pattern', () => {
     expect(content).toContain('register(');
     expect(content).toContain('gatherAll(');
     expect(content).toContain('getScenarioGraphProvider');
+    expect(content).toContain('getRepositoryProvider');
+  });
+
+  it('verifies RepositoryProvider satisfies the provider contract', () => {
+    const providerPath = path.join(SRC_ROOT, 'services/repository-provider.ts');
+    const content = fs.readFileSync(providerPath, 'utf-8');
+
+    // Check that it imports and implements the interface
+    expect(content).toContain('IntelligenceProvider');
+    expect(content).toContain('implements IntelligenceProvider');
+
+    // Check that it satisfies the FULL contract: name, version, priority, enabled(), gather()
+    expect(content).toContain('readonly name =');
+    expect(content).toContain('readonly version =');
+    expect(content).toContain('readonly priority =');
+    expect(content).toContain('enabled(): boolean');
+    expect(content).toContain('async gather(');
+  });
+
+  it('ensures RepositoryProvider returns RepositoryContext (not raw DB rows)', () => {
+    const providerPath = path.join(SRC_ROOT, 'services/repository-provider.ts');
+    const content = fs.readFileSync(providerPath, 'utf-8');
+
+    // RepositoryContext should be exported
+    expect(content).toContain('export interface RepositoryContext');
+
+    // The gather return type should be RepositoryContext, not raw DB types
+    expect(content).toContain('IntelligenceProvider<RepositoryContext>');
+  });
+
+  it('ensures RepositoryProvider does NOT compute confidence (centralized)', () => {
+    const providerPath = path.join(SRC_ROOT, 'services/repository-provider.ts');
+    const content = fs.readFileSync(providerPath, 'utf-8');
+
+    // Provider should return quality signals...
+    expect(content).toContain('signals:');
+    // ...and must NOT assign a confidence itself.
+    expect(content).not.toMatch(/confidence\s*[:=]/);
   });
 });
