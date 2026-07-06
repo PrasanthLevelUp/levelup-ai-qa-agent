@@ -50,6 +50,8 @@ import { FEATURE_FLAGS } from '../config/features';
 import { logger } from '../utils/logger';
 import { getRepositoryProvider } from './repository-provider';
 import { evaluateRepositoryEquivalence } from './repository-equivalence';
+import { isShadowActive } from './migration-state';
+import { recordProviderShadowMetric } from '../db/postgres';
 
 const MOD = 'intelligence-orchestrator';
 
@@ -442,7 +444,7 @@ export class IntelligenceOrchestrator {
         // the provider output is observed, never trusted, until the match rate
         // proves equivalence and legacy can be deleted. Fully fail-open: any
         // error here can never affect the production (legacy) result.
-        await this.runRepositoryDualPathShadow(query, repoGraph);
+        await this.runRepositoryDualPathShadow(query, repoGraph, timingsMs['repository'] ?? null);
       } else {
         missingCritical.push('repository-context-id');
       }
@@ -868,8 +870,11 @@ export class IntelligenceOrchestrator {
   private async runRepositoryDualPathShadow(
     query: OrchestratorQuery,
     legacyRepoGraph: IntentQueryResult,
+    legacyDurationMs: number | null,
   ): Promise<void> {
-    if (process.env.REPOSITORY_DUAL_PATH !== 'true') return;
+    // State-driven gate: shadow runs while migration mode is Shadow, and also
+    // while it is Provider (legacy kept as a rollback shadow) — see migration-state.
+    if (!isShadowActive('repository')) return;
     try {
       const providerResult = await getRepositoryProvider().gatherForDualPath({
         intent: query.intent,
@@ -879,11 +884,33 @@ export class IntelligenceOrchestrator {
         targetUrl: query.targetUrl,
         caller: query.caller,
       });
-      evaluateRepositoryEquivalence(
+      const { match, differences } = evaluateRepositoryEquivalence(
         legacyRepoGraph as IntentQueryResult & { healingEvidence?: { signals?: any } },
         providerResult.context,
         { intent: query.intent, caller: query.caller },
       );
+
+      // Persist a durable metric row (fail-open) so the Migration Report can
+      // aggregate match-rate + latency across restarts — logs alone are lossy.
+      const providerDurationMs =
+        typeof providerResult.metadata?.durationMs === 'number'
+          ? providerResult.metadata.durationMs
+          : null;
+      await recordProviderShadowMetric({
+        provider: 'repository',
+        providerVersion: providerResult.metadata?.providerVersion ?? null,
+        companyId: query.companyId ?? null,
+        projectId: query.projectId ?? null,
+        repoContextId: query.repoContextId ?? null,
+        intent: query.intent ?? null,
+        caller: query.caller ?? null,
+        matched: match,
+        differenceCount: differences.length,
+        // Cap the stored diff list so a pathological mismatch can't bloat the row.
+        differenceSummary: differences.slice(0, 20),
+        durationLegacyMs: legacyDurationMs,
+        durationProviderMs: providerDurationMs,
+      });
     } catch (err: any) {
       // Shadow comparison must never affect production. Log and move on.
       logger.warn(MOD, 'Repository dual-path shadow failed (non-critical)', {

@@ -337,16 +337,23 @@ describe('Architecture Contract: Provider Pattern', () => {
   });
 });
 
-describe('Architecture Contract: Migration Discipline (one provider at a time)', () => {
-  // The migration loop is: Provider → Register → Dual Path → Compare → Delete
-  // Legacy → Merge → Next Provider. We must NOT accumulate providers with no
-  // consumers. Until RepositoryProvider completes its dual-path cycle and legacy
-  // is deleted, NO further provider (Knowledge, Similarity, Patterns, App
-  // Profile, DOM) may be introduced/registered. This test fails loudly if
-  // someone adds the next provider prematurely.
-  const ALLOWED_PROVIDERS = new Set(['scenario-graph-provider', 'repository-provider']);
+describe('Architecture Contract: Migration Discipline (state-driven)', () => {
+  // The migration loop is: Provider → Register → Shadow → Metrics → 99.9% →
+  // Flip Provider → Delete Legacy → Merge → Next Provider. Discipline is now
+  // enforced from the MIGRATION_REGISTRY (services/migration-state) — the single
+  // source of truth for each source's phase — instead of a hardcoded allow-list
+  // that rots the moment a migration advances. The rules below verify the
+  // *current declared state*, so they keep protecting us as sources migrate
+  // without needing a test edit for every legitimate advance.
+  //
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const {
+    MIGRATION_REGISTRY,
+    sourcesMidMigration,
+    MigrationMode,
+  } = require('../../src/services/migration-state');
 
-  it('does not add a new *-provider module before Repository migration completes', () => {
+  it('every provider implementation declares its migration phase in the registry', () => {
     const serviceFiles = findTsFiles(path.join(SRC_ROOT, 'services'));
     // A "provider" here means a concrete implementation of the contract — i.e. a
     // module that `implements IntelligenceProvider`. The interface/infra modules
@@ -355,32 +362,66 @@ describe('Architecture Contract: Migration Discipline (one provider at a time)',
       .filter(f => fs.readFileSync(f, 'utf-8').includes('implements IntelligenceProvider'))
       .map(f => path.basename(f, '.ts'));
 
-    const unexpected = providerModules.filter(name => !ALLOWED_PROVIDERS.has(name));
-    if (unexpected.length > 0) {
+    const declaredModules = new Set(
+      Object.values(MIGRATION_REGISTRY).map((m: any) => m.module),
+    );
+    const undeclared = providerModules.filter(name => !declaredModules.has(name));
+    if (undeclared.length > 0) {
       throw new Error(
-        `❌ Migration discipline violation: unexpected provider module(s) added:\n` +
-          `  ${unexpected.join(', ')}\n\n` +
-          `Do NOT introduce another provider until RepositoryProvider has completed a full\n` +
-          `dual-path migration cycle (compare → prove equivalence → delete legacy → merge).\n` +
-          `If Repository migration is genuinely done, update ALLOWED_PROVIDERS in this test.`,
+        `❌ Migration discipline violation: provider module(s) with no declared phase:\n` +
+          `  ${undeclared.join(', ')}\n\n` +
+          `Every module that implements IntelligenceProvider MUST be declared in\n` +
+          `MIGRATION_REGISTRY (src/services/migration-state.ts) with its migration phase\n` +
+          `(legacy | shadow | provider). Add an entry describing where it is in its\n` +
+          `legacy → provider migration before registering it.`,
       );
     }
-    expect(unexpected).toEqual([]);
+    expect(undeclared).toEqual([]);
   });
 
-  it('registry registers exactly the two migrated/infra providers (no premature additions)', () => {
+  it('at most ONE source is mid-migration (shadow + legacy present) at a time', () => {
+    // This is the "one migration at a time" law. It naturally blocks introducing
+    // the next provider (Knowledge, Similarity, …) in Shadow while Repository is
+    // still mid-migration — enforced by STATE, not by hardcoded provider names.
+    const midFlight = sourcesMidMigration();
+    if (midFlight.length > 1) {
+      throw new Error(
+        `❌ Migration discipline violation: ${midFlight.length} sources are mid-migration:\n` +
+          `  ${midFlight.map((m: any) => m.key).join(', ')}\n\n` +
+          `Only ONE source may be in Shadow (with legacy still present) at a time.\n` +
+          `Complete the in-flight migration (reach the match-rate gate, flip to\n` +
+          `Provider, delete legacy) before starting the next one.`,
+      );
+    }
+    expect(midFlight.length).toBeLessThanOrEqual(1);
+  });
+
+  it('registry registers exactly the declared providers (no undeclared registrations)', () => {
     const registryPath = path.join(SRC_ROOT, 'services/provider-registry.ts');
     const content = fs.readFileSync(registryPath, 'utf-8');
     const registerCalls = (content.match(/registry\.register\(/g) || []).length;
-    expect(registerCalls).toBe(2); // ScenarioGraph + Repository only
+    // Derived from the registry, not hardcoded: one registration per declared
+    // migration source. Advancing/adding a source updates both together.
+    expect(registerCalls).toBe(Object.keys(MIGRATION_REGISTRY).length);
   });
 
-  it('runs the RepositoryProvider in shadow via gatherForDualPath (legacy stays source of truth)', () => {
+  it('repository is declared in SHADOW with legacy still present', () => {
+    const repo = MIGRATION_REGISTRY['repository'];
+    expect(repo).toBeDefined();
+    // This PR proves-via-shadow; it must NOT flip to Provider or delete legacy.
+    expect(repo.mode).toBe(MigrationMode.Shadow);
+    expect(repo.legacyPresent).toBe(true);
+  });
+
+  it('runs the RepositoryProvider in shadow + persists metrics (legacy stays source of truth)', () => {
     const orchestratorPath = path.join(SRC_ROOT, 'services/intelligence-orchestrator.ts');
     const content = fs.readFileSync(orchestratorPath, 'utf-8');
-    // Dual-path must invoke the provider through the shadow entrypoint...
+    // Shadow must invoke the provider through the shadow entrypoint, compare, and
+    // persist a durable metric — gated by migration STATE (isShadowActive)...
     expect(content).toContain('gatherForDualPath');
     expect(content).toContain('evaluateRepositoryEquivalence');
+    expect(content).toContain('recordProviderShadowMetric');
+    expect(content).toContain('isShadowActive');
     // ...and must NOT consume the provider's output into the returned bundle yet
     // (repositoryGraph is still built from the legacy repoGraph).
     expect(content).toContain('available: repoGraph.available');

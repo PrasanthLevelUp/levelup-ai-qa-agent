@@ -1704,6 +1704,35 @@ async function initSchema(client: PoolClient): Promise<void> {
     await run(stmt.label, stmt.sql);
   }
 
+  // ─── Phase MIGRATION: Provider shadow comparison metrics ────────
+  // Durable telemetry for the legacy → provider migration. Each row is one
+  // shadow comparison (legacy vs provider) so the Migration Report can show
+  // match rate, mismatch reasons, and latency deltas over a real traffic window
+  // — far more valuable than ephemeral logs.
+  console.log('🔧 [DB] Phase MIGRATION: Provider shadow metrics...');
+  await run('provider_shadow_metrics', `CREATE TABLE IF NOT EXISTS provider_shadow_metrics (
+    id SERIAL PRIMARY KEY,
+    provider TEXT NOT NULL,
+    provider_version INTEGER NOT NULL DEFAULT 0,
+    company_id INTEGER,
+    project_id INTEGER,
+    repo_context_id INTEGER,
+    intent TEXT,
+    caller TEXT,
+    matched BOOLEAN NOT NULL,
+    difference_count INTEGER NOT NULL DEFAULT 0,
+    difference_summary JSONB NOT NULL DEFAULT '[]',
+    duration_legacy_ms INTEGER,
+    duration_provider_ms INTEGER,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+  )`);
+  for (const idx of [
+    `CREATE INDEX IF NOT EXISTS idx_psm_provider_created ON provider_shadow_metrics(provider, created_at DESC)`,
+    `CREATE INDEX IF NOT EXISTS idx_psm_matched ON provider_shadow_metrics(provider, matched)`,
+  ]) {
+    await safeExec(client, idx.match(/idx_\w+/)![0], idx);
+  }
+
   console.log(`✅ [DB] initSchema complete (${ok} ok, ${fail} errors)`);
 }
 
@@ -3479,6 +3508,185 @@ export async function getHistoricalStats(companyId?: number): Promise<Historical
 /* -------------------------------------------------------------------------- */
 /*  Token Usage                                                               */
 /* -------------------------------------------------------------------------- */
+
+/* -------------------------------------------------------------------------- */
+/*  Provider Shadow Metrics — legacy → provider migration telemetry            */
+/* -------------------------------------------------------------------------- */
+
+/** One recorded shadow comparison between a legacy path and its provider. */
+export interface ProviderShadowMetricInput {
+  provider: string;
+  providerVersion: number | null;
+  companyId?: number | null;
+  projectId?: number | null;
+  repoContextId?: number | null;
+  intent?: string | null;
+  caller?: string | null;
+  matched: boolean;
+  differenceCount: number;
+  /** Human-readable difference descriptions (capped by caller). */
+  differenceSummary: string[];
+  durationLegacyMs?: number | null;
+  durationProviderMs?: number | null;
+}
+
+/**
+ * Persist a single shadow comparison. FAIL-OPEN: telemetry must never break the
+ * request path, so any error is swallowed with a warning. This is the durable
+ * counterpart to the in-memory match-rate recorder.
+ */
+export async function recordProviderShadowMetric(m: ProviderShadowMetricInput): Promise<void> {
+  try {
+    await getPool().query(
+      `INSERT INTO provider_shadow_metrics
+         (provider, provider_version, company_id, project_id, repo_context_id,
+          intent, caller, matched, difference_count, difference_summary,
+          duration_legacy_ms, duration_provider_ms)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+      [
+        m.provider,
+        m.providerVersion ?? 0,
+        m.companyId ?? null,
+        m.projectId ?? null,
+        m.repoContextId ?? null,
+        m.intent ?? null,
+        m.caller ?? null,
+        m.matched,
+        m.differenceCount ?? 0,
+        JSON.stringify(m.differenceSummary ?? []),
+        m.durationLegacyMs ?? null,
+        m.durationProviderMs ?? null,
+      ],
+    );
+  } catch (err: any) {
+    console.warn(`[provider_shadow_metrics] record failed (non-fatal): ${err?.message || err}`);
+  }
+}
+
+/** Aggregated migration report for one provider over a time window. */
+export interface ProviderShadowReport {
+  provider: string;
+  windowHours: number;
+  total: number;
+  matched: number;
+  mismatched: number;
+  matchRatePct: number;
+  avgLegacyMs: number | null;
+  avgProviderMs: number | null;
+  /** Positive = provider is faster than legacy by this many ms (on average). */
+  avgSpeedupMs: number | null;
+  providerVersions: number[];
+  lastComparisonAt: string | null;
+  topMismatchReasons: Array<{ reason: string; count: number }>;
+}
+
+/**
+ * Aggregate shadow metrics into a migration report. Optionally scoped to a
+ * company/project and bounded to the last `windowHours`. Fail-safe: on any
+ * error (e.g. table missing on a fresh DB) it returns a zeroed report rather
+ * than throwing, so the endpoint always responds.
+ */
+export async function getProviderShadowReport(
+  provider: string,
+  opts: { windowHours?: number; companyId?: number; projectId?: number } = {},
+): Promise<ProviderShadowReport> {
+  const windowHours = opts.windowHours && opts.windowHours > 0 ? opts.windowHours : 24;
+  const empty: ProviderShadowReport = {
+    provider,
+    windowHours,
+    total: 0,
+    matched: 0,
+    mismatched: 0,
+    matchRatePct: 100,
+    avgLegacyMs: null,
+    avgProviderMs: null,
+    avgSpeedupMs: null,
+    providerVersions: [],
+    lastComparisonAt: null,
+    topMismatchReasons: [],
+  };
+
+  try {
+    const params: any[] = [provider, windowHours];
+    let scope = '';
+    if (opts.companyId != null) {
+      params.push(opts.companyId);
+      scope += ` AND company_id = $${params.length}`;
+    }
+    if (opts.projectId != null) {
+      params.push(opts.projectId);
+      scope += ` AND project_id = $${params.length}`;
+    }
+    const where = `WHERE provider = $1 AND created_at >= NOW() - ($2 || ' hours')::interval${scope}`;
+
+    const agg = await getPool().query(
+      `SELECT
+         COUNT(*)::int AS total,
+         COUNT(*) FILTER (WHERE matched)::int AS matched,
+         AVG(duration_legacy_ms)::float AS avg_legacy_ms,
+         AVG(duration_provider_ms)::float AS avg_provider_ms,
+         MAX(created_at) AS last_at,
+         ARRAY_AGG(DISTINCT provider_version) AS versions
+       FROM provider_shadow_metrics ${where}`,
+      params,
+    );
+
+    const row = agg.rows[0] || {};
+    const total = Number(row.total) || 0;
+    if (total === 0) return empty;
+
+    const matched = Number(row.matched) || 0;
+    const avgLegacyMs = row.avg_legacy_ms != null ? round2(Number(row.avg_legacy_ms)) : null;
+    const avgProviderMs = row.avg_provider_ms != null ? round2(Number(row.avg_provider_ms)) : null;
+    const avgSpeedupMs =
+      avgLegacyMs != null && avgProviderMs != null ? round2(avgLegacyMs - avgProviderMs) : null;
+
+    // Top mismatch reasons: unnest the JSONB difference arrays of mismatches.
+    // Reasons are normalized to their prefix before the first ':' so
+    // "primaryMethods: legacy has X" and "primaryMethods: provider has Y"
+    // aggregate into a single "primaryMethods" bucket — actionable at a glance.
+    const reasons = await getPool().query(
+      `SELECT reason, COUNT(*)::int AS count FROM (
+         SELECT split_part(diff::text, ':', 1) AS reason
+         FROM provider_shadow_metrics,
+              LATERAL jsonb_array_elements_text(difference_summary) AS diff
+         ${where} AND matched = false
+       ) t
+       GROUP BY reason
+       ORDER BY count DESC
+       LIMIT 10`,
+      params,
+    );
+
+    return {
+      provider,
+      windowHours,
+      total,
+      matched,
+      mismatched: total - matched,
+      matchRatePct: round4((matched / total) * 100),
+      avgLegacyMs,
+      avgProviderMs,
+      avgSpeedupMs,
+      providerVersions: (row.versions || []).filter((v: any) => v != null).map((v: any) => Number(v)),
+      lastComparisonAt: row.last_at ? new Date(row.last_at).toISOString() : null,
+      topMismatchReasons: reasons.rows.map((r: any) => ({
+        reason: String(r.reason).replace(/"/g, '').trim(),
+        count: Number(r.count),
+      })),
+    };
+  } catch (err: any) {
+    console.warn(`[provider_shadow_metrics] report failed (non-fatal): ${err?.message || err}`);
+    return empty;
+  }
+}
+
+function round2(n: number): number {
+  return Math.round((Number(n) || 0) * 100) / 100;
+}
+function round4(n: number): number {
+  return Math.round((Number(n) || 0) * 1e4) / 1e4;
+}
 
 export async function logTokenUsage(engine: string, tokensUsed: number, costUsd: number, companyId?: number): Promise<void> {
   const today = new Date().toISOString().slice(0, 10);
