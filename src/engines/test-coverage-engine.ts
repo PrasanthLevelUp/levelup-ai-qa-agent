@@ -33,7 +33,7 @@ const MOD = 'test-coverage-engine';
  * Tracked in every generation so we can correlate quality with prompt evolution and
  * quickly diagnose "last week was better" reports by identifying which version ran.
  */
-const PROMPT_VERSION = 'v3.6-scenario-aware-retrieval';
+const PROMPT_VERSION = 'v3.7-element-level-retrieval';
 
 /**
  * Engine architecture version — increment when the pipeline or core algorithm changes
@@ -1240,16 +1240,20 @@ Return ONLY valid JSON, no markdown fences.`;
       const reqText = `${input.title} ${input.description} ${input.acceptanceCriteria || ''} ${input.businessFlow || ''}`;
       // Scenario-aware query: fold the planned scenario titles/objectives/risk
       // areas into the retrieval query so ranking targets what will be tested.
-      const planQuery = scenarioPlan
-        ? scenarioPlan.scenarios
-            .map(s => `${s.title || ''} ${s.objective || ''} ${s.riskArea || ''}`)
-            .join(' ')
-        : '';
+      // One query string PER planned scenario — this makes the retrieval unit
+      // "the elements a scenario needs" (forms/elements are pulled round-robin
+      // across scenarios) rather than a single global ranking.
+      const scenarioQueries = scenarioPlan
+        ? scenarioPlan.scenarios.map(s => `${s.title || ''} ${s.objective || ''} ${s.riskArea || ''}`)
+        : [];
+      // Flattened query is still used for the page/test-data (coarser) ranking.
+      const planQuery = scenarioQueries.join(' ');
       const optimized = optimizeKnowledgeForCategory(knowledge, reqText, {
         category: cls.category,
         confidence: cls.confidence,
         minConfidence: PROMPT_OPTIMIZER_MIN_CONFIDENCE,
         queryText: planQuery,
+        scenarioQueries,
       });
       genKnowledge = optimized.knowledge;
       optimizeStats = optimized.stats;
@@ -1258,6 +1262,7 @@ Return ONLY valid JSON, no markdown fences.`;
         category: optimizeStats.category,
         confidence: optimizeStats.confidence,
         scenarioAware: planQuery.length > 0,
+        perScenarioUnits: scenarioQueries.length,
         pages: `${optimizeStats.pages.before}→${optimizeStats.pages.after}`,
         forms: `${optimizeStats.forms.before}→${optimizeStats.forms.after}`,
         elements: `${optimizeStats.elements.before}→${optimizeStats.elements.after}`,
@@ -1332,6 +1337,25 @@ Return ONLY valid JSON, no markdown fences.`;
   2. Infer scenarios from the Business Flow beyond the happy path where relevant — interrupted/resumed flow, session timeout, navigation (back/forward/deep-link/refresh), and state carried between steps.
   3. Enumerate EVERY distinct situation worth testing, THEN bucket each into the selected coverage type it belongs to. Cover EVERY selected type on its own — never collapse to a single happy path, never merge types. No fixed count and no upper cap; the requirement + context decide depth. Never pad with reworded repetition or ungrounded guesses.`;
 
+    // Output JSON schema — kept as a discrete string so the prompt breakdown can
+    // measure the SCHEMA cost separately from the reasoning/instruction scaffold
+    // (they are the two big fixed-overhead sections and are tuned differently).
+    const outputSchema = `{
+  "scenarios": [{ "scenario": string, "objective": string, "coverageType": string, "priority": "P0"|"P1"|"P2"|"P3", "riskArea": string }],
+  "testCases": [{
+    "title": string, "objective": string, "scenarioIndex": number, "riskArea": string,
+    "preconditions": string, "steps": string[],
+    "expectedResult": string, "testData": string,
+    "priority": "P0"|"P1"|"P2"|"P3", "severity": "critical"|"major"|"minor"|"trivial",
+    "tags": string[], "automationReady": boolean,
+    "automationComplexity": "low"|"medium"|"high", "selectorAvailability": "high"|"medium"|"low"|"unknown",
+    "source": "requirement"|"knowledge"|"test_data"|"app_profile", "sourceEvidence": string
+  }],
+  "coverageTypeEvaluations": [{ "coverageType": string, "status": "covered"|"not_applicable", "reason": string }],
+  "suggestedTestCases": [ /* same shape as a testCase; source "gap_analysis". MUST be [] in Standard mode. */ ],
+  "missingRequirements": [{ "question": string, "area": string, "rationale": string }]
+}`;
+
     const prompt = `You are a principal QA engineer writing an enterprise-grade test design. Understand the requirement deeply, then cover EACH selected coverage type thoroughly — never let positive crowd out the others.
 
 REQUIREMENT:
@@ -1373,21 +1397,7 @@ QUALITY: specific actionable title (not "Verify login works"); clear preconditio
 SOURCE TAGGING: every case sets "source" ("requirement" | "knowledge" | "test_data" | "app_profile"; "gap_analysis" ONLY in suggestedTestCases) and "sourceEvidence" (short exact evidence, e.g. "AC: valid login", "standard_user dataset"). Never use source "assumption".
 
 Return JSON (use [] for empty buckets):
-{
-  "scenarios": [{ "scenario": string, "objective": string, "coverageType": string, "priority": "P0"|"P1"|"P2"|"P3", "riskArea": string }],
-  "testCases": [{
-    "title": string, "objective": string, "scenarioIndex": number, "riskArea": string,
-    "preconditions": string, "steps": string[],
-    "expectedResult": string, "testData": string,
-    "priority": "P0"|"P1"|"P2"|"P3", "severity": "critical"|"major"|"minor"|"trivial",
-    "tags": string[], "automationReady": boolean,
-    "automationComplexity": "low"|"medium"|"high", "selectorAvailability": "high"|"medium"|"low"|"unknown",
-    "source": "requirement"|"knowledge"|"test_data"|"app_profile", "sourceEvidence": string
-  }],
-  "coverageTypeEvaluations": [{ "coverageType": string, "status": "covered"|"not_applicable", "reason": string }],
-  "suggestedTestCases": [ /* same shape as a testCase; source "gap_analysis". MUST be [] in Standard mode. */ ],
-  "missingRequirements": [{ "question": string, "area": string, "rationale": string }]
-}
+${outputSchema}
 
 Return ONLY valid JSON. Address EVERY selected coverage type, organise scenarios by coverageType, and be comprehensive while staying grounded. ${expand ? 'Keep grounded coverage and assumption-based suggestions in SEPARATE buckets.' : 'Use ALL provided context to ground committed coverage; keep suggestedTestCases and missingRequirements empty.'}`;
 
@@ -1403,7 +1413,11 @@ Return ONLY valid JSON. Address EVERY selected coverage type, organise scenarios
     const knowledgeSectionChars = enterpriseBlock.length + repoBlock.length + orchestratedBlock.length;
     const accountedChars =
       requirementSectionChars + knowledgeSectionChars + appProfileBlock.length +
-      testDataBlock.length + coverageObjectives.length + scopeBlock.length + scenarioPlanBlock.length;
+      testDataBlock.length + coverageObjectives.length + scopeBlock.length +
+      scenarioPlanBlock.length + outputSchema.length;
+    // "instructions" = the static reasoning/rules scaffold (everything not
+    // attributed to a grounding block or the JSON schema). Schema is measured on
+    // its own so the two big FIXED-overhead sections are visible separately.
     const instructionsChars = Math.max(0, prompt.length - accountedChars);
     const promptBreakdown: PromptSectionBreakdown = buildPromptBreakdown([
       { key: 'requirement', label: 'Requirement + Analysis', text: 'x'.repeat(requirementSectionChars) },
@@ -1412,7 +1426,8 @@ Return ONLY valid JSON. Address EVERY selected coverage type, organise scenarios
       { key: 'testData', label: 'Test Data', text: testDataBlock },
       { key: 'coverageObjectives', label: 'Coverage Objectives', text: coverageObjectives },
       { key: 'scenarioPlan', label: 'Scenario Plan', text: scenarioPlanBlock },
-      { key: 'instructions', label: 'Instructions + Schema', text: 'x'.repeat(instructionsChars) },
+      { key: 'instructions', label: 'Instructions', text: 'x'.repeat(instructionsChars) },
+      { key: 'schema', label: 'Output Schema', text: outputSchema },
     ]);
     logger.info(MOD, 'Prompt breakdown', {
       totalChars: promptBreakdown.totalChars,

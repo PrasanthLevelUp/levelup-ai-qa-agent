@@ -240,6 +240,18 @@ export function optimizeKnowledgeForCategory<K extends KnowledgeLike | undefined
      * broad category vocabulary. Purely additive: omitted → category-only ranking.
      */
     queryText?: string;
+    /**
+     * Per-scenario retrieval queries — one string per PLANNED scenario (its
+     * title + objective + risk-area). When supplied, the retrieval UNIT for
+     * fine-grained context (forms + key elements) becomes "the items each
+     * scenario needs" rather than a single global ranking. Elements/forms are
+     * scored against EACH scenario and selected round-robin, so every scenario
+     * contributes its most relevant items to the budget and no scenario is
+     * starved by a globally dominant one (e.g. "Valid Login" keeps the email/
+     * password/login-button while "Logout" still keeps the logout/profile menu).
+     * Purely additive: omitted → the previous global top-K ranking is used.
+     */
+    scenarioQueries?: string[];
     /** Per-type top-K retrieval caps (override CAP_DEFAULTS). */
     caps?: RetrievalCaps;
   },
@@ -295,6 +307,18 @@ export function optimizeKnowledgeForCategory<K extends KnowledgeLike | undefined
   const relevant = Array.from(new Set([...vocab, ...reqTokens, ...queryTokens]));
   const caps = { ...CAP_DEFAULTS, ...(opts?.caps || {}) };
 
+  // Per-scenario term sets (element-level retrieval). Each planned scenario gets
+  // its own term set = category vocab + requirement tokens + that scenario's own
+  // tokens. Forms/elements are then retrieved round-robin across these sets so
+  // every scenario's needed items are represented, not just a global winner.
+  // Empty (or single) → we fall back to the global `relevant` ranking below.
+  const scenarioTermSets = (opts?.scenarioQueries || [])
+    .map((q) => {
+      const t = toTokens(q);
+      return t.length ? Array.from(new Set([...vocab, ...reqTokens, ...t])) : [];
+    })
+    .filter((t) => t.length > 0);
+
   // Nothing to trim if there is no profile and no test data.
   if (!ap && !td) {
     return { knowledge, stats: { ...baseStats, reason: 'no-profile-no-testdata' } };
@@ -317,33 +341,31 @@ export function optimizeKnowledgeForCategory<K extends KnowledgeLike | undefined
     nextKnowledge.applicationProfile = { ...ap, pages: kept };
   }
 
-  /* ---- Forms ---- */
+  /* ---- Forms (element-level: retrieved per scenario when planned) ---- */
   if (ap?.forms?.length) {
     const currentAp = nextKnowledge.applicationProfile ?? { ...ap };
-    const kept = rankAndTrim(
-      ap.forms,
-      (f) => {
-        const fieldText = Array.isArray(f.fields)
-          ? f.fields.map((fd: any) => haystack(fd, ['name', 'label', 'type'])).join(' ')
-          : '';
-        return `${haystack(f, ['page', 'action', 'method'])} ${fieldText}`;
-      },
-      relevant,
-      KEEP_MIN.forms,
-      caps.forms,
+    const formText = (f: any) => {
+      const fieldText = Array.isArray(f.fields)
+        ? f.fields.map((fd: any) => haystack(fd, ['name', 'label', 'type'])).join(' ')
+        : '';
+      return `${haystack(f, ['page', 'action', 'method'])} ${fieldText}`;
+    };
+    const kept = rankAndTrimScoped(
+      ap.forms, formText, relevant, scenarioTermSets, KEEP_MIN.forms, caps.forms,
     );
     if (kept.length < ap.forms.length) anyTrim = true;
     baseStats.forms.after = kept.length;
     nextKnowledge.applicationProfile = { ...currentAp, forms: kept };
   }
 
-  /* ---- Key elements ---- */
+  /* ---- Key elements (element-level: retrieved per scenario when planned) ---- */
   if (ap?.keyElements?.length) {
     const currentAp = nextKnowledge.applicationProfile ?? { ...ap };
-    const kept = rankAndTrim(
+    const kept = rankAndTrimScoped(
       ap.keyElements,
       (e) => haystack(e, ['label', 'tag', 'selector', 'role']),
       relevant,
+      scenarioTermSets,
       KEEP_MIN.elements,
       caps.elements,
     );
@@ -441,4 +463,82 @@ function rankAndTrim<T>(
   // Top up to the floor with the earliest unmatched items (original order).
   const topUp = unmatched.slice(0, keepMin - keptScored.length);
   return [...keptScored, ...topUp].sort((a, b) => a.index - b.index).map((s) => s.item);
+}
+
+/**
+ * Scenario-scoped retrieval — the "retrieval unit is the elements a SCENARIO
+ * needs, not a whole page/global list" refinement. When `scenarioTermSets` is
+ * empty it is exactly `rankAndTrim` (global top-K); otherwise:
+ *   1. Score every item against EACH scenario's term set.
+ *   2. Build per-scenario ranked lists (score desc, index asc; score 0 dropped).
+ *   3. Round-robin: take the #1 item from scenario A, then B, then C, … then the
+ *      #2 from each, and so on — adding each item once (dedup by index) until the
+ *      `keepMax` budget is full. This guarantees every scenario contributes its
+ *      most-relevant items before any single scenario consumes the whole budget,
+ *      so no scenario is starved by a globally dominant one.
+ *   4. Fail-open: if the round-robin found nothing (no scenario matched any
+ *      item), fall back to the global `rankAndTrim`. If it found fewer than
+ *      `keepMin`, top up from the global ranking to the floor.
+ *   5. Winners are emitted in original document order for a stable prompt.
+ * Deterministic and pure — same inputs always yield the same slice.
+ */
+function rankAndTrimScoped<T>(
+  items: T[],
+  toText: (item: T) => string,
+  globalTerms: string[],
+  scenarioTermSets: string[][],
+  keepMin: number,
+  keepMax: number,
+): T[] {
+  // No per-scenario signal → identical to the global top-K path.
+  if (!scenarioTermSets.length) {
+    return rankAndTrim(items, toText, globalTerms, keepMin, keepMax);
+  }
+  if (items.length <= keepMin) return items;
+  const ceiling = Math.max(keepMin, keepMax);
+
+  // Score each item once per scenario (text computed once).
+  const texts = items.map((it) => toText(it));
+  const perScenarioRanked: number[][] = scenarioTermSets.map((terms) =>
+    texts
+      .map((t, index) => ({ index, score: scoreRelevance(t, terms) }))
+      .filter((s) => s.score > 0)
+      .sort((a, b) => (b.score - a.score) || (a.index - b.index))
+      .map((s) => s.index),
+  );
+
+  // Round-robin across scenarios until the budget is full.
+  const chosen = new Set<number>();
+  const cursors = new Array(perScenarioRanked.length).fill(0);
+  let progressed = true;
+  while (chosen.size < ceiling && progressed) {
+    progressed = false;
+    for (let s = 0; s < perScenarioRanked.length && chosen.size < ceiling; s++) {
+      const list = perScenarioRanked[s];
+      let c = cursors[s];
+      while (c < list.length && chosen.has(list[c])) c++;
+      if (c < list.length) {
+        chosen.add(list[c]);
+        cursors[s] = c + 1;
+        progressed = true;
+      }
+    }
+  }
+
+  // Nothing matched any scenario → fall back to global ranking.
+  if (chosen.size === 0) {
+    return rankAndTrim(items, toText, globalTerms, keepMin, keepMax);
+  }
+
+  // Below the floor → top up from the global ranking (dedup, preserve order).
+  if (chosen.size < keepMin) {
+    const globalTopUp = rankAndTrim(items, toText, globalTerms, keepMin, ceiling);
+    for (const it of globalTopUp) {
+      if (chosen.size >= keepMin) break;
+      const idx = items.indexOf(it);
+      if (idx >= 0) chosen.add(idx);
+    }
+  }
+
+  return items.filter((_, index) => chosen.has(index));
 }
