@@ -1111,6 +1111,21 @@ export function createScriptGenRouter(): Router {
           ...(rtmUpdate ? { rtmUpdate } : {}),
           // Sprint 4B: automation marking + automation-coverage delta (before/after)
           ...(automationUpdate ? { automationUpdate } : {}),
+          // Pipeline funnel + per-case trace, ALSO on success — so a PARTIAL
+          // generation (e.g. 8/12 cases emitted) surfaces WHICH cases dropped and
+          // why, directly in the UI diagnostics panel (not only on total failure).
+          ...(result.pipeline
+            ? { pipeline: { ...result.pipeline, cases: result.pipeline.cases.slice(0, 25) } }
+            : {}),
+          // Non-fatal warnings the deterministic engine collected (test-data
+          // normalization reshapes, unmapped steps under warn policy). Surfaced so
+          // the UI can show them even when generation otherwise succeeded.
+          ...(result.testDataWarnings && result.testDataWarnings.length > 0
+            ? { testDataWarnings: result.testDataWarnings.slice(0, 25) }
+            : {}),
+          ...(result.unmappedSteps && result.unmappedSteps.length > 0
+            ? { unmappedSteps: result.unmappedSteps.slice(0, 25) }
+            : {}),
         },
       });
     } catch (err: any) {
