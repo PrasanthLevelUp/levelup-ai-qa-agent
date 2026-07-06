@@ -112,6 +112,16 @@ const COMPLEXITY_WEIGHTS: ComplexityWeights = {
 const FAST_THRESHOLD = floatEnv('GEN_FAST_THRESHOLD', 25);
 const STANDARD_THRESHOLD = floatEnv('GEN_STANDARD_THRESHOLD', 40);
 
+/**
+ * Gap-analysis complexity gate (Test Case Lab fix — Priority 3 / "D").
+ * Gap analysis is a whole extra LLM round-trip. For simple, solved-problem
+ * requirements (login, logout, forgot-password, search) it adds latency + cost
+ * without finding real gaps. Skip it below this composite-complexity score;
+ * gap analysis then only runs for genuinely complex flows (banking, insurance,
+ * multi-step checkout, approval workflows). Env-overridable.
+ */
+const GAP_ANALYSIS_MIN_COMPLEXITY = floatEnv('GEN_GAP_ANALYSIS_MIN_COMPLEXITY', 35);
+
 /** Signals used to classify requirement complexity — all cheap to compute, ZERO LLM calls. */
 export interface ComplexitySignals {
   requirementChars: number;
@@ -1021,7 +1031,11 @@ Return ONLY valid JSON, no markdown fences.`;
     // existing callers are unaffected. NOTE: only the *budgets* change per tier —
     // the prompt itself is identical across tiers (quality is not reduced).
     maxOutputTokens: number = 8000,
-    maxPromptChars: number = 60000
+    maxPromptChars: number = 60000,
+    // Priority 1 ("A"): only broaden the committed coverage beyond the user's
+    // selection when this explicit opt-in is set. Default FALSE → generate
+    // EXACTLY the selected types.
+    aiCoverageExpansion = false
   ): Promise<{
     scenarios: TestScenario[];
     testCases: TestCase[];
@@ -1036,17 +1050,25 @@ Return ONLY valid JSON, no markdown fences.`;
     /** Intelligence Score from the orchestrator (undefined on the legacy path). */
     intelligenceScore?: IntelligenceScore;
   }> {
-    // GAP-ANALYSIS (expanded) mode only: auto-expand to a comprehensive baseline so
-    // the *suggested additional coverage* (assumption-based) bucket is thorough.
-    // In STANDARD mode we keep the requested types — committed coverage is grounded
-    // in the requirement AND the provided context (knowledge / profile / test data),
-    // not padded with ungrounded assumptions.
+    // ── Priority 1 ("A") — respect the user's coverage selection ──
+    // Previously EXPANDED (gap-analysis) mode silently added a
+    // positive/negative/edge/boundary/integration baseline, turning a 3-type
+    // request into 5. That broke user trust and inflated tokens/cases. We now
+    // only broaden the committed coverage when the caller explicitly enables
+    // "AI Coverage Expansion". Otherwise we generate EXACTLY the selected types.
+    // NOTE: `expand` (the assumption-based suggestions bucket) is still driven by
+    // mode — that bucket is kept SEPARATE from committed coverage, so it never
+    // changes which types the user asked for.
     const expand = mode === 'expanded';
-    if (expand) {
+    if (aiCoverageExpansion) {
       const baselineTypes: CoverageType[] = ['positive', 'negative', 'edge_cases', 'boundary', 'integration'];
+      const before = coverageTypes.length;
       coverageTypes = Array.from(new Set([...coverageTypes, ...baselineTypes]));
+      logger.info(MOD, 'AI Coverage Expansion ON — broadened committed coverage types', {
+        from: before, to: coverageTypes.length,
+      });
     } else if (coverageTypes.length === 0) {
-      // Standard mode with no explicit types — default to positive (happy path).
+      // No explicit types — default to positive (happy path).
       coverageTypes = ['positive'];
     }
 
@@ -1378,21 +1400,32 @@ Return ONLY valid JSON array.`;
     input: RequirementInput,
     coverageTypes: CoverageType[],
     knowledge?: KnowledgeContext,
-    options?: { includeCoverageGaps?: boolean; deduplicate?: boolean; mode?: GenerationMode }
+    options?: {
+      includeCoverageGaps?: boolean;
+      deduplicate?: boolean;
+      mode?: GenerationMode;
+      /**
+       * Test Case Lab fix — Priority 1 ("A"). When TRUE, the engine may broaden
+       * the committed coverage beyond the user's selected types (adds the
+       * positive/negative/edge/boundary/integration baseline). Default FALSE:
+       * we generate EXACTLY the coverage types the user selected — no silent
+       * 3→5 expansion. Only an explicit "AI Coverage Expansion" opt-in widens it.
+       */
+      aiCoverageExpansion?: boolean;
+    }
   ): Promise<GenerationResult> {
-    // The "Coverage Gap Analysis" toggle drives BOTH the generation mode and the
-    // separate gap-analysis LLM call:
-    //   • OFF → STANDARD mode: committed coverage GROUNDED in the requirement AND all
-    //           provided context (App Knowledge, App Profile, Test Data). No assumptions,
-    //           no separate suggestions, no gap call.
-    //   • ON  → EXPANDED mode: the same grounded coverage + a separate assumption-based
-    //           "suggested additional coverage" bucket + missing-requirement questions +
-    //           the non-automatable gap analysis pass.
-    // Product rule: context is a first-class default input; assumptions appear only when
-    // Gap Analysis is enabled. Callers can still force a mode via options.mode.
+    // The "Coverage Gap Analysis" toggle drives the separate assumption-based
+    // suggestions bucket + the gap-analysis LLM call. It NO LONGER silently
+    // expands the committed coverage types — that is now a distinct, explicit
+    // opt-in ("aiCoverageExpansion", Priority 1) so the generator always
+    // respects the user's selection.
+    //   • Gap Analysis OFF → STANDARD mode: committed coverage GROUNDED in the
+    //           requirement + provided context. No assumptions, no gap call.
+    //   • Gap Analysis ON  → EXPANDED mode: same grounded coverage + a separate
+    //           assumption-based "suggested additional coverage" bucket +
+    //           missing-requirement questions + the non-automatable gap pass.
     const includeCoverageGaps = options?.includeCoverageGaps !== false;
-    const mode: GenerationMode = options?.mode ?? (includeCoverageGaps ? 'expanded' : 'strict');
-    logger.info(MOD, 'Starting full coverage generation', { title: input.title, coverageTypes, includeCoverageGaps, mode });
+    const aiCoverageExpansion = options?.aiCoverageExpansion === true;
 
     // Pipeline wall-clock start — used for the end-to-end totalMs telemetry.
     const pipelineStart = Date.now();
@@ -1412,6 +1445,29 @@ Return ONLY valid JSON array.`;
       maxOutputTokens: tierCfg.maxOutputTokens,
       maxPromptChars: tierCfg.maxPromptChars,
       runAnalysis: tierCfg.runAnalysis,
+    });
+
+    // ── Priority 3 ("D") — skip gap analysis for simple requirements ──
+    // Gap analysis is a whole extra LLM round-trip. For solved-problem flows
+    // (login, logout, forgot-password, search) it adds cost + latency without
+    // finding real gaps. Only run it when the caller asked for it AND the
+    // requirement is complex enough to warrant it.
+    const gapComplexityMet = complexity.signals.complexityScore >= GAP_ANALYSIS_MIN_COMPLEXITY;
+    const runGapAnalysis = includeCoverageGaps && gapComplexityMet;
+    // Mode drives the assumption-based suggestions bucket in the generation
+    // prompt — keep it aligned with whether gap analysis actually runs, so a
+    // simple requirement stays fully grounded (strict) with no suggestions.
+    const mode: GenerationMode = options?.mode ?? (runGapAnalysis ? 'expanded' : 'strict');
+    if (includeCoverageGaps && !gapComplexityMet) {
+      logger.info(MOD, 'Gap analysis auto-skipped — requirement below complexity gate', {
+        complexityScore: Math.round(complexity.signals.complexityScore),
+        gate: GAP_ANALYSIS_MIN_COMPLEXITY,
+        tier: complexity.tier,
+      });
+    }
+    logger.info(MOD, 'Generation plan', {
+      title: input.title, coverageTypes, aiCoverageExpansion, includeCoverageGaps,
+      runGapAnalysis, mode,
     });
 
     // Phase 2: Analyze requirement.
@@ -1439,7 +1495,7 @@ Return ONLY valid JSON array.`;
     const generationStart = Date.now();
     const gen = await this.generateTestCoverage(
       input, analysis, coverageTypes, knowledge, mode,
-      tierCfg.maxOutputTokens, tierCfg.maxPromptChars,
+      tierCfg.maxOutputTokens, tierCfg.maxPromptChars, aiCoverageExpansion,
     );
     const generationMs = Date.now() - generationStart;
     const { scenarios, testCases: rawTestCases, missingRequirements, coverageTypeEvaluations, tokensUsed: t2, promptChars, intelligenceScore } = gen;
@@ -1449,36 +1505,57 @@ Return ONLY valid JSON array.`;
       suggested: rawSuggested.length, missingRequirements: missingRequirements.length, mode,
     });
 
+    // ── Priority 4 ("C") — parallelize independent post-generation work ──
+    // Both phases below consume the just-generated output and are independent of
+    // each other: de-dup reads the test-case buckets; gap analysis reads the
+    // scenarios. Running them sequentially wasted wall-clock. Kick both off and
+    // await together (Promise.all) for a meaningful latency cut. Each fails open
+    // internally, so a Promise.all rejection is not expected, but we still guard.
+
     // Phase 5b: Semantic de-duplication — drop near-identical cases (e.g. three
     // variants of the same happy-path login). Cheap batched embeddings call; fails
     // open. Can be disabled via options.deduplicate=false. Applied to both buckets.
-    let testCases = rawTestCases;
-    let suggestedTestCases = rawSuggested;
-    let duplicatesRemoved = 0;
-    if (options?.deduplicate !== false) {
+    const dedupWork = async (): Promise<{
+      testCases: TestCase[]; suggestedTestCases: TestCase[]; removed: number;
+    }> => {
+      if (options?.deduplicate === false) {
+        return { testCases: rawTestCases, suggestedTestCases: rawSuggested, removed: 0 };
+      }
+      let kept = rawTestCases;
+      let keptSuggested = rawSuggested;
+      let removed = 0;
       if (rawTestCases.length > 1) {
         const dedup = await this.deduplicateTestCases(rawTestCases);
-        testCases = dedup.kept;
-        duplicatesRemoved += dedup.removed;
+        kept = dedup.kept;
+        removed += dedup.removed;
       }
       if (rawSuggested.length > 1) {
         const dedupS = await this.deduplicateTestCases(rawSuggested);
-        suggestedTestCases = dedupS.kept;
-        duplicatesRemoved += dedupS.removed;
+        keptSuggested = dedupS.kept;
+        removed += dedupS.removed;
       }
-    }
+      return { testCases: kept, suggestedTestCases: keptSuggested, removed };
+    };
 
-    // Phase 6: Gap analysis (only in expanded mode — saves a full LLM call in strict).
-    let gaps: CoverageGap[] = [];
-    let t3 = 0;
-    if (includeCoverageGaps) {
+    // Phase 6: Gap analysis — only when the caller asked for it AND the
+    // requirement cleared the complexity gate (Priority 3). Saves a full LLM
+    // call for simple requirements.
+    const gapWork = async (): Promise<{ gaps: CoverageGap[]; tokensUsed: number }> => {
+      if (!runGapAnalysis) {
+        logger.info(MOD, 'Gap analysis skipped — not requested or below complexity gate');
+        return { gaps: [], tokensUsed: 0 };
+      }
       const gapResult = await this.analyzeCoverageGaps(input, analysis, scenarios, knowledge);
-      gaps = gapResult.gaps;
-      t3 = gapResult.tokensUsed;
-      logger.info(MOD, 'Gap analysis complete', { gaps: gaps.length });
-    } else {
-      logger.info(MOD, 'Gap analysis skipped (strict mode) — saved one LLM call');
-    }
+      logger.info(MOD, 'Gap analysis complete', { gaps: gapResult.gaps.length });
+      return gapResult;
+    };
+
+    const [dedupResult, gapResult] = await Promise.all([dedupWork(), gapWork()]);
+    const testCases = dedupResult.testCases;
+    const suggestedTestCases = dedupResult.suggestedTestCases;
+    const duplicatesRemoved = dedupResult.removed;
+    const gaps = gapResult.gaps;
+    const t3 = gapResult.tokensUsed;
 
     const totalTokens = t1 + t2 + t3;
     const result: GenerationResult = {

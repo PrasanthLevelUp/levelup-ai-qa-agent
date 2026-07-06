@@ -220,6 +220,10 @@ describe('Test Case Lab Pipeline - Full Coverage Generation (Expanded Mode)', ()
     const result = await engine.generateFullCoverage(input, coverageTypes, undefined, {
       includeCoverageGaps: true, // expanded mode
       deduplicate: true,
+      // Force expanded mode explicitly. As of the Test Case Lab fix, expanded
+      // mode is otherwise gated on complexity (simple requirements like this one
+      // auto-derive 'strict'); we pass mode here to exercise expanded-mode output.
+      mode: 'expanded',
     });
 
     expect(result.mode).toBe('expanded');
