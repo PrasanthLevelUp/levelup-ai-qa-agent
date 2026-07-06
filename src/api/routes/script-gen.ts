@@ -1132,8 +1132,15 @@ export function createScriptGenRouter(): Router {
             'Generation will not silently emit generic, ungrounded scripts.',
           code: 'DETERMINISTIC_GENERATION_EMPTY',
           intendedTestCaseCount: err.intendedCaseCount,
-          resolvedTestCaseCount: 0,
+          resolvedTestCaseCount: err.pipeline?.generatedScripts ?? 0,
           caseErrors: err.caseErrors.slice(0, 10),
+          // Pipeline observability (user request) — the funnel + per-case trace
+          // that pinpoints WHERE the count dropped to zero (canonicalization /
+          // parsing / grounding / emit), so "nothing generated" is localizable
+          // in one screen without SQL or logs.
+          pipeline: err.pipeline
+            ? { ...err.pipeline, cases: err.pipeline.cases.slice(0, 25) }
+            : undefined,
           nextAction: 'REVIEW_TEST_CASES',
         });
       }

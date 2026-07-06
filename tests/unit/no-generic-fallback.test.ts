@@ -85,6 +85,18 @@ async function main() {
       // name the failing Stage-1 reason per case (was `caseErrors: []`).
       assert(threw.caseErrors.length === 2, 'batch: caseErrors carries a reason per case (not [])');
       assert(threw.caseErrors.every(e => /STAGE 1/.test(e)), 'batch: each reason names the failing stage');
+      // Pipeline observability — the funnel must show the count dropping to 0 at
+      // canonicalization (11→0 pattern) so the failing stage is obvious.
+      const p = threw.pipeline;
+      assert(!!p, 'batch: pipeline summary present on the error');
+      if (p) {
+        assert(p.inputTestCases === 2, 'batch/pipeline: inputTestCases = 2');
+        assert(p.canonicalized === 0, 'batch/pipeline: canonicalized = 0 (drop point)');
+        assert(p.parsed === 0 && p.grounded === 0 && p.generatedScripts === 0, 'batch/pipeline: all downstream stages = 0');
+        assert(p.cases.length === 2, 'batch/pipeline: one trace per case');
+        assert(p.cases.every(c => c.reachedStage === 'Canonicalization' && c.status === 'FAILED'), 'batch/pipeline: each case stalls at Canonicalization/FAILED');
+        assert(p.cases.every(c => typeof c.reason === 'string' && c.reason.length > 0), 'batch/pipeline: each case carries a reason');
+      }
     }
   }
 
@@ -142,6 +154,18 @@ async function main() {
     catch (err) { threw = err; }
     assert(threw === null, 'instruction-shape: no longer throws (root cause fixed)');
     assert(result && result.generatedFiles.length > 0, 'instruction-shape: emits grounded spec file(s)');
+    // Pipeline observability on the SUCCESS path — the funnel should show a
+    // full traversal (1→1→1→1→1), proving the case reached "Generated".
+    if (result) {
+      const p = result.pipeline;
+      assert(!!p, 'instruction-shape/pipeline: summary present on success result');
+      if (p) {
+        assert(p.inputTestCases === 1, 'instruction-shape/pipeline: inputTestCases = 1');
+        assert(p.canonicalized === 1 && p.parsed === 1, 'instruction-shape/pipeline: canonicalized & parsed = 1');
+        assert(p.generatedScripts === 1, 'instruction-shape/pipeline: generatedScripts = 1');
+        assert(p.cases.length === 1 && p.cases[0]!.status === 'OK' && p.cases[0]!.reachedStage === 'Generated', 'instruction-shape/pipeline: case traced OK → Generated');
+      }
+    }
   }
 
   /* ── single testCase with no parseable steps → THROWS ──────────────────── */

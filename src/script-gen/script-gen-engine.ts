@@ -221,6 +221,55 @@ export function classifyLocatorProvenance(e: {
   return 'fallback';
 }
 
+/**
+ * Pipeline observability (user request) — a per-run summary that shows WHERE in
+ * the deterministic requirement/test-case pipeline the count drops to zero, so
+ * "nothing generated" can be localized in one screen without SQL or logs.
+ *
+ * The stages mirror the real code path a case travels through:
+ *
+ *   inputTestCases   → cases handed to the deterministic engine
+ *   canonicalized    → cases whose steps normalized to ≥1 canonical string step
+ *   parsed           → cases whose canonical steps yielded ≥1 automatable action
+ *                      (the per-case translator was actually invoked)
+ *   grounded         → cases that resolved ≥1 REAL locator against the App Profile
+ *   generatedScripts → cases that emitted at least one spec file
+ *
+ * When two adjacent numbers differ, that gap is the failing stage. Example:
+ *   11 → 11 → 11 → 0 → 0  means parsing works but grounding failed (App Profile /
+ *   Locator Intelligence problem), NOT a canonicalization problem.
+ */
+export type PipelineStageName =
+  | 'Canonicalization'
+  | 'Step Parsing'
+  | 'Grounding'
+  | 'Script Emit'
+  | 'Generated';
+
+/** Per-test-case trace entry — the deepest stage a single case reached. */
+export interface CaseTrace {
+  id: string | number | null;
+  title: string | null;
+  /** The deepest pipeline stage this case reached. */
+  reachedStage: PipelineStageName;
+  status: 'OK' | 'FAILED';
+  /** Human-readable reason when status is FAILED. */
+  reason?: string;
+  /** Canonical step count (post-normalization). */
+  stepCount?: number;
+}
+
+/** Aggregate pipeline summary across all cases in a requirement/batch run. */
+export interface PipelineSummary {
+  inputTestCases: number;
+  canonicalized: number;
+  parsed: number;
+  grounded: number;
+  generatedScripts: number;
+  /** Per-case breakdown (capped by the caller when serialized to the API). */
+  cases: CaseTrace[];
+}
+
 export interface GenerationResult {
   testPlan: TestPlan;
   generatedFiles: GeneratedFile[];
@@ -253,6 +302,12 @@ export interface GenerationResult {
    * specific method was chosen. Present only when repo profile is available.
    */
   repositoryIntelligence?: RepositoryIntelligenceReport;
+  /**
+   * Pipeline observability (user request). Present on deterministic
+   * requirement/test-case runs — lets the API and dashboard show WHERE the
+   * count dropped to zero (canonicalization / parsing / grounding / emit).
+   */
+  pipeline?: PipelineSummary;
 }
 
 /** Page Object metadata exposed for transparency and debugging. */
@@ -411,7 +466,13 @@ export class DeterministicGenerationEmptyError extends Error {
   readonly intendedCaseCount: number;
   /** Per-case reasons collected by the batch generator (best-effort). */
   readonly caseErrors: string[];
-  constructor(intendedCaseCount: number, caseErrors: string[] = [], cause?: string) {
+  /**
+   * Pipeline summary (user request) — shows WHERE the count dropped to zero so
+   * the failing stage is obvious without SQL or logs. Present when the batch
+   * generator ran far enough to build it.
+   */
+  readonly pipeline?: PipelineSummary;
+  constructor(intendedCaseCount: number, caseErrors: string[] = [], cause?: string, pipeline?: PipelineSummary) {
     super(
       `Deterministic generation from ${intendedCaseCount} test case(s) produced no grounded script` +
         (cause ? `: ${cause}` : '') +
@@ -420,6 +481,7 @@ export class DeterministicGenerationEmptyError extends Error {
     this.name = 'DeterministicGenerationEmptyError';
     this.intendedCaseCount = intendedCaseCount;
     this.caseErrors = caseErrors;
+    if (pipeline) this.pipeline = pipeline;
   }
 }
 
@@ -724,7 +786,7 @@ export class ScriptGenEngine {
         return batchResult;
       }
       logger.error(MOD, 'Deterministic requirement-batch generation produced nothing — refusing generic fallback');
-      throw new DeterministicGenerationEmptyError(config.testCases.length, batch?.errors ?? []);
+      throw new DeterministicGenerationEmptyError(config.testCases.length, batch?.errors ?? [], undefined, batch?.pipeline);
     }
 
     if (config.testCase) {
@@ -1309,6 +1371,19 @@ ${combined.map(l => (l ? `    ${l}` : '')).join('\n')}
     const groundingReports: LocatorGroundingReport[] = [];
     const repoIntelReports: RepositoryIntelligenceReport[] = [];
 
+    // ── Pipeline observability (user request) ──────────────────────────────
+    // Track WHERE each case falls out so "nothing generated" is localizable in
+    // one screen. Counts are monotonic funnel stages; per-case traces name the
+    // deepest stage each case reached and why it stopped.
+    const caseTraces: CaseTrace[] = [];
+    const pipelineCounts = {
+      inputTestCases: cases.length,
+      canonicalized: 0,
+      parsed: 0,
+      grounded: 0,
+      generatedScripts: 0,
+    };
+
     // The shared test-data module path is a repository convention (Repo
     // Intelligence), not a literal — resolve it once so the de-dupe check below
     // matches whatever folder the connected repo uses (defaults to tests/data).
@@ -1328,6 +1403,13 @@ ${combined.map(l => (l ? `    ${l}` : '')).join('\n')}
 
     for (const tc of cases) {
       const caseLabel = `Test case ${tc.id ?? tc.title ?? '?'}`;
+      const trace: CaseTrace = {
+        id: (tc.id ?? null) as CaseTrace['id'],
+        title: (tc.title ?? null) as CaseTrace['title'],
+        reachedStage: 'Canonicalization',
+        status: 'FAILED',
+      };
+      caseTraces.push(trace);
       try {
         // ── STAGE 1 observability (Bug #2 fix) ──
         // Normalize the steps FIRST and inspect the diagnostics. When a case
@@ -1335,17 +1417,40 @@ ${combined.map(l => (l ? `    ${l}` : '')).join('\n')}
         // instead of discarding it as a bare `null`. This is what populates the
         // 422 `caseErrors` so users see the real Stage-1 reason per case.
         const { steps: normalizedSteps, diagnostics } = this.parseTestCaseStepsWithDiagnostics(tc);
+        trace.stepCount = normalizedSteps.length;
         if (normalizedSteps.length === 0) {
-          errors.push(describeStageOneFailure(caseLabel, diagnostics));
+          // Died at canonicalization/parsing — the steps payload yielded 0
+          // automatable steps. reachedStage stays "Canonicalization".
+          trace.reason = describeStageOneFailure(caseLabel, diagnostics);
+          errors.push(trace.reason);
           continue;
         }
+        // Canonicalization + step parsing succeeded.
+        pipelineCounts.canonicalized++;
+        pipelineCounts.parsed++;
+        trace.reachedStage = 'Step Parsing';
 
         // Reuse the single-case translator by scoping config to this case.
         const single = this.generateFromTestCase({ ...config, testCase: tc, testCases: undefined }, crawl);
         if (!single || single.generatedFiles.length === 0) {
           // Steps parsed but a later stage (grounding/emit) produced nothing.
-          errors.push(`${caseLabel}: STAGE 3/4 — ${normalizedSteps.length} step(s) parsed but no script emitted`);
+          // Distinguish grounding failure from emit failure using the report.
+          const grounded = single?.locatorGrounding;
+          if (grounded && (grounded.groundedCount > 0 || grounded.realCount > 0)) {
+            trace.reachedStage = 'Grounding';
+            pipelineCounts.grounded++;
+            trace.reason = `${caseLabel}: STAGE 4 (script emit) — ${normalizedSteps.length} step(s) parsed and ${grounded.realCount} locator(s) grounded, but no spec emitted`;
+          } else {
+            trace.reachedStage = 'Step Parsing';
+            trace.reason = `${caseLabel}: STAGE 3 (grounding) — ${normalizedSteps.length} step(s) parsed but 0 locators grounded against the App Profile`;
+          }
+          errors.push(trace.reason);
           continue;
+        }
+        // Grounding produced at least one real locator for this case.
+        if (single.locatorGrounding && (single.locatorGrounding.groundedCount > 0 || single.locatorGrounding.realCount > 0)) {
+          pipelineCounts.grounded++;
+          trace.reachedStage = 'Grounding';
         }
         if (single.locatorGrounding) groundingReports.push(single.locatorGrounding);
         if (single.repositoryIntelligence) repoIntelReports.push(single.repositoryIntelligence);
@@ -1379,8 +1484,14 @@ ${combined.map(l => (l ? `    ${l}` : '')).join('\n')}
         totalAssertions += single.stats.totalAssertions;
         totalTests += single.stats.totalTests;
         if (single.testPlan.flows[0]) flows.push(single.testPlan.flows[0]);
+        // Case fully traversed the pipeline and emitted a spec.
+        pipelineCounts.generatedScripts++;
+        trace.reachedStage = 'Generated';
+        trace.status = 'OK';
+        delete trace.reason;
       } catch (err: any) {
-        errors.push(`${caseLabel}: STAGE 3 threw — ${err?.message}`);
+        trace.reason = `${caseLabel}: STAGE 3 threw — ${err?.message}`;
+        errors.push(trace.reason);
       }
     }
 
@@ -1398,6 +1509,17 @@ ${combined.map(l => (l ? `    ${l}` : '')).join('\n')}
     }
 
     const reqLabel = cases[0]?.requirement_id ? `requirement ${cases[0].requirement_id}` : 'requirement';
+
+    // Assemble the pipeline summary (user request) — the funnel + per-case trace
+    // that lets the API / dashboard localize WHERE the count dropped to zero.
+    const pipeline: PipelineSummary = { ...pipelineCounts, cases: caseTraces };
+    logger.info(MOD, 'Requirement pipeline summary', {
+      inputTestCases: pipeline.inputTestCases,
+      canonicalized: pipeline.canonicalized,
+      parsed: pipeline.parsed,
+      grounded: pipeline.grounded,
+      generatedScripts: pipeline.generatedScripts,
+    });
 
     if (generatedFiles.length === 0) {
       // Bug #2 fix: DO NOT discard the per-case diagnostics. Previously this
@@ -1435,6 +1557,7 @@ ${combined.map(l => (l ? `    ${l}` : '')).join('\n')}
           model: 'deterministic-requirement-batch',
         },
         errors,
+        pipeline,
       };
     }
 
@@ -1480,6 +1603,7 @@ ${combined.map(l => (l ? `    ${l}` : '')).join('\n')}
         model: 'deterministic-requirement-batch',
       },
       errors,
+      pipeline,
       ...(locatorGrounding.total > 0 ? { locatorGrounding } : {}),
       ...(repositoryIntelligence ? { repositoryIntelligence } : {}),
     };
