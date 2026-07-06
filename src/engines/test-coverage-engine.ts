@@ -17,6 +17,14 @@ import {
   type IntelligenceScore,
 } from '../services/intelligence-orchestrator';
 import { planScenarios, buildScenarioPlanBlock, type ScenarioPlan } from './scenario-planner';
+import { classifyQACategory } from './qa-knowledge-engine';
+import {
+  optimizeKnowledgeForCategory,
+  buildPromptBreakdown,
+  estimateCostUsd,
+  type PromptSectionBreakdown,
+  type OptimizeStats,
+} from './prompt-optimizer';
 
 const MOD = 'test-coverage-engine';
 
@@ -25,7 +33,7 @@ const MOD = 'test-coverage-engine';
  * Tracked in every generation so we can correlate quality with prompt evolution and
  * quickly diagnose "last week was better" reports by identifying which version ran.
  */
-const PROMPT_VERSION = 'v3.3-scenario-plan';
+const PROMPT_VERSION = 'v3.4-prompt-optimizer';
 
 /**
  * Engine architecture version — increment when the pipeline or core algorithm changes
@@ -153,6 +161,20 @@ const GAP_ANALYSIS_MIN_COMPLEXITY = floatEnv('GEN_GAP_ANALYSIS_MIN_COMPLEXITY', 
  * candidates the LLM keeps only if the requirement/context supports them.
  */
 const SCENARIO_PLANNER_ENABLED = (process.env.GEN_SCENARIO_PLANNER || 'true').toLowerCase() !== 'false';
+
+/**
+ * Prompt Optimizer — deterministic, ZERO-token trimming of the grounding
+ * context (application profile pages/forms/elements + test-data sets) down to
+ * what the requirement's QA category actually needs. The dominant token cost is
+ * the INPUT prompt, not the output; sending the entire crawled app profile for
+ * a "User Login" requirement is pure waste. Default ON; set
+ * GEN_PROMPT_OPTIMIZER=false to send the full context (legacy behaviour).
+ * Fail-open: for `generic`/low-confidence categories or small profiles the
+ * context is passed through unchanged, so the prompt is byte-for-byte legacy.
+ */
+const PROMPT_OPTIMIZER_ENABLED = (process.env.GEN_PROMPT_OPTIMIZER || 'true').toLowerCase() !== 'false';
+/** Minimum classification confidence before the optimizer trims context. */
+const PROMPT_OPTIMIZER_MIN_CONFIDENCE = parseFloat(process.env.GEN_PROMPT_OPTIMIZER_MIN_CONFIDENCE || '0.5');
 
 /** Signals used to classify requirement complexity — all cheap to compute, ZERO LLM calls. */
 export interface ComplexitySignals {
@@ -460,6 +482,12 @@ export interface GenerationResult {
     automationReadyCount: number;
     gapsFound: number;
     tokensUsed: number;
+    /** Prompt (input) tokens summed across every LLM call this run. */
+    promptTokens?: number;
+    /** Completion (output) tokens summed across every LLM call this run. */
+    completionTokens?: number;
+    /** Rough USD cost estimate for the run (input+output at configured rates). */
+    estimatedCostUsd?: number;
     /** How many near-duplicate cases the semantic dedup pass removed. */
     duplicatesRemoved?: number;
     /** Count of separate suggested (expansion) cases. */
@@ -500,6 +528,17 @@ export interface GenerationResult {
       generationTokens?: number;
       /** Total tokens across every LLM call in this run. */
       totalTokens?: number;
+      /** Prompt (input) tokens summed across every LLM call — the dominant cost. */
+      promptTokens?: number;
+      /** Completion (output) tokens summed across every LLM call. */
+      completionTokens?: number;
+      /** Rough USD cost estimate for this run (input+output at configured rates). */
+      estimatedCostUsd?: number;
+      /** Deterministic per-section breakdown of the generation prompt (chars +
+       *  estimated tokens) — shows WHERE input tokens go. Zero LLM cost. */
+      promptBreakdown?: PromptSectionBreakdown;
+      /** What the Prompt Optimizer trimmed from the grounding context (before/after). */
+      promptOptimization?: OptimizeStats;
       /** Number of scenarios produced. */
       scenarioCount?: number;
       /** Number of committed test cases produced. */
@@ -925,7 +964,7 @@ Do NOT invent placeholder data (john@test.com, password123, ABC Product) when a 
   async analyzeRequirement(
     input: RequirementInput,
     knowledge?: KnowledgeContext
-  ): Promise<{ analysis: RequirementAnalysis; tokensUsed: number }> {
+  ): Promise<{ analysis: RequirementAnalysis; tokensUsed: number; promptTokens?: number; completionTokens?: number }> {
     const knowledgeBlock = knowledge?.modules?.length
       ? `\n\nAPPLICATION KNOWLEDGE:\n${knowledge.modules.map(m =>
           `Module: ${m.name}\n  Workflows: ${m.workflows || 'N/A'}\n  Business Rules: ${m.businessRules || 'N/A'}\n  APIs: ${m.apis || 'N/A'}`
@@ -981,7 +1020,7 @@ Return ONLY valid JSON, no markdown fences.`;
         summary: input.description.slice(0, 200),
       };
     }
-    return { analysis, tokensUsed: resp.tokensUsed };
+    return { analysis, tokensUsed: resp.tokensUsed, promptTokens: resp.promptTokens, completionTokens: resp.completionTokens };
   }
 
   /**
@@ -1088,10 +1127,20 @@ Return ONLY valid JSON, no markdown fences.`;
     missingRequirements: MissingRequirement[];
     coverageTypeEvaluations: CoverageTypeEvaluation[];
     tokensUsed: number;
+    /** Prompt (input) tokens for the generation call. */
+    promptTokens: number;
+    /** Completion (output) tokens for the generation call. */
+    completionTokens: number;
     /** Size of the generation prompt actually sent — for measurability
      *  (prompt size → output volume → tokens/cost), per the "measure, don't
      *  just keep raising the budget" principle. */
     promptChars: number;
+    /** Deterministic per-section breakdown of the generation prompt (chars +
+     *  estimated tokens), so we can SEE where prompt tokens go instead of
+     *  guessing. Zero LLM cost — computed from the assembled block strings. */
+    promptBreakdown?: PromptSectionBreakdown;
+    /** What the Prompt Optimizer trimmed (before/after per grounding section). */
+    promptOptimization?: OptimizeStats;
     /** Intelligence Score from the orchestrator (undefined on the legacy path). */
     intelligenceScore?: IntelligenceScore;
   }> {
@@ -1117,23 +1166,56 @@ Return ONLY valid JSON, no markdown fences.`;
       coverageTypes = ['positive'];
     }
 
-    const knowledgeBugs = knowledge?.historicalBugs?.length
-      ? `\nHistorical bugs to consider: ${knowledge.historicalBugs.join('; ')}`
+    // ── Prompt Optimizer (QA-first, ZERO tokens) ──
+    // Trim the grounding context (app profile pages/forms/elements + test-data
+    // sets) to what the requirement's QA category actually needs BEFORE any
+    // block is assembled. The INPUT prompt — not the output — is the dominant
+    // token cost, and shipping the entire crawled app profile for a "User
+    // Login" requirement is pure waste. Fail-open: generic/low-confidence
+    // requirements pass through unchanged (byte-for-byte legacy prompt). Only
+    // trims the LEGACY grounding blocks; the orchestrated path already scopes by
+    // intent and is left untouched.
+    let genKnowledge = knowledge;
+    let optimizeStats: OptimizeStats | undefined;
+    if (PROMPT_OPTIMIZER_ENABLED && knowledge) {
+      const cls = classifyQACategory(input, analysis.featureType);
+      const reqText = `${input.title} ${input.description} ${input.acceptanceCriteria || ''} ${input.businessFlow || ''}`;
+      const optimized = optimizeKnowledgeForCategory(knowledge, reqText, {
+        category: cls.category,
+        confidence: cls.confidence,
+        minConfidence: PROMPT_OPTIMIZER_MIN_CONFIDENCE,
+      });
+      genKnowledge = optimized.knowledge;
+      optimizeStats = optimized.stats;
+      logger.info(MOD, 'Prompt optimizer', {
+        applied: optimizeStats.applied,
+        category: optimizeStats.category,
+        confidence: optimizeStats.confidence,
+        pages: `${optimizeStats.pages.before}→${optimizeStats.pages.after}`,
+        forms: `${optimizeStats.forms.before}→${optimizeStats.forms.after}`,
+        elements: `${optimizeStats.elements.before}→${optimizeStats.elements.after}`,
+        testData: `${optimizeStats.testData.before}→${optimizeStats.testData.after}`,
+        reason: optimizeStats.reason,
+      });
+    }
+
+    const knowledgeBugs = genKnowledge?.historicalBugs?.length
+      ? `\nHistorical bugs to consider: ${genKnowledge.historicalBugs.join('; ')}`
       : '';
-    const knowledgeTests = knowledge?.existingTestCases?.length
-      ? `\nExisting test coverage: ${knowledge.existingTestCases.join('; ')}`
+    const knowledgeTests = genKnowledge?.existingTestCases?.length
+      ? `\nExisting test coverage: ${genKnowledge.existingTestCases.join('; ')}`
       : '';
-    const enterpriseBlock = this.buildEnterpriseKnowledgeBlock(knowledge, input);
+    const enterpriseBlock = this.buildEnterpriseKnowledgeBlock(genKnowledge, input);
     // Phase 2 — intent-scoped orchestrated intelligence. When available, it
     // REPLACES the legacy flat repo / app-profile / test-data blocks (the rich
     // enterprise-knowledge block is always kept). Fully additive: '' when the
     // flag is off or no scope/intelligence is present → legacy blocks are used.
-    const orchestrated = await this.buildOrchestratedIntelligenceBlock(input, knowledge);
+    const orchestrated = await this.buildOrchestratedIntelligenceBlock(input, genKnowledge);
     const useOrchestrated = orchestrated.block.length > 0;
     const orchestratedBlock = orchestrated.block;
-    const repoBlock = useOrchestrated ? '' : this.buildRepoIntelligenceBlock(knowledge);
-    const appProfileBlock = useOrchestrated ? '' : this.buildApplicationProfileBlock(knowledge);
-    const testDataBlock = useOrchestrated ? '' : this.buildTestDataBlock(knowledge);
+    const repoBlock = useOrchestrated ? '' : this.buildRepoIntelligenceBlock(genKnowledge);
+    const appProfileBlock = useOrchestrated ? '' : this.buildApplicationProfileBlock(genKnowledge);
+    const testDataBlock = useOrchestrated ? '' : this.buildTestDataBlock(genKnowledge);
 
     // ── Per-type coverage objectives ──
     // Each SELECTED coverage type is an INDEPENDENT objective with its own goal and
@@ -1298,6 +1380,35 @@ Return JSON (use [] for empty buckets):
 
 Return ONLY valid JSON. Address EVERY selected coverage type, organise scenarios by coverageType, and be comprehensive while staying grounded. ${expand ? 'Keep grounded coverage and assumption-based suggestions in SEPARATE buckets.' : 'Use ALL provided context to ground committed coverage; keep suggestedTestCases and missingRequirements empty.'}`;
 
+    // ── Deterministic prompt breakdown (analytics, ZERO tokens) ──
+    // Attribute the assembled prompt to named sections so we can SEE where the
+    // INPUT tokens actually go (requirement vs app profile vs knowledge vs
+    // instructions vs scenario plan) instead of reporting one opaque number.
+    // "instructions" is the static reasoning/schema scaffold — everything not
+    // accounted for by a grounding block.
+    const requirementSectionChars =
+      input.title.length + input.description.length +
+      (input.acceptanceCriteria?.length || 0) + (input.businessFlow?.length || 0);
+    const knowledgeSectionChars = enterpriseBlock.length + repoBlock.length + orchestratedBlock.length;
+    const accountedChars =
+      requirementSectionChars + knowledgeSectionChars + appProfileBlock.length +
+      testDataBlock.length + coverageObjectives.length + scopeBlock.length + scenarioPlanBlock.length;
+    const instructionsChars = Math.max(0, prompt.length - accountedChars);
+    const promptBreakdown: PromptSectionBreakdown = buildPromptBreakdown([
+      { key: 'requirement', label: 'Requirement + Analysis', text: 'x'.repeat(requirementSectionChars) },
+      { key: 'appProfile', label: 'App Profile', text: appProfileBlock },
+      { key: 'knowledge', label: 'App Knowledge', text: 'x'.repeat(knowledgeSectionChars) },
+      { key: 'testData', label: 'Test Data', text: testDataBlock },
+      { key: 'coverageObjectives', label: 'Coverage Objectives', text: coverageObjectives },
+      { key: 'scenarioPlan', label: 'Scenario Plan', text: scenarioPlanBlock },
+      { key: 'instructions', label: 'Instructions + Schema', text: 'x'.repeat(instructionsChars) },
+    ]);
+    logger.info(MOD, 'Prompt breakdown', {
+      totalChars: promptBreakdown.totalChars,
+      estTokens: promptBreakdown.totalEstimatedTokens,
+      sections: promptBreakdown.sections.map(s => `${s.key}:${s.estimatedTokens}(${s.pctOfPrompt}%)`).join(' '),
+    });
+
     // Exhaustive, multi-type coverage with a rich grounding context: request the
     // full output budget and a generous prompt-char budget so neither the input
     // context nor the JSON schema at the end of the prompt is truncated.
@@ -1356,7 +1467,16 @@ Return ONLY valid JSON. Address EVERY selected coverage type, organise scenarios
       parsed.coverageTypeEvaluations
     );
 
-    return { scenarios, testCases, suggestedTestCases, missingRequirements, coverageTypeEvaluations, tokensUsed: resp.tokensUsed, promptChars: prompt.length, intelligenceScore: orchestrated.intelligenceScore };
+    return {
+      scenarios, testCases, suggestedTestCases, missingRequirements, coverageTypeEvaluations,
+      tokensUsed: resp.tokensUsed,
+      promptTokens: resp.promptTokens,
+      completionTokens: resp.completionTokens,
+      promptChars: prompt.length,
+      promptBreakdown,
+      promptOptimization: optimizeStats,
+      intelligenceScore: orchestrated.intelligenceScore,
+    };
   }
 
   /**
@@ -1414,7 +1534,7 @@ Return ONLY valid JSON. Address EVERY selected coverage type, organise scenarios
     analysis: RequirementAnalysis,
     scenarios: TestScenario[],
     knowledge?: KnowledgeContext
-  ): Promise<{ gaps: CoverageGap[]; tokensUsed: number }> {
+  ): Promise<{ gaps: CoverageGap[]; tokensUsed: number; promptTokens?: number; completionTokens?: number }> {
     const existingCoverage = knowledge?.existingTestCases?.length
       ? `\nExisting Test Cases: ${knowledge.existingTestCases.join('; ')}`
       : '';
@@ -1460,7 +1580,7 @@ Return ONLY valid JSON array.`;
     } catch {
       gaps = [];
     }
-    return { gaps, tokensUsed: resp.tokensUsed };
+    return { gaps, tokensUsed: resp.tokensUsed, promptTokens: resp.promptTokens, completionTokens: resp.completionTokens };
   }
 
   /* ---- Full Pipeline ---- */
@@ -1545,10 +1665,13 @@ Return ONLY valid JSON array.`;
     const analysisStart = Date.now();
     let analysis: RequirementAnalysis;
     let t1 = 0;
+    let p1 = 0, c1 = 0; // analysis prompt/completion split
     if (tierCfg.runAnalysis) {
       const analyzed = await this.analyzeRequirement(input, knowledge);
       analysis = analyzed.analysis;
       t1 = analyzed.tokensUsed;
+      p1 = analyzed.promptTokens ?? 0;
+      c1 = analyzed.completionTokens ?? 0;
     } else {
       analysis = this.heuristicAnalysis(input, complexity);
     }
@@ -1567,6 +1690,10 @@ Return ONLY valid JSON array.`;
     );
     const generationMs = Date.now() - generationStart;
     const { scenarios, testCases: rawTestCases, missingRequirements, coverageTypeEvaluations, tokensUsed: t2, promptChars, intelligenceScore } = gen;
+    const p2 = gen.promptTokens ?? 0;      // generation prompt tokens
+    const c2 = gen.completionTokens ?? 0;  // generation completion tokens
+    const promptBreakdown = gen.promptBreakdown;
+    const promptOptimization = gen.promptOptimization;
     let rawSuggested = gen.suggestedTestCases || [];
     logger.info(MOD, 'Test generation complete', {
       scenarios: scenarios.length, testCases: rawTestCases.length,
@@ -1608,7 +1735,7 @@ Return ONLY valid JSON array.`;
     // Phase 6: Gap analysis — only when the caller asked for it AND the
     // requirement cleared the complexity gate (Priority 3). Saves a full LLM
     // call for simple requirements.
-    const gapWork = async (): Promise<{ gaps: CoverageGap[]; tokensUsed: number }> => {
+    const gapWork = async (): Promise<{ gaps: CoverageGap[]; tokensUsed: number; promptTokens?: number; completionTokens?: number }> => {
       if (!runGapAnalysis) {
         logger.info(MOD, 'Gap analysis skipped — not requested or below complexity gate');
         return { gaps: [], tokensUsed: 0 };
@@ -1624,8 +1751,16 @@ Return ONLY valid JSON array.`;
     const duplicatesRemoved = dedupResult.removed;
     const gaps = gapResult.gaps;
     const t3 = gapResult.tokensUsed;
+    const p3 = gapResult.promptTokens ?? 0;      // gap-analysis prompt tokens
+    const c3 = gapResult.completionTokens ?? 0;  // gap-analysis completion tokens
 
     const totalTokens = t1 + t2 + t3;
+    // Prompt (input) vs completion (output) totals across every LLM call. This
+    // is what makes token analytics honest: the UI can now show WHERE tokens go
+    // (big input prompt vs small output) instead of one opaque total.
+    const promptTokensTotal = p1 + p2 + p3;
+    const completionTokensTotal = c1 + c2 + c3;
+    const estimatedCostUsd = estimateCostUsd(promptTokensTotal, completionTokensTotal);
     const result: GenerationResult = {
       requirementAnalysis: analysis,
       scenarios,
@@ -1643,6 +1778,9 @@ Return ONLY valid JSON array.`;
         automationReadyCount: testCases.filter(tc => tc.automationReady).length,
         gapsFound: gaps.length,
         tokensUsed: totalTokens,
+        promptTokens: promptTokensTotal,
+        completionTokens: completionTokensTotal,
+        estimatedCostUsd,
         duplicatesRemoved,
         suggestedCount: suggestedTestCases.length,
         missingRequirementsCount: missingRequirements.length,
@@ -1667,6 +1805,11 @@ Return ONLY valid JSON array.`;
           analysisTokens: t1,
           generationTokens: t2,
           totalTokens,
+          promptTokens: promptTokensTotal,
+          completionTokens: completionTokensTotal,
+          estimatedCostUsd,
+          promptBreakdown,
+          promptOptimization,
           scenarioCount: scenarios.length,
           testCaseCount: testCases.length,
         },
@@ -1795,7 +1938,7 @@ Return ONLY valid JSON array.`;
     prompt: string,
     maxTokens: number,
     opts?: { complexity?: 'simple' | 'standard' | 'complex'; maxPromptChars?: number }
-  ): Promise<{ content: string; tokensUsed: number }> {
+  ): Promise<{ content: string; tokensUsed: number; promptTokens: number; completionTokens: number }> {
     // Use ModelSelector for intelligent model selection
     const modelConfig = this.modelSelector.selectModel('test_generation', opts?.complexity || 'standard');
     const effectiveMaxTokens = Math.min(maxTokens, modelConfig.maxTokens);
@@ -1815,6 +1958,8 @@ Return ONLY valid JSON array.`;
 
     let content = '';
     let tokensUsed = 0;
+    let promptTokens = 0;
+    let completionTokens = 0;
     let usedModel = modelConfig.model;
 
     // Provider routing — Claude when TEST_PROVIDER=anthropic + configured;
@@ -1835,6 +1980,9 @@ Return ONLY valid JSON array.`;
         });
         content = r.content || '{}';
         tokensUsed = r.tokensUsed;
+        // Anthropic usage split when available; fall back to attributing all to prompt.
+        promptTokens = r.promptTokens ?? Math.max(0, tokensUsed - (r.completionTokens ?? 0));
+        completionTokens = r.completionTokens ?? Math.max(0, tokensUsed - promptTokens);
         usedModel = r.model;
         routed = true;
       } catch (err) {
@@ -1855,7 +2003,9 @@ Return ONLY valid JSON array.`;
         ],
       });
       content = resp.choices[0]?.message?.content || '{}';
-      tokensUsed = (resp.usage?.prompt_tokens || 0) + (resp.usage?.completion_tokens || 0);
+      promptTokens = resp.usage?.prompt_tokens || 0;
+      completionTokens = resp.usage?.completion_tokens || 0;
+      tokensUsed = promptTokens + completionTokens;
       usedModel = modelConfig.model;
     }
 
@@ -1876,6 +2026,6 @@ Return ONLY valid JSON array.`;
       logger.warn(MOD, 'Cost tracking failed (non-blocking)', { error: (err as Error).message });
     });
 
-    return { content: content.trim(), tokensUsed };
+    return { content: content.trim(), tokensUsed, promptTokens, completionTokens };
   }
 }

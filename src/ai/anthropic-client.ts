@@ -98,6 +98,10 @@ export interface ChatCompletionResult {
   content: string;
   tokensUsed: number;
   model: string;
+  /** Prompt (input) tokens for this call — enables prompt-vs-completion analytics. */
+  promptTokens?: number;
+  /** Completion (output) tokens for this call — enables prompt-vs-completion analytics. */
+  completionTokens?: number;
 }
 
 interface AnthropicConfig {
@@ -190,9 +194,11 @@ export class AnthropicClient {
         });
 
         const content = this.extractText(resp);
-        const tokensUsed = (resp.usage?.input_tokens || 0) + (resp.usage?.output_tokens || 0);
+        const promptTokens = resp.usage?.input_tokens || 0;
+        const completionTokens = resp.usage?.output_tokens || 0;
+        const tokensUsed = promptTokens + completionTokens;
 
-        return { content, tokensUsed, model: resp.model || model };
+        return { content, tokensUsed, model: resp.model || model, promptTokens, completionTokens };
       } catch (error) {
         const message = (error as Error).message;
         logger.warn(MOD, 'Anthropic call failed', {
