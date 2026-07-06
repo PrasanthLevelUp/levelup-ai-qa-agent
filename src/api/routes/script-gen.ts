@@ -50,12 +50,12 @@ import { resolveBaseUrl } from '../../services/url-resolver';
 import { parseScriptContent } from '../../services/script-file-parser';
 import { LocatorResolver, type CrawlDataLike, type LocatorReport } from '../../services/locator-resolver';
 import { FolderStructureAnalyzer } from '../../services/folder-analyzer';
-import { ScriptGenEngine, type GenerationConfig, type GenerationResult, type GeneratedFile } from '../../script-gen/script-gen-engine';
+import { ScriptGenEngine, DeterministicGenerationEmptyError, type GenerationConfig, type GenerationResult, type GeneratedFile } from '../../script-gen/script-gen-engine';
 import { deriveTestCaseTargetUrls, profileCoversTargets } from '../../script-gen/test-case-coverage';
 import { getRepositoryContext } from '../../db/postgres';
 import { KnowledgeOptimizer, type KnowledgeItem } from '../../ai/knowledge-optimizer';
 import { AIReviewEngine } from '../../script-gen/ai-review-engine';
-import { ValidationRunner, computeReliabilityBreakdown } from '../../script-gen/validation-runner';
+import { ValidationRunner, computeReliabilityBreakdown, toPublicReliability } from '../../script-gen/validation-runner';
 import { ProjectExportEngine } from '../../script-gen/project-export-engine';
 import {
   createBranch,
@@ -1046,10 +1046,14 @@ export function createScriptGenRouter(): Router {
           files: result.generatedFiles.map((f: GeneratedFile) => ({ path: f.path, size: f.content.length, type: f.type })),
           testPlan: result.testPlan,
           validationReport,
-          // Honest, decomposed reliability — code quality vs grounding vs
-          // business coverage vs combined execution readiness. The dashboard
-          // should headline `executionReadiness`, NOT validationReport.overallScore.
-          reliabilityBreakdown,
+          // Honest, TRIMMED reliability — only the four headline numbers the UI
+          // needs: executionReadiness (weakest-link) + its code/grounding/
+          // coverage components. The dashboard must headline
+          // `reliability.executionReadiness`, NOT validationReport.overallScore
+          // (code-only). The detailed weighting/dimensions/copy stay internal
+          // (persisted in intelligence_metadata) so scoring can evolve without a
+          // frozen public contract.
+          reliability: toPublicReliability(reliabilityBreakdown),
           stats: result.stats,
           generationTimeMs,
           errors: result.errors,
@@ -1110,6 +1114,29 @@ export function createScriptGenRouter(): Router {
         },
       });
     } catch (err: any) {
+      // Honest failure for test-case / requirement intent. The engine now
+      // REFUSES to fall back to the generic workflow generator when real cases
+      // were supplied but produced nothing — it throws this typed error instead
+      // of emitting 4 ungrounded specs dressed up as a 100% success. Surface it
+      // as an actionable 422 so the dashboard routes the user to review /
+      // regenerate the test cases rather than shipping fake scripts.
+      if (err instanceof DeterministicGenerationEmptyError) {
+        console.warn(
+          `[ScriptGen] ❌ Deterministic generation from ${err.intendedCaseCount} case(s) produced nothing — refusing generic fallback`,
+        );
+        return res.status(422).json({
+          success: false,
+          error:
+            'These test cases could not be turned into grounded scripts (no automatable steps resolved against the app). ' +
+            'Review or regenerate the test cases in Test Case Lab, then try again. ' +
+            'Generation will not silently emit generic, ungrounded scripts.',
+          code: 'DETERMINISTIC_GENERATION_EMPTY',
+          intendedTestCaseCount: err.intendedCaseCount,
+          resolvedTestCaseCount: 0,
+          caseErrors: err.caseErrors.slice(0, 10),
+          nextAction: 'REVIEW_TEST_CASES',
+        });
+      }
       console.error('[ScriptGen] Generation error:', err);
       res.status(500).json({ success: false, error: err.message });
     }

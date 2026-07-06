@@ -147,6 +147,35 @@ export function computeReliabilityBreakdown(input: {
   };
 }
 
+/**
+ * Public, stable projection of {@link ReliabilityBreakdown} for the API/UI.
+ *
+ * The full breakdown carries internal presentation fields (headline, the
+ * `dimensions[]` array with per-dimension copy) and uses verbose internal names
+ * (`groundingQuality`, `businessCoverage`). Exposing all of that on the public
+ * response would freeze an over-detailed contract we'd have to support forever.
+ *
+ * The dashboard only needs the four headline numbers, so the public response
+ * exposes exactly those (with the concise, UI-friendly keys the frontend uses).
+ * The detailed weighting/algorithm and copy stay internal — persisted in
+ * `intelligence_metadata` for diagnostics — so scoring can evolve freely.
+ */
+export interface PublicReliability {
+  executionReadiness: number;      // 0-100 headline (weakest-link)
+  grounding: number | null;        // 0-100, null when no locators were expected
+  coverage: number | null;         // 0-100, null when there were no intended cases
+  codeQuality: number;             // 0-100
+}
+
+export function toPublicReliability(b: ReliabilityBreakdown): PublicReliability {
+  return {
+    executionReadiness: b.executionReadiness,
+    grounding: b.groundingQuality,
+    coverage: b.businessCoverage,
+    codeQuality: b.codeQuality,
+  };
+}
+
 /* -------------------------------------------------------------------------- */
 /*  Engine                                                                    */
 /* -------------------------------------------------------------------------- */
