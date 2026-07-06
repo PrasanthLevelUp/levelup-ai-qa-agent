@@ -17,6 +17,14 @@ import {
   type IntelligenceScore,
 } from '../services/intelligence-orchestrator';
 import { planScenarios, buildScenarioPlanBlock, type ScenarioPlan } from './scenario-planner';
+import {
+  buildDraftTestCases,
+  buildDraftBlock,
+  buildFormatterPrompt,
+  buildDeterministicOutput,
+  buildScenariosFromDrafts,
+  type DraftTestCase,
+} from './scenario-builder';
 import { classifyQACategory } from './qa-knowledge-engine';
 import {
   optimizeKnowledgeForCategory,
@@ -33,7 +41,7 @@ const MOD = 'test-coverage-engine';
  * Tracked in every generation so we can correlate quality with prompt evolution and
  * quickly diagnose "last week was better" reports by identifying which version ran.
  */
-const PROMPT_VERSION = 'v3.7-element-level-retrieval';
+const PROMPT_VERSION = 'v3.9-formatter-mode';
 
 /**
  * Engine architecture version — increment when the pipeline or core algorithm changes
@@ -210,6 +218,40 @@ const SCENARIO_PLANNER_ENABLED = (process.env.GEN_SCENARIO_PLANNER || 'true').to
 const PROMPT_OPTIMIZER_ENABLED = (process.env.GEN_PROMPT_OPTIMIZER || 'true').toLowerCase() !== 'false';
 /** Minimum classification confidence before the optimizer trims context. */
 const PROMPT_OPTIMIZER_MIN_CONFIDENCE = parseFloat(process.env.GEN_PROMPT_OPTIMIZER_MIN_CONFIDENCE || '0.5');
+
+/**
+ * Deterministic Scenario Builder (Phase 2 of the QA-first architecture). When
+ * enabled, after the planner decides WHAT to test and the retriever scopes the
+ * context, the builder (see scenario-builder.ts) ASSEMBLES a concrete, grounded
+ * DRAFT test case for every planned scenario — real selectors from the App
+ * Profile, real dataset references from Test Data, concrete steps — so the LLM
+ * only REFINES the wording instead of re-inventing coverage from scratch. This
+ * both raises the scenario/case COUNT off the weak "5 scenarios" floor (drafts
+ * are a floor, never a ceiling) and makes generation deterministic + grounded.
+ * Default ON; set GEN_SCENARIO_BUILDER=false to fall back to the plan-only
+ * prompt (LLM expands the plan itself). Requires the planner to be enabled.
+ */
+const SCENARIO_BUILDER_ENABLED = (process.env.GEN_SCENARIO_BUILDER || 'true').toLowerCase() !== 'false';
+
+/**
+ * Formatter Mode (the token-reduction payoff of the QA-first architecture).
+ * When the deterministic builder has produced COMPLETE drafts, we stop asking
+ * the LLM to reason at all: instead of the full generation prompt (requirement +
+ * app profile + knowledge + test data + coverage essay + plan + drafts +
+ * instructions + schema), the model receives ONLY the finished test-case objects
+ * and a short "polish the wording, don't change logic or count" instruction. The
+ * deterministic layer decided WHAT to test and assembled the steps/selectors/
+ * data; the LLM only edits English. This is what actually cuts INPUT tokens (the
+ * previous draft-block approach ADDED tokens; this REPLACES the whole prompt).
+ *
+ * Guaranteed coverage: the builder's deterministic output is the FALLBACK — if
+ * the formatter LLM errors, returns invalid JSON, or drops/duplicates cases, we
+ * ship the deterministic test cases unchanged. Coverage never depends on the
+ * model. Scoped to STANDARD mode (Gap Analysis still uses the reasoning prompt,
+ * since assumptions genuinely require the model to think beyond the drafts).
+ * Default ON; set GEN_FORMATTER_MODE=false to keep the full reasoning prompt.
+ */
+const FORMATTER_MODE_ENABLED = (process.env.GEN_FORMATTER_MODE || 'true').toLowerCase() !== 'false';
 
 /** Signals used to classify requirement complexity — all cheap to compute, ZERO LLM calls. */
 export interface ComplexitySignals {
@@ -1271,6 +1313,55 @@ Return ONLY valid JSON, no markdown fences.`;
       });
     }
 
+    // ── Deterministic Scenario Builder (QA-first, ZERO tokens) ──
+    // The plan decided WHAT to test; the retriever produced the SCOPED context
+    // (real selectors/URLs/datasets). Instead of asking the LLM to re-discover
+    // all of that and (as observed) under-generate to a weak 5-scenario floor,
+    // we ASSEMBLE a concrete, grounded DRAFT test case for every planned
+    // scenario — plus conditional ones the requirement/context supports — from
+    // the real App Profile + Test Data. The LLM then only REFINES the wording.
+    // Pure/deterministic/fail-open: no drafts ⇒ empty block ⇒ legacy behaviour.
+    let draftBlock = '';
+    let draftDrafts: DraftTestCase[] = [];
+    if (SCENARIO_BUILDER_ENABLED && SCENARIO_PLANNER_ENABLED && scenarioPlan) {
+      const built = buildDraftTestCases(scenarioPlan, genKnowledge, input);
+      draftDrafts = built.drafts;
+      draftBlock = buildDraftBlock(built.drafts);
+      logger.info(MOD, 'Scenario builder', {
+        planned: scenarioPlan.scenarios.length,
+        drafts: built.drafts.length,
+        grounded: built.groundedCount,
+        conditionalKept: built.conditionalKept,
+        applied: draftBlock.length > 0,
+      });
+    }
+
+    // ── Formatter Mode decision ──
+    // When the builder produced COMPLETE drafts, switch the LLM from "generate"
+    // to "format": it will receive ONLY the finished test-case objects (no
+    // requirement/app-profile/knowledge/coverage/reasoning), cutting the input
+    // prompt to the drafts + a short polish instruction. Scoped to STANDARD mode
+    // (Gap Analysis still reasons over assumptions). Coverage is guaranteed by
+    // the deterministic fallback below, never by the model.
+    //
+    // CRITICAL coverage guard: only engage formatter mode when the drafts cover
+    // EVERY selected coverage type. If the user selected a type the plan/KB does
+    // not yet cover (e.g. "boundary" or "performance" on a login), we must NOT
+    // silently drop it — we fall back to the full reasoning prompt so the LLM
+    // fills that gap. This preserves the "never reduce coverage" contract: the
+    // formatter path can only ever match or exceed the selected-type coverage.
+    const draftCoverageTypes = new Set(draftDrafts.map(d => d.coverageType));
+    const allSelectedTypesCovered = coverageTypes.every(ct => draftCoverageTypes.has(ct));
+    const formatterMode =
+      FORMATTER_MODE_ENABLED && !expand && draftDrafts.length > 0 && allSelectedTypesCovered;
+    const deterministicOutput = formatterMode ? buildDeterministicOutput(draftDrafts) : undefined;
+    if (FORMATTER_MODE_ENABLED && !expand && draftDrafts.length > 0 && !allSelectedTypesCovered) {
+      logger.info(MOD, 'Formatter mode skipped — drafts do not cover all selected types', {
+        selected: coverageTypes.join(','),
+        draftTypes: Array.from(draftCoverageTypes).join(','),
+      });
+    }
+
     const knowledgeBugs = genKnowledge?.historicalBugs?.length
       ? `\nHistorical bugs to consider: ${genKnowledge.historicalBugs.join('; ')}`
       : '';
@@ -1327,7 +1418,13 @@ Return ONLY valid JSON, no markdown fences.`;
     // model does the full enumeration itself. Either way the block is a few
     // hundred chars, not the ~1.4K-char phase essay it replaces.
     const hasPlan = scenarioPlanBlock.trim().length > 0;
-    const reasoningBlock = hasPlan
+    const hasDrafts = draftBlock.trim().length > 0;
+    const reasoningBlock = hasDrafts
+      ? `REASONING (do this INTERNALLY; output ONLY the final JSON):
+  1. Extract every obligation from the Acceptance Criteria as precondition → action → expected → risk. EACH obligation must be verified by ≥1 test case (missing one is the worst failure).
+  2. REFINE THE PRE-BUILT DRAFTS below — they were assembled DETERMINISTICALLY from the scenario plan and the REAL app structure (selectors/URLs/datasets). Do NOT re-derive coverage or re-discover the app: produce one polished test case per draft (keeping its scenarioIndex, real selectors, dataset references, priority, riskArea and source), then ADD any further cases the requirement/context clearly implies. The drafts are a FLOOR — never emit fewer cases than drafts.
+  3. Cover EVERY selected coverage type on its own — never collapse to a single happy path, never merge types into one scenario. No upper cap; the requirement + context decide depth. Never pad with reworded repetition or ungrounded guesses, and never invent selectors/pages/datasets absent from the drafts/context.`
+      : hasPlan
       ? `REASONING (do this INTERNALLY; output ONLY the final JSON):
   1. Extract every obligation from the Acceptance Criteria as precondition → action → expected → risk. EACH obligation must be verified by ≥1 test case (missing one is the worst failure).
   2. EXPAND THE SCENARIO PLAN above — it is the baseline set of scenarios this feature category requires. Keep every planned scenario that applies, then ADD any further scenarios the requirement, business flow, App Knowledge, App Profile or Test Data imply. Do NOT re-derive what the plan already lists; enrich and ground it.
@@ -1356,7 +1453,7 @@ Return ONLY valid JSON, no markdown fences.`;
   "missingRequirements": [{ "question": string, "area": string, "rationale": string }]
 }`;
 
-    const prompt = `You are a principal QA engineer writing an enterprise-grade test design. Understand the requirement deeply, then cover EACH selected coverage type thoroughly — never let positive crowd out the others.
+    const fullPrompt = `You are a principal QA engineer writing an enterprise-grade test design. Understand the requirement deeply, then cover EACH selected coverage type thoroughly — never let positive crowd out the others.
 
 REQUIREMENT:
 Title: ${input.title}
@@ -1376,6 +1473,7 @@ ${scopeBlock}
 COVERAGE OBJECTIVES — the user explicitly selected these. Treat EACH as a separate, independent objective; every one MUST be addressed in the output:
 ${coverageObjectives}
 ${scenarioPlanBlock}
+${draftBlock}
 ${reasoningBlock}
 
 OUTPUT RULES:
@@ -1401,35 +1499,56 @@ ${outputSchema}
 
 Return ONLY valid JSON. Address EVERY selected coverage type, organise scenarios by coverageType, and be comprehensive while staying grounded. ${expand ? 'Keep grounded coverage and assumption-based suggestions in SEPARATE buckets.' : 'Use ALL provided context to ground committed coverage; keep suggestedTestCases and missingRequirements empty.'}`;
 
+    // ── Active prompt selection ──
+    // In FORMATTER MODE the model only re-words the deterministic drafts, so the
+    // prompt is the minimal "polish these test cases" payload — NOT the full
+    // generation prompt. This is the actual token cut: the whole requirement/
+    // app-profile/knowledge/coverage/reasoning scaffold is DROPPED from the call.
+    const formatterPrompt = formatterMode && deterministicOutput
+      ? buildFormatterPrompt(deterministicOutput.testCases)
+      : '';
+    const prompt = formatterMode ? formatterPrompt : fullPrompt;
+
     // ── Deterministic prompt breakdown (analytics, ZERO tokens) ──
     // Attribute the assembled prompt to named sections so we can SEE where the
-    // INPUT tokens actually go (requirement vs app profile vs knowledge vs
-    // instructions vs scenario plan) instead of reporting one opaque number.
-    // "instructions" is the static reasoning/schema scaffold — everything not
-    // accounted for by a grounding block.
-    const requirementSectionChars =
-      input.title.length + input.description.length +
-      (input.acceptanceCriteria?.length || 0) + (input.businessFlow?.length || 0);
-    const knowledgeSectionChars = enterpriseBlock.length + repoBlock.length + orchestratedBlock.length;
-    const accountedChars =
-      requirementSectionChars + knowledgeSectionChars + appProfileBlock.length +
-      testDataBlock.length + coverageObjectives.length + scopeBlock.length +
-      scenarioPlanBlock.length + outputSchema.length;
-    // "instructions" = the static reasoning/rules scaffold (everything not
-    // attributed to a grounding block or the JSON schema). Schema is measured on
-    // its own so the two big FIXED-overhead sections are visible separately.
-    const instructionsChars = Math.max(0, prompt.length - accountedChars);
-    const promptBreakdown: PromptSectionBreakdown = buildPromptBreakdown([
-      { key: 'requirement', label: 'Requirement + Analysis', text: 'x'.repeat(requirementSectionChars) },
-      { key: 'appProfile', label: 'App Profile', text: appProfileBlock },
-      { key: 'knowledge', label: 'App Knowledge', text: 'x'.repeat(knowledgeSectionChars) },
-      { key: 'testData', label: 'Test Data', text: testDataBlock },
-      { key: 'coverageObjectives', label: 'Coverage Objectives', text: coverageObjectives },
-      { key: 'scenarioPlan', label: 'Scenario Plan', text: scenarioPlanBlock },
-      { key: 'instructions', label: 'Instructions', text: 'x'.repeat(instructionsChars) },
-      { key: 'schema', label: 'Output Schema', text: outputSchema },
-    ]);
+    // INPUT tokens actually go instead of reporting one opaque number. Formatter
+    // mode has just two sections: the finished drafts (the payload) and the tiny
+    // polish instruction — this is what makes the reduction visible in History.
+    let promptBreakdown: PromptSectionBreakdown;
+    if (formatterMode && deterministicOutput) {
+      const draftsPayloadChars = JSON.stringify(deterministicOutput.testCases).length;
+      const formatterInstructionChars = Math.max(0, prompt.length - draftsPayloadChars);
+      promptBreakdown = buildPromptBreakdown([
+        { key: 'draftTestCases', label: 'Draft Test Cases (payload)', text: 'x'.repeat(draftsPayloadChars) },
+        { key: 'instructions', label: 'Formatter Instructions', text: 'x'.repeat(formatterInstructionChars) },
+      ]);
+    } else {
+      const requirementSectionChars =
+        input.title.length + input.description.length +
+        (input.acceptanceCriteria?.length || 0) + (input.businessFlow?.length || 0);
+      const knowledgeSectionChars = enterpriseBlock.length + repoBlock.length + orchestratedBlock.length;
+      const accountedChars =
+        requirementSectionChars + knowledgeSectionChars + appProfileBlock.length +
+        testDataBlock.length + coverageObjectives.length + scopeBlock.length +
+        scenarioPlanBlock.length + draftBlock.length + outputSchema.length;
+      // "instructions" = the static reasoning/rules scaffold (everything not
+      // attributed to a grounding block or the JSON schema). Schema is measured on
+      // its own so the two big FIXED-overhead sections are visible separately.
+      const instructionsChars = Math.max(0, prompt.length - accountedChars);
+      promptBreakdown = buildPromptBreakdown([
+        { key: 'requirement', label: 'Requirement + Analysis', text: 'x'.repeat(requirementSectionChars) },
+        { key: 'appProfile', label: 'App Profile', text: appProfileBlock },
+        { key: 'knowledge', label: 'App Knowledge', text: 'x'.repeat(knowledgeSectionChars) },
+        { key: 'testData', label: 'Test Data', text: testDataBlock },
+        { key: 'coverageObjectives', label: 'Coverage Objectives', text: coverageObjectives },
+        { key: 'scenarioPlan', label: 'Scenario Plan', text: scenarioPlanBlock },
+        { key: 'draftTestCases', label: 'Draft Test Cases', text: draftBlock },
+        { key: 'instructions', label: 'Instructions', text: 'x'.repeat(instructionsChars) },
+        { key: 'schema', label: 'Output Schema', text: outputSchema },
+      ]);
+    }
     logger.info(MOD, 'Prompt breakdown', {
+      mode: formatterMode ? 'formatter' : 'generation',
       totalChars: promptBreakdown.totalChars,
       estTokens: promptBreakdown.totalEstimatedTokens,
       sections: promptBreakdown.sections.map(s => `${s.key}:${s.estimatedTokens}(${s.pctOfPrompt}%)`).join(' '),
@@ -1455,6 +1574,44 @@ Return ONLY valid JSON. Address EVERY selected coverage type, organise scenarios
 
     let scenarios = parsed.scenarios || [];
     let testCases = parsed.testCases || [];
+
+    // ── Formatter-mode reconciliation (coverage guaranteed by the builder) ──
+    // The scenarios array is ALWAYS the deterministic one (the LLM was not asked
+    // to produce it). The polished test cases are accepted ONLY if the model
+    // honoured the contract (same count, valid JSON); otherwise we ship the
+    // deterministic test cases unchanged. Either way coverage == the builder's
+    // output — it never depends on the model.
+    if (formatterMode && deterministicOutput) {
+      scenarios = buildScenariosFromDrafts(draftDrafts) as unknown as TestScenario[];
+      const polished = Array.isArray(parsed.testCases) ? parsed.testCases : [];
+      const contractOk = polished.length === deterministicOutput.testCases.length;
+      if (contractOk) {
+        // Trust the wording, but RE-STAMP the deterministic invariants the model
+        // must not have changed (scenarioIndex/priority/source/selectors live in
+        // steps). We keep the polished English fields and restore the rest.
+        testCases = deterministicOutput.testCases.map((det, i) => {
+          const p: any = polished[i] || {};
+          return {
+            ...det,
+            title: typeof p.title === 'string' && p.title.trim() ? p.title : det.title,
+            objective: typeof p.objective === 'string' && p.objective.trim() ? p.objective : det.objective,
+            preconditions: typeof p.preconditions === 'string' && p.preconditions.trim() ? p.preconditions : det.preconditions,
+            expectedResult: typeof p.expectedResult === 'string' && p.expectedResult.trim() ? p.expectedResult : det.expectedResult,
+            steps: Array.isArray(p.steps) && p.steps.length === det.steps.length
+              && p.steps.every((s: unknown) => typeof s === 'string' && (s as string).trim().length > 0)
+              ? p.steps : det.steps,
+          };
+        }) as unknown as TestCase[];
+        logger.info(MOD, 'Formatter mode applied (polished wording, deterministic logic)', {
+          cases: testCases.length,
+        });
+      } else {
+        testCases = deterministicOutput.testCases as unknown as TestCase[];
+        logger.warn(MOD, 'Formatter contract violated — shipping deterministic drafts', {
+          expected: deterministicOutput.testCases.length, got: polished.length,
+        });
+      }
+    }
     // Assumptions (suggestions + missing-requirement questions) are surfaced ONLY
     // when Gap Analysis is ON. In Standard mode both buckets are forced empty so
     // committed coverage stays grounded in the requirement + provided context.
