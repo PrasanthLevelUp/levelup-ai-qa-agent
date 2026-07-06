@@ -81,7 +81,67 @@ async function main() {
     assert(result === null, 'batch: never returns a generic GenerationResult');
     if (threw instanceof DeterministicGenerationEmptyError) {
       assert(threw.intendedCaseCount === 2, 'batch: reports the 2 intended cases');
+      // Observability (Bug #2): caseErrors must NO LONGER be empty — it must
+      // name the failing Stage-1 reason per case (was `caseErrors: []`).
+      assert(threw.caseErrors.length === 2, 'batch: caseErrors carries a reason per case (not [])');
+      assert(threw.caseErrors.every(e => /STAGE 1/.test(e)), 'batch: each reason names the failing stage');
     }
+  }
+
+  /* ── unparseable object-shape steps → THROWS with shape+keys diagnostics ── */
+  {
+    const config: GenerationConfig = {
+      url: 'https://example.test/',
+      cachedCrawlData,
+      testCases: [
+        { id: 201, title: 'Foreign schema', steps: [{ foo: 1, bar: true }] as any },
+      ] as any,
+    };
+    let threw: any = null;
+    try { await engine.generate(config); }
+    catch (err) { threw = err; }
+    assert(threw instanceof DeterministicGenerationEmptyError, 'foreign-shape: throws (no generic fallback)');
+    if (threw instanceof DeterministicGenerationEmptyError) {
+      assert(threw.caseErrors.length === 1, 'foreign-shape: caseErrors populated');
+      assert(/shape=object-array/.test(threw.caseErrors[0]!), 'foreign-shape: reason names detected shape');
+      assert(/keys=\[foo, bar\]/.test(threw.caseErrors[0]!), 'foreign-shape: reason names observed keys');
+    }
+  }
+
+  /* ── canonical model absorbs the {instruction,expectedResult} root cause ── */
+  {
+    // The EXACT shape that produced `DeterministicGenerationEmptyError(11, [])`
+    // for requirement c45af114. It must now GENERATE grounded scripts instead
+    // of throwing — proving the canonical normalizer closed the root cause.
+    const groundedCrawl: any = {
+      url: 'https://automationexercise.com/login', finalUrl: 'https://automationexercise.com/login',
+      title: 'Login', pageType: 'login',
+      elements: [
+        { tag: 'input', attributes: { 'data-qa': 'login-email', name: 'email', type: 'email' }, text: '' },
+        { tag: 'input', attributes: { 'data-qa': 'login-password', name: 'password', type: 'password' }, text: '' },
+        { tag: 'button', attributes: { 'data-qa': 'login-button' }, text: 'Login' },
+      ],
+      forms: [], buttons: [], inputs: [], headings: [], navigationLinks: [], totalElements: 3, interactiveElements: 3,
+    };
+    const config: GenerationConfig = {
+      url: 'https://automationexercise.com/login',
+      cachedCrawlData: groundedCrawl,
+      testCases: [{
+        id: 102, title: 'Login with valid credentials', requirement_id: 'c45af114',
+        steps: [
+          { instruction: 'Navigate to https://automationexercise.com/login', expectedResult: 'page loads' },
+          { instruction: 'Enter email into login-email', expectedResult: 'ok' },
+          { instruction: 'Enter password into login-password', expectedResult: 'ok' },
+          { instruction: 'Click login-button', expectedResult: 'logged in' },
+        ] as any,
+      }] as any,
+    };
+    let threw: any = null;
+    let result: any = null;
+    try { result = await engine.generate(config); }
+    catch (err) { threw = err; }
+    assert(threw === null, 'instruction-shape: no longer throws (root cause fixed)');
+    assert(result && result.generatedFiles.length > 0, 'instruction-shape: emits grounded spec file(s)');
   }
 
   /* ── single testCase with no parseable steps → THROWS ──────────────────── */

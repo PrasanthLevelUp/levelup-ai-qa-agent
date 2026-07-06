@@ -22,6 +22,11 @@ import OpenAI from 'openai';
 import { AnthropicClient, resolveAnthropicModel, isAnthropicConfigured } from '../ai/anthropic-client';
 import * as nodePath from 'path';
 import { PageCrawler, type CrawlResult, type CrawlConfig, type PageElement } from './page-crawler';
+import {
+  normalizeTestCase,
+  describeStageOneFailure,
+  type NormalizationDiagnostics,
+} from './canonical-test-case';
 import type { AuthConfig, AuthResult } from './auth-engine';
 import { WorkflowMapper, type WorkflowMap, type WorkflowFlow, type WorkflowStep, type WorkflowAction } from './workflow-mapper';
 import { SelectorQualityEngine, type ScoredSelector } from './selector-quality-engine';
@@ -742,7 +747,17 @@ export class ScriptGenEngine {
         return tcResult;
       }
       logger.error(MOD, 'Deterministic test-case generation produced nothing — refusing generic fallback');
-      throw new DeterministicGenerationEmptyError(1, deterministic?.errors ?? []);
+      // Surface the Stage-1 reason (shape/keys) even for the single-case path so
+      // the 422 `caseErrors` is never empty (Bug #2 fix).
+      const singleCaseErrors = deterministic?.errors?.length
+        ? deterministic.errors
+        : (() => {
+            const { steps, diagnostics } = this.parseTestCaseStepsWithDiagnostics(config.testCase);
+            return steps.length === 0
+              ? [describeStageOneFailure(`Test case ${config.testCase!.id ?? config.testCase!.title ?? '?'}`, diagnostics)]
+              : [`Test case ${config.testCase!.id ?? config.testCase!.title ?? '?'}: STAGE 3/4 — ${steps.length} step(s) parsed but no script emitted`];
+          })();
+      throw new DeterministicGenerationEmptyError(1, singleCaseErrors);
     }
 
     // ─── Step 2: Build workflow map (URL / plain-English generation ONLY) ──
@@ -1312,11 +1327,24 @@ ${combined.map(l => (l ? `    ${l}` : '')).join('\n')}
     }>();
 
     for (const tc of cases) {
+      const caseLabel = `Test case ${tc.id ?? tc.title ?? '?'}`;
       try {
+        // ── STAGE 1 observability (Bug #2 fix) ──
+        // Normalize the steps FIRST and inspect the diagnostics. When a case
+        // yields 0 automatable steps we now record WHY (shape + observed keys)
+        // instead of discarding it as a bare `null`. This is what populates the
+        // 422 `caseErrors` so users see the real Stage-1 reason per case.
+        const { steps: normalizedSteps, diagnostics } = this.parseTestCaseStepsWithDiagnostics(tc);
+        if (normalizedSteps.length === 0) {
+          errors.push(describeStageOneFailure(caseLabel, diagnostics));
+          continue;
+        }
+
         // Reuse the single-case translator by scoping config to this case.
         const single = this.generateFromTestCase({ ...config, testCase: tc, testCases: undefined }, crawl);
         if (!single || single.generatedFiles.length === 0) {
-          errors.push(`Test case ${tc.id ?? tc.title ?? '?'} produced no script`);
+          // Steps parsed but a later stage (grounding/emit) produced nothing.
+          errors.push(`${caseLabel}: STAGE 3/4 — ${normalizedSteps.length} step(s) parsed but no script emitted`);
           continue;
         }
         if (single.locatorGrounding) groundingReports.push(single.locatorGrounding);
@@ -1352,7 +1380,7 @@ ${combined.map(l => (l ? `    ${l}` : '')).join('\n')}
         totalTests += single.stats.totalTests;
         if (single.testPlan.flows[0]) flows.push(single.testPlan.flows[0]);
       } catch (err: any) {
-        errors.push(`Test case ${tc.id ?? tc.title ?? '?'}: ${err?.message}`);
+        errors.push(`${caseLabel}: STAGE 3 threw — ${err?.message}`);
       }
     }
 
@@ -1369,7 +1397,46 @@ ${combined.map(l => (l ? `    ${l}` : '')).join('\n')}
       }
     }
 
-    if (generatedFiles.length === 0) return null;
+    const reqLabel = cases[0]?.requirement_id ? `requirement ${cases[0].requirement_id}` : 'requirement';
+
+    if (generatedFiles.length === 0) {
+      // Bug #2 fix: DO NOT discard the per-case diagnostics. Previously this
+      // returned `null`, which erased the `errors[]` array — so `generate()`
+      // threw `DeterministicGenerationEmptyError(n, [])` and the 422 reported
+      // `caseErrors: []` (no way to see the real Stage-1 reason). We now return
+      // an empty-but-diagnostic result so the errors propagate to the 422.
+      return {
+        testPlan: {
+          name: `Test Plan: ${reqLabel} (0 generated)`,
+          description: `Deterministic requirement-based automation produced no scripts from ${cases.length} case(s)`,
+          baseUrl: config.url,
+          pageType: crawl.pageType,
+          flows: [],
+          fixtures: [],
+          pageObjects: [],
+          metadata: {
+            generatedAt: new Date().toISOString(),
+            crawlTimeMs: crawl.crawlTimeMs,
+            totalElements: crawl.elements.length,
+            selectorQuality: 0,
+            model: 'deterministic-requirement-batch',
+            tokensUsed: 0,
+          },
+        },
+        generatedFiles: [],
+        stats: {
+          totalTests: 0,
+          totalAssertions: 0,
+          avgSelectorScore: 0,
+          pageObjectsGenerated: 0,
+          crawlTimeMs: crawl.crawlTimeMs,
+          generationTimeMs: Date.now() - startTime,
+          tokensUsed: 0,
+          model: 'deterministic-requirement-batch',
+        },
+        errors,
+      };
+    }
 
     // Aggregate per-case grounding into one report → real "REAL LOCATORS x/y".
     const locatorGrounding = this.mergeLocatorGrounding(groundingReports);
@@ -1381,7 +1448,6 @@ ${combined.map(l => (l ? `    ${l}` : '')).join('\n')}
     // Aggregate repository intelligence across all cases (de-duplicate Page Objects).
     const repositoryIntelligence = this.mergeRepoIntelligence(repoIntelReports);
 
-    const reqLabel = cases[0]?.requirement_id ? `requirement ${cases[0].requirement_id}` : 'requirement';
     const testPlan: TestPlan = {
       name: `Test Plan: ${reqLabel} (${cases.length} cases)`,
       description: `Deterministic requirement-based automation — ${cases.length} test cases across ${generatedFiles.filter(f => f.type === 'test').length} page spec${generatedFiles.filter(f => f.type === 'test').length > 1 ? 's' : ''}`,
@@ -1551,23 +1617,36 @@ ${testBlocks.join('\n\n')}
     return { path: `${testFolder}/${fileName}`, content, type: 'test' };
   }
 
-  /** Parse test-case steps into a clean ordered list of step strings. */
+  /**
+   * Parse a test case's steps into the canonical `string[]` contract.
+   *
+   * The engine no longer guesses payload shapes inline. ALL shape tolerance
+   * (string[], object[], keyed-object, JSON string, newline prose, and foreign
+   * key schemas like `{instruction, expectedResult}`) lives in the single
+   * canonical normalizer (`canonical-test-case.ts`). This method is a thin
+   * adapter so every existing caller keeps working while consuming exactly one
+   * contract. Use `parseTestCaseStepsWithDiagnostics` when you also need the
+   * reason a payload produced zero steps (Stage-1 observability).
+   */
   private parseTestCaseSteps(tc: GenerationConfig['testCase']): string[] {
     if (!tc) return [];
-    let steps: any = tc.steps;
-    if (typeof steps === 'string') {
-      try { steps = JSON.parse(steps); } catch { /* keep string */ }
+    return normalizeTestCase(tc).canonical.steps;
+  }
+
+  /**
+   * Same as `parseTestCaseSteps` but also returns the normalization diagnostics
+   * (detected shape, observed keys, warnings). Used by the batch generator to
+   * emit an honest per-case reason when a case yields 0 automatable steps,
+   * instead of discarding it as a bare `null` (the old `caseErrors: []` bug).
+   */
+  private parseTestCaseStepsWithDiagnostics(
+    tc: GenerationConfig['testCase'],
+  ): { steps: string[]; diagnostics: NormalizationDiagnostics } {
+    if (!tc) {
+      return { steps: [], diagnostics: { stepCount: 0, sourceShape: 'empty', warnings: ['no test case'] } };
     }
-    let arr: string[] = [];
-    if (Array.isArray(steps)) {
-      arr = steps.map((s: any) =>
-        typeof s === 'string' ? s : (s?.action ?? s?.step ?? s?.description ?? '')
-      ).map((s: string) => String(s).trim()).filter(Boolean);
-    } else if (typeof steps === 'string') {
-      arr = steps.split(/\r?\n/).map(l => l.replace(/^\s*\d+[.)]\s*/, '').trim()).filter(Boolean);
-    }
-    // Strip a leading "N." numeric prefix if the array form carried it.
-    return arr.map(s => s.replace(/^\s*\d+[.)]\s*/, '').trim()).filter(Boolean);
+    const { canonical, diagnostics } = normalizeTestCase(tc);
+    return { steps: canonical.steps, diagnostics };
   }
 
   /** Parse "Username: x, Password: y" (or JSON) test data into credentials. */
