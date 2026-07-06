@@ -16,6 +16,7 @@ import {
   type OrchestratorSource,
   type IntelligenceScore,
 } from '../services/intelligence-orchestrator';
+import { planScenarios, buildScenarioPlanBlock, type ScenarioPlan } from './scenario-planner';
 
 const MOD = 'test-coverage-engine';
 
@@ -24,7 +25,7 @@ const MOD = 'test-coverage-engine';
  * Tracked in every generation so we can correlate quality with prompt evolution and
  * quickly diagnose "last week was better" reports by identifying which version ran.
  */
-const PROMPT_VERSION = 'v3.2-senior-qa';
+const PROMPT_VERSION = 'v3.3-scenario-plan';
 
 /**
  * Engine architecture version — increment when the pipeline or core algorithm changes
@@ -140,6 +141,18 @@ const STANDARD_THRESHOLD = floatEnv('GEN_STANDARD_THRESHOLD', 45);
  * multi-step checkout, approval workflows). Env-overridable.
  */
 const GAP_ANALYSIS_MIN_COMPLEXITY = floatEnv('GEN_GAP_ANALYSIS_MIN_COMPLEXITY', 35);
+
+/**
+ * Scenario Planner (QA-first architecture). When enabled, a deterministic,
+ * LLM-free planner (see scenario-planner.ts + qa-knowledge-engine.ts) decides
+ * the baseline scenarios a requirement should cover and injects them into the
+ * generation prompt as a plan to EXPAND. The LLM becomes the enrichment step,
+ * not the inventor — improving consistency and letting us run a tighter output
+ * budget. Default ON; set GEN_SCENARIO_PLANNER=false to fall back to the legacy
+ * plan-free prompt. Grounding is never overridden — planned scenarios are
+ * candidates the LLM keeps only if the requirement/context supports them.
+ */
+const SCENARIO_PLANNER_ENABLED = (process.env.GEN_SCENARIO_PLANNER || 'true').toLowerCase() !== 'false';
 
 /** Signals used to classify requirement complexity — all cheap to compute, ZERO LLM calls. */
 export interface ComplexitySignals {
@@ -1133,6 +1146,29 @@ Return ONLY valid JSON, no markdown fences.`;
       return `  ${i + 1}. ${g.label}  (use coverageType: "${ct}")\n       Goal: ${g.goal}\n       Look for: ${g.lookFor}`;
     }).join('\n');
 
+    // ── Deterministic Scenario Plan (QA-first) ──
+    // Before the LLM runs, plan the baseline scenarios this feature category
+    // implies (zero tokens). The plan is injected into the prompt as a set of
+    // scenarios to EXPAND, so the LLM enriches known-good QA obligations instead
+    // of re-deriving them. Filtered to the user's selected coverage types and
+    // never overrides grounding. Empty block ('') for unknown categories → the
+    // prompt is byte-for-byte the legacy prompt (safe fallback).
+    let scenarioPlanBlock = '';
+    let scenarioPlan: ScenarioPlan | undefined;
+    if (SCENARIO_PLANNER_ENABLED) {
+      scenarioPlan = planScenarios(input, coverageTypes, analysis.featureType);
+      scenarioPlanBlock = buildScenarioPlanBlock(scenarioPlan);
+      logger.info(MOD, 'Scenario plan built', {
+        category: scenarioPlan.classification.category,
+        confidence: scenarioPlan.classification.confidence,
+        planned: scenarioPlan.scenarios.length,
+        grounded: scenarioPlan.groundedCount,
+        conditional: scenarioPlan.conditionalCount,
+        knowledgeVersion: scenarioPlan.knowledgeVersion,
+        applied: scenarioPlanBlock.length > 0,
+      });
+    }
+
     // ── Mode-specific scope guidance ──
     // STANDARD (default): committed coverage grounded in requirement + context
     //   (App Knowledge, App Profile, Test Data). No assumptions.
@@ -1167,7 +1203,7 @@ ${scopeBlock}
 
 COVERAGE OBJECTIVES — the user explicitly selected these. Treat EACH as a separate, independent objective; every one MUST be addressed in the output:
 ${coverageObjectives}
-
+${scenarioPlanBlock}
 HOW A SENIOR QA ENGINEER REASONS — follow these phases INTERNALLY before you emit JSON (do NOT output your reasoning, only the final JSON):
 
   PHASE 1 — EXTRACT TEST OBLIGATIONS from the Acceptance Criteria.
