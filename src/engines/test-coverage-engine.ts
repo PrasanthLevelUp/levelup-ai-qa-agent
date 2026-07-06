@@ -33,7 +33,7 @@ const MOD = 'test-coverage-engine';
  * Tracked in every generation so we can correlate quality with prompt evolution and
  * quickly diagnose "last week was better" reports by identifying which version ran.
  */
-const PROMPT_VERSION = 'v3.4-prompt-optimizer';
+const PROMPT_VERSION = 'v3.5-compressed-instructions';
 
 /**
  * Engine architecture version — increment when the pipeline or core algorithm changes
@@ -73,18 +73,30 @@ const intEnv = (name: string, fallback: number): number => {
   return Number.isFinite(v) && v > 0 ? v : fallback;
 };
 
+// ── ROLLED BACK (user directive): output token budget is NO LONGER a lever to
+// reduce the number of generated test cases. Coverage is the product; the
+// Scenario Planner + Coverage Engine decide how many scenarios/cases exist, and
+// the output budget must be generous enough to emit ALL of them without
+// truncation. The previous "lower STANDARD 5000→3500 so it makes ~6-8 cases,
+// not 13" coupling has been removed. `maxOutputTokens` here is now only a HARD
+// SAFETY CEILING (guards against runaway generation), not a case-count target —
+// and it is further raised at runtime to a coverage-driven floor (see
+// coverageDrivenOutputBudget). The tier still scales the INPUT prompt budget and
+// whether the separate analysis round-trip runs; that is about input cost and
+// does not cap coverage.
 const TIER_CONFIGS: Record<ComplexityTier, TierConfig> = {
   FAST: {
-    maxOutputTokens: intEnv('GEN_FAST_MAX_TOKENS', 2500),
+    // Raised 2500 → 6000: a "small" requirement can still legitimately require
+    // many negative/edge cases. Never let the ceiling truncate coverage.
+    maxOutputTokens: intEnv('GEN_FAST_MAX_TOKENS', 6000),
     maxPromptChars: intEnv('GEN_FAST_MAX_PROMPT_CHARS', 24000),
     runAnalysis: false,
   },
   STANDARD: {
-    // Lowered 5000 → 3500. A medium requirement (e.g. a login with the default
-    // positive/negative/edge selection) needs ~6–8 focused, high-quality cases,
-    // not 13. 3500 output tokens comfortably fits that while cutting cost/latency.
-    // Genuinely large requirements escalate to COMPREHENSIVE and get the full budget.
-    maxOutputTokens: intEnv('GEN_STANDARD_MAX_TOKENS', 3500),
+    // Restored 3500 → 8000 (matches COMPREHENSIVE). Output budget must never be
+    // the reason coverage shrinks. Input cost is optimized via the Prompt
+    // Optimizer + instruction compression, NOT by capping output cases.
+    maxOutputTokens: intEnv('GEN_STANDARD_MAX_TOKENS', 8000),
     maxPromptChars: intEnv('GEN_STANDARD_MAX_PROMPT_CHARS', 40000),
     runAnalysis: false,
   },
@@ -94,6 +106,29 @@ const TIER_CONFIGS: Record<ComplexityTier, TierConfig> = {
     runAnalysis: true,
   },
 };
+
+/**
+ * Coverage-driven output budget (user directive: "the Scenario Planner and
+ * Coverage Engine should determine coverage first and produce the complete
+ * scenario set"). Given the number of scenarios the deterministic planner
+ * expects and the number of coverage types the user selected, compute a floor
+ * for output tokens so the model is NEVER forced to drop scenarios/cases to fit
+ * a fixed tier budget. Pure, zero-token. The tier's `maxOutputTokens` acts only
+ * as an additional hard safety ceiling above this floor.
+ */
+const OUTPUT_TOKENS_PER_SCENARIO = intEnv('GEN_OUTPUT_TOKENS_PER_SCENARIO', 750);
+const OUTPUT_TOKENS_HARD_CEILING = intEnv('GEN_OUTPUT_TOKENS_HARD_CEILING', 16000);
+function coverageDrivenOutputBudget(plannedScenarios: number, coverageTypeCount: number, tierCeiling: number): number {
+  // Each planned scenario yields one or more cases; budget generously per
+  // scenario. Also ensure at least a few scenarios' worth per selected coverage
+  // type so a multi-type selection is never starved.
+  const byScenario = Math.max(0, plannedScenarios) * OUTPUT_TOKENS_PER_SCENARIO;
+  const byCoverageType = Math.max(1, coverageTypeCount) * 2 * OUTPUT_TOKENS_PER_SCENARIO;
+  const floor = Math.max(byScenario, byCoverageType);
+  // The budget is the LARGER of the tier ceiling and the coverage-driven floor,
+  // capped only by an absolute hard ceiling to prevent pathological runaway.
+  return Math.min(OUTPUT_TOKENS_HARD_CEILING, Math.max(tierCeiling, floor));
+}
 
 /** Complexity scoring weights — env-overridable so they can be tuned from telemetry.
  *  These define how much each signal contributes to the composite complexity score.
@@ -1266,7 +1301,26 @@ Return ONLY valid JSON, no markdown fences.`;
   Produce "testCases" GROUNDED in the REQUIREMENT and the PROVIDED CONTEXT, organised by the coverage objectives below. App Knowledge, App Profile and Test Data are FIRST-CLASS inputs by default — use them to drive AND enrich real, committed test cases (see GROUNDED SCOPE below).
   "suggestedTestCases" MUST be an empty array [] and "missingRequirements" MUST be an empty array [] — assumptions are surfaced only when Gap Analysis is ON.`;
 
-    const prompt = `You are a principal QA engineer with deep product intuition, writing an enterprise-grade test design. Think the way a senior tester actually works: first UNDERSTAND the requirement deeply, enumerate every situation worth testing, and only then organise that thinking into the selected coverage types. Be exhaustive — the client has chosen these coverage types deliberately and expects EACH ONE covered thoroughly. Never stop at the first obvious case, and never let one type (usually positive) crowd out the others.
+    // ── Reasoning block (adaptive, QA-first) ──
+    // When the deterministic Scenario Planner produced a plan, it REPLACES the
+    // generic "enumerate every situation" reasoning: the plan already lists the
+    // baseline scenarios this category requires, so the model EXPANDS the plan
+    // instead of re-deriving it (the user's point — the plan must replace the
+    // reasoning, not stack on top of it). With no plan (generic category), the
+    // model does the full enumeration itself. Either way the block is a few
+    // hundred chars, not the ~1.4K-char phase essay it replaces.
+    const hasPlan = scenarioPlanBlock.trim().length > 0;
+    const reasoningBlock = hasPlan
+      ? `REASONING (do this INTERNALLY; output ONLY the final JSON):
+  1. Extract every obligation from the Acceptance Criteria as precondition → action → expected → risk. EACH obligation must be verified by ≥1 test case (missing one is the worst failure).
+  2. EXPAND THE SCENARIO PLAN above — it is the baseline set of scenarios this feature category requires. Keep every planned scenario that applies, then ADD any further scenarios the requirement, business flow, App Knowledge, App Profile or Test Data imply. Do NOT re-derive what the plan already lists; enrich and ground it.
+  3. Cover EVERY selected coverage type on its own — never collapse to a single happy path, never merge types into one scenario. No fixed count and no upper cap; the requirement + context decide depth. Never pad with reworded repetition or ungrounded guesses.`
+      : `REASONING (do this INTERNALLY; output ONLY the final JSON):
+  1. Extract every obligation from the Acceptance Criteria as precondition → action → expected → risk. EACH obligation must be verified by ≥1 test case (missing one is the worst failure).
+  2. Infer scenarios from the Business Flow beyond the happy path where relevant — interrupted/resumed flow, session timeout, navigation (back/forward/deep-link/refresh), and state carried between steps.
+  3. Enumerate EVERY distinct situation worth testing, THEN bucket each into the selected coverage type it belongs to. Cover EVERY selected type on its own — never collapse to a single happy path, never merge types. No fixed count and no upper cap; the requirement + context decide depth. Never pad with reworded repetition or ungrounded guesses.`;
+
+    const prompt = `You are a principal QA engineer writing an enterprise-grade test design. Understand the requirement deeply, then cover EACH selected coverage type thoroughly — never let positive crowd out the others.
 
 REQUIREMENT:
 Title: ${input.title}
@@ -1286,80 +1340,25 @@ ${scopeBlock}
 COVERAGE OBJECTIVES — the user explicitly selected these. Treat EACH as a separate, independent objective; every one MUST be addressed in the output:
 ${coverageObjectives}
 ${scenarioPlanBlock}
-HOW A SENIOR QA ENGINEER REASONS — follow these phases INTERNALLY before you emit JSON (do NOT output your reasoning, only the final JSON):
+${reasoningBlock}
 
-  PHASE 1 — EXTRACT TEST OBLIGATIONS from the Acceptance Criteria.
-    Do not paste the AC. Decompose each criterion (including Given/When/Then) into its testable parts:
-      • Precondition (the state that must exist, e.g. "a locked account exists")
-      • Action (what the user/system does, e.g. "submit login")
-      • Expected (the observable outcome, e.g. "account-locked message shown")
-      • Risk (what breaks if this fails, e.g. "Authentication / unauthorized access")
-    Every obligation you extract MUST be verified by at least one test case. Missing an AC obligation is the worst failure mode — do not let it happen.
+OUTPUT RULES:
+  - Every scenario sets "coverageType" (exact id, e.g. "positive"), "objective" (one sentence: what it PROVES), "priority", "riskArea". Group scenarios by coverage type.
+  - Every test case sets "scenarioIndex" (0-based) to its scenario, plus its own "objective" (the single thing it verifies) and "riskArea" (the product risk it guards against).
+  - "coverageTypeEvaluations": exactly ONE entry per selected coverage type — status "covered", or "not_applicable" with a one-line "reason". NEVER silently skip a selected type.
 
-  PHASE 2 — INFER FLOW SCENARIOS from the Business Flow / Workflow.
-    From the flow (e.g. Login → Dashboard → Checkout → Payment) reason beyond the happy path WITHOUT being told to:
-      • interrupted flow (user abandons or a step fails midway)
-      • resume flow (user returns and continues)
-      • session timeout / expiry during the flow
-      • navigation (back/forward, deep-link into a later step, refresh)
-      • state carried between steps (data from step N still valid at step N+1)
-    Include the flow-derived scenarios that are RELEVANT to the requirement and to the selected coverage types.
+GROUNDED SCOPE (defines what belongs in "testCases") — a case is GROUNDED if it traces to any of:
+  • REQUIREMENT (title/description/acceptance criteria/business flow) — stated or directly implied;
+  • APP KNOWLEDGE — a documented business rule relevant to this feature (e.g. "accounts lock after 3 failed logins" makes a lockout case grounded, not an assumption);
+  • APP PROFILE — real pages/forms/elements/selectors;
+  • TEST DATA — a RELEVANT dataset (use its real records as the case's test data, and cover what that dataset exercises).
+  These four are FIRST-CLASS inputs: use them to DRIVE and ENRICH committed cases. The ONLY thing excluded from "testCases" is an ASSUMPTION — a value/limit/behaviour absent from BOTH the requirement AND all context. Do NOT test an UNRELATED dataset just because it exists (e.g. a "locked_users" set when nothing mentions lockout). ${expand ? 'Assumptions go to suggestedTestCases / missingRequirements.' : 'Omit assumptions (they appear only when Gap Analysis is ON).'}
+${expand ? `  ASSUMPTIONS (Gap Analysis ON): ungrounded ideas go in "suggestedTestCases" (source "gap_analysis"), NEVER in "testCases". If an idea needs an unstated value/limit (max length, lockout threshold, session timeout), do NOT invent a test — add a "missingRequirements" question instead. Never emit source "assumption".`
+  : `  ASSUMPTIONS (Gap Analysis OFF): "suggestedTestCases" and "missingRequirements" MUST both be []. Staying grounded does NOT mean under-generating — produce every case the requirement + context genuinely support.`}
 
-  PHASE 3 — ENUMERATE, THEN BUCKET (do not generate one bucket at a time).
-    First list EVERY distinct situation worth testing that the obligations (Phase 1), the flow (Phase 2), and the provided context imply. THEN assign each situation to the selected coverage type it best belongs to:
-      "What scenarios exist? → Which are Positive? → Which are Negative? → Which are Edge? → …"
-    This guarantees a situation is never missed just because you were thinking about one bucket at a time.
+QUALITY: specific actionable title (not "Verify login works"); clear preconditions; 3-6 numbered steps; precise expected result; realistic testData from AVAILABLE TEST DATA when relevant; honest automation fields. No trivial duplicates (reworded restatements of one behaviour) — but different input/role/state/error are DISTINCT, keep them all.
 
-  PHASE 4 — COVER EVERY SELECTED TYPE EXHAUSTIVELY.
-    - Handle each selected coverage type ON ITS OWN. Do NOT merge several types into one scenario, and do NOT collapse the work down to a single happy-path scenario.
-    - For each type, emit ALL the distinct grounded scenarios it genuinely implies — one scenario per distinct situation — and the concrete test cases under each. A real requirement normally yields MULTIPLE scenarios and MULTIPLE cases per selected type.
-    - There are NO fixed counts and NO upper cap. The client selected these types on purpose — be thorough. Let the requirement + context decide depth, but never pad with reworded repetition or ungrounded guesses.
-    - Every scenario MUST set "coverageType" to the exact id of the type it belongs to (e.g. "positive", "negative", "edge_cases"). Group your work by coverage type.
-    - Each scenario MUST set "objective": one sentence stating what the scenario PROVES.
-    - Each test case MUST set "scenarioIndex" (0-based) to its scenario, plus its own "objective" (the single thing it verifies) and "riskArea" (the product risk it guards against).
-
-EVERY SELECTED TYPE MUST BE EVALUATED — populate "coverageTypeEvaluations":
-  - Add exactly one entry per selected coverage type.
-  - If the type applies, set status "covered" (you will have produced scenarios/cases for it).
-  - If a type honestly does NOT apply to THIS requirement given the available context (e.g. "localization" for a backend-only rule with no localised content), still add an entry with status "not_applicable" and a one-line "reason" explaining why — NEVER silently skip a selected type.
-
-GROUNDED SCOPE — the single most important rule (defines what belongs in "testCases"):
-  - A test case belongs in "testCases" if it is GROUNDED in any of the following:
-      • the REQUIREMENT (title / description / acceptance criteria / business flow) — explicitly stated or directly implied; OR
-      • APP KNOWLEDGE — a documented business rule relevant to this feature (e.g. "accounts lock after 3 failed logins" makes a lockout case GROUNDED, not an assumption); OR
-      • APP PROFILE — real pages/forms/elements/selectors of the application; OR
-      • TEST DATA — a dataset/scenario RELEVANT to the requirement (use the real records as the case's test data, and cover the scenarios that dataset is meant to exercise).
-  - These four are FIRST-CLASS, DEFAULT inputs. Use them to DRIVE and ENRICH committed cases — do not hold back grounded coverage.
-  - Being comprehensive does NOT mean inventing: the ONLY thing excluded from "testCases" is an ASSUMPTION — a behaviour/value/limit absent from BOTH the requirement AND all provided context.
-  - Guard against irrelevant grounding: an UNRELATED dataset alone (e.g. a "locked_users" set when the requirement and knowledge never mention lockout) is NOT a reason to test that behaviour. Ground in context that is RELEVANT to this requirement.
-  - Concrete example: requirement "standard user logs in and reaches Inventory", with a "standard_user" dataset and an App Profile of the login + inventory pages → GROUNDED testCases: successful login (using the real standard_user record), navigation to Inventory, and any login/inventory behaviour the App Knowledge documents. If nothing states lockout/length limits/concurrency, those are ASSUMPTIONS — ${expand ? 'put them in suggestedTestCases / missingRequirements.' : 'OMIT them (they appear only when Gap Analysis is ON).'}
-${expand ? `
-ASSUMPTIONS → SUGGESTIONS & MISSING REQUIREMENTS (Gap Analysis is ON):
-  - Assumption-based test ideas (ungrounded negative/boundary/security/concurrency/permission) go in "suggestedTestCases" with source "gap_analysis" — NEVER in "testCases".
-  - If an idea needs you to ASSUME a value/limit not stated anywhere (e.g. username max length, lockout threshold, session timeout), DO NOT invent a test — add a "missingRequirements" entry phrased as a question (e.g. { "question": "What is the maximum username length?", "area": "Input validation", "rationale": "No length limit is stated, so a boundary test cannot be written reliably." }).
-  - NEVER emit a test case with source "assumption".` : `
-ASSUMPTIONS (Gap Analysis is OFF):
-  - Do NOT generate assumption-based cases and do NOT fill "missingRequirements". Both "suggestedTestCases" and "missingRequirements" MUST be []. Staying grounded does NOT mean under-generating — produce every case the requirement + provided context genuinely support.`}
-
-QUALITY STANDARDS — each test case must be enterprise-reusable and carry the full schema:
-  - Specific, actionable title (NOT vague like "Verify login works").
-  - "objective": the one precise thing this case verifies.
-  - "riskArea": the product risk it guards against (e.g. "Unauthorized access", "Revenue loss").
-  - Clear preconditions, numbered steps (3-6), precise expected result, realistic test data drawn from AVAILABLE TEST DATA when relevant.
-  - Automation fields ("automationReady", "automationComplexity", "selectorAvailability") set honestly.
-
-NO TRIVIAL DUPLICATES:
-  - Do NOT emit two cases that verify the SAME behaviour with reworded titles. But distinct situations (different input, role, state, or error) are NOT duplicates — keep them all. Only merge true restatements of one another.
-
-SOURCE TAGGING — every test case (in BOTH buckets) MUST include:
-  - "source": one of "requirement" | "knowledge" | "test_data" | "app_profile" | "gap_analysis"
-      • "requirement" — directly verifies the stated requirement / acceptance criteria.
-      • "knowledge"  — grounded in an APP KNOWLEDGE business rule (a valid committed source by default).
-      • "test_data"  — grounded in / using a real dataset or scenario from AVAILABLE TEST DATA (a valid committed source by default).
-      • "app_profile"— grounded in the crawled APP PROFILE structure/selectors (a valid committed source by default).
-      • "gap_analysis" — ONLY for "suggestedTestCases": assumption-based coverage NOT grounded in the requirement or context.
-  - "source" MUST NOT be "assumption" — assumptions go to "missingRequirements" instead.
-  - "sourceEvidence": a short phrase naming the exact evidence (e.g. "AC: standard user logs in", "standard_user dataset", "Authentication Rules knowledge").
+SOURCE TAGGING: every case sets "source" ("requirement" | "knowledge" | "test_data" | "app_profile"; "gap_analysis" ONLY in suggestedTestCases) and "sourceEvidence" (short exact evidence, e.g. "AC: valid login", "standard_user dataset"). Never use source "assumption".
 
 Return JSON (use [] for empty buckets):
 {
@@ -1681,12 +1680,28 @@ Return ONLY valid JSON array.`;
       tier: complexity.tier, analyzedViaLLM: tierCfg.runAnalysis, analysisMs,
     });
 
-    // Phase 5: Generate tests (mode-aware — strict vs expanded). Token + prompt
-    // budgets come from the selected tier.
+    // Phase 5: Generate tests (mode-aware — strict vs expanded). The INPUT prompt
+    // budget comes from the tier, but the OUTPUT budget is COVERAGE-DRIVEN — it
+    // scales with the number of scenarios the deterministic planner expects and
+    // the number of coverage types selected, so the model is never forced to
+    // drop scenarios/cases to fit a fixed budget (user directive). Zero-token:
+    // planScenarios is pure/deterministic.
+    const plannedForBudget = SCENARIO_PLANNER_ENABLED
+      ? planScenarios(input, coverageTypes, analysis.featureType).scenarios.length
+      : 0;
+    const outputBudget = coverageDrivenOutputBudget(
+      plannedForBudget, coverageTypes.length, tierCfg.maxOutputTokens,
+    );
+    logger.info(MOD, 'Coverage-driven output budget', {
+      plannedScenarios: plannedForBudget,
+      coverageTypes: coverageTypes.length,
+      tierCeiling: tierCfg.maxOutputTokens,
+      outputBudget,
+    });
     const generationStart = Date.now();
     const gen = await this.generateTestCoverage(
       input, analysis, coverageTypes, knowledge, mode,
-      tierCfg.maxOutputTokens, tierCfg.maxPromptChars, aiCoverageExpansion,
+      outputBudget, tierCfg.maxPromptChars, aiCoverageExpansion,
     );
     const generationMs = Date.now() - generationStart;
     const { scenarios, testCases: rawTestCases, missingRequirements, coverageTypeEvaluations, tokensUsed: t2, promptChars, intelligenceScore } = gen;
