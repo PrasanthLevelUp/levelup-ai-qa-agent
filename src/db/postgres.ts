@@ -8437,6 +8437,89 @@ export async function getTestCasesForRequirement(
     console.warn(`[postgres] getTestCasesForRequirement: traceability fallback failed (non-blocking): ${linkErr?.message}`);
   }
 
+  // ── Bridge path: the legacy numeric requirement chain (exact title match) ──
+  // Some test cases exist ONLY under the legacy coverage data model:
+  //     test_requirements(SERIAL id)
+  //       → generated_test_scenarios.requirement_id (numeric FK)
+  //       → generated_test_cases.scenario_id
+  // with NO RTM UUID FK and NO traceability link. This happens when cases were
+  // generated via the coverage flow WITHOUT an RTM requirementId, or imported
+  // before the RTM association existed. To requirement-based script generation
+  // this looks like "requirement has 0 cases" and it silently drops to the
+  // generic LLM flow (smoke/search/navigation/form) with 0%-grounded locators.
+  //
+  // We bridge the two models ONLY when it is provably safe: the RTM requirement
+  // must map to EXACTLY ONE legacy requirement — same company, IDENTICAL title —
+  // that actually has test cases. Any ambiguity (zero, or more than one, title
+  // match that has cases) means we cannot be certain which cases belong to this
+  // requirement, so we REFUSE to bridge and let the caller surface an honest
+  // "no linked cases" result rather than grounding generation with the wrong
+  // test cases. Best-effort: any error degrades to "no cases" exactly as before.
+  try {
+    const reqRow = await pool.query(
+      `SELECT title, company_id FROM requirements WHERE id = $1 AND deleted_at IS NULL`,
+      [requirementId],
+    );
+    const rtmTitle: string | undefined = reqRow.rows[0]?.title;
+    const rtmCompany: number | null = reqRow.rows[0]?.company_id ?? (companyId ?? null);
+    if (rtmTitle && rtmCompany != null) {
+      // Legacy numeric requirements with an EXACT title match in the same
+      // company that actually have cases. Require EXACTLY ONE — else ambiguous.
+      const candidates = await pool.query(
+        `SELECT trq.id, COUNT(tc.id)::int AS case_count
+           FROM test_requirements trq
+           JOIN generated_test_scenarios ts ON ts.requirement_id = trq.id
+           JOIN generated_test_cases tc ON tc.scenario_id = ts.id
+          WHERE trq.company_id = $1 AND trq.title = $2
+          GROUP BY trq.id
+         HAVING COUNT(tc.id) > 0`,
+        [rtmCompany, rtmTitle],
+      );
+      if (candidates.rows.length === 1) {
+        const legacyReqId = candidates.rows[0].id;
+        const bridged = await pool.query(
+          `SELECT ${SELECT_COLS}
+             FROM generated_test_cases tc
+             JOIN generated_test_scenarios ts ON tc.scenario_id = ts.id${SCRIPT_COUNT_JOIN}
+            WHERE ts.requirement_id = $1
+            ORDER BY tc.priority, tc.id`,
+          [legacyReqId],
+        );
+        if (bridged.rows.length > 0) {
+          console.warn(
+            `[postgres] getTestCasesForRequirement: FK + traceability returned 0 for requirement ${requirementId}; ` +
+              `bridged ${bridged.rows.length} case(s) from legacy numeric requirement ${legacyReqId} ` +
+              `(exact title match "${rtmTitle}", company ${rtmCompany}). Self-healing the RTM link.`,
+          );
+          // Self-heal: establish the RTM link (UUID FK + traceability) so the
+          // fast path works next time. Requires a concrete companyId; skipped
+          // (read still succeeds) when none is available.
+          const healCompany = companyId ?? rtmCompany;
+          if (healCompany != null) {
+            try {
+              await linkTestCasesToRequirement({
+                testCaseIds: bridged.rows.map((row) => row.id),
+                requirementId,
+                companyId: healCompany,
+              });
+            } catch (healErr: any) {
+              console.warn(`[postgres] getTestCasesForRequirement: RTM link self-heal failed (non-blocking): ${healErr?.message}`);
+            }
+          }
+          return bridged.rows;
+        }
+      } else if (candidates.rows.length > 1) {
+        console.warn(
+          `[postgres] getTestCasesForRequirement: refusing to bridge requirement ${requirementId} — ` +
+            `${candidates.rows.length} legacy requirements share the title "${rtmTitle}" in company ${rtmCompany}; ` +
+            `ambiguous, returning no cases (honest empty rather than wrong grounding).`,
+        );
+      }
+    }
+  } catch (bridgeErr: any) {
+    console.warn(`[postgres] getTestCasesForRequirement: legacy bridge failed (non-blocking): ${bridgeErr?.message}`);
+  }
+
   return r.rows;
 }
 

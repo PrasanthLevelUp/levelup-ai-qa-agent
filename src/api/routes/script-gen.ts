@@ -55,7 +55,7 @@ import { deriveTestCaseTargetUrls, profileCoversTargets } from '../../script-gen
 import { getRepositoryContext } from '../../db/postgres';
 import { KnowledgeOptimizer, type KnowledgeItem } from '../../ai/knowledge-optimizer';
 import { AIReviewEngine } from '../../script-gen/ai-review-engine';
-import { ValidationRunner } from '../../script-gen/validation-runner';
+import { ValidationRunner, computeReliabilityBreakdown } from '../../script-gen/validation-runner';
 import { ProjectExportEngine } from '../../script-gen/project-export-engine';
 import {
   createBranch,
@@ -290,34 +290,40 @@ export function createScriptGenRouter(): Router {
       }
 
       // ── Honesty guard: requirement intent with NO resolvable cases ───────
-      // If the caller explicitly asked for requirement-based generation (a
-      // requirementId, no single testCase, no inline uploaded cases) but we
-      // could not resolve a SINGLE linked test case — even after the
-      // FK→traceability fallback in getTestCasesForRequirement — then the ONLY
-      // thing the engine can do is drop to the generic URL-discovery flow
-      // (smoke/search/navigation/form) and stamp it with a meaningless 100%
-      // reliability score. That is exactly the "many scenarios, 4 generic
-      // 0%-grounded scripts" symptom. Fail LOUD and actionable instead of
-      // silently shipping garbage. URL-based generation (no requirementId) is
-      // unaffected and still uses the LLM discovery path as designed.
+      // Requirement intent is asserted by EITHER a supplied requirementId OR an
+      // explicit generationSource === 'requirement_based'. Either way, when the
+      // user asked to generate FROM A REQUIREMENT, there is exactly ONE correct
+      // source of truth — its linked test cases. If none resolve (after FK →
+      // traceability → legacy-numeric-bridge in getTestCasesForRequirement) the
+      // system must NOT quietly switch to the generic URL-discovery generator
+      // and dress it up with a 100% score. That second generation path is the
+      // root of the "many scenarios → 4 unrelated smoke/search/nav/form scripts,
+      // 0% grounded" class of bugs. Fail loud + actionable so the user is routed
+      // to create/link test cases first. URL / plain-English generation (no
+      // requirement intent) is unaffected and still uses the LLM path as designed.
+      const requirementIntent =
+        requirementId != null || rawGenerationSource === 'requirement_based';
       if (
-        requirementId != null &&
+        requirementIntent &&
         !testCase &&
         requirementTestCases.length === 0 &&
         !(Array.isArray(inlineTestCasesRaw) && inlineTestCasesRaw.length > 0)
       ) {
         console.warn(
-          `[ScriptGen] ❌ Requirement ${requirementId} resolved 0 test cases (FK + traceability fallback both empty). ` +
-            `Refusing to emit generic ungrounded scripts.`,
+          `[ScriptGen] ❌ Requirement ${requirementId ?? '(unspecified id)'} resolved 0 test cases ` +
+            `(FK + traceability + legacy-numeric bridge all empty). Refusing to emit generic ungrounded scripts.`,
         );
         return res.status(422).json({
           success: false,
           error:
             'This requirement has no linked test cases, so grounded per-test-case scripts cannot be generated. ' +
-            'Link the requirement’s test cases first (Test Case Lab → link to requirement), or generate from a URL / uploaded CSV instead.',
+            'Generate the requirement’s test cases first (Test Case Lab), or generate from a URL / uploaded CSV instead.',
           code: 'REQUIREMENT_HAS_NO_TEST_CASES',
-          requirementId: String(requirementId),
+          requirementId: requirementId != null ? String(requirementId) : null,
           resolvedTestCaseCount: 0,
+          // Explicit next step so the dashboard can deep-link the user forward
+          // instead of leaving them staring at a failed generation.
+          nextAction: 'GENERATE_TEST_CASES',
         });
       }
 
@@ -693,8 +699,11 @@ export function createScriptGenRouter(): Router {
       const validator = new ValidationRunner();
       const validationReport = validator.validate(result.generatedFiles, result.testPlan);
 
-      // Determine validation status
-      const validationStatus = validationReport.overallScore >= 80 ? 'passed' : 'needs_review';
+      // Determine validation status. Provisionally set from code quality here;
+      // downgraded below to reflect the honest execution-readiness score once
+      // grounding + business coverage are known (so a 0%-grounded generic script
+      // is never marked "passed" on the strength of clean syntax alone).
+      let validationStatus = validationReport.overallScore >= 80 ? 'passed' : 'needs_review';
 
       // ── Sprint 4: Locator Resolution Report ──
       // Resolve a locator for each interactive element implied by the test case
@@ -826,6 +835,38 @@ export function createScriptGenRouter(): Router {
         } catch { /* non-fatal */ }
       }
 
+      // ── Honest reliability breakdown ─────────────────────────────────────
+      // validationReport.overallScore is CODE QUALITY only (syntax/structure).
+      // On its own it produced the misleading "100% reliable" headline on a
+      // script whose locators were 0% grounded and whose files didn't match the
+      // requirement. Decompose reliability into code quality, grounding quality
+      // and business coverage, and combine them weakest-link so a zeroed
+      // dimension collapses the headline execution-readiness score.
+      const intendedTestCaseCount =
+        (testCase ? 1 : 0) + requirementTestCases.length;
+      // The deterministic engine stamps a real model name; the generic fallback
+      // path reports a "fallback"/"rule-based" model. If we intended to generate
+      // from real cases but the fallback ran, business coverage is 0.
+      const ranGenericFallback = /fallback|rule[-_ ]?based/i.test(String(result.stats?.model ?? ''));
+      const usedRealTestCases = intendedTestCaseCount > 0 && !ranGenericFallback;
+      const grounding =
+        locatorReport && (locatorReport as any).totalLocators > 0
+          ? {
+              grounded: (locatorReport as any).validatedCount ?? 0,
+              total: (locatorReport as any).totalLocators ?? 0,
+            }
+          : null;
+      const reliabilityBreakdown = computeReliabilityBreakdown({
+        codeQuality: validationReport.overallScore,
+        grounding,
+        intendedTestCaseCount,
+        usedRealTestCases,
+      });
+      console.log(`[ScriptGen] 📐 Reliability — ${reliabilityBreakdown.headline}`);
+      // Honest status gate: a script is only "passed" when it is genuinely
+      // execution-ready (code AND grounding AND coverage), not merely syntactic.
+      validationStatus = reliabilityBreakdown.executionReadiness >= 80 ? 'passed' : 'needs_review';
+
       // Build intelligence metadata — tracks every intelligence source used
       const intelligenceMetadata = {
         repoIntelligenceUsed: !!repoIntelligence,
@@ -855,6 +896,9 @@ export function createScriptGenRouter(): Router {
         folderStrategy: typeof folderStrategy === 'object' ? JSON.stringify(folderStrategy) : (folderStrategy ?? undefined),
         ...(locatorReport ? { locatorConfidence: locatorReport.avgConfidence, locatorTodoCount: locatorReport.todoCount } : {}),
         ...(folderDecision ? { folderDecision } : {}),
+        // Honest, decomposed reliability (code / grounding / business coverage /
+        // execution readiness) so History never shows a misleading single 100%.
+        reliabilityBreakdown,
       };
 
       console.log(`[ScriptGen] 📊 Intelligence summary: repoIntel=${intelligenceMetadata.repoIntelligenceUsed} (${intelligenceMetadata.repoFramework ?? 'n/a'}), knowledge=${intelligenceMetadata.knowledgeItemsUsed} items, cache=${intelligenceMetadata.profileCacheUsed}, adaptive=${intelligenceMetadata.adaptiveCodegenUsed} (${intelligenceMetadata.adaptiveMode ?? 'n/a'})`);
@@ -873,7 +917,11 @@ export function createScriptGenRouter(): Router {
           knowledgeItemTitles: knowledgeItemsUsed.map((ki: any) => ki.title),
         },
         validation_status: validationStatus,
-        reliability_score: validationReport.overallScore,
+        // HONEST headline score: execution readiness (weakest-link of code
+        // quality × grounding × business coverage), NOT the code-only score.
+        // A syntactically perfect but 0%-grounded generic script now persists a
+        // low reliability score instead of a misleading 100%.
+        reliability_score: reliabilityBreakdown.executionReadiness,
         tokens_used: result.stats.tokensUsed,
         model: result.stats.model,
         generation_time_ms: generationTimeMs,
@@ -998,6 +1046,10 @@ export function createScriptGenRouter(): Router {
           files: result.generatedFiles.map((f: GeneratedFile) => ({ path: f.path, size: f.content.length, type: f.type })),
           testPlan: result.testPlan,
           validationReport,
+          // Honest, decomposed reliability — code quality vs grounding vs
+          // business coverage vs combined execution readiness. The dashboard
+          // should headline `executionReadiness`, NOT validationReport.overallScore.
+          reliabilityBreakdown,
           stats: result.stats,
           generationTimeMs,
           errors: result.errors,
