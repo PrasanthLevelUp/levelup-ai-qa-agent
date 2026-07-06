@@ -200,3 +200,85 @@ describe('optimizeKnowledgeForCategory', () => {
     expect(urls).toContain('/cart');
   });
 });
+
+/* ------------------------------------------------------------------ */
+/*  Per-scenario (element-level) retrieval                             */
+/* ------------------------------------------------------------------ */
+
+describe('optimizeKnowledgeForCategory — element-level per-scenario retrieval', () => {
+  // A profile whose interactive elements belong to DISTINCT scenarios: the
+  // login flow (email/password/login/forgot/remember) and the logout flow
+  // (logout/profile menu/session label). A single global top-K could fill the
+  // budget with only one flow's elements; round-robin must represent both.
+  function twoFlowProfile() {
+    return {
+      applicationProfile: {
+        name: 'App',
+        keyElements: [
+          { label: 'Email field', tag: 'input', selector: '#email' },
+          { label: 'Password field', tag: 'input', selector: '#password' },
+          { label: 'Login button', tag: 'button', selector: '#login' },
+          { label: 'Forgot password link', tag: 'a', selector: '#forgot' },
+          { label: 'Remember me checkbox', tag: 'input', selector: '#remember' },
+          { label: 'Logout button', tag: 'button', selector: '#logout' },
+          { label: 'Profile menu', tag: 'button', selector: '#profile' },
+          { label: 'Session label', tag: 'span', selector: '#session' },
+        ],
+      },
+      testData: [],
+    };
+  }
+
+  const scenarioQueries = [
+    'Valid login with email and password',
+    'Logout ends the session from the profile menu',
+    'Forgot password reset link',
+    'Remember me keeps the session',
+  ];
+
+  it('represents EVERY scenario — the logout flow survives alongside login', () => {
+    const res = optimizeKnowledgeForCategory(twoFlowProfile(), 'User authentication', {
+      category: 'authentication',
+      confidence: 1,
+      scenarioQueries,
+      caps: { elements: 6 },
+    });
+    const labels = res.knowledge!.applicationProfile!.keyElements!.map((e: any) => e.label.toLowerCase());
+    // Both the login flow AND the logout flow must be present (no starvation).
+    expect(labels.some((l: string) => /login|password|email/.test(l))).toBe(true);
+    expect(labels.some((l: string) => /logout|profile|session/.test(l))).toBe(true);
+  });
+
+  it('emits winners in original document order (stable prompt)', () => {
+    const res = optimizeKnowledgeForCategory(twoFlowProfile(), 'User authentication', {
+      category: 'authentication',
+      confidence: 1,
+      scenarioQueries,
+      caps: { elements: 6 },
+    });
+    const original = twoFlowProfile().applicationProfile.keyElements.map((e) => e.selector);
+    const kept = res.knowledge!.applicationProfile!.keyElements!.map((e: any) => e.selector);
+    const keptInOriginalOrder = original.filter((s) => kept.includes(s));
+    expect(kept).toEqual(keptInOriginalOrder);
+  });
+
+  it('is deterministic with per-scenario queries', () => {
+    const a = optimizeKnowledgeForCategory(twoFlowProfile(), 'auth', { category: 'authentication', confidence: 1, scenarioQueries, caps: { elements: 6 } });
+    const b = optimizeKnowledgeForCategory(twoFlowProfile(), 'auth', { category: 'authentication', confidence: 1, scenarioQueries, caps: { elements: 6 } });
+    expect(JSON.stringify(a.knowledge)).toBe(JSON.stringify(b.knowledge));
+  });
+
+  it('falls back to global ranking when no scenario queries are supplied', () => {
+    const withScenarios = optimizeKnowledgeForCategory(twoFlowProfile(), 'auth', { category: 'authentication', confidence: 1, scenarioQueries: [], caps: { elements: 6 } });
+    const globalOnly = optimizeKnowledgeForCategory(twoFlowProfile(), 'auth', { category: 'authentication', confidence: 1, caps: { elements: 6 } });
+    // Empty scenarioQueries must behave exactly like the global top-K path.
+    expect(JSON.stringify(withScenarios.knowledge)).toBe(JSON.stringify(globalOnly.knowledge));
+  });
+
+  it('does not mutate the original element list', () => {
+    const k = twoFlowProfile();
+    const before = k.applicationProfile.keyElements.length;
+    optimizeKnowledgeForCategory(k, 'auth', { category: 'authentication', confidence: 1, scenarioQueries, caps: { elements: 4 } });
+    expect(k.applicationProfile.keyElements.length).toBe(before);
+  });
+});

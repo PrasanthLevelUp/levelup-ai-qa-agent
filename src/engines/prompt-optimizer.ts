@@ -153,6 +153,32 @@ const CATEGORY_RELEVANCE: Record<Exclude<QACategory, 'generic'>, string[]> = {
  */
 const KEEP_MIN = { pages: 3, forms: 3, elements: 6, testData: 2 };
 
+/**
+ * Maximum number of items of a given kind to RETRIEVE into the prompt. This is
+ * what turns category filtering into real top-K retrieval: when many items match
+ * (e.g. every form on an e-commerce site has an "email" field, so a plain
+ * category match keeps login + signup + newsletter + contact), we rank by
+ * relevance and keep only the most relevant `keepMax`. Env-overridable so the
+ * budget can be tuned from telemetry. A strongly-matching item is never dropped
+ * below keepMin; coverage/scenarios are never affected — this only scopes the
+ * grounding CONTEXT injected into the single generation prompt.
+ */
+const CAP_DEFAULTS = {
+  pages: intEnvOpt('GEN_RETRIEVE_MAX_PAGES', 8),
+  forms: intEnvOpt('GEN_RETRIEVE_MAX_FORMS', 6),
+  elements: intEnvOpt('GEN_RETRIEVE_MAX_ELEMENTS', 12),
+  testData: intEnvOpt('GEN_RETRIEVE_MAX_TESTDATA', 6),
+};
+
+function intEnvOpt(name: string, def: number): number {
+  const raw = process.env[name];
+  if (raw == null || raw === '') return def;
+  const n = parseInt(raw, 10);
+  return Number.isFinite(n) && n > 0 ? n : def;
+}
+
+export type RetrievalCaps = Partial<typeof CAP_DEFAULTS>;
+
 /** Loose structural shapes so the optimizer stays decoupled from the engine. */
 interface ProfileLike {
   pages?: Array<any>;
@@ -193,14 +219,6 @@ function haystack(obj: any, fields: string[]): string {
   return parts.join(' ').toLowerCase();
 }
 
-/** True when `text` contains any of the vocabulary terms. */
-function matchesAny(text: string, vocab: string[]): boolean {
-  for (const term of vocab) {
-    if (term && text.includes(term)) return true;
-  }
-  return false;
-}
-
 /**
  * Trim a knowledge context to the grounding relevant for the requirement's QA
  * category. Deterministic, pure, fail-open. Returns the (shallow-cloned)
@@ -210,7 +228,33 @@ function matchesAny(text: string, vocab: string[]): boolean {
 export function optimizeKnowledgeForCategory<K extends KnowledgeLike | undefined>(
   knowledge: K,
   requirementText: string,
-  opts?: { category?: QACategory; confidence?: number; minConfidence?: number },
+  opts?: {
+    category?: QACategory;
+    confidence?: number;
+    minConfidence?: number;
+    /**
+     * Scenario-aware retrieval query. When the deterministic Scenario Planner has
+     * decided WHAT to test, its scenario titles/objectives/risk-areas are passed
+     * here so retrieval ranks the App Profile / Test Data toward the pages, forms,
+     * fields and datasets the PLANNED scenarios actually reference — not just the
+     * broad category vocabulary. Purely additive: omitted → category-only ranking.
+     */
+    queryText?: string;
+    /**
+     * Per-scenario retrieval queries — one string per PLANNED scenario (its
+     * title + objective + risk-area). When supplied, the retrieval UNIT for
+     * fine-grained context (forms + key elements) becomes "the items each
+     * scenario needs" rather than a single global ranking. Elements/forms are
+     * scored against EACH scenario and selected round-robin, so every scenario
+     * contributes its most relevant items to the budget and no scenario is
+     * starved by a globally dominant one (e.g. "Valid Login" keeps the email/
+     * password/login-button while "Logout" still keeps the logout/profile menu).
+     * Purely additive: omitted → the previous global top-K ranking is used.
+     */
+    scenarioQueries?: string[];
+    /** Per-type top-K retrieval caps (override CAP_DEFAULTS). */
+    caps?: RetrievalCaps;
+  },
 ): OptimizeResult<K> {
   const baseStats: OptimizeStats = {
     applied: false,
@@ -253,12 +297,27 @@ export function optimizeKnowledgeForCategory<K extends KnowledgeLike | undefined
 
   const vocab = CATEGORY_RELEVANCE[category as Exclude<QACategory, 'generic'>] || [];
   // Requirement tokens (>=3 chars) broaden the "relevant" set so a well-named
-  // page matching the requirement itself is never dropped.
-  const reqTokens = (requirementText || '')
-    .toLowerCase()
-    .split(/[^a-z0-9]+/)
-    .filter((t) => t.length >= 3);
-  const relevant = Array.from(new Set([...vocab, ...reqTokens]));
+  // page matching the requirement itself is never dropped. The scenario-aware
+  // query (planned scenario titles/objectives/risk-areas) is folded in too, so
+  // retrieval ranks toward what the PLANNED scenarios actually reference.
+  const toTokens = (s: string) =>
+    (s || '').toLowerCase().split(/[^a-z0-9]+/).filter((t) => t.length >= 3);
+  const reqTokens = toTokens(requirementText);
+  const queryTokens = toTokens(opts?.queryText || '');
+  const relevant = Array.from(new Set([...vocab, ...reqTokens, ...queryTokens]));
+  const caps = { ...CAP_DEFAULTS, ...(opts?.caps || {}) };
+
+  // Per-scenario term sets (element-level retrieval). Each planned scenario gets
+  // its own term set = category vocab + requirement tokens + that scenario's own
+  // tokens. Forms/elements are then retrieved round-robin across these sets so
+  // every scenario's needed items are represented, not just a global winner.
+  // Empty (or single) → we fall back to the global `relevant` ranking below.
+  const scenarioTermSets = (opts?.scenarioQueries || [])
+    .map((q) => {
+      const t = toTokens(q);
+      return t.length ? Array.from(new Set([...vocab, ...reqTokens, ...t])) : [];
+    })
+    .filter((t) => t.length > 0);
 
   // Nothing to trim if there is no profile and no test data.
   if (!ap && !td) {
@@ -270,44 +329,45 @@ export function optimizeKnowledgeForCategory<K extends KnowledgeLike | undefined
 
   /* ---- Pages ---- */
   if (ap?.pages?.length) {
-    const kept = filterByRelevance(
+    const kept = rankAndTrim(
       ap.pages,
       (p) => haystack(p, ['url', 'title', 'pageType']),
       relevant,
       KEEP_MIN.pages,
+      caps.pages,
     );
     if (kept.length < ap.pages.length) anyTrim = true;
     baseStats.pages.after = kept.length;
     nextKnowledge.applicationProfile = { ...ap, pages: kept };
   }
 
-  /* ---- Forms ---- */
+  /* ---- Forms (element-level: retrieved per scenario when planned) ---- */
   if (ap?.forms?.length) {
     const currentAp = nextKnowledge.applicationProfile ?? { ...ap };
-    const kept = filterByRelevance(
-      ap.forms,
-      (f) => {
-        const fieldText = Array.isArray(f.fields)
-          ? f.fields.map((fd: any) => haystack(fd, ['name', 'label', 'type'])).join(' ')
-          : '';
-        return `${haystack(f, ['page', 'action', 'method'])} ${fieldText}`;
-      },
-      relevant,
-      KEEP_MIN.forms,
+    const formText = (f: any) => {
+      const fieldText = Array.isArray(f.fields)
+        ? f.fields.map((fd: any) => haystack(fd, ['name', 'label', 'type'])).join(' ')
+        : '';
+      return `${haystack(f, ['page', 'action', 'method'])} ${fieldText}`;
+    };
+    const kept = rankAndTrimScoped(
+      ap.forms, formText, relevant, scenarioTermSets, KEEP_MIN.forms, caps.forms,
     );
     if (kept.length < ap.forms.length) anyTrim = true;
     baseStats.forms.after = kept.length;
     nextKnowledge.applicationProfile = { ...currentAp, forms: kept };
   }
 
-  /* ---- Key elements ---- */
+  /* ---- Key elements (element-level: retrieved per scenario when planned) ---- */
   if (ap?.keyElements?.length) {
     const currentAp = nextKnowledge.applicationProfile ?? { ...ap };
-    const kept = filterByRelevance(
+    const kept = rankAndTrimScoped(
       ap.keyElements,
       (e) => haystack(e, ['label', 'tag', 'selector', 'role']),
       relevant,
+      scenarioTermSets,
       KEEP_MIN.elements,
+      caps.elements,
     );
     if (kept.length < ap.keyElements.length) anyTrim = true;
     baseStats.elements.after = kept.length;
@@ -316,7 +376,7 @@ export function optimizeKnowledgeForCategory<K extends KnowledgeLike | undefined
 
   /* ---- Test data ---- */
   if (td?.length) {
-    const kept = filterByRelevance(
+    const kept = rankAndTrim(
       td,
       (d) => {
         const keys = Array.isArray(d.sampleKeys) ? d.sampleKeys.join(' ') : '';
@@ -324,6 +384,7 @@ export function optimizeKnowledgeForCategory<K extends KnowledgeLike | undefined
       },
       relevant,
       KEEP_MIN.testData,
+      caps.testData,
     );
     if (kept.length < td.length) anyTrim = true;
     baseStats.testData.after = kept.length;
@@ -340,34 +401,144 @@ export function optimizeKnowledgeForCategory<K extends KnowledgeLike | undefined
   };
 }
 
+/** Number of DISTINCT relevance terms that appear in `text`. Higher = more relevant. */
+function scoreRelevance(text: string, terms: string[]): number {
+  if (!text) return 0;
+  let score = 0;
+  for (const term of terms) {
+    if (term && text.includes(term)) score += 1;
+  }
+  return score;
+}
+
 /**
- * Keep every item whose searchable text matches the relevance vocabulary. If
- * that yields fewer than `keepMin`, top up with the earliest non-matching items
- * (preserving original order) so we never over-trim below a safe floor. If
- * nothing matches at all, keep the first `keepMin` (fail-open — never empty a
- * populated section).
+ * Rank-and-trim = real top-K retrieval (replaces the old binary "keep anything
+ * that matches"). Steps, all deterministic and fail-open:
+ *   1. Score every item by how many relevance terms it contains.
+ *   2. Items with score 0 are "unmatched"; items with score > 0 are "matched".
+ *   3. If NOTHING matches → keep the first `keepMin` (never empty a populated
+ *      section — preserves navigational context).
+ *   4. Otherwise keep matched items. If more than `keepMax` matched (the
+ *      e-commerce case: every form has an email field), rank by (score desc,
+ *      original-index asc) and keep only the top `keepMax` — the MOST relevant.
+ *      Fewer than keepMax → keep them all in original order (no reordering, so
+ *      the common single-feature case is byte-for-byte stable).
+ *   5. If the result is still below `keepMin`, top up with the earliest
+ *      unmatched items to the floor.
+ * `keepMax` is clamped to be ≥ keepMin so the cap can never fight the floor.
  */
-function filterByRelevance<T>(
+function rankAndTrim<T>(
   items: T[],
   toText: (item: T) => string,
-  vocab: string[],
+  terms: string[],
   keepMin: number,
+  keepMax: number,
 ): T[] {
   if (items.length <= keepMin) return items;
+  const ceiling = Math.max(keepMin, keepMax);
 
-  const matched: T[] = [];
-  const unmatched: T[] = [];
-  for (const it of items) {
-    if (matchesAny(toText(it), vocab)) matched.push(it);
-    else unmatched.push(it);
-  }
+  const scored = items.map((item, index) => ({ item, index, score: scoreRelevance(toText(item), terms) }));
+  const matched = scored.filter((s) => s.score > 0);
+  const unmatched = scored.filter((s) => s.score === 0);
 
   if (matched.length === 0) {
     // No signal — keep a safe floor rather than everything or nothing.
     return items.slice(0, keepMin);
   }
-  if (matched.length >= keepMin) return matched;
 
-  // Top up to the floor with the earliest unmatched items.
-  return [...matched, ...unmatched.slice(0, keepMin - matched.length)];
+  let keptScored: typeof matched;
+  if (matched.length > ceiling) {
+    // Too many matched — retrieve only the most relevant top-K.
+    keptScored = [...matched]
+      .sort((a, b) => (b.score - a.score) || (a.index - b.index))
+      .slice(0, ceiling)
+      // restore original document order among the winners for a stable prompt.
+      .sort((a, b) => a.index - b.index);
+  } else {
+    keptScored = matched; // already in original order
+  }
+
+  if (keptScored.length >= keepMin) return keptScored.map((s) => s.item);
+
+  // Top up to the floor with the earliest unmatched items (original order).
+  const topUp = unmatched.slice(0, keepMin - keptScored.length);
+  return [...keptScored, ...topUp].sort((a, b) => a.index - b.index).map((s) => s.item);
+}
+
+/**
+ * Scenario-scoped retrieval — the "retrieval unit is the elements a SCENARIO
+ * needs, not a whole page/global list" refinement. When `scenarioTermSets` is
+ * empty it is exactly `rankAndTrim` (global top-K); otherwise:
+ *   1. Score every item against EACH scenario's term set.
+ *   2. Build per-scenario ranked lists (score desc, index asc; score 0 dropped).
+ *   3. Round-robin: take the #1 item from scenario A, then B, then C, … then the
+ *      #2 from each, and so on — adding each item once (dedup by index) until the
+ *      `keepMax` budget is full. This guarantees every scenario contributes its
+ *      most-relevant items before any single scenario consumes the whole budget,
+ *      so no scenario is starved by a globally dominant one.
+ *   4. Fail-open: if the round-robin found nothing (no scenario matched any
+ *      item), fall back to the global `rankAndTrim`. If it found fewer than
+ *      `keepMin`, top up from the global ranking to the floor.
+ *   5. Winners are emitted in original document order for a stable prompt.
+ * Deterministic and pure — same inputs always yield the same slice.
+ */
+function rankAndTrimScoped<T>(
+  items: T[],
+  toText: (item: T) => string,
+  globalTerms: string[],
+  scenarioTermSets: string[][],
+  keepMin: number,
+  keepMax: number,
+): T[] {
+  // No per-scenario signal → identical to the global top-K path.
+  if (!scenarioTermSets.length) {
+    return rankAndTrim(items, toText, globalTerms, keepMin, keepMax);
+  }
+  if (items.length <= keepMin) return items;
+  const ceiling = Math.max(keepMin, keepMax);
+
+  // Score each item once per scenario (text computed once).
+  const texts = items.map((it) => toText(it));
+  const perScenarioRanked: number[][] = scenarioTermSets.map((terms) =>
+    texts
+      .map((t, index) => ({ index, score: scoreRelevance(t, terms) }))
+      .filter((s) => s.score > 0)
+      .sort((a, b) => (b.score - a.score) || (a.index - b.index))
+      .map((s) => s.index),
+  );
+
+  // Round-robin across scenarios until the budget is full.
+  const chosen = new Set<number>();
+  const cursors = new Array(perScenarioRanked.length).fill(0);
+  let progressed = true;
+  while (chosen.size < ceiling && progressed) {
+    progressed = false;
+    for (let s = 0; s < perScenarioRanked.length && chosen.size < ceiling; s++) {
+      const list = perScenarioRanked[s];
+      let c = cursors[s];
+      while (c < list.length && chosen.has(list[c])) c++;
+      if (c < list.length) {
+        chosen.add(list[c]);
+        cursors[s] = c + 1;
+        progressed = true;
+      }
+    }
+  }
+
+  // Nothing matched any scenario → fall back to global ranking.
+  if (chosen.size === 0) {
+    return rankAndTrim(items, toText, globalTerms, keepMin, keepMax);
+  }
+
+  // Below the floor → top up from the global ranking (dedup, preserve order).
+  if (chosen.size < keepMin) {
+    const globalTopUp = rankAndTrim(items, toText, globalTerms, keepMin, ceiling);
+    for (const it of globalTopUp) {
+      if (chosen.size >= keepMin) break;
+      const idx = items.indexOf(it);
+      if (idx >= 0) chosen.add(idx);
+    }
+  }
+
+  return items.filter((_, index) => chosen.has(index));
 }
