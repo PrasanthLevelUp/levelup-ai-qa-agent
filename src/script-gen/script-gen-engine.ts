@@ -1029,7 +1029,12 @@ export class ScriptGenEngine {
           // Review fix: treat a record as "having password" when the password field
           // EXISTS (even if undefined), so synthesized records (which carry
           // `password: undefined`) trigger the `user.password ?? env` fallback.
-          hasPassword: 'password' in (caseData.value || {}) || 'pass' in (caseData.value || {}),
+          // Defensive guard: when the resolved value is a primitive (e.g. a plain
+          // string "paviramesh1812@gmail.com" instead of {username,password}), the
+          // `in` operator throws. Only check object values.
+          hasPassword: (caseData.value && typeof caseData.value === 'object')
+            ? ('password' in caseData.value || 'pass' in caseData.value)
+            : false,
         }
       : undefined;
 
@@ -3018,10 +3023,11 @@ ${gotoB}${sessionLogin('pageB')}
               : `${ctx.data.varName}.password ?? process.env.TEST_PASSWORD ?? ''`;
           } else {
             const valid = this.resolveValidUserRecord(index);
-            if (valid && 'username' in (valid.value || {})) {
+            const validObj = valid?.value && typeof valid.value === 'object' ? valid.value : null;
+            if (valid && validObj && 'username' in validObj) {
               localDecls.push(`const user = ${valid.ref};`);
               baseUser = `user.username ?? ''`;
-              basePass = 'password' in (valid.value || {})
+              basePass = 'password' in validObj
                 ? `user.password ?? ''`
                 : `user.password ?? process.env.TEST_PASSWORD ?? ''`;
             } else {
@@ -3035,8 +3041,8 @@ ${gotoB}${sessionLogin('pageB')}
         // as `validUser` for clarity in the emitted spec.
         const validCounterpart = (): { u?: string; p?: string } => {
           const valid = this.resolveValidUserRecord(index);
-          const val = valid?.value || {};
-          if (valid && ('username' in val || 'password' in val)) {
+          const val = valid?.value && typeof valid.value === 'object' ? valid.value : null;
+          if (valid && val && ('username' in val || 'password' in val)) {
             localDecls.push(`const validUser = ${valid.ref};`);
             return {
               u: 'username' in val ? `validUser.username ?? ''` : undefined,
