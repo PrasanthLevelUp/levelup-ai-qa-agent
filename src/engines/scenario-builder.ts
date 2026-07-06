@@ -85,6 +85,45 @@ export interface BuildDraftsResult {
   conditionalKept: number;
 }
 
+/**
+ * A finished scenario summary, structurally identical to the engine's
+ * TestScenario. Derived DETERMINISTICALLY from the drafts — the LLM never has to
+ * produce the scenarios array.
+ */
+export interface FormatterScenario {
+  scenario: string;
+  objective: string;
+  coverageType: string;
+  priority: 'P0' | 'P1' | 'P2' | 'P3';
+  riskArea: string;
+}
+
+/**
+ * A finished test case, structurally identical to the engine's TestCase (plus
+ * scenarioIndex). This is the DETERMINISTIC output of the builder — it is both
+ * (a) the payload the LLM is asked to merely re-word, and (b) the guaranteed
+ * fallback if the LLM formatter fails or drops cases. Either way coverage is
+ * fixed by the builder, not the model.
+ */
+export interface FormatterTestCase {
+  title: string;
+  objective: string;
+  scenarioIndex: number;
+  riskArea: string;
+  preconditions: string;
+  steps: string[];
+  expectedResult: string;
+  testData: string;
+  priority: 'P0' | 'P1' | 'P2' | 'P3';
+  severity: 'critical' | 'major' | 'minor' | 'trivial';
+  tags: string[];
+  automationReady: boolean;
+  automationComplexity: 'low' | 'medium' | 'high';
+  selectorAvailability: 'high' | 'medium' | 'low' | 'unknown';
+  source: 'requirement' | 'knowledge' | 'test_data' | 'app_profile';
+  sourceEvidence: string;
+}
+
 /* ------------------------------------------------------------------ */
 /*  Helpers                                                            */
 /* ------------------------------------------------------------------ */
@@ -356,4 +395,93 @@ Rules for using the drafts:
 DRAFTS (${drafts.length}):
 ${lines.join('\n')}
 --- END DRAFT TEST CASES ---`;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Formatter mode — the LLM formats, it does not generate             */
+/* ------------------------------------------------------------------ */
+
+const SEVERITY_FOR_PRIORITY: Record<DraftTestCase['priority'], FormatterTestCase['severity']> = {
+  P0: 'critical', P1: 'major', P2: 'minor', P3: 'trivial',
+};
+
+/**
+ * Map a deterministic draft to a COMPLETE, final test-case object. This is the
+ * heart of the "assemble, don't invent" shift: the object below is already a
+ * shippable test case — real steps, real selectors, real dataset, priority,
+ * severity, provenance. The LLM's only remaining job is to re-word the English.
+ * If the LLM is skipped or fails, THIS is what ships (coverage never depends on
+ * the model). `scenarioIndex` is the position in the emitted list so it always
+ * lines up with the deterministically-derived scenarios array.
+ */
+export function draftToTestCase(draft: DraftTestCase, scenarioIndex: number): FormatterTestCase {
+  return {
+    title: draft.title,
+    objective: draft.objective,
+    scenarioIndex,
+    riskArea: draft.riskArea,
+    preconditions: draft.preconditions,
+    steps: draft.steps.slice(),
+    expectedResult: draft.expectedResult,
+    testData: draft.testData,
+    priority: draft.priority,
+    severity: SEVERITY_FOR_PRIORITY[draft.priority] || 'major',
+    tags: draft.tags.slice(),
+    automationReady: draft.automationReady,
+    automationComplexity: draft.grounded ? 'low' : 'medium',
+    selectorAvailability: draft.selectorAvailability,
+    source: draft.source === 'requirement' ? 'knowledge' : draft.source,
+    sourceEvidence: draft.sourceEvidence,
+  };
+}
+
+/** Derive the scenarios array DETERMINISTICALLY from the drafts (no LLM). */
+export function buildScenariosFromDrafts(drafts: DraftTestCase[]): FormatterScenario[] {
+  return drafts.map(d => ({
+    scenario: d.title,
+    objective: d.objective,
+    coverageType: d.coverageType,
+    priority: d.priority,
+    riskArea: d.riskArea,
+  }));
+}
+
+/** The complete deterministic result — scenarios + test cases, zero LLM. */
+export function buildDeterministicOutput(drafts: DraftTestCase[]): {
+  scenarios: FormatterScenario[];
+  testCases: FormatterTestCase[];
+} {
+  return {
+    scenarios: buildScenariosFromDrafts(drafts),
+    testCases: drafts.map((d, i) => draftToTestCase(d, i)),
+  };
+}
+
+/**
+ * Build the MINIMAL formatter prompt. This is the whole point of the redesign:
+ * the model receives ONLY the finished test-case objects and a short "polish the
+ * wording, do not change logic or count" instruction — NO requirement, NO app
+ * profile, NO knowledge, NO test-data block, NO coverage essay, NO reasoning
+ * scaffold. The deterministic layer already did the thinking; the model only
+ * edits English. This is what actually cuts the input tokens (the previous
+ * approach ADDED a draft block on top of the full prompt — this REPLACES it).
+ */
+export function buildFormatterPrompt(testCases: FormatterTestCase[]): string {
+  // Compact, whitespace-free JSON keeps the payload as small as possible.
+  const payload = JSON.stringify(testCases);
+  return `You are a senior QA technical editor. Below are ${testCases.length} test cases that were assembled DETERMINISTICALLY from the real application (real selectors, URLs and datasets). The logic is FINAL and correct.
+
+YOUR ONLY JOB: improve the ENGLISH wording so each reads like a polished, professional test case — sharpen the "title", "objective", "preconditions", "expectedResult" and re-phrase each step for clarity.
+
+STRICT RULES (violating any of these is a failure):
+  • Return EXACTLY ${testCases.length} test cases, in the SAME order. Do NOT add, remove, split or merge cases.
+  • Do NOT change any: "scenarioIndex", "priority", "severity", "coverageType" tags, "source", "sourceEvidence", "automationReady", "automationComplexity", "selectorAvailability".
+  • Preserve every SELECTOR and URL exactly (anything in parentheses like "(#email)", and any http URL) and preserve every dataset name in "testData".
+  • Keep the same NUMBER of steps and the same action per step — reword for clarity only. Never invent steps, selectors, pages or datasets.
+
+Return ONLY valid JSON in this exact shape (no prose):
+{ "testCases": ${'[{ "title": string, "objective": string, "scenarioIndex": number, "riskArea": string, "preconditions": string, "steps": string[], "expectedResult": string, "testData": string, "priority": string, "severity": string, "tags": string[], "automationReady": boolean, "automationComplexity": string, "selectorAvailability": string, "source": string, "sourceEvidence": string }]'} }
+
+TEST CASES TO POLISH:
+${payload}`;
 }

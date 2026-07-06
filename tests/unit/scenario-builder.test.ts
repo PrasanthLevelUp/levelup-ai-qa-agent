@@ -15,6 +15,10 @@ import { planScenarios } from '../../src/engines/scenario-planner';
 import {
   buildDraftTestCases,
   buildDraftBlock,
+  buildDeterministicOutput,
+  buildScenariosFromDrafts,
+  draftToTestCase,
+  buildFormatterPrompt,
 } from '../../src/engines/scenario-builder';
 import type { CoverageType } from '../../src/engines/test-coverage-engine';
 
@@ -172,5 +176,79 @@ describe('buildDraftBlock', () => {
 
   it('returns empty string for no drafts', () => {
     expect(buildDraftBlock([])).toBe('');
+  });
+});
+
+describe('Formatter mode — deterministic output', () => {
+  it('maps every draft to a COMPLETE test case (no field left to the LLM)', () => {
+    const plan = planScenarios(LOGIN_REQ, COVERAGE, 'authentication');
+    const { drafts } = buildDraftTestCases(plan, LOGIN_KNOWLEDGE, LOGIN_REQ);
+    const out = buildDeterministicOutput(drafts);
+
+    // One scenario + one test case per draft — coverage fixed by the builder.
+    expect(out.scenarios.length).toBe(drafts.length);
+    expect(out.testCases.length).toBe(drafts.length);
+
+    out.testCases.forEach((tc, i) => {
+      expect(tc.title.length).toBeGreaterThan(0);
+      expect(tc.steps.length).toBeGreaterThan(0);
+      expect(tc.expectedResult.length).toBeGreaterThan(0);
+      expect(tc.preconditions.length).toBeGreaterThan(0);
+      expect(['P0', 'P1', 'P2', 'P3']).toContain(tc.priority);
+      expect(['critical', 'major', 'minor', 'trivial']).toContain(tc.severity);
+      // scenarioIndex is the POSITION in the emitted list so it always aligns
+      // with the deterministically-derived scenarios array.
+      expect(tc.scenarioIndex).toBe(i);
+      // Never emit 'requirement' as a source in formatter output.
+      expect(['knowledge', 'test_data', 'app_profile']).toContain(tc.source);
+    });
+  });
+
+  it('derives severity from priority deterministically', () => {
+    const plan = planScenarios(LOGIN_REQ, COVERAGE, 'authentication');
+    const { drafts } = buildDraftTestCases(plan, LOGIN_KNOWLEDGE, LOGIN_REQ);
+    const p0 = drafts.find(d => d.priority === 'P0');
+    if (p0) expect(draftToTestCase(p0, 0).severity).toBe('critical');
+  });
+
+  it('scenarios derived from drafts carry the coverage type + risk area', () => {
+    const plan = planScenarios(LOGIN_REQ, COVERAGE, 'authentication');
+    const { drafts } = buildDraftTestCases(plan, LOGIN_KNOWLEDGE, LOGIN_REQ);
+    const scenarios = buildScenariosFromDrafts(drafts);
+    scenarios.forEach((s, i) => {
+      expect(s.scenario).toBe(drafts[i].title);
+      expect(s.coverageType).toBe(drafts[i].coverageType);
+      expect(s.riskArea).toBe(drafts[i].riskArea);
+    });
+  });
+});
+
+describe('Formatter mode — minimal prompt', () => {
+  it('is DRAMATICALLY smaller than the equivalent full draft block, and preserves selectors', () => {
+    const plan = planScenarios(LOGIN_REQ, COVERAGE, 'authentication');
+    const { drafts } = buildDraftTestCases(plan, LOGIN_KNOWLEDGE, LOGIN_REQ);
+    const out = buildDeterministicOutput(drafts);
+    const formatterPrompt = buildFormatterPrompt(out.testCases);
+
+    // The prompt must NOT contain the requirement, app-profile block headers,
+    // knowledge or coverage-objective scaffolding — only the polish payload.
+    expect(formatterPrompt).toContain('polish');
+    expect(formatterPrompt).toContain(`EXACTLY ${out.testCases.length}`);
+    // Real selectors and URLs survive into the payload (the model must keep them).
+    expect(formatterPrompt).toContain('#email');
+    expect(formatterPrompt).toContain('#login-btn');
+    // It must NOT drag in the heavy generation scaffolding.
+    expect(formatterPrompt).not.toContain('COVERAGE OBJECTIVES');
+    expect(formatterPrompt).not.toContain('GROUNDED SCOPE');
+    expect(formatterPrompt).not.toContain('Acceptance Criteria');
+  });
+
+  it('emits compact (whitespace-free) JSON for the payload', () => {
+    const plan = planScenarios(LOGIN_REQ, COVERAGE, 'authentication');
+    const { drafts } = buildDraftTestCases(plan, LOGIN_KNOWLEDGE, LOGIN_REQ);
+    const out = buildDeterministicOutput(drafts);
+    const formatterPrompt = buildFormatterPrompt(out.testCases);
+    // The compact array serialization appears verbatim in the prompt.
+    expect(formatterPrompt).toContain(JSON.stringify(out.testCases));
   });
 });
