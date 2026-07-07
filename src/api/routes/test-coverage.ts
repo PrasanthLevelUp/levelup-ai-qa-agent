@@ -76,7 +76,7 @@ function buildAiMetadata(fields: Record<string, any>): Record<string, any> {
  * stored once, then projected per consumer. Manual QA sees business prose;
  * Script-Gen reads grounding (elsewhere). No duplicate storage, no duplicate logic.
  */
-function projectToManual(dbRows: any[]): ManualTestCase[] {
+function projectToManual(dbRows: any[]): any[] {
   const renderer = new ManualRenderer();
   return dbRows.map(row => {
     // Build a canonical scenario from the DB row. The DB stores:
@@ -108,8 +108,36 @@ function projectToManual(dbRows: any[]): ManualTestCase[] {
       source: metadata.source || 'knowledge',
       sourceEvidence: metadata.sourceEvidence || '',
     };
-    // Project to manual — business prose only, selectors hidden
-    return renderer.render(canonical);
+    // Business projection: clean steps + observable expected (NO selectors).
+    const manual: ManualTestCase = renderer.render(canonical);
+    // IMPORTANT: the ManualTestCase is the *business content* projection only.
+    // The dashboard's read contract additionally depends on the DB row's
+    // envelope fields (id, coverage_type, automation_status, script_count,
+    // automation_ready, source, requirement linkage, timestamps…) and on the
+    // snake_case transport shape (expected_result / test_data). Projecting to a
+    // bare ManualTestCase dropped all of that — which made the per-test-case
+    // "Generate Script" button (guarded by `tc.id != null`), the coverage-type
+    // grouping and the automation badges disappear. So we preserve the full row
+    // envelope and overlay the business projection on top, while hiding the
+    // technical grounding/selectors from this manual surface.
+    const { grounding: _grounding, expected: metaExpected, ...safeMetadata } = metadata as any;
+    const safeExpected = metaExpected
+      ? { observable: metaExpected.observable, business: metaExpected.business }
+      : undefined;
+    return {
+      ...row,
+      // Overlay the business projection in the snake_case shape the UI consumes.
+      title: manual.title,
+      preconditions: manual.preconditions,
+      steps: manual.steps,
+      expected_result: manual.expected,
+      test_data: manual.testData,
+      priority: manual.priority,
+      severity: manual.severity,
+      tags: manual.tags,
+      // ai_metadata minus technical grounding (selectors stay hidden from manual).
+      ai_metadata: safeExpected ? { ...safeMetadata, expected: safeExpected } : safeMetadata,
+    };
   });
 }
 

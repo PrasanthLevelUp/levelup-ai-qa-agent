@@ -36,7 +36,7 @@ const VALID_PRIORITIES = ['Critical', 'High', 'Medium', 'Low'];
  * PHASE B — Project canonical scenarios (DB rows) to Manual test cases.
  * Same logic as test-coverage.ts — one canonical scenario, projected per consumer.
  */
-function projectToManual(dbRows: any[]): ManualTestCase[] {
+function projectToManual(dbRows: any[]): any[] {
   const renderer = new ManualRenderer();
   return dbRows.map(row => {
     const metadata = row.ai_metadata || {};
@@ -63,7 +63,29 @@ function projectToManual(dbRows: any[]): ManualTestCase[] {
       source: metadata.source || 'knowledge',
       sourceEvidence: metadata.sourceEvidence || '',
     };
-    return renderer.render(canonical);
+    // Business projection: clean steps + observable expected (NO selectors).
+    const manual: ManualTestCase = renderer.render(canonical);
+    // Preserve the DB row envelope (id, automation_status, is_automated,
+    // script_count, requirement_id, created_at…) that the Script-Gen requirement
+    // picker depends on — a bare ManualTestCase dropped `id`, breaking the
+    // "Load a test case" flow (Number(undefined) → NaN). Overlay the business
+    // projection in the snake_case transport shape; hide technical grounding.
+    const { grounding: _grounding, expected: metaExpected, ...safeMetadata } = metadata as any;
+    const safeExpected = metaExpected
+      ? { observable: metaExpected.observable, business: metaExpected.business }
+      : undefined;
+    return {
+      ...row,
+      title: manual.title,
+      preconditions: manual.preconditions,
+      steps: manual.steps,
+      expected_result: manual.expected,
+      test_data: manual.testData,
+      priority: manual.priority,
+      severity: manual.severity,
+      tags: manual.tags,
+      ai_metadata: safeExpected ? { ...safeMetadata, expected: safeExpected } : safeMetadata,
+    };
   });
 }
 
