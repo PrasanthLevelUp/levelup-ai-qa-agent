@@ -491,10 +491,17 @@ export function createTestCoverageRouter(): Router {
               steps: tc.steps || [],
               expectedResult: tc.expectedResult || '',
               testData: tc.testData || '',
-              // Enterprise AI metadata (objective + product riskArea) in one JSONB bag.
+              // Enterprise AI metadata in one JSONB bag: business objective, product
+              // riskArea, plus the technical projection of the scenario — per-step
+              // `grounding` (selectors/pages, hidden from manual QA) and the
+              // structured `expected` (observable | business | technical). Keeping
+              // these in ai_metadata is the "separate DATA, not pipelines" model:
+              // one scenario persisted once, rendered differently per surface.
               aiMetadata: buildAiMetadata({
                 objective: (tc as any).objective,
                 riskArea: (tc as any).riskArea,
+                grounding: (tc as any).grounding,
+                expected: (tc as any).expected,
               }),
               priority: tc.priority || 'P2',
               severity: tc.severity || 'major',

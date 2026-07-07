@@ -26,6 +26,8 @@ import {
   applyPolish,
   type DraftTestCase,
   type FormatterTestCase,
+  type StepGrounding,
+  type StructuredExpected,
 } from './scenario-builder';
 import { validateCanonicalTestCases } from './canonical-validator';
 import { assembleScenarioGraph } from '../graph/scenario-graph-builder';
@@ -484,7 +486,22 @@ export interface TestCase {
    */
   objective?: string;
   preconditions: string;
+  /** Business-readable action steps ONLY (no selectors/URLs). */
   steps: string[];
+  /**
+   * Per-step technical grounding (selector / page / control), aligned to `steps`
+   * by 1-based `stepIndex`. Hidden from manual QA; consumed by Script-Gen and the
+   * Validator. This is the "technical projection" of the scenario — the selectors
+   * that used to be crammed into step prose now live here as typed data.
+   */
+  grounding?: StepGrounding[];
+  /**
+   * Structured expected outcome. `observable` is the human-checkable result shown
+   * to manual QA; `business` restates the objective; `technical` carries an
+   * automation post-condition (selector/page). `expectedResult` below mirrors
+   * `observable` for back-compat.
+   */
+  expected?: StructuredExpected;
   expectedResult: string;
   testData: string;
   /**
