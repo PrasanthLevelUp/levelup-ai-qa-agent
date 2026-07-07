@@ -13,6 +13,8 @@
 import { Router, type Request, type Response } from 'express';
 import { logger } from '../../utils/logger';
 import { getContextFromRequest } from '../middleware/context';
+import { ManualRenderer } from '../../renderers/scenario-renderer';
+import type { CanonicalScenario, ManualTestCase } from '../../renderers/scenario-renderer';
 import {
   createRequirement,
   getRequirements,
@@ -29,6 +31,41 @@ import {
 const MOD = 'requirements-routes';
 
 const VALID_PRIORITIES = ['Critical', 'High', 'Medium', 'Low'];
+
+/**
+ * PHASE B — Project canonical scenarios (DB rows) to Manual test cases.
+ * Same logic as test-coverage.ts — one canonical scenario, projected per consumer.
+ */
+function projectToManual(dbRows: any[]): ManualTestCase[] {
+  const renderer = new ManualRenderer();
+  return dbRows.map(row => {
+    const metadata = row.ai_metadata || {};
+    const canonical: CanonicalScenario = {
+      schemaVersion: 2,
+      title: row.title || '',
+      objective: metadata.objective || '',
+      scenarioIndex: 0,
+      scenarioId: row.id?.toString() || '',
+      riskArea: metadata.riskArea || row.risk_area || '',
+      preconditions: row.preconditions || '',
+      steps: Array.isArray(row.steps) ? row.steps : [],
+      grounding: metadata.grounding,
+      expected: metadata.expected,
+      expectedResult: row.expected_result || '',
+      testData: row.test_data || '',
+      selectors: [],
+      priority: row.priority || 'P2',
+      severity: row.severity || 'major',
+      tags: Array.isArray(row.tags) ? row.tags : [],
+      automationReady: row.automation_ready ?? false,
+      automationComplexity: row.automation_complexity || 'medium',
+      selectorAvailability: row.selector_availability || 'unknown',
+      source: metadata.source || 'knowledge',
+      sourceEvidence: metadata.sourceEvidence || '',
+    };
+    return renderer.render(canonical);
+  });
+}
 
 export function createRequirementsRouter(): Router {
   const router = Router();
@@ -192,7 +229,11 @@ export function createRequirementsRouter(): Router {
   router.get('/:id/test-cases', async (req: Request, res: Response) => {
     try {
       const companyId = (req as any).companyId;
-      const testCases = await getTestCasesForRequirement(String(req.params.id), companyId);
+      const testCasesRaw = await getTestCasesForRequirement(String(req.params.id), companyId);
+      
+      // PHASE B — Project canonical scenarios to Manual test cases (business only)
+      const testCases = projectToManual(testCasesRaw);
+      
       res.json({ success: true, data: testCases, count: testCases.length });
     } catch (error: any) {
       logger.error(MOD, 'Failed to list requirement test cases', { error: error?.message });

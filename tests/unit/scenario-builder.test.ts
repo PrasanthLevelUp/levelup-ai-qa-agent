@@ -61,7 +61,7 @@ const LOGIN_KNOWLEDGE: any = {
 const COVERAGE: CoverageType[] = ['positive', 'negative', 'edge_cases'];
 
 describe('buildDraftTestCases — grounding', () => {
-  it('grounds steps in the REAL selectors and submit control from the App Profile', () => {
+  it('keeps step text business-readable and captures REAL selectors in grounding (not in prose)', () => {
     const plan = planScenarios(LOGIN_REQ, COVERAGE, 'authentication');
     const { drafts, groundedCount } = buildDraftTestCases(plan, LOGIN_KNOWLEDGE, LOGIN_REQ);
 
@@ -70,10 +70,31 @@ describe('buildDraftTestCases — grounding', () => {
 
     const first = drafts[0];
     const stepsText = first.steps.join(' ');
-    expect(stepsText).toContain('#email');
-    expect(stepsText).toContain('#password');
-    expect(stepsText).toContain('#login-btn');
-    expect(stepsText).toContain('https://app.example.com/login');
+    // Separate DATA, not pipelines: the manual/business projection (steps) must
+    // NOT contain selectors or raw URLs — those belong to the technical
+    // projection (grounding).
+    expect(stepsText).not.toContain('#email');
+    expect(stepsText).not.toContain('#password');
+    expect(stepsText).not.toContain('#login-btn');
+    expect(stepsText).not.toContain('https://app.example.com/login');
+    // Steps read like business actions.
+    expect(stepsText).toContain('Email field');
+    expect(stepsText).toContain('Password field');
+
+    // The REAL selectors survive in the hidden per-step grounding, aligned by index.
+    const groundedSelectors = first.grounding.map(g => g.selector).filter(Boolean);
+    expect(groundedSelectors).toContain('#email');
+    expect(groundedSelectors).toContain('#password');
+    expect(groundedSelectors).toContain('#login-btn');
+    first.grounding.forEach(g => {
+      expect(g.stepIndex).toBeGreaterThanOrEqual(1);
+      expect(g.stepIndex).toBeLessThanOrEqual(first.steps.length);
+    });
+
+    // Structured expected: an observable outcome (shown to manual QA) + objective mirror.
+    expect(first.expected.observable.length).toBeGreaterThan(0);
+    expect(first.expectedResult).toBe(first.expected.observable);
+
     expect(first.source).toBe('app_profile');
     expect(first.grounded).toBe(true);
     expect(first.testData).toContain('standard_user');
@@ -225,7 +246,7 @@ describe('Formatter mode — deterministic output', () => {
 });
 
 describe('Formatter mode — minimal prompt', () => {
-  it('is DRAMATICALLY smaller than the equivalent full draft block, and preserves selectors', () => {
+  it('is DRAMATICALLY smaller than the full draft block, and withholds selectors as invariants', () => {
     const plan = planScenarios(LOGIN_REQ, COVERAGE, 'authentication');
     const { drafts } = buildDraftTestCases(plan, LOGIN_KNOWLEDGE, LOGIN_REQ);
     const out = buildDeterministicOutput(drafts);
@@ -235,9 +256,13 @@ describe('Formatter mode — minimal prompt', () => {
     // knowledge or coverage-objective scaffolding — only the polish payload.
     expect(formatterPrompt).toContain('polish');
     expect(formatterPrompt).toContain(`EXACTLY ${out.testCases.length}`);
-    // Real selectors and URLs survive into the payload (the model must keep them).
-    expect(formatterPrompt).toContain('#email');
-    expect(formatterPrompt).toContain('#login-btn');
+    // Selectors and raw URLs are technical invariants that live in `grounding`,
+    // NOT in the editable wording payload — the model never sees them and so
+    // cannot corrupt them (and this trims the tokens further). Steps stay
+    // business-readable.
+    expect(formatterPrompt).not.toContain('#email');
+    expect(formatterPrompt).not.toContain('#login-btn');
+    expect(formatterPrompt).not.toContain('"grounding"');
     // It must NOT drag in the heavy generation scaffolding.
     expect(formatterPrompt).not.toContain('COVERAGE OBJECTIVES');
     expect(formatterPrompt).not.toContain('GROUNDED SCOPE');

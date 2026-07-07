@@ -40,7 +40,7 @@ import type { AnnotatedPlannedScenario, ScenarioPlan } from './scenario-planner'
 /* ------------------------------------------------------------------ */
 
 interface FieldLike { name?: string; type?: string; required?: boolean; selector?: string; label?: string }
-interface FormLike { page?: string; action?: string; method?: string; fields?: FieldLike[]; submitSelector?: string }
+interface FormLike { page?: string; action?: string; method?: string; fields?: FieldLike[]; submitSelector?: string; submitLabel?: string }
 interface ElementLike { label?: string; tag?: string; selector?: string; role?: string }
 interface PageLike { url?: string; title?: string; pageType?: string }
 interface ProfileLike {
@@ -52,11 +52,71 @@ interface KnowledgeLike { applicationProfile?: ProfileLike; testData?: DatasetLi
 interface RequirementLike { title?: string; description?: string; acceptanceCriteria?: string; businessFlow?: string }
 
 /**
+ * Per-step GROUNDING — the technical anchor for ONE step, kept OUT of the visible
+ * step text. This is the heart of the "Separate DATA, not PIPELINES" model: the
+ * step string stays business-readable ("Enter the registered email address")
+ * while the implementation metadata lives here, hidden from the Manual Test
+ * Case UI and consumed only by the Script/Automation renderer.
+ *
+ * Same scenario → different fields → different renderers. No duplicate pipeline,
+ * no duplicate intelligence, no selector clutter in manual output.
+ *
+ * **EXTENSIBILITY**: Grounding is not just selectors. This structure is designed
+ * to evolve as Healing and Script Generation mature. Future fields:
+ *   • `role` / `ariaLabel` — accessibility anchors (WAI-ARIA)
+ *   • `locator` — Playwright locator string
+ *   • `domFingerprint` — structural DOM signature for healing resilience
+ *   • `visualAnchor` — coordinate/image hash for visual regression
+ *   • `repoIntelligence` — component/file location from repository analysis
+ * The name "grounding" (not "selectors") future-proofs this for all forms of
+ * technical anchoring. Renderers consume only the fields they need; the rest
+ * pass through as opaque metadata.
+ */
+export interface StepGrounding {
+  /** 1-based index of the step this grounding anchors (aligns with steps[]). */
+  stepIndex: number;
+  /** Real selector from the App Profile (e.g. "#email"), when one applies. */
+  selector?: string;
+  /** Page/URL the step acts on, when known. */
+  page?: string;
+  /** Human control label the step refers to (e.g. "Email"), for renderers. */
+  control?: string;
+  // Future: role, locator, domFingerprint, visualAnchor, repoIntelligence
+}
+
+/**
+ * A STRUCTURED expected result — one datum with three projections so each
+ * renderer shows the right thing (the audit's "generic expected result" fix,
+ * done via data shape, not a new interpretation engine):
+ *   • observable — what a manual tester SEES (Manual UI shows this).
+ *   • business   — the business meaning/state it proves.
+ *   • technical  — the automation anchor (selector/page to assert). Hidden from manual.
+ *
+ * `expectedResult: string` (below) is kept as a mirror of `observable` for
+ * backward compatibility with every existing consumer/DB column.
+ */
+export interface StructuredExpected {
+  observable: string;
+  business?: string;
+  technical?: { selector?: string; page?: string };
+}
+
+/**
  * A deterministically-assembled draft test case. Mirrors the engine's TestCase
  * shape closely so the LLM's job is to REFINE fields, not restructure. Kept as
  * its own type so the builder stays decoupled and unit-testable in isolation.
+ *
+ * **SCHEMA VERSION 2**: Canonical representation — one scenario carries business
+ * (steps) and technical (grounding) projections; renderers project it per surface.
+ * Future schema evolution (v3, v4, …) will use this field for safe migrations.
  */
 export interface DraftTestCase {
+  /**
+   * Schema version of the canonical scenario representation. Increment when the
+   * shape of steps/grounding/expected evolves. Renderers check this to apply
+   * migrations or format-specific logic.
+   */
+  schemaVersion: 2;
   /** 0-based index of the planned scenario this draft expands. */
   scenarioIndex: number;
   /**
@@ -73,8 +133,18 @@ export interface DraftTestCase {
   priority: 'P0' | 'P1' | 'P2' | 'P3';
   riskArea: string;
   preconditions: string;
+  /** Business-readable action steps — NO selectors/DOM tokens (Manual UI shows these). */
   steps: string[];
+  /**
+   * Per-step technical grounding (selector/page), aligned to `steps` by
+   * `stepIndex`. Hidden from manual output; consumed by the Script renderer.
+   * This is where selectors live now — never inside the step text.
+   */
+  grounding: StepGrounding[];
+  /** Backward-compatible observable expected result (mirrors `expected.observable`). */
   expectedResult: string;
+  /** Structured expected result (observable / business / technical projections). */
+  expected: StructuredExpected;
   testData: string;
   tags: string[];
   automationReady: boolean;
@@ -112,8 +182,15 @@ export interface FormatterScenario {
  * (a) the payload the LLM is asked to merely re-word, and (b) the guaranteed
  * fallback if the LLM formatter fails or drops cases. Either way coverage is
  * fixed by the builder, not the model.
+ *
+ * **SCHEMA VERSION 2**: Canonical representation. Increment for future evolution.
  */
 export interface FormatterTestCase {
+  /**
+   * Schema version of the canonical scenario. Renderers check this for migrations.
+   * Optional for backward-compat (legacy/hand-built cases); draftToTestCase always sets it.
+   */
+  schemaVersion?: 2;
   title: string;
   objective: string;
   scenarioIndex: number;
@@ -121,14 +198,28 @@ export interface FormatterTestCase {
   scenarioId: string;
   riskArea: string;
   preconditions: string;
+  /** Business-readable action steps — NO selectors/DOM tokens (Manual UI shows these). */
   steps: string[];
+  /**
+   * Per-step technical grounding (selector/page), aligned to `steps`. Hidden
+   * from manual output; consumed by the Script renderer. Selectors live here,
+   * never in the step text. Optional so hand-built/legacy cases still typecheck;
+   * `draftToTestCase` always populates it.
+   */
+  grounding?: StepGrounding[];
+  /** Backward-compatible observable expected result (mirrors `expected.observable`). */
   expectedResult: string;
+  /**
+   * Structured expected result (observable / business / technical projections).
+   * Optional for the same back-compat reason as `grounding`.
+   */
+  expected?: StructuredExpected;
   testData: string;
   /**
-   * Selectors referenced by the steps, extracted DETERMINISTICALLY (the tokens
-   * in parentheses like "#email"). Surfaced as a typed field so the Validator
-   * can assert every selector is real BEFORE the LLM is ever called, and so
-   * traceability does not depend on re-parsing prose.
+   * Real selectors this case is grounded in, derived DETERMINISTICALLY from the
+   * per-step `grounding` (no longer re-parsed from prose). Surfaced as a typed
+   * field so the Validator can assert every selector is real BEFORE the LLM is
+   * ever called, and so traceability does not depend on step wording.
    */
   selectors: string[];
   priority: 'P0' | 'P1' | 'P2' | 'P3';
@@ -264,11 +355,67 @@ function dataPhraseFor(coverageType: string, field: FieldLike): string {
   }
 }
 
-/** Expected-result phrasing anchored on the scenario objective + coverage type. */
-function expectedResultFor(scenario: AnnotatedPlannedScenario): string {
-  // The objective already states what the scenario PROVES — the most honest,
-  // grounded expected result is that objective, which the LLM then sharpens.
-  return scenario.objective;
+/**
+ * Build a STRUCTURED expected result for a scenario. Replaces the old
+ * "expectedResult = scenario.objective" (which produced generic, intent-only
+ * results). We split ONE outcome into:
+ *   • observable — a concrete, user-visible result a manual tester can check,
+ *                  shaped by the coverage type (success vs rejection vs error);
+ *   • business   — the meaning/state it proves (the scenario objective);
+ *   • technical  — the automation anchor (a post-condition selector/page) when
+ *                  the App Profile gives us one.
+ *
+ * Deterministic and fail-open. The LLM later sharpens `observable` wording only.
+ * No new interpretation engine — this is a data-shape change, per the plan.
+ */
+function buildExpected(
+  scenario: AnnotatedPlannedScenario,
+  form: FormLike | undefined,
+  ap: ProfileLike | undefined,
+): StructuredExpected {
+  const ct = scenario.coverageType;
+  // A post-condition anchor for automation: a "success" landmark (e.g. a logout
+  // control) for positive flows, else the form's page. Never shown to manual QA.
+  const successEl = (ap?.keyElements || []).find(e =>
+    /log ?out|sign ?out|dashboard|account|profile|welcome/i.test(`${e.label || ''} ${e.selector || ''} ${e.role || ''}`),
+  );
+  const page = form?.page || ap?.loginUrl || ap?.baseUrl;
+  const technical =
+    ct === 'positive' && successEl?.selector
+      ? { selector: successEl.selector, page }
+      : page
+      ? { page }
+      : undefined;
+
+  let observable: string;
+  switch (ct) {
+    case 'negative':
+      observable =
+        'The action is rejected, a clear, specific error message is shown, and no state change or navigation occurs.';
+      break;
+    case 'edge_cases':
+      observable =
+        'The application handles the edge input gracefully — it either accepts it correctly or shows a clear validation message, without errors or data corruption.';
+      break;
+    case 'boundary':
+      observable =
+        'Values at and within the limit are accepted; values beyond the limit are rejected with a clear boundary/validation message.';
+      break;
+    case 'security':
+      observable =
+        'The malicious input is safely rejected or neutralised — it is not executed or reflected back, and the user sees a safe, generic error (no sensitive detail).';
+      break;
+    case 'role_based':
+      observable =
+        'Access is denied for the unauthorized role and the user is shown an appropriate "not permitted" / access-denied message.';
+      break;
+    default: // positive, integration, performance, …
+      observable = successEl?.label
+        ? `The action succeeds and the user reaches the expected next state (e.g. the "${successEl.label}" area is visible).`
+        : 'The action succeeds and the user reaches the expected next state, with confirmation shown.';
+  }
+
+  return { observable, business: scenario.objective, technical };
 }
 
 /* ------------------------------------------------------------------ */
@@ -317,30 +464,45 @@ export function buildDraftTestCases(
     const form = pickForm(ap?.forms, scenarioTerms);
     const dataset = pickDataset(knowledge?.testData, scenarioTerms);
 
-    // ── Steps ── grounded in the real form fields + submit selector when present.
+    // ── Steps ── business-readable action text ONLY. Technical grounding
+    // (selectors / page) is captured separately in `grounding[]`, aligned to
+    // steps by 1-based index. This is the core of the "separate DATA, not
+    // pipelines" model: the same scenario carries a business projection (steps)
+    // and a technical projection (grounding) so Manual renderers show clean
+    // prose while Script-Gen consumes the selectors — no selector strings ever
+    // leak into the text a human QA reads.
     const steps: string[] = [];
+    const grounding: StepGrounding[] = [];
     const navTarget = loginUrl || form?.page || baseUrl;
-    if (navTarget) steps.push(`Navigate to ${navTarget}`);
+    if (navTarget) {
+      steps.push(`Navigate to the ${form?.page ? 'page under test' : 'application'}`);
+      grounding.push({ stepIndex: steps.length, page: navTarget });
+    }
 
     let usedRealSelector = false;
     const fields = (form?.fields || []).slice(0, 8);
     for (const f of fields) {
-      const sel = f.selector ? ` (${f.selector})` : '';
       if (f.selector) usedRealSelector = true;
       const fieldLabel = f.label || f.name || 'field';
-      steps.push(`Enter ${dataPhraseFor(scenario.coverageType, f)} in the ${fieldLabel} field${sel}`);
+      steps.push(`Enter ${dataPhraseFor(scenario.coverageType, f)} in the ${fieldLabel} field`);
+      grounding.push({ stepIndex: steps.length, selector: f.selector, page: form?.page, control: fieldLabel });
     }
     if (form?.submitSelector) {
       usedRealSelector = true;
-      steps.push(`Click the submit control (${form.submitSelector})`);
+      const submitLabel = form.submitLabel || 'Submit';
+      steps.push(`Click the ${submitLabel} button`);
+      grounding.push({ stepIndex: steps.length, selector: form.submitSelector, page: form?.page, control: submitLabel });
     } else if (form) {
       steps.push('Submit the form');
+      grounding.push({ stepIndex: steps.length, page: form?.page, control: 'Submit' });
     }
     if (!steps.length) {
       // No App Profile at all — still produce a usable skeleton from the objective.
       steps.push(`Exercise the "${scenario.title}" scenario against the application`);
     }
-    steps.push('Observe and verify the outcome');
+    // NOTE: no generic "Observe and verify the outcome" step. Verification lives
+    // in the structured `expected` (observable + business + technical) so manual
+    // QA sees a specific, checkable outcome instead of a filler step.
 
     // ── Preconditions ── grounded in the real app + dataset when present.
     const preParts: string[] = [];
@@ -370,7 +532,10 @@ export function buildDraftTestCases(
     }
     if (usedRealSelector) groundedCount += 1;
 
+    const expected = buildExpected(scenario, form, ap);
+
     drafts.push({
+      schemaVersion: 2,
       scenarioIndex: index,
       scenarioId: scenario.id,
       title: scenario.title,
@@ -380,7 +545,11 @@ export function buildDraftTestCases(
       riskArea: scenario.riskArea,
       preconditions,
       steps,
-      expectedResult: expectedResultFor(scenario),
+      grounding,
+      expected,
+      // Mirror of the structured `observable` outcome, kept for back-compat with
+      // consumers that still read the flat string.
+      expectedResult: expected.observable,
       testData,
       tags: Array.from(new Set([category, scenario.coverageType])),
       automationReady: usedRealSelector,
@@ -424,7 +593,7 @@ export function buildDraftBlock(drafts: DraftTestCase[]): string {
 These drafts were built by the platform from the crawled App Profile (real selectors), the Test Data sets, and the QA knowledge base — NOT guessed. Your job is to REFINE them into final, polished test cases, NOT to re-derive coverage from scratch.
 
 Rules for using the drafts:
-  • Produce one testCase per draft as the baseline, keeping its "scenarioIndex", the REAL selectors in the steps, the REAL dataset references, priority, riskArea and source. Improve ONLY the wording/specificity (sharper title, concrete values, crisp expected result).
+  • Produce one testCase per draft as the baseline, keeping its "scenarioIndex", the REAL dataset references, priority, riskArea and source. Improve ONLY the wording/specificity (sharper title, concrete values, crisp expected result). Keep steps business-readable — do NOT put selectors, element ids or raw URLs in the step text (technical grounding is tracked separately).
   • You MAY split a draft into multiple concrete test cases when it genuinely covers distinct inputs/states (e.g. wrong-password vs unknown-user), and you MAY add further cases the requirement or context clearly implies. The drafts are a FLOOR, not a ceiling — never emit FEWER cases than there are drafts.
   • Do NOT invent selectors, pages or datasets not present in the drafts/context. Do NOT drop a draft unless it is truly unsupported by the requirement.
   • Keep the deterministic grounding: a draft tagged source "app_profile"/"test_data" must stay grounded in that evidence.
@@ -453,7 +622,15 @@ const SEVERITY_FOR_PRIORITY: Record<DraftTestCase['priority'], FormatterTestCase
  */
 export function draftToTestCase(draft: DraftTestCase, scenarioIndex: number): FormatterTestCase {
   const steps = draft.steps.slice();
+  const grounding = (draft.grounding || []).map(g => ({ ...g }));
+  // Selectors are now derived from the typed per-step grounding rather than
+  // re-parsed from prose (steps no longer contain selector tokens). Fall back to
+  // prose extraction only if grounding somehow carries none (e.g. LLM-added
+  // steps), so the Validator always has selectors to check.
+  const groundedSelectors = grounding.map(g => g.selector).filter((s): s is string => !!s);
+  const selectors = groundedSelectors.length ? Array.from(new Set(groundedSelectors)) : extractSelectors(steps);
   return {
+    schemaVersion: draft.schemaVersion,
     title: draft.title,
     objective: draft.objective,
     scenarioIndex,
@@ -461,9 +638,11 @@ export function draftToTestCase(draft: DraftTestCase, scenarioIndex: number): Fo
     riskArea: draft.riskArea,
     preconditions: draft.preconditions,
     steps,
+    grounding,
+    expected: { ...draft.expected, technical: draft.expected?.technical ? { ...draft.expected.technical } : undefined },
     expectedResult: draft.expectedResult,
     testData: draft.testData,
-    selectors: extractSelectors(steps),
+    selectors,
     priority: draft.priority,
     severity: SEVERITY_FOR_PRIORITY[draft.priority] || 'major',
     tags: draft.tags.slice(),
@@ -547,7 +726,7 @@ YOUR ONLY JOB: sharpen the wording of "title", "objective", "preconditions", "ex
 
 STRICT RULES (violating any is a failure):
   • Return EXACTLY ${testCases.length} objects in the SAME order, each with the SAME "id". Never add, remove, split, merge or reorder.
-  • Keep the SAME number of steps per case and the SAME action per step — reword only. Preserve every selector/URL token in parentheses (e.g. "(#email)") and any http URL EXACTLY.
+  • Keep the SAME number of steps per case and the SAME action per step — reword only. Keep every step business-readable: do NOT add CSS/XPath selectors, element ids, or raw URLs — those live outside the step text.
   • Do not add fields. Do not invent steps, selectors, pages or data.
 
 Return ONLY valid JSON (no prose):
