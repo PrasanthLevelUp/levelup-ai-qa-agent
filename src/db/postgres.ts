@@ -5137,6 +5137,21 @@ export interface GeneratedScriptRecord {
     locatorStrategy?: string;
     folderStrategy?: string;
     generationSource?: string;
+    /**
+     * Token provenance. 'llm' = tokens_used is a real measured model total.
+     * 'test-case-attributed' = deterministic generation spent 0 LLM tokens, so
+     * tokens_used is this script's attributed share of its source requirement's
+     * generation cost (see tokenAttribution for the breakdown).
+     */
+    tokenSource?: 'llm' | 'test-case-attributed';
+    /** Breakdown backing an attributed token figure (deterministic path only). */
+    tokenAttribution?: {
+      perCaseTokens: number;
+      totalTokens: number;
+      testCaseCount: number;
+    };
+    /** Allow forward-compatible extra fields without a schema/type migration. */
+    [key: string]: any;
   };
 }
 
@@ -5235,6 +5250,127 @@ export async function getScriptHistory(
   );
 
   return { records: dataR.rows, total };
+}
+
+/**
+ * Token attribution for a script generated deterministically from a Test Case
+ * Lab case. The deterministic translator spends 0 LLM tokens turning steps into
+ * code, but the *test case itself* cost real tokens to generate. To show an
+ * honest, non-zero token figure in Script History, we attribute this script's
+ * fair share of its source requirement's generation cost:
+ *
+ *   perCaseTokens = round(requirement.totalTokens / requirement.testCaseCount)
+ *
+ * Returns null when the requirement / metadata can't be resolved so callers can
+ * fall back to 0. Fail-safe: never throws.
+ *
+ * @param requirementId  Numeric test_requirements.id (from the test case's
+ *                       scenario → requirement link), NOT the RTM UUID.
+ */
+export async function getTestCaseTokenAttribution(
+  requirementId: number,
+  companyId?: number,
+): Promise<{ perCaseTokens: number; totalTokens: number; testCaseCount: number } | null> {
+  try {
+    if (!requirementId || Number.isNaN(requirementId)) return null;
+    const pool = getPool();
+    const conds = ['id = $1'];
+    const vals: any[] = [requirementId];
+    if (companyId !== undefined && companyId !== null) {
+      conds.push(`(company_id = $${vals.length + 1} OR company_id IS NULL)`);
+      vals.push(companyId);
+    }
+    const r = await pool.query(
+      `SELECT analysis FROM test_requirements WHERE ${conds.join(' AND ')} LIMIT 1`,
+      vals,
+    );
+    const row = r.rows[0];
+    if (!row) return null;
+
+    const analysis = typeof row.analysis === 'string' ? JSON.parse(row.analysis) : row.analysis;
+    const meta = analysis?.generationMetadata ?? {};
+    // Prefer the explicit total; fall back to analysis+generation token split.
+    const totalTokens: number =
+      Number(meta.totalTokens) ||
+      (Number(meta.analysisTokens) || 0) + (Number(meta.generationTokens) || 0) ||
+      0;
+    if (totalTokens <= 0) return null;
+
+    // Prefer the count captured at generation time; otherwise count live rows.
+    let testCaseCount: number = Number(meta.testCaseCount) || 0;
+    if (testCaseCount <= 0) {
+      const c = await pool.query(
+        `SELECT COUNT(*)::int AS c
+           FROM generated_test_cases tc
+           JOIN generated_test_scenarios ts ON tc.scenario_id = ts.id
+          WHERE ts.requirement_id = $1`,
+        [requirementId],
+      );
+      testCaseCount = c.rows[0]?.c || 0;
+    }
+    if (testCaseCount <= 0) testCaseCount = 1; // avoid divide-by-zero
+
+    const perCaseTokens = Math.round(totalTokens / testCaseCount);
+    return { perCaseTokens, totalTokens, testCaseCount };
+  } catch (err: any) {
+    console.error('[getTestCaseTokenAttribution] failed:', err?.message);
+    return null;
+  }
+}
+
+/**
+ * Batch token attribution for a set of scripts (read-time backfill for legacy
+ * rows). Given script ids, returns a map scriptId → attributed token figures by
+ * joining each script's linked test case → scenario → requirement and reading
+ * the requirement's stored generation cost. One query, no N+1. Fail-safe:
+ * returns an empty map on any error.
+ *
+ * Used by the Script History endpoint so scripts generated BEFORE the write-path
+ * attribution landed (persisted tokens_used = 0) still display an honest,
+ * non-zero token figure.
+ */
+export async function getAttributedTokensForScripts(
+  scriptIds: number[],
+): Promise<Map<number, { perCaseTokens: number; totalTokens: number; testCaseCount: number }>> {
+  const out = new Map<number, { perCaseTokens: number; totalTokens: number; testCaseCount: number }>();
+  try {
+    if (!Array.isArray(scriptIds) || scriptIds.length === 0) return out;
+    const r = await getPool().query(
+      `SELECT gs.id AS script_id,
+              COALESCE(
+                NULLIF(tr.analysis->'generationMetadata'->>'totalTokens','')::numeric,
+                (COALESCE(NULLIF(tr.analysis->'generationMetadata'->>'analysisTokens','')::numeric,0)
+                 + COALESCE(NULLIF(tr.analysis->'generationMetadata'->>'generationTokens','')::numeric,0))
+              ) AS total_tokens,
+              COALESCE(
+                NULLIF(tr.analysis->'generationMetadata'->>'testCaseCount','')::int,
+                (SELECT COUNT(*)::int
+                   FROM generated_test_cases tc2
+                   JOIN generated_test_scenarios ts2 ON tc2.scenario_id = ts2.id
+                  WHERE ts2.requirement_id = tr.id)
+              ) AS case_count
+         FROM generated_scripts gs
+         JOIN generated_test_cases tc ON tc.id = gs.test_case_id
+         JOIN generated_test_scenarios ts ON ts.id = tc.scenario_id
+         JOIN test_requirements tr ON tr.id = ts.requirement_id
+        WHERE gs.id = ANY($1::int[])`,
+      [scriptIds],
+    );
+    for (const row of r.rows) {
+      const totalTokens = Number(row.total_tokens) || 0;
+      let caseCount = Number(row.case_count) || 0;
+      if (totalTokens <= 0) continue;
+      if (caseCount <= 0) caseCount = 1;
+      out.set(Number(row.script_id), {
+        perCaseTokens: Math.round(totalTokens / caseCount),
+        totalTokens,
+        testCaseCount: caseCount,
+      });
+    }
+  } catch (err: any) {
+    console.error('[getAttributedTokensForScripts] failed:', err?.message);
+  }
+  return out;
 }
 
 // ───────────────────────────────────────────────────────────────────────────

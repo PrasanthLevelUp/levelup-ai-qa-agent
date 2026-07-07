@@ -28,6 +28,8 @@ import {
   autoLinkScriptTraceability,
   getTestCaseById,
   getTestCasesForRequirement,
+  getTestCaseTokenAttribution,
+  getAttributedTokensForScripts,
   getLinkedDatasets,
   getTestDataRecords,
   resolveTestData,
@@ -867,6 +869,41 @@ export function createScriptGenRouter(): Router {
       // execution-ready (code AND grounding AND coverage), not merely syntactic.
       validationStatus = reliabilityBreakdown.executionReadiness >= 80 ? 'passed' : 'needs_review';
 
+      // ── Token attribution for deterministic (0-LLM-token) generations ──
+      // The deterministic translator spends 0 LLM tokens turning a structured
+      // test case into code — but that test case DID cost real tokens to
+      // generate. Rather than show a misleading "0 tokens", attribute this
+      // script's fair share of its source requirement's generation cost so
+      // History shows an honest, non-zero figure. LLM (url/plain-English)
+      // generations keep their real measured token count. Fail-open.
+      let effectiveTokens = result.stats.tokensUsed ?? 0;
+      let tokenSource: 'llm' | 'test-case-attributed' = effectiveTokens > 0 ? 'llm' : 'test-case-attributed';
+      let tokenAttribution:
+        | { perCaseTokens: number; totalTokens: number; testCaseCount: number }
+        | undefined;
+      if (effectiveTokens <= 0) {
+        const srcReqId = Number(
+          testCase?.scenario?.requirement_id ??
+          requirementTestCases?.[0]?.scenario?.requirement_id ??
+          NaN,
+        );
+        if (!Number.isNaN(srcReqId)) {
+          const attr = await getTestCaseTokenAttribution(srcReqId, companyId ?? undefined);
+          if (attr && attr.perCaseTokens > 0) {
+            tokenAttribution = attr;
+            // Requirement batch (N cases → one script row) attributes the sum of
+            // the batch's cases; a single test case attributes its per-case share.
+            const casesInThisScript = requirementTestCases.length > 0 ? requirementTestCases.length : 1;
+            effectiveTokens = attr.perCaseTokens * casesInThisScript;
+            console.log(`[ScriptGen] 🎟️ Attributed ${effectiveTokens} tokens from requirement ${srcReqId} (${attr.perCaseTokens}/case × ${casesInThisScript}, req total ${attr.totalTokens}/${attr.testCaseCount} cases)`);
+          } else {
+            tokenSource = 'llm'; // nothing to attribute — leave as measured (0)
+          }
+        } else {
+          tokenSource = 'llm';
+        }
+      }
+
       // Build intelligence metadata — tracks every intelligence source used
       const intelligenceMetadata = {
         repoIntelligenceUsed: !!repoIntelligence,
@@ -899,6 +936,11 @@ export function createScriptGenRouter(): Router {
         // Honest, decomposed reliability (code / grounding / business coverage /
         // execution readiness) so History never shows a misleading single 100%.
         reliabilityBreakdown,
+        // Token provenance so the UI can label the number honestly: 'llm' = real
+        // measured tokens from the model; 'test-case-attributed' = this script's
+        // share of its source requirement's generation cost (deterministic path).
+        tokenSource,
+        ...(tokenAttribution ? { tokenAttribution } : {}),
       };
 
       console.log(`[ScriptGen] 📊 Intelligence summary: repoIntel=${intelligenceMetadata.repoIntelligenceUsed} (${intelligenceMetadata.repoFramework ?? 'n/a'}), knowledge=${intelligenceMetadata.knowledgeItemsUsed} items, cache=${intelligenceMetadata.profileCacheUsed}, adaptive=${intelligenceMetadata.adaptiveCodegenUsed} (${intelligenceMetadata.adaptiveMode ?? 'n/a'})`);
@@ -922,7 +964,10 @@ export function createScriptGenRouter(): Router {
         // A syntactically perfect but 0%-grounded generic script now persists a
         // low reliability score instead of a misleading 100%.
         reliability_score: reliabilityBreakdown.executionReadiness,
-        tokens_used: result.stats.tokensUsed,
+        // effectiveTokens = real measured LLM tokens, OR (for deterministic
+        // test-case generation) this script's attributed share of the source
+        // requirement's generation cost. Never a misleading bare 0.
+        tokens_used: effectiveTokens,
         model: result.stats.model,
         generation_time_ms: generationTimeMs,
         files_generated: result.generatedFiles.map((f: GeneratedFile) => ({ path: f.path, size: f.content.length, type: f.type })),
@@ -1176,14 +1221,51 @@ export function createScriptGenRouter(): Router {
 
       const { records, total } = await getScriptHistory(companyId, { projectId, limit, offset, sortBy, sortOrder });
 
+      // Read-time token backfill for LEGACY rows: scripts generated before the
+      // write-path attribution landed persisted tokens_used = 0. For any such
+      // row that is linked to a test case, attribute its fair share of the
+      // source requirement's generation cost so History shows an honest,
+      // non-zero token figure. One batched query (no N+1). Fail-open.
+      let attributionMap = new Map<number, { perCaseTokens: number; totalTokens: number; testCaseCount: number }>();
+      try {
+        const legacyIds = records
+          .filter((r: any) => (!r.tokens_used || Number(r.tokens_used) <= 0) && r.test_case_id != null)
+          .map((r: any) => Number(r.id));
+        if (legacyIds.length > 0) {
+          attributionMap = await getAttributedTokensForScripts(legacyIds);
+        }
+      } catch (attrErr: any) {
+        console.warn('[ScriptGen] token attribution backfill skipped:', attrErr?.message);
+      }
+
       // Sprint 4B — enrich each record with a structured per-file breakdown
       // parsed from the stored `script_content` blob. `script_content` is kept
       // for backward compatibility; the new `files` array powers the redesigned
       // file-wise history view (filename, content, language, framework, …).
-      const data = records.map((rec: any) => ({
-        ...rec,
-        files: parseScriptContent(rec.script_content, rec.files_generated),
-      }));
+      const data = records.map((rec: any) => {
+        const attr = attributionMap.get(Number(rec.id));
+        // Only override a falsy/zero token count; never clobber a real measured one.
+        const tokensUsed = (!rec.tokens_used || Number(rec.tokens_used) <= 0) && attr
+          ? attr.perCaseTokens
+          : rec.tokens_used;
+        // Merge a tokenSource marker into intelligence_metadata for the UI label.
+        let intel = rec.intelligence_metadata;
+        if (attr) {
+          let parsed: any = {};
+          if (typeof intel === 'string') {
+            try { parsed = JSON.parse(intel) || {}; } catch { parsed = {}; }
+          } else {
+            parsed = intel || {};
+          }
+          intel = { ...parsed, tokenSource: 'test-case-attributed', tokenAttribution: attr };
+        }
+        return {
+          ...rec,
+          tokens_used: tokensUsed,
+          intelligence_metadata: intel,
+          files: parseScriptContent(rec.script_content, rec.files_generated),
+        };
+      });
 
       res.json({
         success: true,
