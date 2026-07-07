@@ -50,6 +50,7 @@ import { knowledgeGraphService, type ReusableMethod } from './knowledge-graph-se
 import { MethodIntelligenceService } from './method-intelligence-service';
 import { getRAGService, type RagExample } from './rag-service';
 import type { MethodSearchHit } from '../db/postgres';
+import { isProviderProduction } from './migration-state';
 
 const MOD = 'RepositoryProvider';
 
@@ -152,9 +153,14 @@ export class RepositoryProvider implements IntelligenceProvider<RepositoryContex
   readonly version = REPOSITORY_VERSION;
   readonly priority = REPOSITORY_PRIORITY;
 
-  /** Feature flag — default false for safe rollout during migration. */
+  /**
+   * Whether the provider is the PRODUCTION path. Driven by the migration-state
+   * machine (Legacy/Shadow/Provider) rather than a bare boolean, so the same
+   * `REPOSITORY_MIGRATION_MODE` concept scales to every source. Backward-compat:
+   * `REPOSITORY_PROVIDER=true` still resolves to Provider mode (see resolveMode).
+   */
   enabled(): boolean {
-    return process.env.REPOSITORY_PROVIDER === 'true';
+    return isProviderProduction('repository');
   }
 
   async gather(query: IntelligenceQuery): Promise<IntelligenceResult<RepositoryContext>> {
