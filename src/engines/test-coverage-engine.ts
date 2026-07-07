@@ -475,6 +475,12 @@ export interface TestScenario {
 export type TestCaseSource = 'requirement' | 'knowledge' | 'test_data' | 'app_profile' | 'gap_analysis' | 'assumption';
 
 export interface TestCase {
+  /**
+   * Schema version of the canonical scenario representation. v2 = business/technical
+   * projections separated (Phase A). Increment when steps/grounding/expected evolve.
+   * Renderers check this for migrations.
+   */
+  schemaVersion?: 2;
   title: string;
   /**
    * The single, specific thing this test case verifies — the case-level

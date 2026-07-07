@@ -55,11 +55,22 @@ interface RequirementLike { title?: string; description?: string; acceptanceCrit
  * Per-step GROUNDING — the technical anchor for ONE step, kept OUT of the visible
  * step text. This is the heart of the "Separate DATA, not PIPELINES" model: the
  * step string stays business-readable ("Enter the registered email address")
- * while the selector/page it maps to lives here, hidden from the Manual Test
+ * while the implementation metadata lives here, hidden from the Manual Test
  * Case UI and consumed only by the Script/Automation renderer.
  *
  * Same scenario → different fields → different renderers. No duplicate pipeline,
  * no duplicate intelligence, no selector clutter in manual output.
+ *
+ * **EXTENSIBILITY**: Grounding is not just selectors. This structure is designed
+ * to evolve as Healing and Script Generation mature. Future fields:
+ *   • `role` / `ariaLabel` — accessibility anchors (WAI-ARIA)
+ *   • `locator` — Playwright locator string
+ *   • `domFingerprint` — structural DOM signature for healing resilience
+ *   • `visualAnchor` — coordinate/image hash for visual regression
+ *   • `repoIntelligence` — component/file location from repository analysis
+ * The name "grounding" (not "selectors") future-proofs this for all forms of
+ * technical anchoring. Renderers consume only the fields they need; the rest
+ * pass through as opaque metadata.
  */
 export interface StepGrounding {
   /** 1-based index of the step this grounding anchors (aligns with steps[]). */
@@ -70,6 +81,7 @@ export interface StepGrounding {
   page?: string;
   /** Human control label the step refers to (e.g. "Email"), for renderers. */
   control?: string;
+  // Future: role, locator, domFingerprint, visualAnchor, repoIntelligence
 }
 
 /**
@@ -93,8 +105,18 @@ export interface StructuredExpected {
  * A deterministically-assembled draft test case. Mirrors the engine's TestCase
  * shape closely so the LLM's job is to REFINE fields, not restructure. Kept as
  * its own type so the builder stays decoupled and unit-testable in isolation.
+ *
+ * **SCHEMA VERSION 2**: Canonical representation — one scenario carries business
+ * (steps) and technical (grounding) projections; renderers project it per surface.
+ * Future schema evolution (v3, v4, …) will use this field for safe migrations.
  */
 export interface DraftTestCase {
+  /**
+   * Schema version of the canonical scenario representation. Increment when the
+   * shape of steps/grounding/expected evolves. Renderers check this to apply
+   * migrations or format-specific logic.
+   */
+  schemaVersion: 2;
   /** 0-based index of the planned scenario this draft expands. */
   scenarioIndex: number;
   /**
@@ -160,8 +182,15 @@ export interface FormatterScenario {
  * (a) the payload the LLM is asked to merely re-word, and (b) the guaranteed
  * fallback if the LLM formatter fails or drops cases. Either way coverage is
  * fixed by the builder, not the model.
+ *
+ * **SCHEMA VERSION 2**: Canonical representation. Increment for future evolution.
  */
 export interface FormatterTestCase {
+  /**
+   * Schema version of the canonical scenario. Renderers check this for migrations.
+   * Optional for backward-compat (legacy/hand-built cases); draftToTestCase always sets it.
+   */
+  schemaVersion?: 2;
   title: string;
   objective: string;
   scenarioIndex: number;
@@ -506,6 +535,7 @@ export function buildDraftTestCases(
     const expected = buildExpected(scenario, form, ap);
 
     drafts.push({
+      schemaVersion: 2,
       scenarioIndex: index,
       scenarioId: scenario.id,
       title: scenario.title,
@@ -600,6 +630,7 @@ export function draftToTestCase(draft: DraftTestCase, scenarioIndex: number): Fo
   const groundedSelectors = grounding.map(g => g.selector).filter((s): s is string => !!s);
   const selectors = groundedSelectors.length ? Array.from(new Set(groundedSelectors)) : extractSelectors(steps);
   return {
+    schemaVersion: draft.schemaVersion,
     title: draft.title,
     objective: draft.objective,
     scenarioIndex,
