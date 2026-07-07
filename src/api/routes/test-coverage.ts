@@ -12,6 +12,8 @@ import {
 } from '../../engines/test-coverage-engine';
 import { TestToScriptEngine } from '../../engines/test-to-script-engine';
 import { GitHubService } from '../../services/github-service';
+import { ManualRenderer } from '../../renderers/scenario-renderer';
+import type { CanonicalScenario, ManualTestCase } from '../../renderers/scenario-renderer';
 import {
   createTestRequirement,
   getTestRequirements,
@@ -61,6 +63,54 @@ function buildAiMetadata(fields: Record<string, any>): Record<string, any> {
     }
   }
   return out;
+}
+
+/**
+ * PHASE B — Project canonical scenarios (DB rows) to Manual test cases.
+ *
+ * Each DB row is a canonical scenario (schemaVersion: 2) with business (steps)
+ * and technical (ai_metadata.grounding) projections. The ManualRenderer projects
+ * the business surface: clean steps + observable expected, NO selectors.
+ *
+ * This is where "Separate DATA, not PIPELINES" manifests: the same scenario is
+ * stored once, then projected per consumer. Manual QA sees business prose;
+ * Script-Gen reads grounding (elsewhere). No duplicate storage, no duplicate logic.
+ */
+function projectToManual(dbRows: any[]): ManualTestCase[] {
+  const renderer = new ManualRenderer();
+  return dbRows.map(row => {
+    // Build a canonical scenario from the DB row. The DB stores:
+    //   • steps (business text)
+    //   • expected_result (observable mirror)
+    //   • ai_metadata.grounding (technical selectors, hidden from manual)
+    //   • ai_metadata.expected (structured { observable, business, technical })
+    const metadata = row.ai_metadata || {};
+    const canonical: CanonicalScenario = {
+      schemaVersion: 2,
+      title: row.title || '',
+      objective: metadata.objective || '',
+      scenarioIndex: 0, // Positional index not relevant for read projection
+      scenarioId: row.id?.toString() || '',
+      riskArea: metadata.riskArea || row.risk_area || '',
+      preconditions: row.preconditions || '',
+      steps: Array.isArray(row.steps) ? row.steps : [],
+      grounding: metadata.grounding,
+      expected: metadata.expected,
+      expectedResult: row.expected_result || '',
+      testData: row.test_data || '',
+      selectors: [], // Not needed for manual projection
+      priority: row.priority || 'P2',
+      severity: row.severity || 'major',
+      tags: Array.isArray(row.tags) ? row.tags : [],
+      automationReady: row.automation_ready ?? false,
+      automationComplexity: row.automation_complexity || 'medium',
+      selectorAvailability: row.selector_availability || 'unknown',
+      source: metadata.source || 'knowledge',
+      sourceEvidence: metadata.sourceEvidence || '',
+    };
+    // Project to manual — business prose only, selectors hidden
+    return renderer.render(canonical);
+  });
 }
 
 export function createTestCoverageRouter(): Router {
@@ -595,7 +645,11 @@ export function createTestCoverageRouter(): Router {
       if (!requirement) return res.status(404).json({ error: 'Not found' });
 
       const scenarios = await getTestScenarios(id);
-      const testCases = await getTestCasesByRequirement(id);
+      const testCasesRaw = await getTestCasesByRequirement(id);
+
+      // PHASE B — Project canonical scenarios to Manual test cases (business prose
+      // only, selectors hidden). The dashboard shows clean, human-readable output.
+      const testCases = projectToManual(testCasesRaw);
 
       return res.json({ requirement, scenarios, testCases });
     } catch (err: any) {
@@ -873,11 +927,11 @@ export function createTestCoverageRouter(): Router {
         return res.status(404).json({ error: 'Requirement not found' });
       }
 
-      // Fetch scenarios and cases
+      // Fetch scenarios and cases (raw DB rows for export — export needs all metadata)
       const scenarios = await getTestScenarios(requirementId);
-      const testCases = await getTestCasesByRequirement(requirementId);
+      const testCasesRaw = await getTestCasesByRequirement(requirementId);
 
-      if (!scenarios.length && !testCases.length) {
+      if (!scenarios.length && !testCasesRaw.length) {
         return res.status(404).json({
           error: 'No test scenarios or cases found for this requirement',
         });
@@ -903,12 +957,12 @@ export function createTestCoverageRouter(): Router {
       let fileExtension: string;
 
       if (format === 'csv') {
-        fileBuffer = await exportService.exportToCSV(testCases, exportOptions);
+        fileBuffer = await exportService.exportToCSV(testCasesRaw, exportOptions);
         contentType = 'text/csv';
         fileExtension = 'csv';
       } else {
         // excel, jira, testrail all produce xlsx
-        fileBuffer = await exportService.exportToExcel(testCases, requirementInfo, exportOptions);
+        fileBuffer = await exportService.exportToExcel(testCasesRaw, requirementInfo, exportOptions);
         contentType = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
         fileExtension = 'xlsx';
       }
@@ -927,7 +981,7 @@ export function createTestCoverageRouter(): Router {
           requirementId,
           format,
           totalScenarios: scenarios.length,
-          totalCases: testCases.length,
+          totalCases: testCasesRaw.length,
           includedGaps: includeGaps,
           fileSizeBytes,
           exportTimeMs,
@@ -945,7 +999,7 @@ export function createTestCoverageRouter(): Router {
       res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
       res.setHeader('X-Export-Time-Ms', String(exportTimeMs));
       res.setHeader('X-Total-Scenarios', String(scenarios.length));
-      res.setHeader('X-Total-Cases', String(testCases.length));
+      res.setHeader('X-Total-Cases', String(testCasesRaw.length));
 
       return res.send(typeof fileBuffer === 'string' ? Buffer.from(fileBuffer) : fileBuffer);
     } catch (err: any) {
