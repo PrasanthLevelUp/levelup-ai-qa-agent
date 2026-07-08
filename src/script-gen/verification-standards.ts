@@ -22,12 +22,21 @@
  *
  *                          URL  →  text  →  done
  *
- * `planVerifications(step, context?)` turns a single step into an ORDERED
- * verification plan (strongest evidence first) of STRUCTURED intents — NOT
- * Playwright code. A framework adapter (the Script Composer) renders the intents
- * into `expect()` calls, so the same plan could target Playwright, Cypress, or
- * Selenium. This is the one decision point for verification, exactly as
- * `evaluateCandidate()` is the one decision point for implementation.
+ * The unit of value is a VERIFICATION OBJECTIVE, not an assertion. A senior
+ * engineer proves a *business objective* ("user authenticated", "cart
+ * updated", "order placed") and backs it with one or more pieces of EVIDENCE:
+ *
+ *        Verification Objective  →  Evidence[]  →  (framework) assertions
+ *
+ * e.g. objective "user authenticated" is proven by evidence
+ * {success-indicator, landmark-control, error-absent}. That is still ONE
+ * objective — success is measured in objectives proven, never in assertion
+ * count. `planVerifications(step, context?)` turns a step into the objectives
+ * it should prove, each carrying framework-agnostic evidence — NOT Playwright.
+ * A framework adapter (the Script Composer) renders evidence into `expect()`
+ * calls, so the same plan could target Playwright, Cypress, or Selenium. This
+ * is the one decision point for verification, exactly as `evaluateCandidate()`
+ * is the one decision point for implementation.
  *
  * Maintainability: step intent is classified into a small, fixed set of
  * verification CATEGORIES (authentication, shopping, navigation, crud, search,
@@ -184,42 +193,78 @@ const CATEGORY_TIERS: Readonly<Record<VerificationCategory, VerificationTier[]>>
 });
 
 // ───────────────────────────────────────────────────────────────────────────
-// The plan (structured intent — NOT framework code)
+// Evidence — the framework-agnostic proof a business objective actually holds.
+// A single objective is backed by one or MORE pieces of evidence. The Composer
+// renders each kind into an `expect()` call; the kinds themselves know nothing
+// about Playwright.
 // ───────────────────────────────────────────────────────────────────────────
 
-/** One thing to verify, with tier, strength, and the rule that produced it. */
-export interface VerificationIntent {
-  tier: VerificationTier;
-  /** Inherited from the tier — used to order the plan. */
-  priority: number;
-  /** Evidence strength (⭐ 1–5) — lets the Composer prefer strong proof. */
-  strength: VerificationStrength;
+export type EvidenceKind =
+  | 'success-indicator' // the success / confirmation UI for the goal is shown
+  | 'state-change'      // the resulting state (badge, count, total, list) is present
+  | 'landmark-control'  // the landmark control that proves we arrived (menu, cart, target)
+  | 'error-absent'      // no unexpected error / validation message appeared
+  | 'error-present'     // the EXPECTED error is shown (negative test)
+  | 'navigation';       // URL / session / persistence is correct (weakest)
+
+/** Strength + priority each evidence kind inherits from its verification tier. */
+const EVIDENCE_META: Readonly<Record<EvidenceKind, { strength: VerificationStrength; priority: number }>> = Object.freeze({
+  'success-indicator': { strength: 5, priority: 100 },
+  'error-present':     { strength: 5, priority: 100 }, // proving a blocked goal IS a business outcome
+  'state-change':      { strength: 4, priority: 80 },
+  'landmark-control':  { strength: 3, priority: 60 },
+  'error-absent':      { strength: 2, priority: 40 },
+  'navigation':        { strength: 1, priority: 20 },
+});
+
+/** Which evidence kind a tier contributes (positive flows). */
+const EVIDENCE_FROM_TIER: Readonly<Record<VerificationTier, EvidenceKind>> = Object.freeze({
+  'business-outcome':  'success-indicator',
+  'application-state': 'state-change',
+  'critical-ui':       'landmark-control',
+  'negative-state':    'error-absent',
+  'technical-state':   'navigation',
+});
+
+/** Signals that a step is the COMPLETION of a flow (final confirmation), for naming. */
+const COMPLETION_SIGNAL =
+  /\b(finish|complete[ds]?|confirm(ed|ation)?|thank\s?you|place[ds]?\s?(the\s)?order|success(ful|fully)?|submit(ted)?|purchas(e|ed)|paid|receipt)\b/i;
+
+// ───────────────────────────────────────────────────────────────────────────
+// The plan — verification OBJECTIVES (not assertions, not framework code)
+// ───────────────────────────────────────────────────────────────────────────
+
+/**
+ * One business objective to prove, with the evidence that proves it. This is
+ * the unit of value: success is measured in objectives proven, and each
+ * objective may need several pieces of evidence (still ONE objective). The
+ * Composer turns `evidence` into framework assertions.
+ */
+export interface VerificationObjective {
+  /** Plain-language business objective, e.g. "user authenticated", "cart updated". */
+  objective: string;
   /** The verification category this step was classified into. */
   category: VerificationCategory;
-  /** What to verify, in plain, framework-agnostic engineering language. */
-  intent: string;
-  /** Why this fired — the deterministic rule/signal, for transparency & tests. */
+  /** Priority of the strongest evidence — orders objectives across a plan. */
+  priority: number;
+  /** Strength (⭐ 1–5) of the strongest evidence backing this objective. */
+  strength: VerificationStrength;
+  /** The evidence that proves the objective, strongest first (framework-agnostic). */
+  evidence: EvidenceKind[];
+  /** True when the objective is a blocked/failed outcome (negative test). */
+  negative: boolean;
+  /** Why this objective/evidence set fired — the deterministic rules, for tests. */
   reason: string;
 }
 
-/** The ordered verification plan for a single step. */
+/** The verification plan for a single step. */
 export interface VerificationPlan {
-  /** Strongest evidence first: business-outcome → … → technical-state. */
-  intents: VerificationIntent[];
+  /** Business objectives to prove, strongest first. Usually one per checkpoint. */
+  objectives: VerificationObjective[];
   /** The category the step was classified into. */
   category: VerificationCategory;
   /** True when the step asserts a failure/error is the expected result. */
   negativeTest: boolean;
-}
-
-function intentFor(
-  tier: VerificationTier,
-  category: VerificationCategory,
-  intent: string,
-  reason: string,
-): VerificationIntent {
-  const spec = VERIFICATION_TIERS[tier];
-  return { tier, priority: spec.priority, strength: spec.strength, category, intent, reason };
 }
 
 /** First matching token of a regex (for a readable `reason`), or ''. */
@@ -228,32 +273,25 @@ function firstMatch(re: RegExp, text: string): string {
   return m ? m[0].toLowerCase() : '';
 }
 
-/** Human phrasing for each tier's default intent, per category. */
-function intentText(tier: VerificationTier, category: VerificationCategory, negativeTest: boolean): string {
-  switch (tier) {
-    case 'business-outcome':
-      return negativeTest
-        ? 'Assert the action did NOT succeed — the user goal must be blocked, not completed.'
-        : 'Assert the primary business outcome is achieved (success confirmation / expected result).';
-    case 'application-state':
-      return 'Assert the resulting application state (counts, totals, list contents) matches expectation.';
-    case 'critical-ui':
-      return category === 'authentication'
-        ? 'Assert the post-auth landmark control (e.g. logout / user menu) is visible.'
-        : 'Assert the essential control(s) for this screen are visible and enabled.';
-    case 'negative-state':
-      return negativeTest
-        ? 'Assert the expected error / validation message IS shown.'
-        : 'Assert no unexpected error / validation message appeared after the action.';
-    case 'technical-state':
-      return 'Assert navigation / session / persistence is correct (URL, cookie, stored data).';
+/** The business objective a step proves, in senior-engineer language. */
+function objectiveName(category: VerificationCategory, completion: boolean, negative: boolean): string {
+  if (negative) return 'action correctly blocked';
+  switch (category) {
+    case 'authentication': return 'user authenticated';
+    case 'shopping':       return completion ? 'order placed' : 'cart updated';
+    case 'crud':           return completion ? 'record saved' : 'record updated';
+    case 'search':         return 'search results returned';
+    case 'forms':          return completion ? 'form submitted' : 'form input accepted';
+    case 'navigation':     return 'destination reached';
+    case 'generic':        return 'expected result produced';
   }
 }
 
 /**
- * Plan the verifications for a single step. Returns an ORDERED plan (strongest
- * evidence first) of structured intents, built purely from deterministic
- * signals in the step + optional context. Never throws; never empty.
+ * Plan the verifications for a single step. Returns the business OBJECTIVES the
+ * step should prove — each carrying framework-agnostic EVIDENCE ordered
+ * strongest-first — built purely from deterministic signals + optional context.
+ * Never throws; never empty. This is the single decision point for verification.
  */
 export function planVerifications(step: VerifiableStep, context?: VerificationContext): VerificationPlan {
   try {
@@ -261,6 +299,7 @@ export function planVerifications(step: VerifiableStep, context?: VerificationCo
     const action = (step.action ?? '').toLowerCase();
     const negativeTest = NEGATIVE_SIGNAL.test(text);
     const category = classifyCategory(text);
+    const completion = COMPLETION_SIGNAL.test(text);
 
     // A tier fires if (a) its category expects it, or (b) a fine-grained signal
     // matches. Collected into a set so nothing is duplicated.
@@ -280,13 +319,8 @@ export function planVerifications(step: VerifiableStep, context?: VerificationCo
     const techHit = firstMatch(TECHNICAL_SIGNAL, text);
     if (techHit || action === 'navigate') add('technical-state', techHit ? `technical signal '${techHit}'` : 'navigate action');
 
-    // Negative handling: a negative test always verifies both the blocked
-    // outcome and the visible error; a normal mutating step verifies error
-    // ABSENCE.
-    if (negativeTest) {
-      add('business-outcome', `negative signal '${firstMatch(NEGATIVE_SIGNAL, text)}'`);
-      add('negative-state', `negative signal '${firstMatch(NEGATIVE_SIGNAL, text)}'`);
-    } else if (MUTATING_ACTIONS.has(action)) {
+    // Negative handling: a normal mutating step verifies error ABSENCE.
+    if (!negativeTest && MUTATING_ACTIONS.has(action)) {
       add('negative-state', `mutating action '${action}'`);
     }
 
@@ -297,27 +331,74 @@ export function planVerifications(step: VerifiableStep, context?: VerificationCo
       add('critical-ui', 'context — landmark control available');
     }
 
-    let intents = [...fired.entries()].map(([tier, reason]) =>
-      intentFor(tier, category, intentText(tier, category, negativeTest), reason),
-    );
+    // ── Collapse the fired tiers into the ONE business objective this step
+    //    proves, backed by evidence (strongest first). This is the shift from
+    //    "count assertions" to "prove objectives": many pieces of evidence,
+    //    one objective. ────────────────────────────────────────────────────
+    let evidence: EvidenceKind[];
+    const reasons = [...fired.values()];
 
-    // Fail-open baseline: never regress to "URL → text → done".
-    if (intents.length === 0) {
-      intents = [intentFor(
-        'business-outcome',
-        category,
-        `Assert the step's stated result: "${(step.description ?? '').trim() || 'expected behaviour'}".`,
-        'baseline — no specific signal matched',
-      )];
+    if (negativeTest) {
+      // A negative test proves exactly one thing: the goal was blocked and the
+      // expected error is shown. One strong objective, one strong evidence.
+      evidence = ['error-present'];
+    } else if (completion) {
+      // At a flow's COMPLETION (order placed, form submitted), the final
+      // confirmation is the proof. Intermediate state (cart badge, running
+      // totals) is STALE by now — asserting it would be a false failure, so we
+      // drop it. Authentication & forms still keep the focused "no validation
+      // error slipped through" guard on the happy path.
+      evidence = ['success-indicator'];
+      if (category === 'authentication' || category === 'forms') evidence.push('error-absent');
+    } else {
+      // Map tiers → evidence, dedup, order by strength.
+      const kinds = new Set<EvidenceKind>();
+      for (const t of fired.keys()) kinds.add(EVIDENCE_FROM_TIER[t]);
+
+      // Strength preference: drop the weakest 'navigation' evidence whenever a
+      // stronger proof is available (a senior engineer doesn't lean on a URL
+      // check when a real outcome is observable).
+      if (kinds.size > 1) kinds.delete('navigation');
+
+      // Focused negative guard: only authentication & forms warrant an explicit
+      // "no error slipped through" check — elsewhere it is noise.
+      if (category !== 'authentication' && category !== 'forms') kinds.delete('error-absent');
+
+      evidence = [...kinds].sort((a, b) => EVIDENCE_META[b].priority - EVIDENCE_META[a].priority);
     }
 
-    // Order strongest evidence first; stable on equal priority.
-    intents.sort((a, b) => b.priority - a.priority);
+    // Fail-open baseline: never regress to "URL → text → done".
+    if (evidence.length === 0) {
+      evidence = ['success-indicator'];
+      reasons.push('baseline — no specific signal matched');
+    }
 
-    return { intents, category, negativeTest };
+    const strength = evidence.reduce<VerificationStrength>(
+      (m, e) => (EVIDENCE_META[e].strength > m ? EVIDENCE_META[e].strength : m), 1);
+    const priority = evidence.reduce((m, e) => Math.max(m, EVIDENCE_META[e].priority), 0);
+
+    const objective: VerificationObjective = {
+      objective: objectiveName(category, completion, negativeTest),
+      category,
+      priority,
+      strength,
+      evidence,
+      negative: negativeTest,
+      reason: reasons.join('; ') || 'baseline',
+    };
+
+    return { objectives: [objective], category, negativeTest };
   } catch {
     return {
-      intents: [intentFor('business-outcome', 'generic', 'Assert the step produced its expected result.', 'fail-open fallback')],
+      objectives: [{
+        objective: 'expected result produced',
+        category: 'generic',
+        priority: EVIDENCE_META['success-indicator'].priority,
+        strength: EVIDENCE_META['success-indicator'].strength,
+        evidence: ['success-indicator'],
+        negative: false,
+        reason: 'fail-open fallback',
+      }],
       category: 'generic',
       negativeTest: false,
     };

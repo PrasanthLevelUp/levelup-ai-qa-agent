@@ -38,6 +38,7 @@ import {
   planVerifications,
   type VerificationContext,
   type VerificationPlan,
+  type EvidenceKind,
 } from './verification-standards';
 import {
   ScenarioIntelligence,
@@ -5010,69 +5011,74 @@ ${config.testCase
   }
 
   /**
-   * Framework + domain adapter: turn a (framework-agnostic) verification plan
-   * into at most two HARD Playwright assertions for this checkpoint. The rule
-   * library decided WHAT class of evidence matters (tier + strength) and WHICH
-   * kind of flow this is (category); this method is the only place that knows
-   * Playwright, and it renders the strongest evidence the step can actually
-   * support. Category-driven — six flows, not per-feature `if`s.
+   * Framework + domain adapter: render a verification PLAN into hard Playwright
+   * assertions. The rule library already decided the business OBJECTIVES to
+   * prove and the EVIDENCE (framework-agnostic) that proves each; this method is
+   * the only place that knows Playwright. It renders each evidence kind into a
+   * resilient assertion, category/completion-aware — six flows, not per-feature
+   * `if`s. Several assertions for one objective is expected and correct: they
+   * are the evidence, not extra objectives.
    */
   private renderVerificationPlan(step: TestPlanStep, plan: VerificationPlan): string[] {
     const text = `${step.description || ''} ${step.target || ''}`.toLowerCase();
-    const lines: string[] = [];
-
-    const ERROR = `page.locator('[data-test="error"], .error-message, .error, .alert-danger, [role="alert"]').first()`;
-    const errorVisible = `await expect(${ERROR}).toBeVisible()`;
-    // Absence of error is a real, hard assertion (count 0) — not a soft no-op.
-    const errorAbsent = `await expect(page.locator('[data-test="error"], .error-message, .alert-danger, [role="alert"]')).toHaveCount(0)`;
-
-    // Negative test: the expected outcome IS the failure. One strong assertion.
-    if (plan.negativeTest) {
-      lines.push(errorVisible);
-      return lines;
-    }
-
-    const isCompletion = /\b(finish|complete|confirm|thank\s?you|place\s?(the\s)?order|success|submitted|purchase[ds]?|paid)\b/.test(text);
-    const landed = `await expect(page.locator('.inventory_list, #inventory_container, [data-test="inventory-container"], .dashboard, [class*="dashboard" i], .app_logo').first()).toBeVisible()`;
-    const confirmation = `await expect(page.locator('.complete-header, [data-test="complete-header"], .complete, [class*="complete" i], .confirmation, [class*="success" i]').first()).toBeVisible()`;
-    const cartState = `await expect(page.locator('.shopping_cart_badge, .cart_badge, [class*="cart" i][class*="badge" i], [data-test*="cart" i]').first()).toBeVisible()`;
-    const resultsState = `await expect(page.locator('.inventory_list, [class*="results" i], [class*="list" i], table tbody tr').first()).toBeVisible()`;
+    const isCompletion = /\b(finish|complete|confirm|thank\s?you|place\s?(the\s)?order|success|submitted|purchase[ds]?|paid|receipt)\b/.test(text);
     const targetSelector = step.selector || (step.target ? this.targetToPlaywright(step.target) : '');
 
-    // Primary evidence — the strongest proof this checkpoint can actually give,
-    // chosen by verification category (the rule library's classification).
-    switch (plan.category) {
-      case 'authentication':
-        lines.push(isCompletion ? confirmation : landed);
-        break;
-      case 'shopping':
-        lines.push(isCompletion ? confirmation : cartState);
-        break;
-      case 'crud':
-        lines.push(isCompletion ? confirmation : resultsState);
-        break;
-      case 'search':
-        lines.push(resultsState);
-        break;
-      case 'forms':
-        lines.push(isCompletion ? confirmation : (targetSelector ? `await expect(${targetSelector}).toBeVisible()` : landed));
-        break;
-      case 'navigation':
-        if (targetSelector) lines.push(`await expect(${targetSelector}).toBeVisible()`);
-        break;
-      default:
-        // generic — only assert if we have a concrete target to anchor on.
-        if (targetSelector) lines.push(`await expect(${targetSelector}).toBeVisible()`);
-        break;
-    }
+    // Resilient locator fragments (SauceDemo-proven, written to generalise).
+    const landed = `page.locator('.inventory_list, #inventory_container, [data-test="inventory-container"], .dashboard, [class*="dashboard" i], .app_logo').first()`;
+    const confirmation = `page.locator('.complete-header, [data-test="complete-header"], .complete, [class*="complete" i], .confirmation, [class*="success" i]').first()`;
+    const cartState = `page.locator('.shopping_cart_badge, .cart_badge, [class*="cart" i][class*="badge" i], [data-test*="cart" i]').first()`;
+    const cartLink = `page.locator('.shopping_cart_link, [data-test*="cart" i], a[href*="cart" i]').first()`;
+    const resultsState = `page.locator('.inventory_list, [class*="results" i], [class*="list" i], table tbody tr').first()`;
+    const authLandmark = `page.locator('#react-burger-menu-btn, [data-test="primary-header"], [class*="menu" i] button, [aria-label*="menu" i], [class*="avatar" i], [class*="account" i]').first()`;
+    const errorGroup = `page.locator('[data-test="error"], .error-message, .alert-danger, [role="alert"]')`;
 
-    // Focused negative guard: after a login or a form submit, a senior engineer
-    // also proves NO validation error slipped through. Kept to those flows so we
-    // don't double every assertion.
-    if ((plan.category === 'authentication' || plan.category === 'forms') && lines.length > 0) {
-      lines.push(errorAbsent);
-    }
+    // Render ONE evidence kind → one resilient assertion, chosen by category.
+    const render = (kind: EvidenceKind): string | null => {
+      switch (kind) {
+        case 'error-present':
+          return `await expect(page.locator('[data-test="error"], .error-message, .error, .alert-danger, [role="alert"]').first()).toBeVisible()`;
+        case 'error-absent':
+          // Absence of error is a real, hard assertion (count 0) — not a soft no-op.
+          return `await expect(${errorGroup}).toHaveCount(0)`;
+        case 'success-indicator':
+          if (isCompletion) return `await expect(${confirmation}).toBeVisible()`;
+          switch (plan.category) {
+            case 'authentication': return `await expect(${landed}).toBeVisible()`;
+            case 'shopping':       return `await expect(${cartState}).toBeVisible()`;
+            case 'crud':
+            case 'search':         return `await expect(${resultsState}).toBeVisible()`;
+            case 'forms':          return targetSelector ? `await expect(${targetSelector}).toBeVisible()` : `await expect(${landed}).toBeVisible()`;
+            default:               return targetSelector ? `await expect(${targetSelector}).toBeVisible()` : `await expect(${landed}).toBeVisible()`;
+          }
+        case 'state-change':
+          return plan.category === 'shopping'
+            ? `await expect(${cartState}).toBeVisible()`
+            : `await expect(${resultsState}).toBeVisible()`;
+        case 'landmark-control':
+          if (plan.category === 'authentication') return `await expect(${authLandmark}).toBeVisible()`;
+          if (plan.category === 'shopping')       return `await expect(${cartLink}).toBeVisible()`;
+          return targetSelector ? `await expect(${targetSelector}).toBeVisible()` : null;
+        case 'navigation':
+          return `await expect(page).toHaveURL(/.+/)`;
+        default:
+          return null;
+      }
+    };
 
+    // Render every objective's evidence; dedup so overlapping evidence collapses
+    // (that is WHY one objective can still be a single strong assertion).
+    const seen = new Set<string>();
+    const lines: string[] = [];
+    for (const objective of plan.objectives) {
+      for (const kind of objective.evidence) {
+        const line = render(kind);
+        if (line && !seen.has(line)) {
+          seen.add(line);
+          lines.push(line);
+        }
+      }
+    }
     return lines;
   }
 

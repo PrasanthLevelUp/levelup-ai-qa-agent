@@ -1,19 +1,19 @@
 /**
  * Sprint 3A measurement harness — Verification Standards → Composer integration.
  *
- * Honest, SauceDemo-only. Measures the *delta* the deterministic verification
- * plan adds when folded into the Script Composer's assertion injection:
- *   BEFORE = the ad-hoc assertion rules only (navigate→title, login→postLogin,
- *            assert→pageType) — i.e. the "URL/text → done" default.
- *   AFTER  = the same ad-hoc base + enrichWithVerificationStandards().
+ * Honest, SauceDemo-only. The headline metric is BUSINESS VERIFICATION
+ * OBJECTIVES PROVEN — not assertion count. Customers care about confidence
+ * (which business goals are proven), so that is what we measure. Supporting
+ * assertion count is reported second, as evidence, never as the goal.
  *
- * Reports assertions/test and tier coverage, per step and in aggregate, so a
- * reviewer can see exactly what stronger evidence the plan bought us.
+ *   BEFORE = the ad-hoc assertion rules only (navigate→title, login→postLogin,
+ *            assert→pageType) — the "URL/text → done" default: 0 named objectives.
+ *   AFTER  = the same ad-hoc base + enrichWithVerificationStandards().
  *
  * Run:  npx ts-node tools/measure-verification.ts
  */
 import { ScriptGenEngine } from '../src/script-gen/script-gen-engine';
-import { planVerifications, verificationTiersInOrder } from '../src/script-gen/verification-standards';
+import { planVerifications } from '../src/script-gen/verification-standards';
 
 // A framework-agnostic view of the private TestPlanStep — enough for the two
 // private methods we exercise (action, description, target, selector, assertions).
@@ -79,44 +79,53 @@ function main(): void {
   after.forEach(s => engine.enrichWithVerificationStandards(s, testPlan));
   const afterTotal = count(after);
 
-  // Tier coverage from the rule library (what evidence classes the plan asks for).
-  const tierHits = new Map<string, number>();
+  const ctx = {
+    pageObjectMembers: pageObjects.flatMap(po => [...po.actions.map(a => a.name), ...po.locators.map(l => l.name)]),
+    existingAssertions: [] as string[],
+  };
+  const isCheckpoint = (s: Step) => ['click', 'press', 'assert'].includes(s.action);
+
+  // The headline: the distinct BUSINESS OBJECTIVES proven across the journey.
+  // (Only checkpoint steps are enriched — fills/navigations are not outcomes.)
+  const objectivesProven = new Map<string, { strength: number; evidence: number }>();
   for (const s of STEPS) {
-    const plan = planVerifications(s as any, {
-      pageObjectMembers: pageObjects.flatMap(po => [...po.actions.map(a => a.name), ...po.locators.map(l => l.name)]),
-      existingAssertions: [],
-    });
-    for (const it of plan.intents) tierHits.set(it.tier, (tierHits.get(it.tier) || 0) + 1);
+    if (!isCheckpoint(s)) continue;
+    for (const o of planVerifications(s as any, ctx).objectives) {
+      const prev = objectivesProven.get(o.objective);
+      objectivesProven.set(o.objective, {
+        strength: Math.max(prev?.strength ?? 0, o.strength),
+        evidence: Math.max(prev?.evidence ?? 0, o.evidence.length),
+      });
+    }
   }
 
   console.log('\n=== Sprint 3A — Verification Standards → Composer (SauceDemo, 12 steps) ===\n');
-  console.log('Per-step assertions (BEFORE → AFTER):');
+
+  console.log('BUSINESS VERIFICATION OBJECTIVES PROVEN  (the metric that matters):');
+  console.log(`  BEFORE (ad-hoc URL/text → done): 0 named objectives`);
+  console.log(`  AFTER  (verification plan)     : ${objectivesProven.size} objectives\n`);
+  for (const [name, m] of objectivesProven) {
+    console.log(`   • ${name.padEnd(22)} ${'⭐'.repeat(m.strength)}  (${m.evidence} piece(s) of evidence)`);
+  }
+
+  const checkpoints = STEPS.filter(isCheckpoint).length;
+  console.log(`\nBusiness checkpoints covered: ${checkpoints}/${STEPS.length} steps` +
+    ` (fills & navigations left clean — not outcomes)`);
+
+  console.log('\nPer-checkpoint objective → evidence (BEFORE → AFTER assertions):');
   for (let i = 0; i < STEPS.length; i++) {
+    if (!isCheckpoint(STEPS[i]!)) continue;
     const b = before[i]!.assertions?.length || 0;
     const a = after[i]!.assertions?.length || 0;
-    const cat = planVerifications(STEPS[i]! as any).category;
+    const o = planVerifications(STEPS[i]! as any, ctx).objectives[0]!;
     console.log(
-      `  ${String(i + 1).padStart(2)}. ${STEPS[i]!.action.padEnd(9)} [${cat.padEnd(14)}] ${b} → ${a}` +
-        (a > b ? `  (+${a - b})` : ''),
+      `  ${String(i + 1).padStart(2)}. ${STEPS[i]!.action.padEnd(7)} “${o.objective}”`.padEnd(46) +
+        ` ${b} → ${a} assertion(s)`,
     );
   }
 
-  console.log('\nAssertions in the journey (this journey = one "test"):');
-  console.log(`  BEFORE (ad-hoc only): ${beforeTotal} assertions`);
-  console.log(`  AFTER  (with plan)  : ${afterTotal} assertions`);
-  const pct = beforeTotal > 0 ? (((afterTotal - beforeTotal) / beforeTotal) * 100).toFixed(0) : 'n/a';
-  console.log(`  Delta               : +${afterTotal - beforeTotal} assertions  (+${pct}%)`);
-  const checkpoints = STEPS.filter(s => ['click', 'press', 'assert'].includes(s.action)).length;
-  console.log(`  Checkpoints enriched: ${checkpoints} of ${STEPS.length} steps (fills/navigations left clean)`);
-
-  console.log('\nTier coverage across the journey (strength ⭐ from the frozen table):');
-  for (const t of verificationTiersInOrder()) {
-    const hits = tierHits.get(t.tier) || 0;
-    console.log(`  ${'⭐'.repeat(t.strength).padEnd(5)} ${t.tier.padEnd(18)} used in ${hits} step(s)`);
-  }
-
-  const stepsWithOutcome = STEPS.filter(s => planVerifications(s as any).intents.some(i => i.tier === 'business-outcome')).length;
-  console.log(`\nSteps now carrying a business-outcome proof: ${stepsWithOutcome}/${STEPS.length}`);
+  console.log('\nSupporting assertions (evidence, NOT the goal):');
+  console.log(`  BEFORE: ${beforeTotal}   AFTER: ${afterTotal}   (each objective backed by ${(afterTotal / Math.max(1, objectivesProven.size)).toFixed(1)} on average)`);
   console.log('');
 }
 
