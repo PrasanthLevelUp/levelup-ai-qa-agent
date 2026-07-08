@@ -589,6 +589,11 @@ like it was maintained by a real engineering team. It is the deterministic backb
 - No `waitForTimeout`; use web-first assertions and auto-waiting.
 - Prefer user-facing locators (`getByRole` / `getByLabel`).
 
+**Logging heuristics**
+- Minimize logging statements — logs waste tokens that could improve assertions, waits, or locators.
+- Default: log only test start/end and critical decision points, not every step.
+- Every log must justify its existence vs. adding an assertion or refining a locator.
+
 These heuristics evolve over time (the ongoing "continuous heuristic tuning" track improves the
 weights from successful generations) — **without** increasing token usage or architectural complexity.
 
