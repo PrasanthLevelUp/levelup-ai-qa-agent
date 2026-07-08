@@ -19,6 +19,21 @@ import { classifyIntent, discoverLocatorCandidates, discoverReuseCandidates } fr
 export * from './types';
 export { classifyIntent, extractTarget, discoverReuseCandidates, discoverLocatorCandidates } from './discover';
 export { rankReport, CANDIDATE_PRIORITY } from './rank';
+export {
+  DEFAULT_CANDIDATE_PRIORITY,
+  configureCandidatePriority,
+  getCandidatePriority,
+  getCandidatePriorityTable,
+  resetEngineeringHeuristics,
+  assessCompatibility,
+  assessQuality,
+  deriveConfidence,
+  passesGate,
+  COMPATIBILITY_MIN,
+  type CandidatePriority,
+  type QualityVerdict,
+  type Confidence,
+} from '../engineering-heuristics';
 
 /** An empty, well-formed report (used on empty input and on any failure). */
 function emptyReport(): CandidateDiscoveryReport {
