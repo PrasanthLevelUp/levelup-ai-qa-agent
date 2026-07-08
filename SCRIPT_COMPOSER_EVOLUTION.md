@@ -72,11 +72,21 @@ Canonical Scenario        (grounding[] + structured expected, one source of trut
 Execution Context         (crawl + repo intelligence + app profile + conventions)
     ↓
 Script Composer           (script-gen/script-gen-engine.ts — ScriptGenEngine)
+    ├── Candidate Resolution   (reuse-first: fixture / page object / helper / component / locator — Sprint 2)
+    ├── Assertion Expansion    (Sprint 3)
+    ├── Coverage Expansion     (Sprint 4)
+    ├── Reuse Decisions        (Existing Code First heuristic — §5.1)
+    └── Engineering Heuristics (deterministic rule library — §5.1)
     ↓
-Quality Gate              (validation-runner + ai-review-engine + framework-auditor)
+Quality Gate              (aggregates/presents quality dimensions — validation-runner + ai-review-engine + framework-auditor)
     ↓
 Persist                   (generated_test_cases / scripts + ai_metadata)
 ```
+
+> **This is the final architecture — it is frozen here.** Notice there is **not a single new pipeline
+> stage** beyond the Validator. Everything the roadmap adds (Sprints 2–6) is *behavior inside the
+> existing Script Composer*, shown as the sub-bullets above. No new orchestrators, no new validators,
+> no moved stage boundaries.
 
 > The **Scenario Integrity Validator** is a deterministic certifier inserted between the Scenario
 > Builder and everything downstream. It does **not** own or mutate scenario data — the Scenario
@@ -110,9 +120,9 @@ The Script Composer (`ScriptGenEngine`) already composes the sub-engines we will
 | --- | --- | --- |
 | `SelectorQualityEngine` + `intelligence/element-intelligence.rankLocatorCandidates` | Locator scoring | **Sprint 2** |
 | `AssertionEngine` | Assertions | **Sprints 3 & 4** |
-| `project-convention-profile` (`buildReuseCatalogue`, `findReusablePageObject`) | Reuse | **Sprint 5** |
-| `ai-review-engine` / `framework-auditor` | Style / audit | **Sprint 6** |
-| `engines/confidence-engine.ts` | Confidence | **Sprint 7** |
+| `project-convention-profile` (`buildReuseCatalogue`, `findReusablePageObject`) | Reuse (candidate resolution) | **Sprint 2** |
+| `ai-review-engine` / `framework-auditor` | Style / audit | **Sprint 5** |
+| `engines/confidence-engine.ts` | Confidence | **Sprint 6** |
 | `core/candidate-ranker.ts` + `core/advisors/*` | Ranking (healing side) | **Reuse target for Sprint 2** |
 
 > **Reuse-first note:** the healing side already has a mature scored candidate ranker
@@ -182,8 +192,24 @@ The score influences **confidence and warnings only.** `generationAllowed` is al
 #### Hard rule #3: it must NOT become a mini Script Composer
 
 The Validator does **not** improve locators, expand assertions, add coverage, or touch the framework.
-Those belong to the Script Composer (Sprints 2–7). Keep the Validator brutally simple — its only job is
+Those belong to the Script Composer (Sprints 2–6). Keep the Validator brutally simple — its only job is
 internal-consistency certification.
+
+#### Hard rule #4: the numeric score is INTERNAL — expose the band, not the number
+
+The `0–100` readiness score is a useful **internal** signal (weighting, telemetry, trend analysis).
+It must **never** reach a user-facing surface as a raw number. Externally — UI, API responses, PR
+comments, Smart TODOs — expose only the confidence band: **High / Medium / Low**.
+
+```
+Internal (ai_metadata):   readinessScore: 91        ← kept, for tuning & telemetry
+External (UI / API):      Confidence: High           ← the only thing users see
+```
+
+Reason: a raw number implies false precision. Users cannot tell whether `91` is meaningfully better
+than `88` — but *High vs. Medium* is honest and actionable. The report keeps both fields
+(`readinessScore` internal, `confidence` external); every serializer that renders to a human surfaces
+`confidence` and hides `readinessScore`.
 
 #### What it validates
 
@@ -233,28 +259,34 @@ Before the Script Composer starts, the Validator computes a scenario-quality sco
 | Grounding | ⚠️ |
 
 ```
-Scenario Ready — 96%   ·   Confidence: High
+Internal:   readinessScore 96   →   External:   Confidence: High
 ```
 
-The score (and the per-check breakdown) is carried alongside the scenario and later feeds the Sprint 7
-Confidence Engine and Smart TODOs — honest signal instead of silent compensation.
+The internal score (and the per-check breakdown) is carried alongside the scenario and later feeds the
+Sprint 6 Confidence Engine and Smart TODOs — honest signal instead of silent compensation. Only the
+**band** is ever shown to a user (Hard rule #4).
 
-#### One number is not enough — expose dimensions to the Quality Gate
+#### One number is not enough — but do NOT create more validators
 
-A single readiness number isn't actionable. The Validator's score is the **Scenario Quality**
-dimension; the Quality Gate combines it with the Composer's own quality signals into one report:
+A single readiness number isn't actionable, so the Quality Gate presents a multi-dimensional report.
+**Critical:** the extra dimensions are **not** new validators. There is exactly one validator — the
+Scenario Integrity Validator — and it owns only the **Scenario** dimension. Every other dimension is
+computed by a **sub-engine that already exists inside the Script Composer** and is simply *surfaced*
+by the Quality Gate. We never add a Locator Validator, Assertion Validator, or Framework Validator;
+doing so would slowly recreate the architecture we just froze.
 
 ```
-Scenario Quality    95      (Scenario Integrity Validator — this sprint)
-Framework Quality   97      (framework-auditor)
-Locator Quality     94      (Sprint 2)
-Assertion Quality   96      (Sprints 3 & 4)
-────────────────────────
-Overall Ready       95
+Scenario     High     (Scenario Integrity Validator — the ONE validator, this sprint)
+Framework    High     (framework-auditor — existing Composer sub-engine)
+Locator      High     (Candidate Resolution — Sprint 2, inside the Composer)
+Assertion    High     (AssertionEngine — Sprints 3 & 4, inside the Composer)
+──────────────────
+Overall      High
 ```
 
-The Validator owns only **Scenario Quality**; the other dimensions are filled in by later sprints. The
-report shape is designed so each dimension plugs in without changing the others.
+> Bands, not numbers, at every level (Hard rule #4). The Quality Gate is an **aggregator/presenter**,
+> not a new validation layer — each dimension plugs in from an existing Composer sub-engine without a
+> new category and without changing the others.
 
 #### Where it lives
 
@@ -273,9 +305,37 @@ moves; the Scenario Builder still owns the data. `generationAllowed` is **always
 
 ---
 
-### Sprint 2 — Locator Ranking Engine  ⭐⭐⭐⭐⭐ (highest ROI)
+### Sprint 2 — Candidate Resolution  ⭐⭐⭐⭐⭐ (highest ROI)
 
-This is **not** "better locators." It is **better locator decision-making.**
+> **Renamed from "Locator Ranking Engine," and now absorbs the former "Framework Reuse" sprint.**
+> Locator selection is only *one* answer this sprint produces. The real question is broader:
+
+> **"What is the best automation representation of this business action?"**
+
+That representation might be a locator — but often the best answer is **no new locator at all**,
+because the framework already has a reusable abstraction. Candidate Resolution ranks *all* of these
+against each other:
+
+- an existing **fixture** (e.g. `authenticatedFixture()`)
+- an existing **page-object method** (e.g. `LoginPage.login()`)
+- an existing **helper**
+- an existing **component**
+- …and only then a **new locator**
+
+```
+Scenario:  "Click Login"
+
+Candidate Resolution discovers:
+   ✓ Existing LoginPage.login()          ← reuse wins
+   ✓ Existing authenticatedFixture()     ← even better: skip the UI entirely
+   ○ Need a new locator                  ← last resort
+```
+
+Sometimes the best locator is **no locator** — reuse of an existing abstraction is more valuable
+and more senior than any freshly-generated `page.fill(); page.fill(); page.click()`. This is where
+LevelUp beats almost everyone: **reuse, not AI.** (This is also why the old standalone "Framework
+Reuse" sprint no longer exists — reuse-vs-generate is the *same* decision as candidate resolution,
+and it must happen *before* any generation begins.)
 
 **Today**
 
@@ -287,20 +347,24 @@ Grounding → Selector
 
 ```
 Grounding → Candidate Discovery → Candidate Ranking → Candidate Selection → Confidence
+            (fixtures, page objects, helpers, components, locators — all candidates)
 ```
 
 #### 4.1 Candidate Discovery — collect, do not select
 
-Gather candidates from every source, in priority order. **Do not choose yet.**
+Gather candidates from every source, in priority order. **Do not choose yet.** Reusable framework
+assets are discovered *first* because reuse beats generation:
 
-1. Existing **Page Object** methods (reuse wins)
-2. **App Profile** (crawled grounding)
-3. **Test Case** wording
-4. **Expected Result** text
-5. **Requirement** text
-6. **DOM** relationships
-7. **Accessibility** (role + name, aria-label, label association)
-8. **AI** — last resort only
+1. Existing **fixture** (highest reuse — may remove the need for UI steps entirely)
+2. Existing **Page Object** method
+3. Existing **helper** / **component**
+4. **App Profile** (crawled grounding)
+5. **Test Case** wording
+6. **Expected Result** text
+7. **Requirement** text
+8. **DOM** relationships
+9. **Accessibility** (role + name, aria-label, label association)
+10. **AI** — last resort only
 
 > **Fallback search chain before AI.** When the App Profile misses an element, do **not** jump to
 > the LLM. Search deterministically first:
@@ -317,7 +381,9 @@ Reuse/extend `core/candidate-ranker.ts` scoring. Indicative scores:
 
 | Source / strategy | Score |
 | --- | --: |
+| Existing fixture (removes UI steps) | 100 |
 | Existing Page Object method | 100 |
+| Existing helper / component | 99 |
 | `data-testid` | 98 |
 | `role` + accessible name | 96 |
 | `aria-label` | 95 |
@@ -329,32 +395,37 @@ Reuse/extend `core/candidate-ranker.ts` scoring. Indicative scores:
 
 **Never just use the first locator. Find → Rank → Choose.**
 
-#### 4.3 Candidate Selection — score the *strategy*, and record *why*
+#### 4.3 Candidate Selection — reuse first, then score the *strategy*, and record *why*
 
-- Choose the highest-scoring candidate.
+- **Existing Code First:** if a fixture / page-object / helper / component candidate resolves the
+  action, prefer it over any new locator — even a perfect one. Reuse beats generation.
+- Otherwise choose the highest-scoring candidate.
 - If the top two are close, keep **both** — record the runner-up as an alternative.
-- Score the **locator strategy**, not just the string — and persist the **reasons**. Debuggability
-  and auditability come for free: when someone asks *"why didn't LevelUp use XPath?"*, the answer is
-  already stored.
+- Score the **strategy** (reuse vs. locator, and which locator strategy), not just the string — and
+  persist the **reasons**. Debuggability and auditability come for free: when someone asks *"why
+  didn't LevelUp use XPath?"* or *"why did it call `login()` instead of filling the form?"*, the
+  answer is already stored.
   ```
-  Chosen:      getByRole('button', { name: 'Login' })   strategy: role   score: 96
-  Why:         ✓ accessible  ✓ stable  ✓ user-facing  ✓ matches framework convention
-  Alternative: getByTestId('login-btn')                 strategy: testid score: 98 (framework prefers role)
+  Chosen:      LoginPage.login(user, pass)              strategy: reuse   score: 100
+  Why:         ✓ existing page object  ✓ zero new code  ✓ matches framework convention
+  Alternative: getByRole('button', { name: 'Login' })   strategy: role    score: 96 (reuse preferred)
   ```
 
-#### 4.4 Confidence banding (feeds Sprint 7)
+#### 4.4 Confidence banding (feeds the Confidence Engine sprint)
+
+Internally scored `0–100`; **only the band is ever surfaced** (Hard rule #4):
 
 | Confidence | Behavior |
 | --- | --- |
-| **> 90** | Generate normally. |
-| **70–90** | Generate normally **and** record `Review recommended.` |
-| **< 70** | Generate a `TODO` with a reason (e.g. *Dynamic element*) and a suggested locator. |
+| **High** | Generate normally. |
+| **Medium** | Generate normally **and** record `Review recommended.` |
+| **Low** | Generate a `TODO` with a reason (e.g. *Dynamic element*) and a suggested approach. |
 
 **Milestones (ship small — measure after each):**
-- **2a** — Candidate Discovery: collect candidates from all sources into a typed list (no behavior change to selection yet).
+- **2a** — Candidate Discovery: collect candidates from all sources — **fixtures / page objects / helpers / components first**, then locators — into a typed list (no behavior change to selection yet).
 - **2b** — Ranking: score candidates via the shared ranker; log chosen vs. alternatives.
-- **2c** — Selection + alternative retention.
-- **2d** — Confidence banding + TODO emission for `< 70`.
+- **2c** — Reuse-first selection + alternative retention (prefer an existing abstraction over a new locator).
+- **2d** — Confidence banding (High/Medium/Low) + TODO emission for `Low`.
 
 ---
 
@@ -396,22 +467,21 @@ Meaningful, business-relevant checks only — never random assertions. Automatio
 
 ---
 
-### Sprint 5 — Framework Reuse  ⭐⭐⭐⭐⭐
-
-Improve **reuse**, not generation. Aggressively consult
-`project-convention-profile` (`buildReuseCatalogue`, `findReusablePageObject`) and repo pattern
-analysis.
-
-```
-login() ; login() ; login()     →     authenticatedFixture()
-```
-
-If `login()` (or any page-object method / fixture / helper) already exists, **reuse it — never
-regenerate.** The less code we generate, the more senior it looks.
+> **Note — "Framework Reuse" is no longer a separate sprint.** Reuse-vs-generate is the *same*
+> decision as candidate resolution, so it now lives inside **Sprint 2 — Candidate Resolution** and its
+> "Existing Code First" heuristic (§5.1). Consulting `project-convention-profile`
+> (`buildReuseCatalogue`, `findReusablePageObject`) happens there, *before* any generation begins:
+>
+> ```
+> login() ; login() ; login()     →     authenticatedFixture()
+> ```
+>
+> If `login()` (or any page-object method / fixture / helper) already exists, **reuse it — never
+> regenerate.** The less code we generate, the more senior it looks.
 
 ---
 
-### Sprint 6 — Humanization  ⭐⭐⭐⭐⭐
+### Sprint 5 — Humanization  ⭐⭐⭐⭐⭐
 
 The framework must not *feel* generated. The problem is rarely correctness — it is that the output
 is **too symmetrical.** Senior engineers extract methods, simplify, and drop noise.
@@ -428,13 +498,14 @@ Make it feel like a teammate wrote it — following project conventions.
 
 ---
 
-### Sprint 7 — Confidence Engine  ⭐⭐⭐⭐⭐
+### Sprint 6 — Confidence Engine  ⭐⭐⭐⭐⭐
 
 **Last. Do not rewrite. Do not regenerate.** Simply identify uncertainty and be honest about it,
 building on `engines/confidence-engine.ts` and the Sprint 2 bands.
 
 Before returning, the composer asks: **"Would I merge this PR?"** — checking locator, assertion,
-reuse, compile, and framework confidence. When confidence is low, **flag**, don't guess.
+reuse, compile, and framework confidence. When confidence is low, **flag**, don't guess. Report the
+band (High/Medium/Low), never a raw number (Hard rule #4).
 
 #### Smart TODOs (not AI noise)
 
@@ -474,7 +545,27 @@ product over time without growing prompt size.
 
 ### Rule families
 
-**Locator heuristics**
+**Existing Code First** ⭐ (the most valuable heuristic)
+
+Before generating *any* new code, every generation must walk this chain and stop at the first hit:
+
+```
+Can an existing fixture solve it?
+        ↓ no
+Can an existing page object solve it?
+        ↓ no
+Can an existing helper solve it?
+        ↓ no
+Can an existing component solve it?
+        ↓ no
+Generate new code
+```
+
+This one rule does more than any other to eliminate duplication and make a generated framework feel
+like it was maintained by a real engineering team. It is the deterministic backbone of Sprint 2
+(Candidate Resolution): reuse is always preferred over generation, even over a perfect new locator.
+
+**Locator heuristics** (only when Existing Code First reaches "generate new")
 - Prefer existing page-object methods.
 - Prefer `data-testid`.
 - Prefer accessible roles and names.
@@ -498,27 +589,38 @@ product over time without growing prompt size.
 - No `waitForTimeout`; use web-first assertions and auto-waiting.
 - Prefer user-facing locators (`getByRole` / `getByLabel`).
 
-These heuristics evolve over time (Sprint 7+ "continuous learning" improves the weights from
-successful generations) — **without** increasing token usage or architectural complexity.
+These heuristics evolve over time (the ongoing "continuous heuristic tuning" track improves the
+weights from successful generations) — **without** increasing token usage or architectural complexity.
 
 ---
 
 ## 6. Long-term stable roadmap
 
-| Phase | Goal | Change type |
-| --- | --- | --- |
-| 1 | Fix & Freeze | Regression fix + freeze declaration |
-| **1.5** | **Scenario Integrity Validator** | **Certify the scenario (readiness score + warnings); never mutate** |
-| 2 | Locator Ranking Engine | Improve **selection**, no architecture changes |
-| 3 | Assertion Expansion | Increase automation coverage |
-| 4 | Coverage Expansion | Add meaningful automation-only validations |
-| 5 | Framework Reuse | Reduce duplication |
-| 6 | Human-like Code Style | Output indistinguishable from hand-written code |
-| 7 | Confidence Engine | Flag uncertain areas instead of guessing |
-| (ongoing) | Continuous Learning | Improve heuristic weights from successful generations |
+| Priority | Goal | Change type | Why |
+| --- | --- | --- | --- |
+| 1 | Fix & Freeze | Regression fix + freeze declaration | Stabilize the foundation |
+| **1.5** | **Scenario Integrity Validator** | **Certify the scenario (band + warnings); never mutate, never block** | The ONE validator |
+| 🥇 2 | **Candidate Resolution** *(absorbs Framework Reuse)* | Reuse-first resolution of the best automation representation | **Reuse before generation** |
+| 🥈 3 | Assertion Expansion | Increase automation coverage | Biggest quality gain users notice |
+| 🥉 4 | Coverage Expansion | Add meaningful automation-only validations | Automation should exceed manual |
+| 5 | Humanization | Output indistinguishable from hand-written code | Make code look hand-written |
+| 6 | Confidence Engine | Flag uncertain areas instead of guessing | Flag uncertainty honestly |
+| (ongoing) | Continuous heuristic tuning | Improve heuristic weights from successful generations | Better decisions, same architecture |
 
 **Notice what is missing:** no new orchestrators, no new intelligence providers, no new pipelines,
-no major rewrites.
+no major rewrites — and **no new validators.** "Framework Reuse" is folded into Candidate Resolution
+because reuse-vs-generate is the same decision. Everything after the Validator is craftsmanship
+*inside* the Script Composer.
+
+### The three questions that gate every future sprint
+
+The architecture is now strong enough. From here the mindset shifts from **"building architecture"**
+to **"building craftsmanship."** Judge every proposed sprint against just three questions — if it
+improves none of them, do not build it, however interesting it is:
+
+1. **Did the ready-to-run rate improve?** (less manual editing after generation)
+2. **Did code reuse increase?** (more existing framework assets used, less duplication)
+3. **Would an experienced Playwright reviewer be more likely to approve this PR without suspecting AI?**
 
 ---
 
@@ -549,12 +651,12 @@ src/script-gen/script-gen-engine.ts        ScriptGenEngine — the Script Compos
   ├── wait-strategy-engine.ts              smart waits
   ├── workflow-mapper.ts                   navigation graph & flows
   ├── validation-runner.ts                 compile / validate       (Quality Gate)
-  ├── ai-review-engine.ts                  style review             → Sprint 6
-  └── framework-auditor.ts                 framework audit          → Sprint 6
+  ├── ai-review-engine.ts                  style review             → Sprint 5
+  └── framework-auditor.ts                 framework audit          → Sprint 5
 src/intelligence/element-intelligence.ts   rankLocatorCandidates   → Sprint 2
-src/intelligence/project-convention-profile.ts  reuse catalogue    → Sprint 5
+src/intelligence/project-convention-profile.ts  reuse catalogue    → Sprint 2 (Candidate Resolution)
 src/core/candidate-ranker.ts               scored ranker (reuse)   → Sprint 2
 src/core/advisors/*                        ranking advisors (reuse) → Sprint 2
-src/engines/confidence-engine.ts           confidence              → Sprint 7
+src/engines/confidence-engine.ts           confidence              → Sprint 6
 src/script-gen/heuristics/  (proposed)     Engineering Heuristics Library → §5
 ```
