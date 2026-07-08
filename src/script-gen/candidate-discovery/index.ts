@@ -18,6 +18,7 @@ import { classifyIntent, discoverLocatorCandidates, discoverReuseCandidates } fr
 
 export * from './types';
 export { classifyIntent, extractTarget, discoverReuseCandidates, discoverLocatorCandidates } from './discover';
+export { rankReport, CANDIDATE_PRIORITY } from './rank';
 
 /** An empty, well-formed report (used on empty input and on any failure). */
 function emptyReport(): CandidateDiscoveryReport {

@@ -56,7 +56,7 @@ import {
 } from '../intelligence/project-convention-profile';
 import { analyzeRepoPatterns } from './repo-pattern-analyzer';
 import { rankLocatorCandidates, type ElementLike } from '../intelligence/element-intelligence';
-import { discoverCandidates, type CandidateDiscoveryReport } from './candidate-discovery';
+import { discoverCandidates, rankReport, type CandidateDiscoveryReport } from './candidate-discovery';
 import { adaptiveGenerateFiles } from './adaptive-codegen';
 import { getRAGService } from '../services/rag-service';
 import { TrueReuseEngine } from '../services/true-reuse-engine';
@@ -1348,12 +1348,16 @@ ${combined.map(l => (l ? `    ${l}` : '')).join('\n')}
     profile?: import('../context/types').RepositoryProfile,
   ): CandidateDiscoveryReport {
     const cat = buildReuseCatalogue(profile);
-    return discoverCandidates(steps, {
+    const discovered = discoverCandidates(steps, {
       pageObjects: cat.pageObjects.map((p) => ({ name: p.name, methods: p.methods, path: p.path })),
       helpers: cat.helpers.map((h) => ({ name: h.name, functions: h.functions, path: h.path })),
       fixtures: cat.fixtures.map((f) => ({ name: f.name, path: f.path })),
       components: cat.components.map((c) => ({ name: c.name, path: c.path })),
     });
+    // Ranking (PR 2B): score + order candidates by engineering value. Still
+    // read-only — it never selects a winner (report.selected stays false) and
+    // never changes the generated code.
+    return rankReport(discovered);
   }
 
   private buildTcResult(

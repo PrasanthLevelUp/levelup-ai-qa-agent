@@ -29,9 +29,24 @@ function hasAny(text: string, words: string[]): boolean {
   return words.some((w) => hasWord(text, w));
 }
 
-/** Build a candidate, deriving the `reuse` flag from the type. */
+/**
+ * The engineering rationale for each candidate family — WHY this option exists.
+ * Set at discovery time so the report reads candidate → reason → score and
+ * Ranking (PR 2B) can explain its decisions without re-deriving intent.
+ */
+const REASON: Record<CandidateType, string> = {
+  'existing-fixture': 'Existing reusable fixture — preferred setup abstraction',
+  'existing-page-object': 'Existing Page Object method — reuse over new code',
+  'existing-helper': 'Existing helper function — reuse over new code',
+  'existing-component': 'Existing component abstraction — reuse over new code',
+  'app-profile-locator': 'Grounded in the crawled Application Profile',
+  'accessibility-locator': 'User-facing accessible locator (role / label)',
+  'dom-locator': 'DOM fallback locator (css / text)',
+};
+
+/** Build a candidate, deriving the `reuse` flag and `reason` from the type. */
 function candidate(type: CandidateType, source: string, detail?: string): ImplementationCandidate {
-  return { type, source, detail, reuse: REUSE_TYPES.has(type) };
+  return { type, source, detail, reuse: REUSE_TYPES.has(type), reason: REASON[type] };
 }
 
 /**
