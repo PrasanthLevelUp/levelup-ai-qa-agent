@@ -17,7 +17,7 @@ engineering heuristics, ranking algorithms, and quality refinements — never th
 orchestrators, intelligence providers, writers, planners, or pipelines.
 
 This document freezes the architecture at **v1.0** and defines the incremental roadmap
-(Sprints 1–7 + the Engineering Heuristics Library) that raises generated-code quality without
+(Sprints 1, 1.5, 2–7 + the two deterministic rule libraries) that raises generated-code quality without
 destabilizing the foundation.
 
 ---
@@ -65,6 +65,8 @@ Requirement
     ↓
 Scenario Builder          (engines/scenario-builder.ts — canonical scenario, Phase A)
     ↓
+Scenario Integrity Engine (certifies the scenario; warnings only, never mutates — Sprint 1.5)
+    ↓
 Canonical Scenario        (grounding[] + structured expected, one source of truth)
     ↓
 Execution Context         (crawl + repo intelligence + app profile + conventions)
@@ -76,11 +78,17 @@ Quality Gate              (validation-runner + ai-review-engine + framework-audi
 Persist                   (generated_test_cases / scripts + ai_metadata)
 ```
 
+> The **Scenario Integrity Engine** is a deterministic certifier inserted between the Scenario
+> Builder and everything downstream. It does **not** own or mutate scenario data — the Scenario
+> Builder remains the sole owner. It only answers: *"Is this canonical scenario internally
+> consistent and automation-ready?"* and attaches a readiness score + warnings. See Sprint 1.5.
+
 ### Where each frozen stage lives in the codebase
 
 | Stage | Primary module(s) |
 | --- | --- |
 | Scenario Builder | `src/engines/scenario-builder.ts` |
+| **Scenario Integrity Engine** | `src/engines/scenario-integrity/` *(proposed — Sprint 1.5)* |
 | Canonical Scenario | `DraftTestCase` / `FormatterTestCase` (`grounding[]`, structured `expected`, `schemaVersion`) |
 | Renderers / Projection | `src/renderers/scenario-renderer.ts` (Manual / Script / BDD) |
 | Execution Context | `src/script-gen/page-crawler.ts`, `src/context/*`, `src/intelligence/project-convention-profile.ts` |
@@ -124,6 +132,86 @@ The Script Composer (`ScriptGenEngine`) already composes the sub-engines we will
 - ✅ Merge PR #247 (Scenario Data Model + Renderers). *(owner action)*
 - ✅ Create this document (`SCRIPT_COMPOSER_EVOLUTION.md`) and **declare the architecture frozen.**
 - **No new intelligence.**
+
+---
+
+### Sprint 1.5 — Scenario Integrity Engine  ⭐⭐⭐⭐⭐ (do before Sprint 2)
+
+A deterministic **certifier** that sits between the Scenario Builder and the Script Composer. It is
+**not new intelligence** — no LLM, no generation. It answers one question:
+
+> **"Is this canonical scenario internally consistent and automation-ready?"**
+
+Today the Script Composer sometimes *compensates* for weak test cases. It shouldn't have to. If the
+Composer always receives a high-quality, certified scenario, locator / assertion / coverage mistakes
+drop **without touching generation.** This is the first of the two deterministic rule libraries (see
+§5) and the natural partner to the Engineering Heuristics Library.
+
+#### Hard rule: report, never rewrite
+
+```
+Scenario → Validator → Issues → (same) Scenario     ✅
+Scenario → Validator → Scenario rewritten           ❌  (forbidden)
+```
+
+The Scenario Builder remains the **sole owner** of scenario data. The Integrity Engine only attaches
+quality signals (warnings + a readiness score); it never mutates steps, grounding, or expected.
+
+#### What it validates
+
+1. **Persona consistency** ⭐⭐⭐⭐⭐ — the persona/test data must match the scenario intent.
+   - `Title: Login with locked user` + `Test Data: standard_user` → **fail**
+   - `Title: Successful login` + `Expected: Authentication rejected` → **fail**
+2. **Coverage polarity** ⭐⭐⭐⭐⭐ — expected outcome must match the coverage type (deterministic):
+   - positive → success state (e.g. dashboard displayed)
+   - negative → error shown
+   - edge → graceful validation
+   - boundary → limit accepted/rejected
+3. **Test-data suitability** ⭐⭐⭐⭐⭐ — dataset must fit the scenario.
+   - `valid login` scenario + `locked_user` dataset → **fail**
+4. **Expected-result consistency** ⭐⭐⭐⭐⭐ — manual outcome vs. structured expected must agree.
+   - manual `Login successful` + expected `Error displayed` → **fail**
+5. **Step completeness** ⭐⭐⭐⭐⭐ — steps must plausibly produce the expected outcome.
+   - `Click Login` → expected `Inventory page`, but no username/password entered → **incomplete, flag**
+6. **Missing preconditions** ⭐⭐⭐⭐⭐ — required preconditions must be present.
+   - `Checkout` without `User logged in` → **flag**
+7. **Grounding completeness** ⭐⭐⭐⭐☆ — every actionable step should have grounding.
+   - `Enter username` with no grounding → **do not fail; reduce confidence.**
+
+#### Automation Readiness Score
+
+Before the Script Composer starts, the engine computes a scenario-quality score so the Composer knows
+**how much to trust the scenario:**
+
+| Check | Result |
+| --- | :--: |
+| Persona | ✅ |
+| Expected | ✅ |
+| Preconditions | ✅ |
+| Grounding | ⚠️ |
+| Test Data | ✅ |
+| Coverage | ✅ |
+
+```
+Scenario Ready — 96%
+```
+
+The score (and the per-check breakdown) is carried alongside the scenario and later feeds the Sprint 7
+Confidence Engine and Smart TODOs — honest signal instead of silent compensation.
+
+#### Where it lives
+
+`src/engines/scenario-integrity/` — a pure, dependency-light rule module. Output is a typed
+`ScenarioIntegrityReport { readinessScore, checks[], warnings[] }` attached to the scenario. No stage
+boundary moves; the Scenario Builder still owns the data.
+
+**Milestones (ship small — measure after each):**
+- **1.5a** — Report scaffold + persona / expected-result / coverage-polarity checks (the three highest-signal, purely-textual checks).
+- **1.5b** — Test-data suitability + missing-preconditions + step-completeness checks.
+- **1.5c** — Grounding-completeness check (confidence penalty, not a failure).
+- **1.5d** — Automation Readiness Score aggregation + surface the report to the Script Composer and dashboard.
+
+> **Sequencing:** only after the Scenario Integrity Engine is stable do we begin Sprint 2.
 
 ---
 
@@ -299,7 +387,21 @@ Emit TODOs **only** when confidence is genuinely low — never a wall of `TODO T
 
 ---
 
-## 5. The Engineering Heuristics Library (the secret sauce)
+## 5. The two deterministic rule libraries (the secret sauce)
+
+The system will have **exactly two** deterministic rule libraries — and no third intelligence layer.
+They complement each other without adding an AI component or growing prompts:
+
+| Library | Question it answers | Stage |
+| --- | --- | --- |
+| **Scenario Integrity Engine** (§4, Sprint 1.5) | *"Is the canonical scenario internally correct and automation-ready?"* | Before the Composer |
+| **Engineering Heuristics Library** (below) | *"Given a correct scenario, what is the best way to implement it as production-quality automation?"* | Inside the Composer |
+
+Together they give a stronger long-term foundation than continually expanding prompts or adding new
+AI components: one certifies the **input**, the other governs the **implementation** — both
+deterministic, both token-free, both versioned and unit-tested.
+
+### 5.1 Engineering Heuristics Library
 
 Not another intelligence. A **deterministic rule library** that captures how experienced automation
 engineers think. Every generation consults it. **No LLM. No prompt. No tokens.** It improves the
@@ -344,6 +446,7 @@ successful generations) — **without** increasing token usage or architectural 
 | Phase | Goal | Change type |
 | --- | --- | --- |
 | 1 | Fix & Freeze | Regression fix + freeze declaration |
+| **1.5** | **Scenario Integrity Engine** | **Certify the scenario (readiness score + warnings); never mutate** |
 | 2 | Locator Ranking Engine | Improve **selection**, no architecture changes |
 | 3 | Assertion Expansion | Increase automation coverage |
 | 4 | Coverage Expansion | Add meaningful automation-only validations |
@@ -376,6 +479,7 @@ no major rewrites.
 
 ```
 src/engines/scenario-builder.ts            canonical scenario (Phase A)
+src/engines/scenario-integrity/ (proposed) Scenario Integrity Engine → Sprint 1.5 / §5
 src/renderers/scenario-renderer.ts         Manual / Script / BDD projection (Phase B)
 src/script-gen/script-gen-engine.ts        ScriptGenEngine — the Script Composer
   ├── selector-quality-engine.ts           locator scoring         → Sprint 2
