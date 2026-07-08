@@ -35,6 +35,11 @@ import { buildStabilityProvider, trackGeneratedSelector } from '../services/inte
 import { getCrawlAdaptationForUrl } from '../services/crawl-adaptation-service';
 import { AssertionEngine, type GeneratedAssertion } from './assertion-engine';
 import {
+  planVerifications,
+  type VerificationContext,
+  type VerificationPlan,
+} from './verification-standards';
+import {
   ScenarioIntelligence,
   type CredentialResolver as ScenarioCredentialResolver,
 } from './scenario-intelligence';
@@ -4936,7 +4941,7 @@ ${config.testCase
           }
         }
 
-        // Inject assertions for navigation and submit actions
+        // ── Existing ad-hoc assertions (kept as a proven base) ──────────
         if (step.action === 'navigate') {
           prevUrl = step.target;
           step.assertions = [
@@ -4953,8 +4958,122 @@ ${config.testCase
           const pageAssertions = this.assertionEngine.generateForPageType(crawl.pageType);
           step.assertions = pageAssertions.map(a => a.playwrightCode);
         }
+
+        // ── Sprint 3A: Verification Standards enrichment ────────────────
+        // Fold the deterministic verification plan into this step's assertions,
+        // strongest evidence first. Additive & fail-open: it only ADDS proof the
+        // ad-hoc rules missed (business outcome, application state, negative
+        // absence), never removes what already works. Replaces the weak
+        // "URL → text → done" default with the senior-engineer hierarchy.
+        this.enrichWithVerificationStandards(step, testPlan);
       }
     }
+  }
+
+  /** Actions that mark a meaningful verification checkpoint. A field entry (fill)
+   *  is NOT an outcome — a senior engineer asserts after the commit, not after
+   *  every keystroke, so we only enrich here. */
+  private static readonly VERIFICATION_CHECKPOINTS = new Set(['click', 'press', 'assert']);
+
+  private enrichWithVerificationStandards(step: TestPlanStep, testPlan: TestPlan): void {
+    // Verification belongs at meaningful checkpoints. `navigate` already gets a
+    // title check from the ad-hoc base; intermediate `fill`/`select`/`hover`
+    // steps are not outcomes. Enriching everything is exactly the AI-generated
+    // "assert after every line" noise a senior reviewer rejects.
+    if (!ScriptGenEngine.VERIFICATION_CHECKPOINTS.has(step.action)) return;
+
+    try {
+      const ctx: VerificationContext = {
+        // Surface page-object members so context can strengthen critical-UI checks.
+        pageObjectMembers: (testPlan.pageObjects || []).flatMap(po => [
+          ...(po.actions || []).map(a => a.name),
+          ...(po.locators || []).map(l => l.name),
+        ]),
+        existingAssertions: step.assertions || [],
+      };
+      const plan = planVerifications(step, ctx);
+
+      // The rule library ranks the plan by evidence strength. The Composer is
+      // deliberately SELECTIVE: it renders the single strongest verification the
+      // step actually supports (plus a focused negative guard), as a HARD
+      // assertion — never a pile of soft `.catch()` no-ops.
+      const lines = this.renderVerificationPlan(step, plan);
+
+      const existing = new Set((step.assertions || []).map(a => a.trim()));
+      const added = lines.filter(l => l && !existing.has(l.trim()));
+      if (added.length > 0) {
+        step.assertions = [...(step.assertions || []), ...added];
+      }
+    } catch {
+      // Fail open — leave the existing ad-hoc assertions untouched.
+    }
+  }
+
+  /**
+   * Framework + domain adapter: turn a (framework-agnostic) verification plan
+   * into at most two HARD Playwright assertions for this checkpoint. The rule
+   * library decided WHAT class of evidence matters (tier + strength) and WHICH
+   * kind of flow this is (category); this method is the only place that knows
+   * Playwright, and it renders the strongest evidence the step can actually
+   * support. Category-driven — six flows, not per-feature `if`s.
+   */
+  private renderVerificationPlan(step: TestPlanStep, plan: VerificationPlan): string[] {
+    const text = `${step.description || ''} ${step.target || ''}`.toLowerCase();
+    const lines: string[] = [];
+
+    const ERROR = `page.locator('[data-test="error"], .error-message, .error, .alert-danger, [role="alert"]').first()`;
+    const errorVisible = `await expect(${ERROR}).toBeVisible()`;
+    // Absence of error is a real, hard assertion (count 0) — not a soft no-op.
+    const errorAbsent = `await expect(page.locator('[data-test="error"], .error-message, .alert-danger, [role="alert"]')).toHaveCount(0)`;
+
+    // Negative test: the expected outcome IS the failure. One strong assertion.
+    if (plan.negativeTest) {
+      lines.push(errorVisible);
+      return lines;
+    }
+
+    const isCompletion = /\b(finish|complete|confirm|thank\s?you|place\s?(the\s)?order|success|submitted|purchase[ds]?|paid)\b/.test(text);
+    const landed = `await expect(page.locator('.inventory_list, #inventory_container, [data-test="inventory-container"], .dashboard, [class*="dashboard" i], .app_logo').first()).toBeVisible()`;
+    const confirmation = `await expect(page.locator('.complete-header, [data-test="complete-header"], .complete, [class*="complete" i], .confirmation, [class*="success" i]').first()).toBeVisible()`;
+    const cartState = `await expect(page.locator('.shopping_cart_badge, .cart_badge, [class*="cart" i][class*="badge" i], [data-test*="cart" i]').first()).toBeVisible()`;
+    const resultsState = `await expect(page.locator('.inventory_list, [class*="results" i], [class*="list" i], table tbody tr').first()).toBeVisible()`;
+    const targetSelector = step.selector || (step.target ? this.targetToPlaywright(step.target) : '');
+
+    // Primary evidence — the strongest proof this checkpoint can actually give,
+    // chosen by verification category (the rule library's classification).
+    switch (plan.category) {
+      case 'authentication':
+        lines.push(isCompletion ? confirmation : landed);
+        break;
+      case 'shopping':
+        lines.push(isCompletion ? confirmation : cartState);
+        break;
+      case 'crud':
+        lines.push(isCompletion ? confirmation : resultsState);
+        break;
+      case 'search':
+        lines.push(resultsState);
+        break;
+      case 'forms':
+        lines.push(isCompletion ? confirmation : (targetSelector ? `await expect(${targetSelector}).toBeVisible()` : landed));
+        break;
+      case 'navigation':
+        if (targetSelector) lines.push(`await expect(${targetSelector}).toBeVisible()`);
+        break;
+      default:
+        // generic — only assert if we have a concrete target to anchor on.
+        if (targetSelector) lines.push(`await expect(${targetSelector}).toBeVisible()`);
+        break;
+    }
+
+    // Focused negative guard: after a login or a form submit, a senior engineer
+    // also proves NO validation error slipped through. Kept to those flows so we
+    // don't double every assertion.
+    if ((plan.category === 'authentication' || plan.category === 'forms') && lines.length > 0) {
+      lines.push(errorAbsent);
+    }
+
+    return lines;
   }
 
   /* ──────────────────────────────────────────────────────────────────────── */
