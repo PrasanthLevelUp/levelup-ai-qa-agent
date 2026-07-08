@@ -12,8 +12,8 @@
  *   • Don't reuse bad code — sleep() / waitForTimeout() / pause() loses.
  *
  * Everything is ONE decision. `evaluateCandidate()` returns the whole verdict —
- * engineeringValue, locatorQuality, compatibility, quality, confidence — in a
- * single call. Ranking then does nothing but `sort(engineeringValue)`, and
+ * candidateScore, locatorQuality, compatibility, quality, confidence — in a
+ * single call. Ranking then does nothing but `sort(candidateScore)`, and
  * Selection does nothing but take the top. All the thinking happens here.
  *
  * Hard rules (unchanged across the whole project):
@@ -178,12 +178,12 @@ export type Confidence = 'high' | 'medium' | 'low';
 /** The complete verdict for a candidate — one object, one decision. */
 export interface CandidateEvaluation {
   /**
-   * Final engineering value = base priority + compatibility adjustment +
+   * Final candidate score = base priority + compatibility adjustment +
    * quality adjustment. THE sort key. A clean, compatible candidate keeps its
    * base (fixture 100); a stale or low-quality reuse candidate is driven below
    * the generated-locator floor so it can never win by merely existing.
    */
-  engineeringValue: number;
+  candidateScore: number;
   /** Locator quality — the only tie-breaker between equal engineering value. */
   locatorQuality: number;
   /** Compatibility with the current project (0–100). Kept for transparency. */
@@ -200,7 +200,7 @@ const QUALITY_PENALTY = 40;
 /**
  * Evaluate a candidate against every engineering standard in ONE call. This is
  * the single decision point: compatibility and quality fold into the final
- * engineeringValue as adjustments, so downstream Ranking is just a sort and
+ * candidateScore as adjustments, so downstream Ranking is just a sort and
  * Selection is just "take the top". No branching lives outside this function.
  */
 export function evaluateCandidate(c: ImplementationCandidate): CandidateEvaluation {
@@ -213,10 +213,10 @@ export function evaluateCandidate(c: ImplementationCandidate): CandidateEvaluati
   const compatibilityAdjustment = c.reuse ? -(COMPAT_OK - compatibility) : 0;
   const qualityAdjustment = c.reuse && !quality.ok ? -QUALITY_PENALTY : 0;
 
-  const engineeringValue = base.engineering + compatibilityAdjustment + qualityAdjustment;
+  const candidateScore = base.engineering + compatibilityAdjustment + qualityAdjustment;
   const confidence = deriveConfidence(base.engineering, compatibility, quality, c.reuse);
 
-  return { engineeringValue, locatorQuality: base.locator, compatibility, quality, confidence };
+  return { candidateScore, locatorQuality: base.locator, compatibility, quality, confidence };
 }
 
 /**

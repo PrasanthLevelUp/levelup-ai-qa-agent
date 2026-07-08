@@ -3,7 +3,7 @@
  * =======================================================
  * One deterministic decision per candidate. Verifies:
  *   • evaluateCandidate() folds compatibility + quality into a single
- *     engineeringValue (the sort key) — Ranking is then just a sort.
+ *     candidateScore (the sort key) — Ranking is then just a sort.
  *   • Stale reuse (deprecated / legacy / wrong-framework) is driven BELOW the
  *     generated-locator floor, so it can never win by merely existing.
  *   • Bad reuse (sleep / waitForTimeout / pause / FIXME) is likewise demoted.
@@ -40,16 +40,16 @@ afterEach(() => resetEngineeringStandards());
 
 describe('evaluateCandidate — the one decision', () => {
   it('a clean, compatible candidate keeps its base engineering value', () => {
-    expect(evaluateCandidate(cand({ type: 'existing-fixture', reuse: true })).engineeringValue).toBe(100);
-    expect(evaluateCandidate(cand({ type: 'app-profile-locator', reuse: false })).engineeringValue).toBe(92);
-    expect(evaluateCandidate(cand({ type: 'dom-locator', reuse: false })).engineeringValue).toBe(75);
+    expect(evaluateCandidate(cand({ type: 'existing-fixture', reuse: true })).candidateScore).toBe(100);
+    expect(evaluateCandidate(cand({ type: 'app-profile-locator', reuse: false })).candidateScore).toBe(92);
+    expect(evaluateCandidate(cand({ type: 'dom-locator', reuse: false })).candidateScore).toBe(75);
   });
 
   it('returns the whole verdict in one object', () => {
     const e = evaluateCandidate(cand({ type: 'existing-page-object', reuse: true }));
     expect(e).toEqual(
       expect.objectContaining({
-        engineeringValue: expect.any(Number),
+        candidateScore: expect.any(Number),
         locatorQuality: expect.any(Number),
         compatibility: expect.any(Number),
         quality: expect.objectContaining({ ok: expect.any(Boolean) }),
@@ -60,7 +60,7 @@ describe('evaluateCandidate — the one decision', () => {
 
   it('DEPRECATED reuse is driven below the generated-locator floor', () => {
     const e = evaluateCandidate(cand({ type: 'existing-fixture', reuse: true, meta: { deprecated: true } }));
-    expect(e.engineeringValue).toBeLessThan(DOM_FLOOR);
+    expect(e.candidateScore).toBeLessThan(DOM_FLOOR);
     expect(e.confidence).toBe('low');
   });
 
@@ -68,14 +68,14 @@ describe('evaluateCandidate — the one decision', () => {
     const e = evaluateCandidate(
       cand({ type: 'existing-page-object', reuse: true, source: 'LegacyLoginPage', meta: { path: 'pages/legacy/login.ts' } }),
     );
-    expect(e.engineeringValue).toBeLessThan(DOM_FLOOR);
+    expect(e.candidateScore).toBeLessThan(DOM_FLOOR);
   });
 
   it('WRONG-framework reuse drops below the floor', () => {
     const e = evaluateCandidate(
       cand({ type: 'existing-helper', reuse: true, meta: { framework: 'cypress', projectFramework: 'playwright' } }),
     );
-    expect(e.engineeringValue).toBeLessThan(DOM_FLOOR);
+    expect(e.candidateScore).toBeLessThan(DOM_FLOOR);
   });
 
   it('BAD-quality reuse (sleep) drops below the floor', () => {
@@ -83,7 +83,7 @@ describe('evaluateCandidate — the one decision', () => {
       cand({ type: 'existing-fixture', reuse: true, meta: { source: 'await sleep(5000)' } }),
     );
     expect(e.quality.ok).toBe(false);
-    expect(e.engineeringValue).toBeLessThan(DOM_FLOOR);
+    expect(e.candidateScore).toBeLessThan(DOM_FLOOR);
     expect(e.confidence).toBe('low');
   });
 
@@ -139,13 +139,13 @@ describe('priority table — internal override', () => {
   });
   it('override changes evaluation, reset restores it', () => {
     configureCandidatePriority({ 'existing-helper': { engineering: 200 } });
-    expect(evaluateCandidate(cand({ type: 'existing-helper', reuse: true })).engineeringValue).toBe(200);
+    expect(evaluateCandidate(cand({ type: 'existing-helper', reuse: true })).candidateScore).toBe(200);
     resetEngineeringStandards();
-    expect(evaluateCandidate(cand({ type: 'existing-helper', reuse: true })).engineeringValue).toBe(96);
+    expect(evaluateCandidate(cand({ type: 'existing-helper', reuse: true })).candidateScore).toBe(96);
   });
 });
 
-describe('integration — Ranking is just sort(engineeringValue)', () => {
+describe('integration — Ranking is just sort(candidateScore)', () => {
   const CTX: DiscoveryContext = {
     pageObjects: [{ name: 'LoginPage', methods: ['login'], path: 'pages/login.page.ts' }],
     fixtures: [{ name: 'loginFixture', path: 'fixtures/auth.fixture.ts' }],

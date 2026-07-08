@@ -3,9 +3,9 @@
  * ==============================================================
  * Ranking does almost nothing on purpose. Every engineering decision already
  * happened in EngineeringStandards.evaluateCandidate() — compatibility and
- * quality are folded into a single `engineeringValue`. So ranking is literally:
+ * quality are folded into a single `candidateScore`. So ranking is literally:
  *
- *     sort by engineeringValue desc, locatorQuality desc, original order.
+ *     sort by candidateScore desc, locatorQuality desc, original order.
  *
  * A clean, compatible reuse candidate keeps its high base value and wins. A
  * stale or low-quality reuse candidate has already been driven below the
@@ -31,7 +31,7 @@ function scoreCandidate(c: ImplementationCandidate): ImplementationCandidate {
   const e = evaluateCandidate(c);
   return {
     ...c,
-    engineeringValue: e.engineeringValue,
+    candidateScore: e.candidateScore,
     locatorQuality: e.locatorQuality,
     compatibility: e.compatibility,
     quality: e.quality,
@@ -41,14 +41,14 @@ function scoreCandidate(c: ImplementationCandidate): ImplementationCandidate {
 
 /**
  * Rank one step's candidates: evaluate each, then sort strongest-first by
- * (engineeringValue desc, locatorQuality desc, original order). The stable
+ * (candidateScore desc, locatorQuality desc, original order). The stable
  * original-order tie-break keeps ranking deterministic.
  */
 function rankStep(step: StepCandidates): StepCandidates {
   const ordered = step.candidates
     .map((c, i) => ({ c: scoreCandidate(c), i }))
     .sort((a, b) => {
-      const ev = (b.c.engineeringValue ?? 0) - (a.c.engineeringValue ?? 0);
+      const ev = (b.c.candidateScore ?? 0) - (a.c.candidateScore ?? 0);
       if (ev !== 0) return ev;
       const lq = (b.c.locatorQuality ?? 0) - (a.c.locatorQuality ?? 0);
       if (lq !== 0) return lq;

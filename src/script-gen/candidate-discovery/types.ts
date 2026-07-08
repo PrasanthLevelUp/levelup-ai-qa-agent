@@ -112,7 +112,7 @@ export interface ImplementationCandidate {
    * outranks generating a brand-new locator, even a perfect one. This is how a
    * senior automation engineer thinks.
    */
-  engineeringValue?: number;
+  candidateScore?: number;
   /**
    * Locator quality (0–100) — the SECONDARY dimension, used only to break ties
    * between candidates of equal engineering value. A great locator does not
@@ -171,7 +171,7 @@ export interface CandidateDiscoveryReport {
   /**
    * False on raw discovery output; true after `rankReport()` has scored and
    * ordered the candidates (PR 2B). When true, each candidate carries
-   * engineeringValue / locatorQuality / rank and each step's candidates are
+   * candidateScore / locatorQuality / rank and each step's candidates are
    * sorted strongest-first.
    */
   ranked: boolean;
