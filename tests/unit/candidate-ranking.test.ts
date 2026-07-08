@@ -46,7 +46,7 @@ describe('rankReport — flags & shape', () => {
 
   it('scores every candidate with both dimensions', () => {
     for (const c of candidatesOf('Click Login')) {
-      expect(typeof c.engineeringValue).toBe('number');
+      expect(typeof c.candidateScore).toBe('number');
       expect(typeof c.locatorQuality).toBe('number');
       expect(c.reason.length).toBeGreaterThan(0);
     }
@@ -60,7 +60,7 @@ describe('engineering-value-first ordering', () => {
     const appLoc = cs.find((c) => c.type === 'app-profile-locator')!;
     // The fixture has LOWER locator quality but wins on engineering value…
     expect(fixture.locatorQuality!).toBeLessThan(appLoc.locatorQuality!);
-    expect(fixture.engineeringValue!).toBeGreaterThan(appLoc.engineeringValue!);
+    expect(fixture.candidateScore!).toBeGreaterThan(appLoc.candidateScore!);
     // …so it ranks ahead of the locator.
     expect(fixture.rank!).toBeLessThan(appLoc.rank!);
   });
