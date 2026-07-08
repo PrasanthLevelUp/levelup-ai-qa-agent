@@ -56,6 +56,7 @@ import {
 } from '../intelligence/project-convention-profile';
 import { analyzeRepoPatterns } from './repo-pattern-analyzer';
 import { rankLocatorCandidates, type ElementLike } from '../intelligence/element-intelligence';
+import { discoverCandidates, type CandidateDiscoveryReport } from './candidate-discovery';
 import { adaptiveGenerateFiles } from './adaptive-codegen';
 import { getRAGService } from '../services/rag-service';
 import { TrueReuseEngine } from '../services/true-reuse-engine';
@@ -303,6 +304,13 @@ export interface GenerationResult {
    * specific method was chosen. Present only when repo profile is available.
    */
   repositoryIntelligence?: RepositoryIntelligenceReport;
+  /**
+   * Candidate Discovery (Sprint 2, PR 1) — every plausible implementation
+   * option discovered per business step (reuse assets + locator families).
+   * Read-only and non-ranking: it does NOT influence the generated code in this
+   * PR. Ranking (PR 2) and selection (PR 3) build on it later.
+   */
+  candidateDiscovery?: CandidateDiscoveryReport;
   /**
    * Pipeline observability (user request). Present on deterministic
    * requirement/test-case runs — lets the API and dashboard show WHERE the
@@ -1319,10 +1327,35 @@ ${combined.map(l => (l ? `    ${l}` : '')).join('\n')}
 
     const totalAssertions = combined.filter(a => /\bexpect\s*\(/.test(a)).length;
     const grounding = this.buildLocatorGroundingReport(tracked, content, stepTracked);
-    return this.buildTcResult(tc, title, baseUrl, crawl, tags, generatedFiles, totalAssertions, startTime, grounding, matchedPOs, usedPOVars);
+    // Candidate Discovery (Sprint 2, PR 1) — computed AFTER the spec is fully
+    // built so it is provably read-only: it can observe but never alter the
+    // generated code. Attached to the result as a transparency report only.
+    const candidateDiscovery = this.discoverStepCandidates(steps, config.repoProfile);
+    return this.buildTcResult(tc, title, baseUrl, crawl, tags, generatedFiles, totalAssertions, startTime, grounding, matchedPOs, usedPOVars, candidateDiscovery);
   }
 
-  /** Assemble a single-case GenerationResult (test plan + stats). */
+  /**
+   * Candidate Discovery (Sprint 2, PR 1) — read-only.
+   *
+   * Discovers every plausible implementation candidate per business step, using
+   * the SAME reuse catalogue the generator already consults. It runs AFTER the
+   * spec has been built and its result is only attached to metadata, so it
+   * cannot alter the generated code. Fails open (never throws) — discovery is a
+   * transparency report, never a gate.
+   */
+  private discoverStepCandidates(
+    steps: string[],
+    profile?: import('../context/types').RepositoryProfile,
+  ): CandidateDiscoveryReport {
+    const cat = buildReuseCatalogue(profile);
+    return discoverCandidates(steps, {
+      pageObjects: cat.pageObjects.map((p) => ({ name: p.name, methods: p.methods, path: p.path })),
+      helpers: cat.helpers.map((h) => ({ name: h.name, functions: h.functions, path: h.path })),
+      fixtures: cat.fixtures.map((f) => ({ name: f.name, path: f.path })),
+      components: cat.components.map((c) => ({ name: c.name, path: c.path })),
+    });
+  }
+
   private buildTcResult(
     tc: NonNullable<GenerationConfig['testCase']>,
     title: string,
@@ -1335,6 +1368,7 @@ ${combined.map(l => (l ? `    ${l}` : '')).join('\n')}
     locatorGrounding?: LocatorGroundingReport,
     matchedPOs?: Array<{ name: string; varName: string; filePath: string; methods: string[]; importPath: string; kind: string }>,
     usedPOVars?: Set<string>,
+    candidateDiscovery?: CandidateDiscoveryReport,
   ): GenerationResult {
     // Real selector quality (0–1), derived from what the spec actually uses —
     // never the old hardcoded 0. Honest blend (review fix #3): a DOM-verified
@@ -1405,6 +1439,7 @@ ${combined.map(l => (l ? `    ${l}` : '')).join('\n')}
       errors: [],
       ...(locatorGrounding ? { locatorGrounding } : {}),
       ...(repositoryIntelligence ? { repositoryIntelligence } : {}),
+      ...(candidateDiscovery ? { candidateDiscovery } : {}),
     };
   }
 
