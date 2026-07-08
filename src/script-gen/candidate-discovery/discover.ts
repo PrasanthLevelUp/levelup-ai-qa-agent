@@ -29,9 +29,51 @@ function hasAny(text: string, words: string[]): boolean {
   return words.some((w) => hasWord(text, w));
 }
 
-/** Build a candidate, deriving the `reuse` flag from the type. */
-function candidate(type: CandidateType, source: string, detail?: string): ImplementationCandidate {
-  return { type, source, detail, reuse: REUSE_TYPES.has(type) };
+/**
+ * The engineering rationale for each candidate family — WHY this option exists.
+ * Set at discovery time so the report reads candidate → reason → score and
+ * Ranking (PR 2B) can explain its decisions without re-deriving intent.
+ */
+const REASON: Record<CandidateType, string> = {
+  'existing-fixture': 'Existing reusable fixture — preferred setup abstraction',
+  'existing-page-object': 'Existing Page Object method — reuse over new code',
+  'existing-helper': 'Existing helper function — reuse over new code',
+  'existing-component': 'Existing component abstraction — reuse over new code',
+  'app-profile-locator': 'Grounded in the crawled Application Profile',
+  'accessibility-locator': 'User-facing accessible locator (role / label)',
+  'dom-locator': 'DOM fallback locator (css / text)',
+};
+
+/** Build a candidate, deriving the `reuse` flag and `reason` from the type. */
+function candidate(
+  type: CandidateType,
+  source: string,
+  detail?: string,
+  meta?: import('./types').CandidateMeta,
+): ImplementationCandidate {
+  const c: ImplementationCandidate = { type, source, detail, reuse: REUSE_TYPES.has(type), reason: REASON[type] };
+  if (meta) c.meta = meta;
+  return c;
+}
+
+/**
+ * Capture the raw signals of a reuse asset into the candidate's meta bag, so
+ * Ranking's Compatibility/Quality heuristics can judge staleness without any
+ * new plumbing. Pure — copies fields only.
+ */
+function assetMeta(
+  asset: { name: string; path?: string; deprecated?: boolean; framework?: string; tags?: string[]; source?: string },
+  ctx: DiscoveryContext,
+): import('./types').CandidateMeta {
+  return {
+    name: asset.name,
+    path: asset.path,
+    deprecated: asset.deprecated,
+    framework: asset.framework,
+    projectFramework: ctx.projectFramework,
+    tags: asset.tags,
+    source: asset.source,
+  };
 }
 
 /**
@@ -98,12 +140,12 @@ export function discoverReuseCandidates(
     for (const m of po.methods ?? []) {
       const methodMatches = targetWords.some((w) => w.length > 2 && norm(m).includes(w)) || hasWord(t, norm(m));
       if (poMatches || methodMatches) {
-        out.push(candidate('existing-page-object', `${po.name}.${m}()`, po.path));
+        out.push(candidate('existing-page-object', `${po.name}.${m}()`, po.path, assetMeta(po, ctx)));
       }
     }
     // A matched PO with no matching method is still a reuse lead worth surfacing.
     if (poMatches && !(po.methods ?? []).length) {
-      out.push(candidate('existing-page-object', `${po.name}`, po.path));
+      out.push(candidate('existing-page-object', `${po.name}`, po.path, assetMeta(po, ctx)));
     }
   }
 
@@ -111,18 +153,18 @@ export function discoverReuseCandidates(
   for (const h of ctx.helpers ?? []) {
     for (const fn of h.functions ?? []) {
       const fnMatches = targetWords.some((w) => w.length > 2 && norm(fn).includes(w)) || hasWord(t, norm(fn));
-      if (fnMatches) out.push(candidate('existing-helper', `${fn}()`, h.path ?? h.name));
+      if (fnMatches) out.push(candidate('existing-helper', `${fn}()`, h.path ?? h.name, assetMeta(h, ctx)));
     }
   }
 
   // Fixtures (e.g. authenticatedFixture).
   for (const f of ctx.fixtures ?? []) {
-    if (matchesName(f.name)) out.push(candidate('existing-fixture', f.name, f.path));
+    if (matchesName(f.name)) out.push(candidate('existing-fixture', f.name, f.path, assetMeta(f, ctx)));
   }
 
   // Components.
   for (const c of ctx.components ?? []) {
-    if (matchesName(c.name)) out.push(candidate('existing-component', c.name, c.path));
+    if (matchesName(c.name)) out.push(candidate('existing-component', c.name, c.path, assetMeta(c, ctx)));
   }
 
   return out;
