@@ -35,6 +35,12 @@ import { buildStabilityProvider, trackGeneratedSelector } from '../services/inte
 import { getCrawlAdaptationForUrl } from '../services/crawl-adaptation-service';
 import { AssertionEngine, type GeneratedAssertion } from './assertion-engine';
 import {
+  planVerifications,
+  type VerificationContext,
+  type VerificationPlan,
+  type EvidenceKind,
+} from './verification-standards';
+import {
   ScenarioIntelligence,
   type CredentialResolver as ScenarioCredentialResolver,
 } from './scenario-intelligence';
@@ -4936,7 +4942,7 @@ ${config.testCase
           }
         }
 
-        // Inject assertions for navigation and submit actions
+        // ── Existing ad-hoc assertions (kept as a proven base) ──────────
         if (step.action === 'navigate') {
           prevUrl = step.target;
           step.assertions = [
@@ -4953,8 +4959,127 @@ ${config.testCase
           const pageAssertions = this.assertionEngine.generateForPageType(crawl.pageType);
           step.assertions = pageAssertions.map(a => a.playwrightCode);
         }
+
+        // ── Sprint 3A: Verification Standards enrichment ────────────────
+        // Fold the deterministic verification plan into this step's assertions,
+        // strongest evidence first. Additive & fail-open: it only ADDS proof the
+        // ad-hoc rules missed (business outcome, application state, negative
+        // absence), never removes what already works. Replaces the weak
+        // "URL → text → done" default with the senior-engineer hierarchy.
+        this.enrichWithVerificationStandards(step, testPlan);
       }
     }
+  }
+
+  /** Actions that mark a meaningful verification checkpoint. A field entry (fill)
+   *  is NOT an outcome — a senior engineer asserts after the commit, not after
+   *  every keystroke, so we only enrich here. */
+  private static readonly VERIFICATION_CHECKPOINTS = new Set(['click', 'press', 'assert']);
+
+  private enrichWithVerificationStandards(step: TestPlanStep, testPlan: TestPlan): void {
+    // Verification belongs at meaningful checkpoints. `navigate` already gets a
+    // title check from the ad-hoc base; intermediate `fill`/`select`/`hover`
+    // steps are not outcomes. Enriching everything is exactly the AI-generated
+    // "assert after every line" noise a senior reviewer rejects.
+    if (!ScriptGenEngine.VERIFICATION_CHECKPOINTS.has(step.action)) return;
+
+    try {
+      const ctx: VerificationContext = {
+        // Surface page-object members so context can strengthen critical-UI checks.
+        pageObjectMembers: (testPlan.pageObjects || []).flatMap(po => [
+          ...(po.actions || []).map(a => a.name),
+          ...(po.locators || []).map(l => l.name),
+        ]),
+        existingAssertions: step.assertions || [],
+      };
+      const plan = planVerifications(step, ctx);
+
+      // The rule library ranks the plan by evidence strength. The Composer is
+      // deliberately SELECTIVE: it renders the single strongest verification the
+      // step actually supports (plus a focused negative guard), as a HARD
+      // assertion — never a pile of soft `.catch()` no-ops.
+      const lines = this.renderVerificationPlan(step, plan);
+
+      const existing = new Set((step.assertions || []).map(a => a.trim()));
+      const added = lines.filter(l => l && !existing.has(l.trim()));
+      if (added.length > 0) {
+        step.assertions = [...(step.assertions || []), ...added];
+      }
+    } catch {
+      // Fail open — leave the existing ad-hoc assertions untouched.
+    }
+  }
+
+  /**
+   * Framework + domain adapter: render a verification PLAN into hard Playwright
+   * assertions. The rule library already decided the business OBJECTIVES to
+   * prove and the EVIDENCE (framework-agnostic) that proves each; this method is
+   * the only place that knows Playwright. It renders each evidence kind into a
+   * resilient assertion, category/completion-aware — six flows, not per-feature
+   * `if`s. Several assertions for one objective is expected and correct: they
+   * are the evidence, not extra objectives.
+   */
+  private renderVerificationPlan(step: TestPlanStep, plan: VerificationPlan): string[] {
+    const text = `${step.description || ''} ${step.target || ''}`.toLowerCase();
+    const isCompletion = /\b(finish|complete|confirm|thank\s?you|place\s?(the\s)?order|success|submitted|purchase[ds]?|paid|receipt)\b/.test(text);
+    const targetSelector = step.selector || (step.target ? this.targetToPlaywright(step.target) : '');
+
+    // Resilient locator fragments (SauceDemo-proven, written to generalise).
+    const landed = `page.locator('.inventory_list, #inventory_container, [data-test="inventory-container"], .dashboard, [class*="dashboard" i], .app_logo').first()`;
+    const confirmation = `page.locator('.complete-header, [data-test="complete-header"], .complete, [class*="complete" i], .confirmation, [class*="success" i]').first()`;
+    const cartState = `page.locator('.shopping_cart_badge, .cart_badge, [class*="cart" i][class*="badge" i], [data-test*="cart" i]').first()`;
+    const cartLink = `page.locator('.shopping_cart_link, [data-test*="cart" i], a[href*="cart" i]').first()`;
+    const resultsState = `page.locator('.inventory_list, [class*="results" i], [class*="list" i], table tbody tr').first()`;
+    const authLandmark = `page.locator('#react-burger-menu-btn, [data-test="primary-header"], [class*="menu" i] button, [aria-label*="menu" i], [class*="avatar" i], [class*="account" i]').first()`;
+    const errorGroup = `page.locator('[data-test="error"], .error-message, .alert-danger, [role="alert"]')`;
+
+    // Render ONE evidence kind → one resilient assertion, chosen by category.
+    const render = (kind: EvidenceKind): string | null => {
+      switch (kind) {
+        case 'error-present':
+          return `await expect(page.locator('[data-test="error"], .error-message, .error, .alert-danger, [role="alert"]').first()).toBeVisible()`;
+        case 'error-absent':
+          // Absence of error is a real, hard assertion (count 0) — not a soft no-op.
+          return `await expect(${errorGroup}).toHaveCount(0)`;
+        case 'success-indicator':
+          if (isCompletion) return `await expect(${confirmation}).toBeVisible()`;
+          switch (plan.category) {
+            case 'authentication': return `await expect(${landed}).toBeVisible()`;
+            case 'shopping':       return `await expect(${cartState}).toBeVisible()`;
+            case 'crud':
+            case 'search':         return `await expect(${resultsState}).toBeVisible()`;
+            case 'forms':          return targetSelector ? `await expect(${targetSelector}).toBeVisible()` : `await expect(${landed}).toBeVisible()`;
+            default:               return targetSelector ? `await expect(${targetSelector}).toBeVisible()` : `await expect(${landed}).toBeVisible()`;
+          }
+        case 'state-change':
+          return plan.category === 'shopping'
+            ? `await expect(${cartState}).toBeVisible()`
+            : `await expect(${resultsState}).toBeVisible()`;
+        case 'landmark-control':
+          if (plan.category === 'authentication') return `await expect(${authLandmark}).toBeVisible()`;
+          if (plan.category === 'shopping')       return `await expect(${cartLink}).toBeVisible()`;
+          return targetSelector ? `await expect(${targetSelector}).toBeVisible()` : null;
+        case 'navigation':
+          return `await expect(page).toHaveURL(/.+/)`;
+        default:
+          return null;
+      }
+    };
+
+    // Render every objective's evidence; dedup so overlapping evidence collapses
+    // (that is WHY one objective can still be a single strong assertion).
+    const seen = new Set<string>();
+    const lines: string[] = [];
+    for (const objective of plan.objectives) {
+      for (const kind of objective.evidence) {
+        const line = render(kind);
+        if (line && !seen.has(line)) {
+          seen.add(line);
+          lines.push(line);
+        }
+      }
+    }
+    return lines;
   }
 
   /* ──────────────────────────────────────────────────────────────────────── */
