@@ -68,6 +68,31 @@ export interface ImplementationCandidate {
   detail?: string;
   /** True when this candidate reuses existing repo code (derived from `type`). */
   reuse: boolean;
+  /**
+   * WHY this candidate exists — a short engineering rationale (e.g. "Existing
+   * reusable abstraction"). Set at discovery time so Ranking can explain its
+   * decision and the report is debuggable: candidate → reason → score.
+   */
+  reason: string;
+
+  // ── Ranking fields (added by PR 2B — Candidate Ranking) ────────────────────
+  // Absent on raw discovery output; populated by rankReport(). Discovery itself
+  // never sets these (the Discovery → Ranking boundary stays explicit).
+  /**
+   * Engineering value (0–100) — the PRIMARY ranking dimension. Reflects the
+   * *engineering decision*, not the locator: reuse of an existing abstraction
+   * outranks generating a brand-new locator, even a perfect one. This is how a
+   * senior automation engineer thinks.
+   */
+  engineeringValue?: number;
+  /**
+   * Locator quality (0–100) — the SECONDARY dimension, used only to break ties
+   * between candidates of equal engineering value. A great locator does not
+   * beat reuse; it only sorts amongst equals.
+   */
+  locatorQuality?: number;
+  /** 1-based position after ranking (1 = strongest). Present only once ranked. */
+  rank?: number;
 }
 
 /** All candidates discovered for one business step. */
@@ -95,12 +120,15 @@ export interface CandidateDiscoveryReport {
   /** Count of candidates that reuse existing repo code. */
   reuseCandidates: number;
   /**
-   * Invariant flag — ALWAYS false in this PR. Discovery never ranks. Present so
-   * downstream code (and tests) can assert the boundary explicitly.
+   * False on raw discovery output; true after `rankReport()` has scored and
+   * ordered the candidates (PR 2B). When true, each candidate carries
+   * engineeringValue / locatorQuality / rank and each step's candidates are
+   * sorted strongest-first.
    */
-  ranked: false;
+  ranked: boolean;
   /**
-   * Invariant flag — ALWAYS false in this PR. Discovery never selects a winner.
+   * Invariant flag — ALWAYS false through PR 2B. Ranking orders candidates but
+   * does NOT pick a winner or change generation; that is Selection (PR 2C).
    */
   selected: false;
 }
