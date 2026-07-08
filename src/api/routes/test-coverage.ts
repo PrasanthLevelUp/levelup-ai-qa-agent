@@ -11,6 +11,7 @@ import {
   type KnowledgeContext,
 } from '../../engines/test-coverage-engine';
 import { TestToScriptEngine } from '../../engines/test-to-script-engine';
+import { validateScenarioIntegrity } from '../../engines/scenario-integrity';
 import { GitHubService } from '../../services/github-service';
 import { ManualRenderer } from '../../renderers/scenario-renderer';
 import type { CanonicalScenario, ManualTestCase } from '../../renderers/scenario-renderer';
@@ -63,6 +64,30 @@ function buildAiMetadata(fields: Record<string, any>): Record<string, any> {
     }
   }
   return out;
+}
+
+/**
+ * SCENARIO INTEGRITY VALIDATOR — non-blocking certification hook (Sprint 1.5).
+ *
+ * Runs the read-only Scenario Integrity Validator over a persisted case and
+ * returns its report for attachment to `ai_metadata.scenarioIntegrity`.
+ *
+ * NON-BLOCKING BY CONTRACT:
+ *   • The validator itself never throws and its `generationAllowed` is always
+ *     `true` — but we ALSO wrap the call so that even an unexpected failure
+ *     here can never interrupt persistence. On any error we return `undefined`,
+ *     which `buildAiMetadata` drops silently.
+ *   • This attaches diagnostic data only; it NEVER alters the case.
+ */
+function certifyScenarioIntegrity(scenario: any): Record<string, any> | undefined {
+  try {
+    return validateScenarioIntegrity(scenario) as unknown as Record<string, any>;
+  } catch (err: any) {
+    logger.warn(MOD, 'Scenario integrity certification skipped (non-blocking)', {
+      error: err?.message,
+    });
+    return undefined;
+  }
 }
 
 /**
@@ -580,6 +605,20 @@ export function createTestCoverageRouter(): Router {
                 riskArea: (tc as any).riskArea,
                 grounding: (tc as any).grounding,
                 expected: (tc as any).expected,
+                // Sprint 1.5 — read-only integrity certification. Diagnostic
+                // only; never blocks (generationAllowed is always true) and
+                // never mutates the case. See SCRIPT_COMPOSER_EVOLUTION.md.
+                scenarioIntegrity: certifyScenarioIntegrity({
+                  title: tc.title,
+                  objective: (tc as any).objective,
+                  coverageType: (tc as any).coverageType || matchingScenario.coverageType,
+                  preconditions: tc.preconditions,
+                  steps: tc.steps,
+                  grounding: (tc as any).grounding,
+                  expected: (tc as any).expected,
+                  expectedResult: tc.expectedResult,
+                  testData: tc.testData,
+                }),
               }),
               priority: tc.priority || 'P2',
               severity: tc.severity || 'major',

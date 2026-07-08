@@ -65,7 +65,7 @@ Requirement
     ↓
 Scenario Builder          (engines/scenario-builder.ts — canonical scenario, Phase A)
     ↓
-Scenario Integrity Engine (certifies the scenario; warnings only, never mutates — Sprint 1.5)
+Scenario Integrity Validator (certifies the scenario; warnings only, never mutates — Sprint 1.5)
     ↓
 Canonical Scenario        (grounding[] + structured expected, one source of truth)
     ↓
@@ -78,7 +78,7 @@ Quality Gate              (validation-runner + ai-review-engine + framework-audi
 Persist                   (generated_test_cases / scripts + ai_metadata)
 ```
 
-> The **Scenario Integrity Engine** is a deterministic certifier inserted between the Scenario
+> The **Scenario Integrity Validator** is a deterministic certifier inserted between the Scenario
 > Builder and everything downstream. It does **not** own or mutate scenario data — the Scenario
 > Builder remains the sole owner. It only answers: *"Is this canonical scenario internally
 > consistent and automation-ready?"* and attaches a readiness score + warnings. See Sprint 1.5.
@@ -88,7 +88,7 @@ Persist                   (generated_test_cases / scripts + ai_metadata)
 | Stage | Primary module(s) |
 | --- | --- |
 | Scenario Builder | `src/engines/scenario-builder.ts` |
-| **Scenario Integrity Engine** | `src/engines/scenario-integrity/` *(proposed — Sprint 1.5)* |
+| **Scenario Integrity Validator** | `src/engines/scenario-integrity/` *(proposed — Sprint 1.5)* |
 | Canonical Scenario | `DraftTestCase` / `FormatterTestCase` (`grounding[]`, structured `expected`, `schemaVersion`) |
 | Renderers / Projection | `src/renderers/scenario-renderer.ts` (Manual / Script / BDD) |
 | Execution Context | `src/script-gen/page-crawler.ts`, `src/context/*`, `src/intelligence/project-convention-profile.ts` |
@@ -135,7 +135,7 @@ The Script Composer (`ScriptGenEngine`) already composes the sub-engines we will
 
 ---
 
-### Sprint 1.5 — Scenario Integrity Engine  ⭐⭐⭐⭐⭐ (do before Sprint 2)
+### Sprint 1.5 — Scenario Integrity Validator  ⭐⭐⭐⭐⭐ (do before Sprint 2)
 
 A deterministic **certifier** that sits between the Scenario Builder and the Script Composer. It is
 **not new intelligence** — no LLM, no generation. It answers one question:
@@ -147,71 +147,129 @@ Composer always receives a high-quality, certified scenario, locator / assertion
 drop **without touching generation.** This is the first of the two deterministic rule libraries (see
 §5) and the natural partner to the Engineering Heuristics Library.
 
-#### Hard rule: report, never rewrite
+> **It is a Validator, not an Engine.** The name is deliberate. Alongside Scenario **Builder**,
+> Script **Composer**, and Quality **Gate**, calling this an "Engine" would imply it owns logic. It
+> does not. It **certifies.** Its entire responsibility is: *"Is this scenario internally
+> consistent?"* — nothing more.
+
+#### Hard rule #1: report, never rewrite
 
 ```
 Scenario → Validator → Issues → (same) Scenario     ✅
 Scenario → Validator → Scenario rewritten           ❌  (forbidden)
 ```
 
-The Scenario Builder remains the **sole owner** of scenario data. The Integrity Engine only attaches
+The Scenario Builder remains the **sole owner** of scenario data. The Integrity Validator only attaches
 quality signals (warnings + a readiness score); it never mutates steps, grounding, or expected.
+
+#### Hard rule #2: the readiness score influences confidence, NEVER behavior
+
+The Automation Readiness Score must **never block generation.** Enterprise teams often intentionally
+automate incomplete requirements — the tool must not become restrictive.
+
+```
+Scenario Ready — 63%   →   Generation blocked.            ❌  (forbidden)
+
+Scenario Ready — 63%   →   Generation completed.          ✅
+                           Confidence: Medium
+                           Warnings:
+                             - Persona mismatch
+                             - Missing grounding
+```
+
+The score influences **confidence and warnings only.** `generationAllowed` is always `true`.
+
+#### Hard rule #3: it must NOT become a mini Script Composer
+
+The Validator does **not** improve locators, expand assertions, add coverage, or touch the framework.
+Those belong to the Script Composer (Sprints 2–7). Keep the Validator brutally simple — its only job is
+internal-consistency certification.
 
 #### What it validates
 
+> Every check below produces **warnings only** — never a hard, generation-blocking failure (Hard
+> rule #2). "warn" means the check found an inconsistency and lowered the readiness score.
+
 1. **Persona consistency** ⭐⭐⭐⭐⭐ — the persona/test data must match the scenario intent.
-   - `Title: Login with locked user` + `Test Data: standard_user` → **fail**
-   - `Title: Successful login` + `Expected: Authentication rejected` → **fail**
+   - `Title: Login with locked user` + `Test Data: standard_user` → **warn**
+   - `Title: Successful login` + `Expected: Authentication rejected` → **warn**
 2. **Coverage polarity** ⭐⭐⭐⭐⭐ — expected outcome must match the coverage type (deterministic):
    - positive → success state (e.g. dashboard displayed)
    - negative → error shown
    - edge → graceful validation
    - boundary → limit accepted/rejected
 3. **Test-data suitability** ⭐⭐⭐⭐⭐ — dataset must fit the scenario.
-   - `valid login` scenario + `locked_user` dataset → **fail**
+   - `valid login` scenario + `locked_user` dataset → **warn**
 4. **Expected-result consistency** ⭐⭐⭐⭐⭐ — manual outcome vs. structured expected must agree.
-   - manual `Login successful` + expected `Error displayed` → **fail**
+   - manual `Login successful` + expected `Error displayed` → **warn**
 5. **Step completeness** ⭐⭐⭐⭐⭐ — steps must plausibly produce the expected outcome.
-   - `Click Login` → expected `Inventory page`, but no username/password entered → **incomplete, flag**
+   - `Click Login` → expected `Inventory page`, but no username/password entered → **warn (incomplete)**
 6. **Missing preconditions** ⭐⭐⭐⭐⭐ — required preconditions must be present.
-   - `Checkout` without `User logged in` → **flag**
-7. **Grounding completeness** ⭐⭐⭐⭐☆ — every actionable step should have grounding.
-   - `Enter username` with no grounding → **do not fail; reduce confidence.**
+   - `Checkout` without `User logged in` → **warn**
+7. **Business flow consistency** ⭐⭐⭐⭐⭐ — steps must follow a possible state progression.
+   Deterministic state-order validation (no AI): each step maps to a business stage
+   (`open → login → browse → add-to-cart → cart → checkout → payment → confirmation → logout`),
+   and impossible orderings are flagged.
+   - `Checkout → Payment → Add item` → **warn** (add-to-cart after checkout is impossible)
+   - `Logout → Add item` → **warn** (authenticated action after logout is impossible)
+   - `Checkout` with no prior `Add item` → **warn** (checkout without a cart)
+8. **Grounding completeness** ⭐⭐⭐⭐☆ — every actionable step should have grounding.
+   - `Enter username` with no grounding → **do not warn hard; reduce confidence** (score penalty only).
 
 #### Automation Readiness Score
 
-Before the Script Composer starts, the engine computes a scenario-quality score so the Composer knows
-**how much to trust the scenario:**
+Before the Script Composer starts, the Validator computes a scenario-quality score so the Composer knows
+**how much to trust the scenario** (confidence only — it never blocks, per Hard rule #2):
 
 | Check | Result |
 | --- | :--: |
 | Persona | ✅ |
-| Expected | ✅ |
-| Preconditions | ✅ |
-| Grounding | ⚠️ |
+| Coverage polarity | ✅ |
 | Test Data | ✅ |
-| Coverage | ✅ |
+| Expected | ✅ |
+| Step completeness | ✅ |
+| Preconditions | ✅ |
+| Business flow | ✅ |
+| Grounding | ⚠️ |
 
 ```
-Scenario Ready — 96%
+Scenario Ready — 96%   ·   Confidence: High
 ```
 
 The score (and the per-check breakdown) is carried alongside the scenario and later feeds the Sprint 7
 Confidence Engine and Smart TODOs — honest signal instead of silent compensation.
 
+#### One number is not enough — expose dimensions to the Quality Gate
+
+A single readiness number isn't actionable. The Validator's score is the **Scenario Quality**
+dimension; the Quality Gate combines it with the Composer's own quality signals into one report:
+
+```
+Scenario Quality    95      (Scenario Integrity Validator — this sprint)
+Framework Quality   97      (framework-auditor)
+Locator Quality     94      (Sprint 2)
+Assertion Quality   96      (Sprints 3 & 4)
+────────────────────────
+Overall Ready       95
+```
+
+The Validator owns only **Scenario Quality**; the other dimensions are filled in by later sprints. The
+report shape is designed so each dimension plugs in without changing the others.
+
 #### Where it lives
 
 `src/engines/scenario-integrity/` — a pure, dependency-light rule module. Output is a typed
-`ScenarioIntegrityReport { readinessScore, checks[], warnings[] }` attached to the scenario. No stage
-boundary moves; the Scenario Builder still owns the data.
+`ScenarioIntegrityReport { readinessScore, confidence, generationAllowed, checks[], warnings[] }`
+attached to the scenario (persisted read-only in `ai_metadata.scenarioIntegrity`). No stage boundary
+moves; the Scenario Builder still owns the data. `generationAllowed` is **always `true`.**
 
 **Milestones (ship small — measure after each):**
 - **1.5a** — Report scaffold + persona / expected-result / coverage-polarity checks (the three highest-signal, purely-textual checks).
 - **1.5b** — Test-data suitability + missing-preconditions + step-completeness checks.
-- **1.5c** — Grounding-completeness check (confidence penalty, not a failure).
-- **1.5d** — Automation Readiness Score aggregation + surface the report to the Script Composer and dashboard.
+- **1.5c** — Business-flow consistency (deterministic state-order) + grounding-completeness (confidence penalty).
+- **1.5d** — Automation Readiness Score aggregation + Scenario Quality dimension surfaced to the Quality Gate & dashboard (read-only, never blocking).
 
-> **Sequencing:** only after the Scenario Integrity Engine is stable do we begin Sprint 2.
+> **Sequencing:** only after the Scenario Integrity Validator is stable do we begin Sprint 2.
 
 ---
 
@@ -271,13 +329,17 @@ Reuse/extend `core/candidate-ranker.ts` scoring. Indicative scores:
 
 **Never just use the first locator. Find → Rank → Choose.**
 
-#### 4.3 Candidate Selection
+#### 4.3 Candidate Selection — score the *strategy*, and record *why*
 
 - Choose the highest-scoring candidate.
-- If the top two are close, keep **both** — record the runner-up as an alternative:
+- If the top two are close, keep **both** — record the runner-up as an alternative.
+- Score the **locator strategy**, not just the string — and persist the **reasons**. Debuggability
+  and auditability come for free: when someone asks *"why didn't LevelUp use XPath?"*, the answer is
+  already stored.
   ```
-  Chosen:      getByRole('button', { name: 'Login' })
-  Alternative: getByTestId('login-btn')
+  Chosen:      getByRole('button', { name: 'Login' })   strategy: role   score: 96
+  Why:         ✓ accessible  ✓ stable  ✓ user-facing  ✓ matches framework convention
+  Alternative: getByTestId('login-btn')                 strategy: testid score: 98 (framework prefers role)
   ```
 
 #### 4.4 Confidence banding (feeds Sprint 7)
@@ -394,7 +456,7 @@ They complement each other without adding an AI component or growing prompts:
 
 | Library | Question it answers | Stage |
 | --- | --- | --- |
-| **Scenario Integrity Engine** (§4, Sprint 1.5) | *"Is the canonical scenario internally correct and automation-ready?"* | Before the Composer |
+| **Scenario Integrity Validator** (§4, Sprint 1.5) | *"Is the canonical scenario internally correct and automation-ready?"* | Before the Composer |
 | **Engineering Heuristics Library** (below) | *"Given a correct scenario, what is the best way to implement it as production-quality automation?"* | Inside the Composer |
 
 Together they give a stronger long-term foundation than continually expanding prompts or adding new
@@ -446,7 +508,7 @@ successful generations) — **without** increasing token usage or architectural 
 | Phase | Goal | Change type |
 | --- | --- | --- |
 | 1 | Fix & Freeze | Regression fix + freeze declaration |
-| **1.5** | **Scenario Integrity Engine** | **Certify the scenario (readiness score + warnings); never mutate** |
+| **1.5** | **Scenario Integrity Validator** | **Certify the scenario (readiness score + warnings); never mutate** |
 | 2 | Locator Ranking Engine | Improve **selection**, no architecture changes |
 | 3 | Assertion Expansion | Increase automation coverage |
 | 4 | Coverage Expansion | Add meaningful automation-only validations |
@@ -479,7 +541,7 @@ no major rewrites.
 
 ```
 src/engines/scenario-builder.ts            canonical scenario (Phase A)
-src/engines/scenario-integrity/ (proposed) Scenario Integrity Engine → Sprint 1.5 / §5
+src/engines/scenario-integrity/ (proposed) Scenario Integrity Validator → Sprint 1.5 / §5
 src/renderers/scenario-renderer.ts         Manual / Script / BDD projection (Phase B)
 src/script-gen/script-gen-engine.ts        ScriptGenEngine — the Script Composer
   ├── selector-quality-engine.ts           locator scoring         → Sprint 2
