@@ -335,6 +335,23 @@ export interface GenerationResult {
    * unmappedStepPolicy='error', the generation fails instead).
    */
   unmappedSteps?: Array<{ testCaseId?: number; step: string }>;
+  /**
+   * Coverage metadata DERIVED per test case (categories + repository assets
+   * reused). Generation Quality: this used to be duplicated as a comment header
+   * inside every spec. The framework already owns Coverage/RTM reports, so the
+   * data now lives here as structured result — the spec code stays clean.
+   */
+  coverage?: CoverageEntry[];
+}
+
+/** Derived coverage metadata for a single generated test case. */
+export interface CoverageEntry {
+  testCaseId?: number;
+  title: string;
+  /** Comma-joined categories, e.g. "Negative, Boundary". */
+  categories: string;
+  /** Semicolon-joined repository assets reused, e.g. "LoginPage (Page Object); …". */
+  assets: string;
 }
 
 /** Page Object metadata exposed for transparency and debugging. */
@@ -1106,15 +1123,13 @@ export class ScriptGenEngine {
 
     const title = tc.title || 'Generated test';
     const tags = this.tcTags(tc);
-    const idMarker = tc.id != null ? `\n  // @tc:TC${tc.id}` : '';
-    // Locator-consistency fix: correct any hallucinated test-hook attribute in
-    // the prose steps (e.g. `data-testid`) to the attribute the crawled DOM
-    // actually uses (e.g. SauceDemo's `data-test`), so the human-readable steps
-    // never contradict the grounded selectors the executable code resolves.
-    const realTestHookAttr = this.detectTestHookAttr(crawl);
-    const stepComments = steps
-      .map((s, i) => `   *   ${i + 1}. ${this.escapeBlockComment(this.normalizeStepSelectors(s, realTestHookAttr))}`)
-      .join('\n');
+    // Generation Quality (Sprint 4): the ONLY comment a senior engineer keeps in
+    // the emitted spec is the traceability marker. Everything else (per-step
+    // narration, coverage header, data-source notes) is duplicated by the Test
+    // Cases / RTM / App Knowledge / Reports the framework already owns, so it is
+    // NOT re-emitted into the script. The marker is 4-space indented to sit flush
+    // with the test body.
+    const idMarker = tc.id != null ? `\n    // @tc:TC${tc.id}` : '';
 
     // ── Repository Intelligence: match ALL relevant existing Page Objects ──
     // (login / inventory / cart / checkout) with real methods + repo-derived
@@ -1142,7 +1157,7 @@ export class ScriptGenEngine {
     // No) need multiple browser contexts and human judgement. Emit a test.fixme
     // with a correct multi-context skeleton instead of a broken single-page run.
     if (this.isNonAutomatable(tc, steps)) {
-      const content = this.buildNonAutomatableSpec(tc, steps, baseUrl, sel, dataRef, { title, idMarker, stepComments, creds }, matchedPOs, testDataImport);
+      const content = this.buildNonAutomatableSpec(tc, steps, baseUrl, sel, dataRef, { title, idMarker, creds }, matchedPOs, testDataImport);
       const fileName = `${toKebab(title).slice(0, 60) || `test-case-${tc.id ?? 'x'}`}.spec.ts`;
       const generatedFiles: GeneratedFile[] = [{ path: `${conv.testFolder}/${fileName}`, content, type: 'test' }];
       const moduleFile = this.buildTestDataModule(dataIndex, conv);
@@ -1242,12 +1257,10 @@ export class ScriptGenEngine {
 
     // Declare the resolved record once at the top of the test body so step code
     // can read `user.username` / `user.password`.
+    // The dataset binding (`const user = getRecord(...)`) is emitted as code, not
+    // narrated — the Test Data Source is already tracked in the RTM/reports.
     const declLines: string[] = [];
     if (dataRef) {
-      const sourceNote = caseData!.representative
-        ? `// Test data bound to dataset "${caseData!.datasetName}" (representative record resolved at runtime).`
-        : `// Test data bound to dataset "${caseData!.datasetName}", record "${caseData!.recordKey}" (selected for this case).`;
-      declLines.push(sourceNote);
       declLines.push(`const ${dataRef.varName} = ${dataRef.ref};`, '');
     }
 
@@ -1256,7 +1269,6 @@ export class ScriptGenEngine {
     // and instantiated, so we never import a class the test doesn't exercise.
     const activePOs = matchedPOs.filter((po) => usedPOVars.has(po.varName));
     if (activePOs.length) {
-      declLines.push(`// Reusing repo Page Object${activePOs.length > 1 ? 's' : ''}: ${activePOs.map((p) => p.name).join(', ')}`);
       for (const po of activePOs) {
         declLines.push(`const ${po.varName} = new ${po.name}(page);`);
       }
@@ -1266,19 +1278,15 @@ export class ScriptGenEngine {
     // Combine the body and Expected-Result assertions, then de-duplicate any
     // repeated top-level assertions (review fix #1 — identical toHaveURL /
     // toHaveText / count checks stacking across precondition + body + final).
-    const verifyHeader = '// ── Verify Expected Result ──';
+    // Generation Quality: no "// Verify Expected Result" section banner — the
+    // assertions are self-describing; a blank line separates them from the body.
     let combined = this.dedupeTopLevelAssertions([
       ...declLines, ...navLines, ...preLines, ...finalLines,
-      '', verifyHeader, ...assertions,
+      '', ...assertions,
     ]);
-    // If every Expected-Result assertion was a duplicate of a body assertion
-    // (all removed by the dedupe pass), drop the now-dangling section header and
-    // its leading blank line so the spec doesn't end with an empty comment.
-    const headerIdx = combined.lastIndexOf(verifyHeader);
-    if (headerIdx !== -1 && !combined.slice(headerIdx + 1).some(l => /\bexpect\s*\(/.test(l))) {
-      combined = combined.slice(0, headerIdx);
-      while (combined.length && combined[combined.length - 1].trim() === '') combined.pop();
-    }
+    // Trim any trailing blank line left when the Expected-Result assertions were
+    // all de-duplicated away, so the spec never ends on an empty line.
+    while (combined.length && combined[combined.length - 1].trim() === '') combined.pop();
 
     // Reference the generated test-data module whenever the body binds a dataset.
     const usesModule = combined.some(l => /\bgetRecord\s*\(/.test(l));
@@ -1291,27 +1299,10 @@ export class ScriptGenEngine {
       importLine += `\nimport { ${po.name} } from '${po.importPath}';`;
     }
 
-    // Priority #5 — derive real coverage categories + the repository assets this
-    // spec reuses, instead of emitting a useless `Coverage: n/a`.
-    const coverageMeta = this.deriveCoverageMetadata(tc, activePOs, caseData);
-
+    // Coverage/asset metadata is still DERIVED (surfaced in the API result and
+    // the Coverage/RTM reports) — it is just no longer duplicated as a comment
+    // header inside the spec. See deriveCoverageMetadata() consumers.
     const content = `${importLine}
-
-/**
- * ${this.escapeBlockComment(title)}
- *
- * Test Case ID: ${tc.id ?? 'n/a'}
- * Priority: ${tc.priority ?? tc['Priority'] ?? 'n/a'}
- * Coverage: ${coverageMeta.categories}
- * Repository Assets Reused: ${coverageMeta.assets}
- * Steps:
-${stepComments}
- * Expected Result: ${this.escapeBlockComment(`${tc.expected_result || ''}`)}
- * Test Data: ${this.escapeBlockComment(`${tc.test_data || 'n/a'}`)}${caseData ? `\n * Test Data Source: ${this.escapeBlockComment(caseData.representative ? `dataset "${caseData.datasetName}" (representative record, runtime-resolved)` : `dataset "${caseData.datasetName}" → record "${caseData.recordKey}"`)} (Test Data Store)` : ''}
- *
- * Generated by LevelUp AI QA Engine (deterministic test-case build)
- * Base URL: ${baseUrl}
- */
 
 test.describe('${escapeStr(title)}', () => {
   test('${escapeStr(title)}', async ({ page }) => {${idMarker}
@@ -1337,7 +1328,16 @@ ${combined.map(l => (l ? `    ${l}` : '')).join('\n')}
     // built so it is provably read-only: it can observe but never alter the
     // generated code. Attached to the result as a transparency report only.
     const candidateDiscovery = this.discoverStepCandidates(steps, config.repoProfile);
-    return this.buildTcResult(tc, title, baseUrl, crawl, tags, generatedFiles, totalAssertions, startTime, grounding, matchedPOs, usedPOVars, candidateDiscovery);
+    // Coverage metadata is DERIVED here (not narrated in the spec) and surfaced
+    // on the result so the framework's Coverage/RTM reports own it.
+    const coverageMeta = this.deriveCoverageMetadata(tc, activePOs, caseData);
+    const coverage: CoverageEntry[] = [{
+      testCaseId: tc.id != null ? Number(tc.id) : undefined,
+      title,
+      categories: coverageMeta.categories,
+      assets: coverageMeta.assets,
+    }];
+    return this.buildTcResult(tc, title, baseUrl, crawl, tags, generatedFiles, totalAssertions, startTime, grounding, matchedPOs, usedPOVars, candidateDiscovery, coverage);
   }
 
   /**
@@ -1379,6 +1379,7 @@ ${combined.map(l => (l ? `    ${l}` : '')).join('\n')}
     matchedPOs?: Array<{ name: string; varName: string; filePath: string; methods: string[]; importPath: string; kind: string }>,
     usedPOVars?: Set<string>,
     candidateDiscovery?: CandidateDiscoveryReport,
+    coverage?: CoverageEntry[],
   ): GenerationResult {
     // Real selector quality (0–1), derived from what the spec actually uses —
     // never the old hardcoded 0. Honest blend (review fix #3): a DOM-verified
@@ -1450,6 +1451,7 @@ ${combined.map(l => (l ? `    ${l}` : '')).join('\n')}
       ...(locatorGrounding ? { locatorGrounding } : {}),
       ...(repositoryIntelligence ? { repositoryIntelligence } : {}),
       ...(candidateDiscovery ? { candidateDiscovery } : {}),
+      ...(coverage && coverage.length ? { coverage } : {}),
     };
   }
 
@@ -1484,6 +1486,7 @@ ${combined.map(l => (l ? `    ${l}` : '')).join('\n')}
     const errors: string[] = [];
     const groundingReports: LocatorGroundingReport[] = [];
     const repoIntelReports: RepositoryIntelligenceReport[] = [];
+    const coverageEntries: CoverageEntry[] = [];
 
     // ── Pipeline observability (user request) ──────────────────────────────
     // Track WHERE each case falls out so "nothing generated" is localizable in
@@ -1568,6 +1571,7 @@ ${combined.map(l => (l ? `    ${l}` : '')).join('\n')}
         }
         if (single.locatorGrounding) groundingReports.push(single.locatorGrounding);
         if (single.repositoryIntelligence) repoIntelReports.push(single.repositoryIntelligence);
+        if (single.coverage) coverageEntries.push(...single.coverage);
 
         const { key, label } = this.primaryPageKey(tc);
         for (const f of single.generatedFiles) {
@@ -1720,6 +1724,7 @@ ${combined.map(l => (l ? `    ${l}` : '')).join('\n')}
       pipeline,
       ...(locatorGrounding.total > 0 ? { locatorGrounding } : {}),
       ...(repositoryIntelligence ? { repositoryIntelligence } : {}),
+      ...(coverageEntries.length ? { coverage: coverageEntries } : {}),
     };
   }
 
@@ -1838,15 +1843,6 @@ ${combined.map(l => (l ? `    ${l}` : '')).join('\n')}
 
     const describeTitle = `${label} — ${specs.length} scenario${specs.length > 1 ? 's' : ''}`;
     const content = `${imports}
-
-/**
- * ${escapeStr(describeTitle)}
- *
- * Consolidated spec — every scenario below exercises the ${label} page.
- * Files are organised by PAGE (coverage), not one-file-per-test-case.
- *
- * Generated by LevelUp AI QA Engine (deterministic test-case build)
- */
 
 test.describe('${escapeStr(describeTitle)}', () => {
 ${testBlocks.join('\n\n')}
@@ -2325,6 +2321,17 @@ ${testBlocks.join('\n\n')}
       };
     };
 
+    // Case polarity. A POSITIVE ("valid credentials") scenario must never
+    // silently fall back to a NEGATIVE fixture (locked/invalid/expired) just
+    // because it happens to be the dataset's first row — that is Problem 3
+    // ("getRecord('locked_users')" inside a valid-login case). An explicit
+    // verbatim reference still wins (handled by isKeyReferenced/isReferenced
+    // in steps 1–2); this guard only governs the *fallback* record choice.
+    const negativeRecord = /lock|problem|glitch|invalid|expired|disabled|blocked|denied|unknown|unregistered|nonexistent|non-existent/;
+    const caseIsPositive =
+      /\b(valid|correct|successful|success|standard|happy|default|primary)\b/.test(haystack) &&
+      !negativeRecord.test(haystack);
+
     // Pick the record whose key best matches the case intent: prefer a key that
     // is referenced (exactly/tolerantly) by the case text, else the first row.
     const pickRecord = (recMap: Map<string, any>): string => {
@@ -2336,6 +2343,18 @@ ${testBlocks.join('\n\n')}
       if (intent) {
         for (const key of recMap.keys()) {
           if (key.toLowerCase().includes(intent[0])) return key;
+        }
+      }
+      // Positive scenario fallback: prefer a valid/standard record, and never
+      // pick a negative fixture as the default row.
+      if (caseIsPositive) {
+        for (const key of recMap.keys()) {
+          if (/standard|valid|default|primary|active|good/i.test(key) && !negativeRecord.test(key.toLowerCase())) {
+            return key;
+          }
+        }
+        for (const key of recMap.keys()) {
+          if (!negativeRecord.test(key.toLowerCase())) return key;
         }
       }
       return [...recMap.keys()][0]!;
@@ -2861,11 +2880,11 @@ export default datasets;
     baseUrl: string,
     sel: Record<string, string>,
     dataRef: { varName: string; ref: string; hasUsername: boolean; hasPassword: boolean } | undefined,
-    meta: { title: string; idMarker: string; stepComments: string; creds: { username: string; password: string } },
+    meta: { title: string; idMarker: string; creds: { username: string; password: string } },
     matchedPOs: Array<{ name: string; varName: string; methods: string[]; importPath: string; kind: string }> = [],
     testDataImport = './data/test-data',
   ): string {
-    const { title, idMarker, stepComments } = meta;
+    const { title, idMarker } = meta;
     const usesModule = !!dataRef;
     const uname = dataRef ? `${dataRef.varName}.username ?? ''` : this.credFillExpr('username', meta.creds.username);
     const pwd = dataRef ? `${dataRef.varName}.password ?? ''` : this.credFillExpr('password', meta.creds.password);
@@ -2902,44 +2921,23 @@ export default datasets;
     const gotoA = `    await pageA.goto('${escapeStr(baseUrl)}');\n`;
     const gotoB = `    await pageB.goto('${escapeStr(baseUrl)}');\n`;
 
-    // Priority #5 — derive coverage categories + reused repository assets.
-    const coverageMeta = this.deriveCoverageMetadata(tc, usePO ? [loginPO!] : [], null);
-
+    // Generation Quality: no coverage/steps header block. The ONE comment kept
+    // is the "not automation-ready" reason — a genuine caveat (why this is
+    // test.fixme with a multi-context skeleton), not step narration.
     return `${importLine}
 
-/**
- * ${this.escapeBlockComment(title)}
- *
- * Test Case ID: ${tc.id ?? 'n/a'}
- * Priority: ${tc.priority ?? tc['Priority'] ?? 'n/a'}
- * Coverage: ${coverageMeta.categories}
- * Repository Assets Reused: ${coverageMeta.assets}
- * Steps:
-${stepComments}
- * Expected Result: ${this.escapeBlockComment(`${tc.expected_result || ''}`)}
- *
- * ⚠️ NOT AUTOMATION-READY (auto-detected): this case requires concurrent /
- * multiple browser sessions, which cannot be exercised by a single linear
- * Playwright \`page\`. Marked test.fixme so it stays visible without producing a
- * misleading single-page run. A correct multi-context skeleton is provided
- * below — complete the assertions and remove .fixme once verified manually.
- *
- * Generated by LevelUp AI QA Engine (deterministic test-case build)
- * Base URL: ${baseUrl}
- */
-
+// NOT AUTOMATION-READY (auto-detected): needs concurrent / multiple browser
+// contexts, which a single linear Playwright \`page\` cannot exercise. Marked
+// test.fixme; complete the assertions and remove .fixme once verified manually.
 test.fixme('${escapeStr(title)} (concurrent — needs multiple browser contexts)', async () => {${idMarker}
-${userDecl}    // Two isolated sessions, each with its own cookies/storage.
-    const browser = await chromium.launch();
+${userDecl}    const browser = await chromium.launch();
     const contextA = await browser.newContext();
     const contextB = await browser.newContext();
     const pageA = await contextA.newPage();
     const pageB = await contextB.newPage();
 
-    // Session A — log in.
 ${gotoA}${sessionLogin('pageA')}
 
-    // Session B — log in with the same credentials.
 ${gotoB}${sessionLogin('pageB')}
 
     // TODO: assert the application's documented concurrent-session behaviour,
@@ -3445,8 +3443,10 @@ ${gotoB}${sessionLogin('pageB')}
       }
     }
 
+    // Generation Quality: the precondition (e.g. "user is logged in") is
+    // materialized as real setup code below, not narrated — the precondition is
+    // already documented on the Test Case.
     const lines: string[] = [];
-    lines.push(`// Precondition: ${this.escapeBlockComment(tc.preconditions || 'user is logged in')}`);
     if (localDecls.length) lines.push(...localDecls);
 
     // Review issue #2 — reuse the repo's high-level login() Page Object method
@@ -3581,9 +3581,27 @@ ${gotoB}${sessionLogin('pageB')}
     steps: string[],
     ctx: { url: string; creds: { username: string; password: string }; sel: Record<string, string>; data?: { varName: string; ref: string; hasUsername: boolean; hasPassword: boolean }; crawl?: CrawlResult; stepTracked?: LocatorGroundingEntry[]; testCaseId?: number },
   ): { lines: string[] } {
+    // Generation Quality (Sprint 4): the ONLY inline comment we allow in the body
+    // is a low-confidence review flag. When a step's locator could NOT be grounded
+    // against the crawled DOM (a semantic/fallback guess), we prepend a single
+    // `// TODO: Review locator` so the engineer knows exactly what to check —
+    // instead of narrating every line with English the RTM already documents.
+    let stepLowConf = false;
+    const flagIfUngrounded = (before: number): void => {
+      const tracked = ctx.stepTracked;
+      if (!tracked) return;
+      for (let i = before; i < tracked.length; i++) {
+        if (!tracked[i].grounded) { stepLowConf = true; return; }
+      }
+    };
+
     // Per-step grounded resolver bound to this case's crawl + tracking sink.
-    const ground = (phrase: string, kind: 'input' | 'button' | 'any', fallback: string, name: string): string =>
-      this.resolveStepControl(phrase, ctx.crawl, kind, fallback, name, ctx.stepTracked);
+    const ground = (phrase: string, kind: 'input' | 'button' | 'any', fallback: string, name: string): string => {
+      const before = ctx.stepTracked?.length ?? 0;
+      const sel = this.resolveStepControl(phrase, ctx.crawl, kind, fallback, name, ctx.stepTracked);
+      flagIfUngrounded(before);
+      return sel;
+    };
 
     // Click-specific resolver: a click phrase is often a short generic qualifier
     // ("signup", "continue") that partial-matches several controls' test hooks
@@ -3602,6 +3620,7 @@ ${gotoB}${sessionLogin('pageB')}
         else r = r ?? rAny;
       }
       if (!r) r = { selector: fallback, grounded: false, knownGood: true, confidence: 40, source: 'fallback' };
+      if (!r.grounded) stepLowConf = true;
       if (ctx.stepTracked) {
         ctx.stepTracked.push({
           name, selector: r.selector, grounded: r.grounded,
@@ -3613,8 +3632,14 @@ ${gotoB}${sessionLogin('pageB')}
     const out: string[] = [];
     let attemptBlock: string[] = []; // statements since the last navigate (for "repeat N times")
 
-    const push = (comment: string, stmts: string[], isNav: boolean) => {
-      out.push(`// ${comment}`);
+    // `push` no longer narrates the step (the RTM/Test Case already documents
+    // "what" each step does). It emits ONLY the executable statements, preceded
+    // by a `// TODO: Review locator` flag when the step's locator was a
+    // low-confidence (ungrounded) guess. The `_comment` arg is retained for call
+    // compatibility but intentionally unused.
+    const push = (_comment: string, stmts: string[], isNav: boolean) => {
+      if (stepLowConf) out.push('// TODO: Review locator');
+      stepLowConf = false;
       for (const s of stmts) out.push(s);
       out.push('');
       if (isNav) attemptBlock = [];
@@ -3659,7 +3684,20 @@ ${gotoB}${sessionLogin('pageB')}
       }
       // 5) Negative test that needs a *non-empty but wrong* value so the step is
       //    meaningful (e.g. "Enter invalid username" with no value provided).
-      if (/\b(invalid|wrong|incorrect|bad|unregistered|nonexistent|non-existent)\b/.test(t)) {
+      //    Differentiate the FAILURE MODE so distinct negative scenarios don't
+      //    collapse into identical code (Problem 4): an "unknown user" must not
+      //    render the same as an "invalid password". The specific username
+      //    sentinels are checked BEFORE the generic invalid/wrong mapping so the
+      //    latter keeps its existing contract ('invalid_user' / 'wrong_password').
+      if (kind === 'username' &&
+          /\b(unknown|unrecognized|unrecognised|not\s+registered|unregistered|no\s+such)\b/.test(t)) {
+        return `'unknown_user'`;
+      }
+      if (kind === 'username' &&
+          /\b(nonexistent|non-existent|does\s+not\s+exist|never\s+registered)\b/.test(t)) {
+        return `'nonexistent_user'`;
+      }
+      if (/\b(invalid|wrong|incorrect|bad)\b/.test(t)) {
         return kind === 'username' ? `'invalid_user'` : `'wrong_password'`;
       }
       // 6) Parsed credential literal, else an env-backed expression (never a
@@ -3669,14 +3707,15 @@ ${gotoB}${sessionLogin('pageB')}
 
     for (const raw of steps) {
       const t = raw.toLowerCase();
+      // Reset the per-step low-confidence flag; each branch that grounds a
+      // locator sets it, and only push()-based action branches consume it.
+      stepLowConf = false;
 
       // ── repeat the above N times (login throttling) ──
       const rep = t.match(/repeat.*?(\d+)\s*times?/);
       if (rep) {
         const n = parseInt(rep[1]!, 10) || 5;
         if (attemptBlock.length) {
-          out.push(`// ${raw}`);
-          out.push(`// Re-submit the same attempt ${n} times to exercise repeated failures.`);
           out.push(`for (let attempt = 0; attempt < ${n}; attempt++) {`);
           for (const s of attemptBlock) out.push(`  ${s}`);
           out.push(`}`);
@@ -3699,7 +3738,6 @@ ${gotoB}${sessionLogin('pageB')}
           crawl: ctx.crawl, stepTracked: ctx.stepTracked, sel: ctx.sel,
         });
         const asserted = grounded ? [grounded] : this.mapAssertionStep(raw, t, ctx);
-        out.push(`// ${raw}`);
         if (asserted.length) {
           for (const s of asserted) out.push(s);
           out.push('');
@@ -3834,8 +3872,9 @@ ${gotoB}${sessionLogin('pageB')}
         continue;
       }
 
-      // Unrecognized step → configurable warning/error (review issue #3).
-      out.push(`// ${raw}`);
+      // Unrecognized step → configurable warning/error (review issue #3). The
+      // step text is embedded in the marker itself (emitUnmappedStep), so we no
+      // longer narrate it on a separate comment line.
       this.emitUnmappedStep(out, raw, ctx.testCaseId);
     }
 
@@ -3868,15 +3907,17 @@ ${gotoB}${sessionLogin('pageB')}
    */
   private emitUnmappedStep(out: string[], raw: string, testCaseId?: number): void {
     this.unmappedSteps.push({ testCaseId, step: raw });
+    // Generation Quality: the marker embeds the exact step text so the one line
+    // is self-contained (no separate narration comment above it).
+    const oneLine = raw.replace(/\s+/g, ' ').trim();
     if (this.unmappedStepPolicy === 'error') {
-      out.push(`// @error: step could not be mapped to a grounded action — generation policy=error.`);
       out.push(`throw new Error(${JSON.stringify(`Unmapped test step (fix the test case): ${raw}`)});`);
     } else if (this.unmappedStepPolicy === 'comment') {
-      out.push(`// NOTE: step not auto-mapped — review manually.`);
+      out.push(`// TODO: Map step — "${oneLine}"`);
     } else {
-      // 'warn' (default): explicit, greppable warning marker + a soft runtime
+      // 'warn' (default): a single greppable TODO marker + a soft runtime
       // annotation so the gap is visible in reports and test output.
-      out.push(`// @warning: step not auto-mapped — review manually (unmappedStepPolicy=warn).`);
+      out.push(`// TODO: Map step — "${oneLine}"`);
       out.push(`test.info().annotations.push({ type: 'warning', description: ${JSON.stringify(`Unmapped step: ${raw}`)} });`);
     }
     out.push('');
@@ -3992,8 +4033,8 @@ ${gotoB}${sessionLogin('pageB')}
       // Assert deterministically on whichever state the app lands in. The
       // "accepted" branch is app-aware: SauceDemo lands on /inventory.html with a
       // Products title; other apps land on whatever URL the Expected Result names
-      // (or simply leave the login page).
-      lines.push(`// Expected outcome depends on whether the supplied values are valid credentials.`);
+      // (or simply leave the login page). The branch condition is self-describing,
+      // so no narration comment is emitted into the spec.
       if (sauce) {
         lines.push(`if (page.url().includes('/inventory.html')) {`);
         lines.push(`  await expect(page).toHaveURL(/inventory\\.html/);`);

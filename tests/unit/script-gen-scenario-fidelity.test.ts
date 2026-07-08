@@ -157,12 +157,28 @@ async function main() {
   ok('specs do NOT use a raw [data-test="error"] locator when getError() exists', ![validLocked, invalid, empty].some(c => /locator\('\[data-test="error"\]'\)/.test(c)));
   ok('valid-creds case does NOT double-navigate (open() present, no page.goto)', /loginPage\.open\(\)/.test(validLocked) && !/page\.goto/.test(validLocked));
 
-  console.log('=== P5: Coverage Metadata (derived categories + assets, never n/a) ===');
-  ok('no spec emits "Coverage: n/a"', ![validLocked, invalid, whitespace, special, empty, maxlen].some(c => /Coverage:\s*n\/a/.test(c)));
-  ok('locked case categorised as Negative', /Coverage:\s*[^\n]*Negative/.test(validLocked));
-  ok('whitespace/max-length categorised as Boundary', /Coverage:\s*[^\n]*Boundary/.test(whitespace) && /Coverage:\s*[^\n]*Boundary/.test(maxlen));
-  ok('empty categorised as Validation', /Coverage:\s*[^\n]*Validation/.test(empty));
-  ok('header lists Repository Assets Reused (LoginPage + dataset)', /Repository Assets Reused:[^\n]*LoginPage \(Page Object\)/.test(validLocked) && /Repository Assets Reused:[^\n]*locked_users/.test(validLocked));
+  // P5 — Generation Quality change: coverage metadata is NO LONGER duplicated as
+  // a comment header inside each spec (the framework's Coverage/RTM reports own
+  // it). It is DERIVED and surfaced as structured data on the generation result
+  // (`result.coverage`). These assertions verify the derivation is still correct
+  // AND that the spec code stays clean of the old header.
+  console.log('=== P5: Coverage Metadata (structured result, not a comment header) ===');
+  const cov = (frag: string) => (result.coverage || []).find(c => c.title.includes(frag));
+  const covLocked = cov('Locked user login attempt with valid credentials');
+  const covEmpty = cov('empty fields');
+  const covWhitespace = cov('whitespace');
+  const covMaxlen = cov('maximum length');
+  ok('result exposes coverage for every generated case', (result.coverage || []).length === 6);
+  ok('no coverage entry is "n/a"', !(result.coverage || []).some(c => /n\/a/.test(c.categories)));
+  ok('locked case categorised as Negative', !!covLocked && /Negative/.test(covLocked.categories));
+  ok('whitespace/max-length categorised as Boundary',
+    !!covWhitespace && /Boundary/.test(covWhitespace.categories) && !!covMaxlen && /Boundary/.test(covMaxlen.categories));
+  ok('empty categorised as Validation', !!covEmpty && /Validation/.test(covEmpty.categories));
+  ok('coverage lists Repository Assets Reused (LoginPage + dataset)',
+    !!covLocked && /LoginPage \(Page Object\)/.test(covLocked.assets) && /locked_users/.test(covLocked.assets));
+  // The spec code itself must NOT carry the old coverage/asset header comments.
+  ok('specs do NOT duplicate coverage as a comment header',
+    ![validLocked, invalid, whitespace, special, empty, maxlen].some(c => /Coverage:|Repository Assets Reused:/.test(c)));
 
   console.log(`\n──────── ${passed} passed, ${failed} failed ────────`);
   if (failed > 0) process.exit(1);
