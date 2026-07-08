@@ -1,26 +1,32 @@
 /**
- * Engineering Heuristics — the single home for deterministic decisions
- * ====================================================================
- * Over time, EVERY deterministic engineering decision the Script Composer makes
- * lives here: candidate priority, compatibility rules, quality standards,
- * confidence thresholds — and later assertion-expansion rules, naming
- * conventions, humanization rules, TODO thresholds, "Existing Code First".
+ * Engineering Standards — the single deterministic decision for a candidate
+ * =========================================================================
+ * These are STANDARDS, not heuristics. Heuristics imply guessing; this is the
+ * opposite — fixed, deterministic engineering rules, exactly like ESLint rules
+ * or compiler passes. The rules encoded here are the ones a senior automation
+ * engineer applies without thinking:
  *
- * The point: the Script Composer becomes an *executor* of these heuristics
- * rather than embedding engineering rules throughout the codebase. One place to
- * evolve behaviour without touching architecture.
+ *   • Existing Code First — reuse beats generation.
+ *   • Prefer role/label locators over raw DOM.
+ *   • Don't reuse stale code — deprecated / legacy / wrong-framework loses.
+ *   • Don't reuse bad code — sleep() / waitForTimeout() / pause() loses.
+ *
+ * Everything is ONE decision. `evaluateCandidate()` returns the whole verdict —
+ * engineeringValue, locatorQuality, compatibility, quality, confidence — in a
+ * single call. Ranking then does nothing but `sort(engineeringValue)`, and
+ * Selection does nothing but take the top. All the thinking happens here.
  *
  * Hard rules (unchanged across the whole project):
  *   • NO AI, NO LLM, NO prompts, NO embeddings, NO fuzzy/semantic matching.
  *   • Pure & deterministic — same input → same output, forever.
- *   • Constants are DATA, not code. Enterprise customers override the priority
- *     table via `configureCandidatePriority()` — no code change required.
+ *   • This is the ONE place engineering behaviour evolves. New rules are added
+ *     here (+1 rule, adjust a weight) — never spread across the codebase.
  */
 
 import type { CandidateType, ImplementationCandidate } from './candidate-discovery/types';
 
 // ───────────────────────────────────────────────────────────────────────────
-// 1. Candidate priority (the engineering-value-first table, now configurable)
+// Candidate priority — the engineering-value-first base table
 // ───────────────────────────────────────────────────────────────────────────
 
 /** The two intrinsic dimensions of a candidate type. */
@@ -32,14 +38,13 @@ export interface CandidatePriority {
 }
 
 /**
- * The default priority table. `engineering` is the primary key (reuse-first);
+ * The base priority table. `engineering` is the primary key (reuse-first);
  * `locator` is the tie-breaker.
  *
  * Deliberate inversion: an app-profile (`data-testid`-class) locator has HIGHER
  * locator quality (96) than a reused fixture (85) — yet the fixture still wins,
- * because engineering value (100 vs 92) decides first. That inversion is the
- * whole point: a senior engineer reuses the fixture instead of hand-rolling a
- * shiny new selector.
+ * because engineering value (100 vs 92) decides first. A senior engineer reuses
+ * the fixture instead of hand-rolling a shiny new selector.
  */
 export const DEFAULT_CANDIDATE_PRIORITY: Readonly<Record<CandidateType, CandidatePriority>> = Object.freeze({
   'existing-fixture':       { engineering: 100, locator: 85 },
@@ -51,7 +56,10 @@ export const DEFAULT_CANDIDATE_PRIORITY: Readonly<Record<CandidateType, Candidat
   'dom-locator':            { engineering: 75,  locator: 70 },
 });
 
-/** Deep-clone the frozen default into a mutable working table. */
+// Override capability exists but is kept INTERNAL — not surfaced through the
+// public barrel. We don't optimise for enterprise customers we don't have yet;
+// when one asks for custom ranking, we expose these. Until then they only serve
+// tests and future work.
 function cloneDefault(): Record<CandidateType, CandidatePriority> {
   const out = {} as Record<CandidateType, CandidatePriority>;
   for (const k of Object.keys(DEFAULT_CANDIDATE_PRIORITY) as CandidateType[]) {
@@ -59,15 +67,9 @@ function cloneDefault(): Record<CandidateType, CandidatePriority> {
   }
   return out;
 }
-
-/** The active table (starts as the default; can be overridden at runtime). */
 let activePriority: Record<CandidateType, CandidatePriority> = cloneDefault();
 
-/**
- * Override part (or all) of the priority table — e.g. an enterprise customer
- * that weights helpers above page objects. Only the keys/dimensions provided
- * are changed; everything else keeps its default. Configuration, not code.
- */
+/** @internal Override part of the priority table (config, not code). */
 export function configureCandidatePriority(
   overrides: Partial<Record<CandidateType, Partial<CandidatePriority>>>,
 ): void {
@@ -82,59 +84,38 @@ export function configureCandidatePriority(
   }
 }
 
-/** The priority for one candidate type (falls back to the DOM floor if unknown). */
-export function getCandidatePriority(type: CandidateType): CandidatePriority {
-  return activePriority[type] ?? activePriority['dom-locator'];
-}
-
-/** The full active table (read-only snapshot). */
-export function getCandidatePriorityTable(): Readonly<Record<CandidateType, CandidatePriority>> {
-  return activePriority;
-}
-
-/** Restore every heuristic to its built-in default (used by tests / reloads). */
-export function resetEngineeringHeuristics(): void {
+/** @internal Restore every standard to its built-in default. */
+export function resetEngineeringStandards(): void {
   activePriority = cloneDefault();
 }
 
+/** The priority for one candidate type (falls back to the DOM floor if unknown). */
+function priorityFor(type: CandidateType): CandidatePriority {
+  return activePriority[type] ?? activePriority['dom-locator'];
+}
+
 // ───────────────────────────────────────────────────────────────────────────
-// 2. Compatibility — "is this reuse compatible with the CURRENT project?"
+// Compatibility — "is this reuse compatible with the CURRENT project?"
 // ───────────────────────────────────────────────────────────────────────────
 
-/**
- * A reuse candidate scoring below this is NOT compatible enough to win on
- * engineering value alone — it drops behind freshly-generated locators.
- */
+/** Below this, a reuse candidate is considered incompatible with the project. */
 export const COMPATIBILITY_MIN = 50;
 
-/** Full marks — freshly generated locators target the current app by definition. */
-const COMPAT_OK = 100;
-/** Explicitly deprecated asset — effectively unusable. */
-const COMPAT_DEPRECATED = 10;
-/** Legacy / obsolete / archived signal in name or path. */
-const COMPAT_LEGACY = 20;
-/** Belongs to a different framework/module than the project uses. */
-const COMPAT_FRAMEWORK_MISMATCH = 15;
+const COMPAT_OK = 100;            // generated locators + clean reuse
+const COMPAT_DEPRECATED = 10;     // explicitly deprecated asset
+const COMPAT_LEGACY = 20;         // legacy / obsolete / archived signal
+const COMPAT_FRAMEWORK_MISMATCH = 15; // wrong framework / module
 
-/**
- * Signals that a repo asset is stale and should NOT be blindly reused:
- * legacy/obsolete page objects, archived or backup code, v1/old duplicates.
- */
-const LEGACY_SIGNAL =
-  // Strong, unambiguous staleness words — match anywhere, incl. camelCase
-  // (e.g. "LegacyLoginPage", "loginArchived").
-  /(legacy|obsolete|deprecated|archived?|superseded|backup)/i;
+/** Strong, unambiguous staleness words — match anywhere, incl. camelCase. */
+const LEGACY_SIGNAL = /(legacy|obsolete|deprecated|archived?|superseded|backup)/i;
 /** Ambiguous signals ("old", "v1", "bak") — only when clearly delimited. */
 const LEGACY_SIGNAL_WEAK = /(?:^|[._\-\/\s])(old|bak|v1)(?=$|[._\-\/\s])/i;
 
 /**
- * Assess whether a candidate is compatible with the current project. Pure,
- * deterministic, signal-based (name/path/tags + explicit metadata) — never
- * inspects intent with an LLM. Non-reuse (generated locators) are always
- * compatible: they are authored for the app as it exists now.
- *
- * Answers: deprecated helper? obsolete page object? wrong framework/module?
- * archived / duplicate code? → low compatibility, so it can't win by default.
+ * Compatibility score (0–100). Generated locators are always 100 (authored for
+ * the app as it exists now). Reuse is penalised when deprecated, legacy /
+ * obsolete / archived, or from a different framework/module. Signal-based; never
+ * inspects intent with an LLM.
  */
 export function assessCompatibility(c: ImplementationCandidate): number {
   if (!c.reuse) return COMPAT_OK;
@@ -152,7 +133,7 @@ export function assessCompatibility(c: ImplementationCandidate): number {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// 3. Quality — "does existing code meet our engineering standards?"
+// Quality — "does existing code meet our engineering standards?"
 // ───────────────────────────────────────────────────────────────────────────
 
 /** The verdict from a quality check. */
@@ -161,12 +142,7 @@ export interface QualityVerdict {
   issues: string[];
 }
 
-/**
- * Anti-patterns that disqualify existing code from blind reuse. If a helper
- * `login()` is full of `sleep(5000)`, we do NOT reuse it — we generate a better
- * implementation. Deterministic source scan; only runs when a source snippet is
- * available (fails open to `ok` when we can't see the code).
- */
+/** Anti-patterns that disqualify existing code from blind reuse. */
 const QUALITY_ANTI_PATTERNS: ReadonlyArray<{ re: RegExp; label: string }> = [
   { re: /\bsleep\s*\(/i,                       label: 'blocking sleep() — flaky, use web-first assertions' },
   { re: /waitForTimeout\s*\(/i,                label: 'hard-coded waitForTimeout — flaky, use auto-waiting locators' },
@@ -177,15 +153,14 @@ const QUALITY_ANTI_PATTERNS: ReadonlyArray<{ re: RegExp; label: string }> = [
 ];
 
 /**
- * Judge whether an existing-code candidate is good enough to reuse. Only reuse
- * candidates are gated (generation quality is the composer's own job). Fails
- * open: when no source snippet is captured, the candidate passes.
+ * Quality verdict for a reuse candidate. Only reuse is gated (generation
+ * quality is the composer's own job). Fails open when no source snippet is
+ * captured, so it never blocks.
  */
 export function assessQuality(c: ImplementationCandidate): QualityVerdict {
   if (!c.reuse) return { ok: true, issues: [] };
-
   const src = c.meta?.source;
-  if (!src) return { ok: true, issues: [] }; // can't see the code → don't block
+  if (!src) return { ok: true, issues: [] };
 
   const issues: string[] = [];
   for (const { re, label } of QUALITY_ANTI_PATTERNS) {
@@ -195,35 +170,68 @@ export function assessQuality(c: ImplementationCandidate): QualityVerdict {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// 4. Confidence — the EXTERNAL-facing summary (raw scores stay internal)
+// The ONE decision — evaluateCandidate()
 // ───────────────────────────────────────────────────────────────────────────
 
 export type Confidence = 'high' | 'medium' | 'low';
 
-/**
- * Collapse the internal numbers (engineering value, compatibility, quality gate)
- * into a single user-facing label. Users see `reason` + `confidence`; they never
- * need to see engineeringValue / locatorQuality directly.
- */
-export function deriveConfidence(args: {
+/** The complete verdict for a candidate — one object, one decision. */
+export interface CandidateEvaluation {
+  /**
+   * Final engineering value = base priority + compatibility adjustment +
+   * quality adjustment. THE sort key. A clean, compatible candidate keeps its
+   * base (fixture 100); a stale or low-quality reuse candidate is driven below
+   * the generated-locator floor so it can never win by merely existing.
+   */
   engineeringValue: number;
+  /** Locator quality — the only tie-breaker between equal engineering value. */
+  locatorQuality: number;
+  /** Compatibility with the current project (0–100). Kept for transparency. */
   compatibility: number;
+  /** Quality verdict (issues found in the reused source, if any). */
   quality: QualityVerdict;
-  gatePass: boolean;
-}): Confidence {
-  const { engineeringValue, compatibility, quality, gatePass } = args;
-  if (!gatePass || !quality.ok) return 'low';
-  if (engineeringValue >= 90 && compatibility >= 80) return 'high';
-  if (engineeringValue >= 75 && compatibility >= COMPATIBILITY_MIN) return 'medium';
-  return 'low';
+  /** External-facing summary. Users see this + reason; never the raw numbers. */
+  confidence: Confidence;
+}
+
+/** How hard a failed quality check pushes a reuse candidate down. */
+const QUALITY_PENALTY = 40;
+
+/**
+ * Evaluate a candidate against every engineering standard in ONE call. This is
+ * the single decision point: compatibility and quality fold into the final
+ * engineeringValue as adjustments, so downstream Ranking is just a sort and
+ * Selection is just "take the top". No branching lives outside this function.
+ */
+export function evaluateCandidate(c: ImplementationCandidate): CandidateEvaluation {
+  const base = priorityFor(c.type);
+  const compatibility = assessCompatibility(c);
+  const quality = assessQuality(c);
+
+  // Adjustments only ever apply to reuse; generated locators are compatible and
+  // ungated by definition.
+  const compatibilityAdjustment = c.reuse ? -(COMPAT_OK - compatibility) : 0;
+  const qualityAdjustment = c.reuse && !quality.ok ? -QUALITY_PENALTY : 0;
+
+  const engineeringValue = base.engineering + compatibilityAdjustment + qualityAdjustment;
+  const confidence = deriveConfidence(base.engineering, compatibility, quality, c.reuse);
+
+  return { engineeringValue, locatorQuality: base.locator, compatibility, quality, confidence };
 }
 
 /**
- * The single gate deciding whether a candidate is eligible to win on
- * engineering value. Generated locators always pass; reuse must be BOTH
- * compatible enough AND meet quality standards. This is the
- * `Reuse Candidate → Quality Check → Ranking` rule, in one place.
+ * Collapse the raw signals into a user-facing label. Internal to the module —
+ * users only ever see the result via the candidate's `confidence`.
  */
-export function passesGate(compatibility: number, quality: QualityVerdict): boolean {
-  return compatibility >= COMPATIBILITY_MIN && quality.ok;
+function deriveConfidence(
+  basePriority: number,
+  compatibility: number,
+  quality: QualityVerdict,
+  reuse: boolean,
+): Confidence {
+  const gatePass = reuse ? compatibility >= COMPATIBILITY_MIN && quality.ok : true;
+  if (!gatePass) return 'low';
+  if (basePriority >= 90 && compatibility >= 80) return 'high';
+  if (basePriority >= 75 && compatibility >= COMPATIBILITY_MIN) return 'medium';
+  return 'low';
 }

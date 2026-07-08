@@ -1,25 +1,19 @@
 /**
- * Candidate Ranking — deterministic priorities (Sprint 2 · PR 2B / 2B.1)
- * =======================================================================
- * Scores and orders the candidates that Discovery (PR 2A) found. NO AI, NO
- * LLM, NO prompts, NO embeddings — fixed heuristics, applied purely.
+ * Candidate Ranking — deterministic ordering (Sprint 2 · PR 2B)
+ * ==============================================================
+ * Ranking does almost nothing on purpose. Every engineering decision already
+ * happened in EngineeringStandards.evaluateCandidate() — compatibility and
+ * quality are folded into a single `engineeringValue`. So ranking is literally:
  *
- * The pipeline is now:  Reuse Candidate → Quality Check → Ranking.
+ *     sort by engineeringValue desc, locatorQuality desc, original order.
  *
- * Three dimensions per candidate (all from EngineeringHeuristics):
- *   • engineeringValue — PRIMARY. Reuse beats generation. A fixture (100)
- *     outranks a brand-new locator (92) even when the locator's quality is
- *     higher. This is how a senior automation engineer thinks.
- *   • locatorQuality  — SECONDARY. Breaks ties between equal engineering value.
- *   • compatibility   — GATE. "Is this reuse compatible with the CURRENT
- *     project?" A deprecated / obsolete / wrong-framework / archived asset
- *     scores low and CANNOT win on engineering value alone.
- *
- * And a quality gate: existing code full of `sleep(5000)` is NOT reused just
- * because it exists — it is out-ranked by a freshly generated implementation.
+ * A clean, compatible reuse candidate keeps its high base value and wins. A
+ * stale or low-quality reuse candidate has already been driven below the
+ * generated-locator floor by its adjustments, so it sorts to the bottom — no
+ * branching here, no gate, no special cases.
  *
  * Boundaries (enforced by tests):
- *   • Ranking ORDERS candidates and sets rank/scores/confidence. It does NOT
+ *   • Ranking ORDERS candidates and records rank/scores/confidence. It does NOT
  *     select a winner and does NOT change generated code (selected stays false).
  *   • Pure: returns a new report; never mutates its input.
  *   • Never throws — fails open by returning the input unranked.
@@ -30,73 +24,43 @@ import type {
   ImplementationCandidate,
   StepCandidates,
 } from './types';
-import {
-  getCandidatePriority,
-  assessCompatibility,
-  assessQuality,
-  deriveConfidence,
-  passesGate,
-  DEFAULT_CANDIDATE_PRIORITY,
-} from '../engineering-heuristics';
+import { evaluateCandidate, DEFAULT_CANDIDATE_PRIORITY } from '../engineering-standards';
 
-/**
- * Score a single candidate across all three dimensions plus the quality gate
- * (pure; returns a new object). A candidate that fails the gate keeps its
- * scores but is flagged so the comparator can demote it below eligible ones.
- */
-function scoreCandidate(c: ImplementationCandidate): ImplementationCandidate & { _gatePass: boolean } {
-  const p = getCandidatePriority(c.type);
-  const compatibility = assessCompatibility(c);
-  const quality = assessQuality(c);
-  const gatePass = c.reuse ? passesGate(compatibility, quality) : true;
-  const confidence = deriveConfidence({
-    engineeringValue: p.engineering,
-    compatibility,
-    quality,
-    gatePass,
-  });
+/** Attach the full engineering evaluation to a candidate (pure; new object). */
+function scoreCandidate(c: ImplementationCandidate): ImplementationCandidate {
+  const e = evaluateCandidate(c);
   return {
     ...c,
-    engineeringValue: p.engineering,
-    locatorQuality: p.locator,
-    compatibility,
-    quality,
-    confidence,
-    _gatePass: gatePass,
+    engineeringValue: e.engineeringValue,
+    locatorQuality: e.locatorQuality,
+    compatibility: e.compatibility,
+    quality: e.quality,
+    confidence: e.confidence,
   };
 }
 
 /**
- * Rank one step's candidates. Sort strongest-first by:
- *   1. gate (eligible before demoted — a stale/low-quality reuse candidate
- *      cannot beat a compatible generated locator),
- *   2. engineeringValue desc (reuse beats generation among eligibles),
- *   3. locatorQuality desc (tie-break),
- *   4. original order (stable, deterministic).
+ * Rank one step's candidates: evaluate each, then sort strongest-first by
+ * (engineeringValue desc, locatorQuality desc, original order). The stable
+ * original-order tie-break keeps ranking deterministic.
  */
 function rankStep(step: StepCandidates): StepCandidates {
-  const scored = step.candidates.map(scoreCandidate);
-  const ordered = scored
-    .map((c, i) => ({ c, i })) // capture original index for a stable tie-break
+  const ordered = step.candidates
+    .map((c, i) => ({ c: scoreCandidate(c), i }))
     .sort((a, b) => {
-      const gate = Number(b.c._gatePass) - Number(a.c._gatePass);
-      if (gate !== 0) return gate;
       const ev = (b.c.engineeringValue ?? 0) - (a.c.engineeringValue ?? 0);
       if (ev !== 0) return ev;
       const lq = (b.c.locatorQuality ?? 0) - (a.c.locatorQuality ?? 0);
       if (lq !== 0) return lq;
       return a.i - b.i;
     })
-    .map(({ c }, idx) => {
-      const { _gatePass, ...clean } = c; // drop the internal helper flag
-      return { ...clean, rank: idx + 1 };
-    });
+    .map(({ c }, idx) => ({ ...c, rank: idx + 1 }));
   return { ...step, candidates: ordered };
 }
 
 /**
  * Rank an entire discovery report. Returns a NEW report with each step's
- * candidates scored and ordered, and `ranked: true`. Never selects a winner
+ * candidates evaluated and ordered, and `ranked: true`. Never selects a winner
  * (`selected` stays false) and never mutates the input. Fails open.
  */
 export function rankReport(report: CandidateDiscoveryReport): CandidateDiscoveryReport {
@@ -113,8 +77,5 @@ export function rankReport(report: CandidateDiscoveryReport): CandidateDiscovery
   }
 }
 
-/**
- * The default priority table (read-only). Kept exported for backward
- * compatibility; the live, override-aware table lives in EngineeringHeuristics.
- */
+/** The base priority table (read-only), re-exported for tests / debugging. */
 export const CANDIDATE_PRIORITY = DEFAULT_CANDIDATE_PRIORITY;

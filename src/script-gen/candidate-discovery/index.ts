@@ -19,21 +19,18 @@ import { classifyIntent, discoverLocatorCandidates, discoverReuseCandidates } fr
 export * from './types';
 export { classifyIntent, extractTarget, discoverReuseCandidates, discoverLocatorCandidates } from './discover';
 export { rankReport, CANDIDATE_PRIORITY } from './rank';
+// The public surface of Engineering Standards is intentionally small: the one
+// decision (evaluateCandidate) and the read-only default table. Compatibility /
+// quality / confidence are folded INTO evaluateCandidate — not separate public
+// concepts — and the override API stays internal until a customer needs it.
 export {
+  evaluateCandidate,
   DEFAULT_CANDIDATE_PRIORITY,
-  configureCandidatePriority,
-  getCandidatePriority,
-  getCandidatePriorityTable,
-  resetEngineeringHeuristics,
-  assessCompatibility,
-  assessQuality,
-  deriveConfidence,
-  passesGate,
-  COMPATIBILITY_MIN,
+  type CandidateEvaluation,
   type CandidatePriority,
   type QualityVerdict,
   type Confidence,
-} from '../engineering-heuristics';
+} from '../engineering-standards';
 
 /** An empty, well-formed report (used on empty input and on any failure). */
 function emptyReport(): CandidateDiscoveryReport {
