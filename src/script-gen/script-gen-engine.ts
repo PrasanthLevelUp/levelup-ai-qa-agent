@@ -3747,6 +3747,15 @@ ${gotoB}${sessionLogin('pageB')}
         continue;
       }
 
+      // ── context / precondition narration (no UI action) ─────────────────────
+      // "User is on the login page", "User is logged in", "Given …" describe
+      // STATE, not an action. They are materialised by the precondition builder
+      // (or are pure scene-setting). Skipping them here prevents a precondition
+      // that merely contains "login"/"user" from being mis-routed into a bogus
+      // field FILL below — the core Action-Quality guarantee that business /
+      // narrative text can never become a UI action.
+      if (this.isContextOnlyStep(t)) continue;
+
       // ── navigate ──
       const urlM = raw.match(/\bhttps?:\/\/[^\s'")]+/i);
       if (/^navigat|^go to|^open|^launch|^visit/.test(t) && !/back|product page|products page/.test(t)) {
@@ -3789,11 +3798,14 @@ ${gotoB}${sessionLogin('pageB')}
       // NOTE: checked BEFORE username because phrases like "Enter password from
       // valid_users" contain the substring "user" (in the dataset name) and would
       // otherwise be mis-mapped to the username field. Password is unambiguous.
-      if (/pass( ?word)?|\bpwd\b/.test(t) && !/click|button/.test(t)) {
+      if (/pass( ?word)?|\bpwd\b/.test(t) && !/click|button/.test(t) && this.hasFillIntent(t)) {
         // Ground the SPECIFIC password field this step names (e.g. "login
         // password" vs "confirm password" vs "signup password") against the
-        // crawl, falling back to the pre-resolved password selector.
-        const sel = ground(this.extractControlPhrase(raw) || 'password', 'input', ctx.sel.password, 'password');
+        // crawl, falling back to the pre-resolved password selector. The grounding
+        // phrase is used only when it looks like a real control name, so business
+        // prose in the step can't be turned into a bogus label locator.
+        const cp = this.extractControlPhrase(raw);
+        const sel = ground(this.looksLikeControlName(cp) ? cp : 'password', 'input', ctx.sel.password, 'password');
         push(raw, [`await ${sel}.fill(${fieldExpr('password', raw, t)});`], false);
         continue;
       }
@@ -3801,11 +3813,14 @@ ${gotoB}${sessionLogin('pageB')}
       // ── username / email field ──
       // Guard against the dataset-name false positive: don't treat a "password"
       // step as username even if the dataset name embeds "user".
-      if (/user( ?name)?|email|login id/.test(t) && !/pass( ?word)?|\bpwd\b/.test(t) && !/click|button/.test(t)) {
+      if (/user( ?name)?|email|login id/.test(t) && !/pass( ?word)?|\bpwd\b/.test(t) && !/click|button/.test(t) && this.hasFillIntent(t)) {
         // Qualifier-aware: "login email" → the login form's email input,
         // "signup email" → the signup form's — no longer both collapsing onto
-        // one pre-resolved field.
-        const sel = ground(this.extractControlPhrase(raw) || 'username email', 'input', ctx.sel.username, 'username');
+        // one pre-resolved field. The grounding phrase is used only when it looks
+        // like a real control name, so a title/outcome phrase can't be turned
+        // into a bogus label locator.
+        const cp = this.extractControlPhrase(raw);
+        const sel = ground(this.looksLikeControlName(cp) ? cp : 'username email', 'input', ctx.sel.username, 'username');
         push(raw, [`await ${sel}.fill(${fieldExpr('username', raw, t)});`], false);
         continue;
       }
@@ -3817,7 +3832,12 @@ ${gotoB}${sessionLogin('pageB')}
       // field against the crawl and fill an authored or sensible value.
       if (/^(enter|type|fill|input|provide|key in|set|choose|select)\b/.test(t) && !/pass( ?word)?|\bpwd\b/.test(t)) {
         const phrase = this.extractControlPhrase(raw);
-        if (phrase) {
+        // Only synthesise a getByLabel fill when the phrase actually names a
+        // control. A verb-led business phrase ("Enter valid login - standard
+        // user") would otherwise become `getByLabel(/valid login-/i).fill(...)` —
+        // a locator that targets scenario prose, not a field. When the phrase is
+        // not control-like we fall through to the honest unmapped-step marker.
+        if (phrase && this.looksLikeControlName(phrase)) {
           const sel = ground(phrase, 'input', `page.getByLabel(/${escapeRegex(phrase)}/i)`, `field:${phrase}`);
           push(raw, [`await ${sel}.fill(${this.genericFillValue(raw, phrase)});`], false);
           continue;
@@ -3895,6 +3915,63 @@ ${gotoB}${sessionLogin('pageB')}
       /\bshould\s+(see|show|display|contain|be|not)\b/.test(t) ||
       /\b(is|are|should be)\s+(displayed|visible|shown|present|correct|hidden|not\s+visible)\b/.test(t)
     );
+  }
+
+  /**
+   * True when a step describes CONTEXT / a PRECONDITION rather than an action —
+   * "User is on the login page", "User is logged in", "Given the cart has 2
+   * items". Such lines are materialised by the precondition builder (or are just
+   * scene-setting); they carry no UI action. Recognising them up front stops a
+   * precondition that merely mentions "login"/"user" from being mis-routed into
+   * a bogus field FILL (Action Quality), and avoids a noisy unmapped-step TODO
+   * for something that is legitimately not a step.
+   */
+  private isContextOnlyStep(t: string): boolean {
+    const s = t.trim();
+    return (
+      /^(given|assume|precondition|background)\b/.test(s) ||
+      /^(the\s+)?user\s+(is|are|was|has|have|should\s+be|already)\b/.test(s)
+    );
+  }
+
+  /**
+   * True when a step genuinely instructs DATA ENTRY into a field. A real fill is
+   * verb-led ("Enter…", "Type…", "Leave … empty") or an explicit field
+   * assignment ("Username: standard_user"). A scenario TITLE or EXPECTED RESULT
+   * that merely contains the substring "user"/"login"/"password"
+   * ("Valid login - standard user", "User is on the login page") has no such
+   * intent and must never become a `.fill(...)`. Anchored at the start (after
+   * common lead-ins) so the noun "login" inside a title cannot masquerade as the
+   * verb "log in".
+   */
+  private hasFillIntent(t: string): boolean {
+    const s = t.replace(
+      /^\s*(?:\d+[.)]\s*)?(?:and\s+|then\s+|next,?\s+|please\s+|the\s+user\s+|user\s+|you\s+|i\s+)?/i,
+      '',
+    );
+    return (
+      /^(enter|type|fill|input|provide|key\s*in|supply|set|choose|select|use|leave|clear|specif|populat|give|re-?enter|re-?type)/i.test(s) ||
+      /^[a-z][a-z0-9_]{1,20}\s*[:=]\s*\S/i.test(s)
+    );
+  }
+
+  /**
+   * True when a phrase plausibly names a UI CONTROL (a field / button label) as
+   * opposed to business prose. Used to gate the generic getByLabel fallback so a
+   * scenario title or expected-result phrase can never be manufactured into a
+   * `page.getByLabel(/…/i)` action (the "getByLabel(/valid login-/i)" defect).
+   * A control name is short and free of outcome / narrative vocabulary.
+   */
+  private looksLikeControlName(phrase: string): boolean {
+    const p = String(phrase).trim().toLowerCase();
+    if (!p) return false;
+    if (p.length > 40 || p.split(/\s+/).length > 5) return false;
+    // Business-outcome / scenario-title / narrative tokens that must never be
+    // treated as a control's accessible name.
+    if (/\b(valid|invalid|successful|success|failure|failed|redirect|redirected|dashboard|logged\s?in|log\s?in|login|logout|credential|credentials|message|displayed|visible|shown|should|scenario|verify|verified|ensure|confirm|expected|able\s+to|correctly|properly|standard\s+user)\b/.test(p)) {
+      return false;
+    }
+    return true;
   }
 
   /**
