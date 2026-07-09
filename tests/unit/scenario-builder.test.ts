@@ -18,7 +18,9 @@ import {
   buildDeterministicOutput,
   buildScenariosFromDrafts,
   draftToTestCase,
+  buildFormatterInputs,
   buildFormatterPrompt,
+  buildRepairPrompt,
   applyPolish,
 } from '../../src/engines/scenario-builder';
 import type { CoverageType } from '../../src/engines/test-coverage-engine';
@@ -281,21 +283,24 @@ describe('Formatter mode — deterministic output', () => {
   });
 });
 
-describe('Formatter mode — minimal prompt', () => {
-  it('is DRAMATICALLY smaller than the full draft block, and withholds selectors as invariants', () => {
+describe('Formatter mode — minimal prompt (FormatterInput contract)', () => {
+  it('does NOT re-teach the 20-principle standard and withholds selectors as invariants', () => {
     const plan = planScenarios(LOGIN_REQ, COVERAGE, 'authentication');
     const { drafts } = buildDraftTestCases(plan, LOGIN_KNOWLEDGE, LOGIN_REQ);
     const out = buildDeterministicOutput(drafts);
-    const formatterPrompt = buildFormatterPrompt(out.testCases);
+    const inputs = buildFormatterInputs(out.testCases);
+    const formatterPrompt = buildFormatterPrompt(inputs);
 
-    // The prompt must NOT contain the requirement, app-profile block headers,
-    // knowledge or coverage-objective scaffolding — only the polish payload.
-    expect(formatterPrompt).toContain('polish');
-    expect(formatterPrompt).toContain(`EXACTLY ${out.testCases.length}`);
+    // The standard is enforced by the deterministic validator AFTER generation,
+    // NOT embedded in the prompt. The prompt must be tiny and must not carry the
+    // 20 principles, principle numbering, or the standard doc's scaffolding.
+    expect(formatterPrompt).not.toContain('QA Artifact Standard');
+    expect(formatterPrompt).not.toContain('20 principles');
+    expect(formatterPrompt).not.toContain('Principle'); // no principle re-teaching
+    expect(formatterPrompt).toContain(`EXACTLY ${inputs.length}`);
     // Selectors and raw URLs are technical invariants that live in `grounding`,
     // NOT in the editable wording payload — the model never sees them and so
-    // cannot corrupt them (and this trims the tokens further). Steps stay
-    // business-readable.
+    // cannot corrupt them (and this trims the tokens further).
     expect(formatterPrompt).not.toContain('#email');
     expect(formatterPrompt).not.toContain('#login-btn');
     expect(formatterPrompt).not.toContain('"grounding"');
@@ -303,26 +308,79 @@ describe('Formatter mode — minimal prompt', () => {
     expect(formatterPrompt).not.toContain('COVERAGE OBJECTIVES');
     expect(formatterPrompt).not.toContain('GROUNDED SCOPE');
     expect(formatterPrompt).not.toContain('Acceptance Criteria');
+    // The INSTRUCTION portion (everything before the data payload) is tiny and
+    // fixed-size — it does not grow with the number of cases or re-teach the
+    // standard. Only the data payload after "TEST CASES:" scales with input.
+    const instructions = formatterPrompt.split('TEST CASES:')[0];
+    expect(instructions.length).toBeLessThan(1200);
   });
 
-  it('sends ONLY the editable wording fields — invariants are withheld from the model', () => {
+  it('sends the FIXED semantic context as DATA + only the editable wording fields', () => {
     // Use the lockout requirement so the plan justifies >1 scenario and the
     // compact JSON array actually contains multiple objects.
     const plan = planScenarios(LOGIN_REQ_LOCKOUT, ['positive', 'negative'], 'authentication');
     const { drafts } = buildDraftTestCases(plan, LOGIN_KNOWLEDGE, LOGIN_REQ_LOCKOUT);
     const out = buildDeterministicOutput(drafts);
-    const formatterPrompt = buildFormatterPrompt(out.testCases);
-    // The editable payload carries the canonical id + wording fields...
+    const inputs = buildFormatterInputs(out.testCases);
+    const formatterPrompt = buildFormatterPrompt(inputs);
+    // The contract carries the canonical id + editable wording fields...
     expect(formatterPrompt).toContain('"id":');
     expect(formatterPrompt).toContain('"expected":');
-    // ...but NOT the deterministic invariants (the model never sees them, so it
-    // literally cannot change them). This is what cuts the OUTPUT tokens too.
+    // ...and the FIXED structural context travels as data (not prose rules).
+    expect(formatterPrompt).toContain('"objective":');
+    expect(formatterPrompt).toContain('"variation":');
+    expect(formatterPrompt).toContain('"expectedBehavior":');
+    expect(formatterPrompt).toContain('"dataRole":');
+    // ...but NOT the technical invariants the model must never touch.
     expect(formatterPrompt).not.toContain('"severity"');
     expect(formatterPrompt).not.toContain('"sourceEvidence"');
     expect(formatterPrompt).not.toContain('"automationComplexity"');
     expect(formatterPrompt).not.toContain('"selectorAvailability"');
     // The payload is compact (whitespace-free array joins).
     expect(formatterPrompt).toContain('},{');
+  });
+
+  it('buildFormatterInputs folds KB semantics into the contract (and falls back safely)', () => {
+    const plan = planScenarios(LOGIN_REQ, COVERAGE, 'authentication');
+    const { drafts } = buildDraftTestCases(plan, LOGIN_KNOWLEDGE, LOGIN_REQ);
+    const out = buildDeterministicOutput(drafts);
+
+    // With semantics provided, they win.
+    const semantics = new Map([
+      [out.testCases[0].scenarioId, {
+        variation: 'invalid password',
+        expectedBehavior: 'an inline error is shown and no session is created',
+        requiredDataRole: 'registered_user',
+      } as any],
+    ]);
+    const withSem = buildFormatterInputs(out.testCases, semantics);
+    expect(withSem[0].variation).toBe('invalid password');
+    expect(withSem[0].expectedBehavior).toBe('an inline error is shown and no session is created');
+    expect(withSem[0].dataRole).toBe('registered_user');
+    // The editable seed wording is carried through from the deterministic case.
+    expect(withSem[0].title).toBe(out.testCases[0].title);
+    expect(withSem[0].id).toBe(out.testCases[0].scenarioId);
+
+    // Without semantics, the contract is still TOTAL (safe defaults).
+    const noSem = buildFormatterInputs(out.testCases);
+    expect(noSem[0].dataRole).toBe('valid_data');
+    expect(typeof noSem[0].variation).toBe('string');
+    expect(noSem[0].variation.length).toBeGreaterThan(0);
+  });
+
+  it('buildRepairPrompt lists ONLY the failing cases and their specific fixes', () => {
+    const plan = planScenarios(LOGIN_REQ, COVERAGE, 'authentication');
+    const { drafts } = buildDraftTestCases(plan, LOGIN_KNOWLEDGE, LOGIN_REQ);
+    const out = buildDeterministicOutput(drafts);
+    const inputs = buildFormatterInputs(out.testCases);
+    const failId = inputs[0].id;
+    const repair = buildRepairPrompt(inputs, {
+      [failId]: ['[step 2] Split the combined action into one action per step.'],
+    });
+    expect(repair).toContain('REQUIRED FIXES');
+    expect(repair).toContain(failId);
+    expect(repair).toContain('Split the combined action');
+    expect(repair).toContain(`EXACTLY ${inputs.length}`);
   });
 });
 

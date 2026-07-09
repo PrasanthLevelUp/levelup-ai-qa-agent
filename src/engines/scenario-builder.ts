@@ -41,7 +41,7 @@
  *     echo.
  */
 
-import type { QACategory } from './qa-knowledge-engine';
+import type { QACategory, ScenarioSemantics } from './qa-knowledge-engine';
 import type {
   PlannedScenarioWithProvenance,
   ProvenanceSource,
@@ -480,7 +480,10 @@ export function buildDraftTestCases(
     const grounding: StepGrounding[] = [];
     const navTarget = loginUrl || form?.page || baseUrl;
     if (navTarget) {
-      steps.push(`Navigate to the ${form?.page ? 'page under test' : 'application'}`);
+      // QA Standard P9 (machine-readable verbs): use "Open ... page", never
+      // "Navigate to" — so the deterministic baseline itself already satisfies
+      // the QA Standard validator and is a clean fallback.
+      steps.push(`Open the ${form?.page ? 'page under test' : 'application'}`);
       grounding.push({ stepIndex: steps.length, page: navTarget });
     }
 
@@ -498,7 +501,9 @@ export function buildDraftTestCases(
       steps.push(`Click the ${submitLabel} button`);
       grounding.push({ stepIndex: steps.length, selector: form.submitSelector, page: form?.page, control: submitLabel });
     } else if (form) {
-      steps.push('Submit the form');
+      // QA Standard P5 (business language): "Click the Submit button", never a
+      // bare "Submit the form" — keep a consistent, parseable action verb.
+      steps.push('Click the Submit button');
       grounding.push({ stepIndex: steps.length, page: form?.page, control: 'Submit' });
     }
     if (!steps.length) {
@@ -677,96 +682,162 @@ export function buildDeterministicOutput(drafts: DraftTestCase[]): {
   };
 }
 
+/* ------------------------------------------------------------------ */
+/*  FormatterInput — the contract, NOT a prompt                        */
+/* ------------------------------------------------------------------ */
+
 /**
- * The ONLY fields the LLM formatter is allowed to touch — the human-readable
- * English. Everything else (priority, severity, coverage, source, selectors,
- * dataset, automation flags, scenarioIndex) is a deterministic INVARIANT and is
- * never sent to the model, so it can never be changed. `id` is the canonical
- * scenarioId, round-tripped so we can re-attach the polished wording to the
- * right invariant object regardless of order.
+ * FormatterInput — the STRUCTURED contract handed to the LLM formatter.
+ * ============================================================================
+ *
+ * This is the heart of the Sprint 2B redesign. The QA Artifact Standard is the
+ * CONTRACT, not a prompt: rather than re-teaching the model 20 principles on
+ * every request, we make the structural decisions DETERMINISTICALLY (upstream,
+ * from `ScenarioSemantics`) and hand the model a nearly-finished object. Almost
+ * everything is already decided:
+ *
+ *   • objective / preconditions / variation / expectedBehavior / dataRole come
+ *     straight from the KB-authored ScenarioSemantics — the model may NOT change
+ *     them (they are FIXED context it reads to write good prose).
+ *   • priority / coverageType are deterministic invariants.
+ *   • title / steps / expected are SEED wording the model refines into natural,
+ *     human-quality English.
+ *
+ * The model's ONLY job becomes "write naturally" — not "think". Because the
+ * decisions are pre-made, the prompt collapses to a few lines (see
+ * `buildFormatterPrompt`) and the 20 principles move OUT of the prompt and INTO
+ * a deterministic validator (`qa-standard-validator.ts`) that runs AFTER
+ * generation. Standard changes happen in ONE place (the validator + the MD doc),
+ * never scattered across prompt strings — no drift.
+ *
+ * `id` is the canonical scenarioId, round-tripped so the polished wording can be
+ * re-attached to the right invariant object regardless of order. Traceability,
+ * selectors, severity, source, automation flags are NEVER sent — the model can
+ * therefore never corrupt them.
  */
-export interface EditablePolishFields {
+export interface FormatterInput {
+  /** Canonical scenarioId — round-trip key; the model must echo it back. */
   id: string;
-  title: string;
+  /* ---- FIXED semantic context (model READS, must honor, must NOT alter) ---- */
+  /** The ONE thing this case verifies (from the scenario). */
   objective: string;
+  /** The valid starting state (deterministic; the model does not rewrite it). */
   preconditions: string;
+  /** The single variable changed from a valid baseline (ScenarioSemantics). */
+  variation: string;
+  /** The observable pass/fail behavior to assert (ScenarioSemantics). */
+  expectedBehavior: string;
+  /** The generic data ROLE this case needs, e.g. "registered_user". */
+  dataRole: string;
+  /** Deterministic priority (invariant). */
+  priority: FormatterTestCase['priority'];
+  /** Coverage type, e.g. "positive" / "negative" (invariant). */
+  coverageType: string;
+  /* ---- SEED wording the model REFINES into human-quality prose ---- */
+  title: string;
   steps: string[];
   expected: string;
 }
 
-/** Project a canonical test case down to only its editable (wording) fields. */
-function toEditable(tc: FormatterTestCase): EditablePolishFields {
-  return {
-    id: tc.scenarioId,
-    title: tc.title,
-    objective: tc.objective,
-    preconditions: tc.preconditions,
-    steps: tc.steps.slice(),
-    expected: tc.expectedResult,
-  };
+/**
+ * Build the FormatterInput contract for each canonical case, folding in the
+ * KB-authored `ScenarioSemantics` (variation / expectedBehavior / dataRole) so
+ * the structural decisions travel as DATA, not as prompt instructions. Pure and
+ * deterministic. `semanticsById` is keyed by scenarioId; when a case has no
+ * semantics (uncurated category / legacy row) the fields fall back to the
+ * scenario's own objective so the contract is always total.
+ */
+export function buildFormatterInputs(
+  cases: FormatterTestCase[],
+  semanticsById?: Map<string, ScenarioSemantics>,
+): FormatterInput[] {
+  return cases.map(tc => {
+    const sem = semanticsById?.get(tc.scenarioId);
+    return {
+      id: tc.scenarioId,
+      objective: tc.objective,
+      preconditions: tc.preconditions,
+      variation: sem?.variation ?? 'none — the primary path is exercised',
+      expectedBehavior: sem?.expectedBehavior ?? tc.objective,
+      dataRole: sem?.requiredDataRole ?? 'valid_data',
+      priority: tc.priority,
+      coverageType: tc.tags?.[tc.tags.length - 1] ?? 'positive',
+      title: tc.title,
+      steps: tc.steps.slice(),
+      expected: tc.expectedResult,
+    };
+  });
 }
 
 /**
- * Build the MINIMAL, CANONICAL formatter prompt.
+ * Build the MINIMAL formatter prompt.
+ * ============================================================================
  *
- * This is the next evolution of Formatter Mode: instead of sending the WHOLE
- * test-case object (16 fields) and asking the model to echo it back, we send
- * ONLY the editable wording fields (`id`, title, objective, preconditions,
- * steps, expected). The deterministic invariants are withheld entirely — the
- * model literally cannot change them because it never sees them. This cuts BOTH
- * the input payload AND (crucially) the OUTPUT: the model re-serialises ~6 short
- * fields per case, not ~16. All withheld fields are re-attached deterministically
- * by `id` after the call. The model edits English; it cannot touch logic.
+ * The QA Artifact Standard is NOT in this prompt. All 20 principles are enforced
+ * by the deterministic `qa-standard-validator.ts` AFTER generation, so the
+ * prompt does not re-teach them every request. Structural decisions already live
+ * in the FormatterInput (objective, preconditions, variation, expectedBehavior,
+ * dataRole, priority, coverage). The model therefore has ONE job — convert the
+ * seed wording into natural human QA prose — and the prompt is a few lines, not
+ * eight pages. This is the token/latency win AND the anti-drift win (the
+ * standard changes in ONE place, never in scattered prompt strings).
+ *
+ * Only the editable wording fields are returned ("id", "title", "steps",
+ * "expected"). Everything else is a withheld invariant re-attached by `id`.
  */
-export function buildFormatterPrompt(testCases: FormatterTestCase[]): string {
-  // Compact, whitespace-free JSON of the editable fields only.
-  const payload = JSON.stringify(testCases.map(toEditable));
-  return `You are a senior QA technical editor enforcing the LevelUp AI QA Artifact Standard. Below are ${testCases.length} test cases assembled DETERMINISTICALLY from the real application. Logic, selectors, data and coverage are FINAL — only the English wording needs polishing.
+export function buildFormatterPrompt(inputs: FormatterInput[]): string {
+  // Compact, whitespace-free JSON — the FormatterInput contract as data.
+  const payload = JSON.stringify(inputs);
+  return `You are a senior QA engineer writing manual test cases. Each item below is an ALREADY-DECIDED test case: its objective, preconditions, the single variable under test, the expected behavior, the required data role, priority and coverage are FIXED. Do NOT change, restate or second-guess them.
 
-YOUR JOB: Rewrite "title", "objective", "preconditions", "steps", and "expected" to comply with the QA Artifact Standard principles below. The SAME test logic, the SAME selectors, the SAME coverage — only the wording changes.
+YOUR ONLY JOB: rewrite "title", "steps" and "expected" into natural, human-quality QA wording that faithfully expresses the fixed context.
 
-CONTRACT (violating any is a failure):
-  • Return EXACTLY ${testCases.length} objects in the SAME order, each with the SAME "id". Never add, remove, split, merge or reorder.
-  • Keep the SAME number of steps per case. If a step combines multiple actions ("Enter username and password"), SPLIT it into separate steps ("Enter registered username" / "Enter valid password"). If the result is MORE steps than the input, that is CORRECT (the input violated the standard).
-  • Do NOT add CSS/XPath selectors, element ids, or raw URLs to step text — those are hidden in grounding.
-  • Do NOT invent new test logic, selectors, pages or data.
+Write like a senior tester:
+  • Title: "Verify <expected behavior> when <condition>."
+  • Steps: one user action each (never combine with "and"); business language ("Enter the registered username", "Click the Login button"); data ROLES, never literal values.
+  • Expected: concrete, observable outcomes a tester can see — never "Login successful" / "works correctly".
 
-QA ARTIFACT STANDARD (enforce these principles):
-
-CORE PRINCIPLES:
-1. ONE OBJECTIVE: Each test verifies exactly ONE thing. Title: "Verify <behavior> when <condition>."
-2. ONE ACTION PER STEP: Never combine. Bad: "Enter username and password." Good: "Enter registered username." (step N) + "Enter valid password." (step N+1).
-3. USER ACTIONS ONLY: What a human does. Bad: "Ensure button is clickable." Good: "Click Login button."
-4. VERIFICATION ≠ ACTION: Separate steps. Bad: "Click Login and verify Home page." Good: "Click Login." + "Verify Home page is displayed."
-5. BUSINESS LANGUAGE: Product terms, never automation. Bad: "Fill username field" / "Trigger submit." Good: "Enter registered email address" / "Click Login button."
-6. OBSERVABLE EXPECTED RESULTS: Granular, specific. Never "Login successful." Always: "Home page is displayed." + "Logged-in username visible in header." + "Logout button available."
-7. TEST DATA ROLES, NOT VALUES: Steps say "registered username" / "valid password" (roles). Never "standard_user" or "secret_sauce" (values).
-8. PRECONDITIONS ≠ STEPS: Preconditions = starting state. Steps = user actions.
-9. MACHINE-READABLE: Consistent verbs ("Open", "Enter", "Click", "Select", "Verify"). Script Generation parses these deterministically.
-
-STEP WORDING:
-• Navigation: "Open <Page> page" (not "Navigate to", "Go to").
-• Input: "Enter <role> <field>" (e.g., "Enter registered email address"). Never "Fill", "Type into".
-• Click: "Click <Control>" (e.g., "Click Login button"). Never "Press", "Trigger".
-• Selection: "Select <Option> from <Dropdown>".
-• Verification: "Verify <Observable> is <State>" (e.g., "Verify error message is displayed").
-• SPLIT multi-action steps: "Enter email and password and click Login" → 3 steps.
-• NO meta-actions: Never "Ensure", "Confirm", "Observe", "Check", "Wait for".
-
-EXPECTED RESULTS:
-• NEVER abstract: "Login successful" / "Operation completes" / "System behaves correctly."
-• ALWAYS specific observables: "Home page is displayed." + "Logged-in username visible in header." + "Login form no longer displayed."
-• Failure scenarios: describe WHAT the user sees ("Error message displayed." + "User remains on Login page." + "No session created.").
-• Each assertion is a separate bullet for failure diagnosis.
-
-TITLE FORMULA (no creativity):
-"Verify <expected behavior> when <condition>."
-Examples: "Verify successful login with valid credentials." / "Verify login fails with an invalid password." / "Verify validation message when password is empty."
+CONTRACT: return EXACTLY ${inputs.length} objects, SAME order, SAME "id". Never add, drop, merge or reorder cases. Do not put selectors, element ids or raw URLs in step text.
 
 Return ONLY valid JSON (no prose, no markdown):
-{ "cases": ${'[{ "id": string, "title": string, "objective": string, "preconditions": string, "steps": string[], "expected": string }]'} }
+{ "cases": ${'[{ "id": string, "title": string, "steps": string[], "expected": string }]'} }
 
-TEST CASES TO POLISH:
+TEST CASES:
+${payload}`;
+}
+
+/**
+ * Build the TARGETED repair prompt.
+ * ============================================================================
+ *
+ * Used ONLY when the deterministic QA-Standard validator flags a case. Instead
+ * of re-teaching the whole standard, we hand the model back ONLY the failing
+ * cases and ONLY their specific violations (produced by the validator). This is
+ * the "Generate → Validator → Repair → Validator" loop: the model fixes exactly
+ * what failed, nothing else. `fixesById` maps scenarioId → short fix
+ * instructions derived from the validator's violations.
+ */
+export function buildRepairPrompt(
+  inputs: FormatterInput[],
+  fixesById: Record<string, string[]>,
+): string {
+  const payload = JSON.stringify(inputs);
+  const fixLines = inputs
+    .map(inp => `  "${inp.id}":\n${(fixesById[inp.id] || []).map(f => `    - ${f}`).join('\n')}`)
+    .join('\n');
+  return `You are a senior QA engineer. The test cases below did NOT meet the QA writing standard. Fix ONLY the listed issues in each case's "title", "steps" and "expected". Keep the same test logic and the fixed context (objective, preconditions, variable under test, data role) unchanged.
+
+REQUIRED FIXES (by case id):
+${fixLines}
+
+General reminders: one user action per step (never combine with "and"); business language (no automation words like "fill"/"trigger"/selectors); verification is its OWN step; expected results are concrete and observable; title is "Verify <behavior> when <condition>."
+
+CONTRACT: return EXACTLY ${inputs.length} objects, SAME order, SAME "id".
+
+Return ONLY valid JSON (no prose, no markdown):
+{ "cases": ${'[{ "id": string, "title": string, "steps": string[], "expected": string }]'} }
+
+TEST CASES:
 ${payload}`;
 }
 
@@ -774,16 +845,15 @@ ${payload}`;
  * Re-attach the LLM's polished wording to the deterministic canonical objects.
  *
  * Coverage/logic NEVER depend on the model: we start from the deterministic
- * cases (the source of truth) and overlay ONLY the wording fields, matched by
- * canonical `id` (falling back to positional order when ids are absent).
+ * cases (the source of truth) and overlay ONLY the wording fields the model was
+ * allowed to touch — `title`, `steps`, `expected` — matched by canonical `id`
+ * (falling back to positional order when ids are absent). `objective` and
+ * `preconditions` are now FIXED context (part of the semantic contract) and are
+ * never overlaid: the model receives them read-only and cannot alter them.
  *
- * **QA Standard adaptation (Sprint 2B):** The formatter prompt now explicitly
- * instructs the model to SPLIT combined-action steps ("Enter username and password"
- * → 2 steps) to comply with Principle 2 (One Action Per Step). This means the
- * polished step count can LEGITIMATELY exceed the deterministic count. We accept
- * this (splitting is a quality improvement), but still reject count DECREASES
- * (merging/dropping steps is a contract violation). Any field the model omitted
- * or blanked falls back to the deterministic value.
+ * Step count: splitting a combined-action step into atomic steps is a legitimate
+ * QA-Standard improvement, so a polished count that is >= the deterministic count
+ * is accepted; a DECREASE (merging/dropping) is rejected and falls back.
  */
 export function applyPolish(
   deterministic: FormatterTestCase[],
@@ -806,11 +876,8 @@ export function applyPolish(
     const str = (v: unknown, fallback: string) =>
       typeof v === 'string' && v.trim() ? v : fallback;
 
-    // Step count adaptation (QA Standard Sprint 2B):
-    // Accept polished steps if:
-    //   (a) same count AND all valid strings (original behavior), OR
-    //   (b) MORE steps than deterministic (splitting combined actions is allowed), OR
-    //   (c) if count decreased or any step is blank → fall back to deterministic
+    // Accept polished steps if: same-or-more count AND every step a non-blank
+    // string. A decrease (merge/drop) or any blank → fall back to deterministic.
     const stepsValid =
       Array.isArray(p.steps) &&
       p.steps.length >= det.steps.length &&
@@ -818,10 +885,8 @@ export function applyPolish(
     const steps = stepsValid ? (p.steps as string[]) : det.steps;
 
     return {
-      ...det, // all deterministic invariants preserved verbatim
+      ...det, // all deterministic invariants preserved verbatim (incl. objective/preconditions)
       title: str(p.title, det.title),
-      objective: str(p.objective, det.objective),
-      preconditions: str(p.preconditions, det.preconditions),
       expectedResult: str(p.expected, det.expectedResult),
       steps,
     };
