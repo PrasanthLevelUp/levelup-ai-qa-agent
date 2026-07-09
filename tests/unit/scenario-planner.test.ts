@@ -11,7 +11,7 @@
 import {
   classifyQACategory,
   getBaselineScenarios,
-  getScenarioTier,
+  getScenarioObligation,
   recognizeScenarioEvidence,
   QA_KNOWLEDGE_BASE,
   QA_KNOWLEDGE_VERSION,
@@ -108,46 +108,48 @@ describe('QA Knowledge Engine — knowledge base integrity', () => {
   });
 });
 
-describe('QA Knowledge Engine — getScenarioTier (KB owns obligation tiers)', () => {
+describe('QA Knowledge Engine — getScenarioObligation (KB owns obligation metadata)', () => {
   const auth = getBaselineScenarios('authentication');
-  const tier = (id: string) => getScenarioTier(auth.find(s => s.id === id)!);
+  const obl = (id: string) => getScenarioObligation(auth.find(s => s.id === id)!);
 
-  it('classifies the happy-path as core', () => {
-    expect(tier('auth-pos-valid')).toBe('core');
+  it('the happy-path is a required, always obligation (the requirement itself)', () => {
+    expect(obl('auth-pos-valid')).toEqual({ level: 'required', condition: 'always' });
   });
 
-  it('classifies category-universal obligations as mandatory (KB, not the Planner)', () => {
+  it('category-universal obligations are required + always (KB data, not Planner policy)', () => {
     // Invalid credentials + required fields are obligations of ANY credential
-    // login — the KB flags them mandatory so they need no keyword evidence.
-    expect(tier('auth-neg-wrong-password')).toBe('mandatory');
-    expect(tier('auth-neg-empty-fields')).toBe('mandatory');
+    // login — the KB marks them {required, always} so they need no keyword evidence.
+    expect(obl('auth-neg-wrong-password')).toEqual({ level: 'required', condition: 'always' });
+    expect(obl('auth-neg-empty-fields')).toEqual({ level: 'required', condition: 'always' });
   });
 
-  it('classifies mechanism-specific scenarios as conditional (need evidence)', () => {
-    // Lockout, session, remember-me, injection, etc. depend on a specific
-    // mechanism/option and must be justified by explicit evidence.
-    expect(tier('auth-neg-locked-user')).toBe('conditional');
-    expect(tier('auth-sec-injection')).toBe('conditional');
-    expect(tier('auth-pos-logout')).toBe('conditional');
+  it('mechanism-specific scenarios are conditional on evidence', () => {
+    // Lockout, injection, logout, etc. depend on a specific mechanism/option and
+    // must be justified by explicit evidence, so they default to condition 'evidence'.
+    expect(obl('auth-neg-locked-user').condition).toBe('evidence');
+    expect(obl('auth-sec-injection').condition).toBe('evidence');
+    expect(obl('auth-pos-logout').condition).toBe('evidence');
   });
 
-  it('exactly one core scenario per category, and every scenario has a valid tier', () => {
+  it('exactly one core scenario per category, and every obligation is well-formed', () => {
     for (const scenarios of Object.values(QA_KNOWLEDGE_BASE)) {
-      const cores = scenarios.filter(s => getScenarioTier(s) === 'core');
+      const cores = scenarios.filter(s => s.core);
       expect(cores.length).toBe(1);
       for (const s of scenarios) {
-        expect(['core', 'mandatory', 'conditional']).toContain(getScenarioTier(s));
+        const o = getScenarioObligation(s);
+        expect(['required', 'optional']).toContain(o.level);
+        expect(['always', 'evidence']).toContain(o.condition);
       }
     }
   });
 
-  it('authentication (the curated gold standard) has NO dead conditional scenarios', () => {
-    // A conditional scenario with no recognition vocabulary could never be
+  it('authentication (the curated gold standard) has NO dead evidence-conditional scenarios', () => {
+    // An 'evidence' scenario with no recognition vocabulary could never be
     // emitted (dead scenario). This PR curates authentication so every one of
-    // its conditional scenarios carries vocabulary; other categories are curated
-    // in later sprints, so this invariant is scoped to authentication for now.
+    // its evidence-conditional scenarios carries vocabulary; other categories are
+    // curated in later sprints, so this invariant is scoped to authentication.
     for (const s of getBaselineScenarios('authentication')) {
-      if (getScenarioTier(s) === 'conditional') {
+      if (getScenarioObligation(s).condition === 'evidence') {
         expect((s.conditionalOnKeywords || []).length).toBeGreaterThan(0);
       }
     }
@@ -249,9 +251,9 @@ describe('Scenario Planner — planScenarios (single source of truth for existen
     expect(plan.scenarios.map(s => s.id).sort()).toEqual(
       ['auth-neg-empty-fields', 'auth-neg-wrong-password', 'auth-pos-valid'],
     );
-    // Every emitted scenario is a core or mandatory obligation (no conditional).
+    // Every emitted scenario is an 'always' obligation (no evidence-conditional).
     for (const s of plan.scenarios) {
-      expect(['core', 'mandatory']).toContain(getScenarioTier(s));
+      expect(getScenarioObligation(s).condition).toBe('always');
     }
     // The conditional scenarios were NOT invented from the coverage type alone.
     const ids = new Set(plan.scenarios.map(s => s.id));
