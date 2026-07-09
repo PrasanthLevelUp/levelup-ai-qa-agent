@@ -56,6 +56,36 @@ export type QACategory =
   | 'generic';
 
 /**
+ * The STRENGTH of an obligation, independent of when it triggers:
+ *   • 'required' — the category is incomplete without this scenario.
+ *   • 'optional' — a valuable scenario, but not a completeness requirement.
+ * (Level does not yet gate emission — it is carried in the contract for future
+ * prioritisation / coverage-gap reporting. `condition` is what decides emission.)
+ */
+export type ObligationLevel = 'required' | 'optional';
+
+/**
+ * WHEN an obligation applies:
+ *   • 'always'   — whenever the feature is of this category; grounded in the
+ *                  Requirement that established the category (no keyword needed).
+ *   • 'evidence' — only when explicit evidence (Acceptance Criteria / Requirement /
+ *                  App Knowledge / Test Data) recognises it via the scenario's
+ *                  `conditionalOnKeywords`; otherwise the scenario is NOT planned.
+ */
+export type ObligationCondition = 'always' | 'evidence';
+
+/**
+ * How a baseline scenario earns its place — KNOWLEDGE, not policy. Keeping
+ * `level` (required/optional) and `condition` (always/evidence) as orthogonal
+ * data lets the Knowledge Base describe every obligation shape without the code
+ * ever growing new tiers.
+ */
+export interface ScenarioObligation {
+  level: ObligationLevel;
+  condition: ObligationCondition;
+}
+
+/**
  * A single baseline scenario the category implies. This is the deterministic
  * "obligation" — the LLM later expands it into concrete, grounded test cases.
  */
@@ -79,6 +109,25 @@ export interface PlannedScenario {
    * keyword evidence. Exactly one scenario per category should be `core`.
    */
   core?: boolean;
+  /**
+   * How this scenario earns its place, expressed as KNOWLEDGE (data), not policy.
+   * The Knowledge Base describes the obligation; the Planner reads it and applies
+   * one fixed, generic rule (see `getScenarioObligation`). Splitting the strength
+   * (`level`) from the trigger (`condition`) lets the KB express new obligations —
+   * "Password Expiry: required, on evidence", "OTP: optional, on evidence" —
+   * WITHOUT inventing new tiers in code.
+   *
+   * When omitted, a sensible default is derived from the scenario's shape: a
+   * `core` happy-path is {required, always}; anything else is {optional, evidence}
+   * (planned only when its `conditionalOnKeywords` are recognised). Set this
+   * explicitly for a category-universal obligation a senior QA engineer writes for
+   * ANY feature of the category before reading the spec — e.g. "invalid credentials
+   * rejected" and "required fields validated" for a credential login — by marking
+   * it `{ level: 'required', condition: 'always' }`. Reserve `condition: 'always'`
+   * for obligations that are genuinely category-universal and technology-independent;
+   * anything depending on a specific mechanism, threshold or option stays `evidence`.
+   */
+  obligation?: ScenarioObligation;
   /**
    * Recognition vocabulary: lowercase terms that let this Knowledge layer
    * RECOGNISE the scenario in the explicit evidence (Acceptance Criteria,
@@ -241,14 +290,14 @@ export function classifyQACategory(
 export const QA_KNOWLEDGE_BASE: Record<Exclude<QACategory, 'generic'>, PlannedScenario[]> = {
   authentication: [
     { id: 'auth-pos-valid', title: 'Valid credentials log in successfully', objective: 'A registered user with correct credentials is authenticated and lands in the authenticated area.', coverageType: 'positive', priority: 'P0', riskArea: 'Authentication / access', core: true },
-    { id: 'auth-neg-wrong-password', title: 'Invalid password is rejected', objective: 'A wrong password does not authenticate and a clear, non-leaking error is shown.', coverageType: 'negative', priority: 'P0', riskArea: 'Unauthorized access' },
-    { id: 'auth-neg-unknown-user', title: 'Unknown / non-existent user is rejected', objective: 'An unregistered identifier cannot authenticate and the error does not reveal whether the account exists.', coverageType: 'negative', priority: 'P1', riskArea: 'Account enumeration' },
-    { id: 'auth-neg-empty-fields', title: 'Empty required fields are rejected', objective: 'Submitting with blank username and/or password is blocked with field-level validation.', coverageType: 'negative', priority: 'P1', riskArea: 'Input validation' },
+    { id: 'auth-neg-wrong-password', title: 'Invalid password is rejected', objective: 'A wrong password does not authenticate and a clear, non-leaking error is shown.', coverageType: 'negative', priority: 'P0', riskArea: 'Unauthorized access', obligation: { level: 'required', condition: 'always' } },
+    { id: 'auth-neg-empty-fields', title: 'Empty required fields are rejected', objective: 'Submitting with blank username and/or password is blocked with field-level validation.', coverageType: 'negative', priority: 'P1', riskArea: 'Input validation', obligation: { level: 'required', condition: 'always' } },
+    { id: 'auth-neg-unknown-user', title: 'Unknown / non-existent user is rejected', objective: 'An unregistered identifier cannot authenticate and the error does not reveal whether the account exists.', coverageType: 'negative', priority: 'P1', riskArea: 'Account enumeration', conditionalOnKeywords: ['unknown', 'non-existent', 'nonexistent', 'not registered', 'unregistered', 'enumerat', 'no account', 'does not exist'] },
     { id: 'auth-neg-locked-user', title: 'Locked / disabled account cannot log in', objective: 'A locked or disabled account is refused even with correct credentials.', coverageType: 'negative', priority: 'P1', riskArea: 'Account state enforcement', conditionalOnKeywords: ['lock', 'disable', 'suspend', 'attempt'] },
-    { id: 'auth-edge-whitespace-case', title: 'Whitespace / case handling on identifier', objective: 'Leading/trailing whitespace is trimmed and identifier case is handled per the rule (case-insensitive email, etc.).', coverageType: 'edge_cases', priority: 'P2', riskArea: 'Input normalization' },
-    { id: 'auth-neg-invalid-identifier-format', title: 'Malformed identifier format is rejected', objective: 'A malformed identifier (missing @, spaces, or invalid characters in an email login) is rejected with field-level validation before authentication is attempted.', coverageType: 'negative', priority: 'P2', riskArea: 'Input validation' },
-    { id: 'auth-sec-injection', title: 'Injection-style credentials are handled safely', objective: 'SQL/script injection strings in the username or password neither authenticate nor error out — they are treated as ordinary invalid input.', coverageType: 'security', priority: 'P1', riskArea: 'Injection safety' },
-    { id: 'auth-edge-password-masking', title: 'Password input is masked and not exposed', objective: 'The password field masks entry and the value is not exposed in the DOM, page source, autocomplete, or logs.', coverageType: 'edge_cases', priority: 'P2', riskArea: 'Credential exposure' },
+    { id: 'auth-edge-whitespace-case', title: 'Whitespace / case handling on identifier', objective: 'Leading/trailing whitespace is trimmed and identifier case is handled per the rule (case-insensitive email, etc.).', coverageType: 'edge_cases', priority: 'P2', riskArea: 'Input normalization', conditionalOnKeywords: ['whitespace', 'trim', 'case-insensitive', 'case sensitive', 'case-sensitive', 'lowercase', 'uppercase', 'normali'] },
+    { id: 'auth-neg-invalid-identifier-format', title: 'Malformed identifier format is rejected', objective: 'A malformed identifier (missing @, spaces, or invalid characters in an email login) is rejected with field-level validation before authentication is attempted.', coverageType: 'negative', priority: 'P2', riskArea: 'Input validation', conditionalOnKeywords: ['email', 'format', 'malformed', 'valid email', 'invalid email', 'identifier'] },
+    { id: 'auth-sec-injection', title: 'Injection-style credentials are handled safely', objective: 'SQL/script injection strings in the username or password neither authenticate nor error out — they are treated as ordinary invalid input.', coverageType: 'security', priority: 'P1', riskArea: 'Injection safety', conditionalOnKeywords: ['injection', 'sql', 'script', 'xss', 'saniti', 'malicious', 'special character'] },
+    { id: 'auth-edge-password-masking', title: 'Password input is masked and not exposed', objective: 'The password field masks entry and the value is not exposed in the DOM, page source, autocomplete, or logs.', coverageType: 'edge_cases', priority: 'P2', riskArea: 'Credential exposure', conditionalOnKeywords: ['mask', 'masked', 'hidden', 'plain text', 'plaintext', 'visible', 'obscure', 'autocomplete'] },
     { id: 'auth-sec-lockout-threshold', title: 'Account lockout after repeated failures', objective: 'After the configured number of failed attempts the account is locked / throttled.', coverageType: 'security', priority: 'P1', riskArea: 'Brute-force resistance', conditionalOnKeywords: ['lock', 'attempt', 'brute', 'throttle', 'rate'] },
     { id: 'auth-sec-session', title: 'Session established and protected', objective: 'A session/token is issued on login and protected resources reject requests without it.', coverageType: 'security', priority: 'P1', riskArea: 'Session management', conditionalOnKeywords: ['session', 'token', 'timeout', 'expire'] },
     { id: 'auth-pos-remember-me', title: 'Remember-me persists the session', objective: 'When remember-me is selected the session persists across browser restarts per policy.', coverageType: 'positive', priority: 'P2', riskArea: 'Session persistence', conditionalOnKeywords: ['remember'] },
@@ -344,6 +393,26 @@ export const QA_KNOWLEDGE_BASE: Record<Exclude<QACategory, 'generic'>, PlannedSc
 export function getBaselineScenarios(category: QACategory): PlannedScenario[] {
   if (category === 'generic') return [];
   return QA_KNOWLEDGE_BASE[category] ?? [];
+}
+
+/**
+ * Resolve a baseline scenario's obligation — the Knowledge Base telling the
+ * Planner HOW the scenario earns its place. The Planner never decides this; it
+ * reads the returned {level, condition} and applies one fixed rule.
+ *
+ * Explicit `obligation` metadata always wins. When absent, a default is derived
+ * from the scenario's shape so uncurated categories keep working unchanged:
+ *   • a `core` happy-path        → { required, always }  (the requirement itself)
+ *   • everything else            → { optional, evidence } (planned only when its
+ *                                    `conditionalOnKeywords` are recognised)
+ *
+ * Keeping this in the KB (not the Planner) is the whole point of Model C: domain
+ * obligations live with the domain knowledge, expressed as data — no code tiers.
+ */
+export function getScenarioObligation(scenario: PlannedScenario): ScenarioObligation {
+  if (scenario.obligation) return scenario.obligation;
+  if (scenario.core) return { level: 'required', condition: 'always' };
+  return { level: 'optional', condition: 'evidence' };
 }
 
 /* ============================================================================
