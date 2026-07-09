@@ -199,6 +199,43 @@ describe('Knowledge layer — recognizeScenarioEvidence (owns vocabulary + match
     const ev: NormalizedEvidence = { ...EMPTY, acceptanceClauses: ['locked after failed attempts'] };
     expect(recognizeScenarioEvidence(locked, ev)).toEqual(recognizeScenarioEvidence(locked, ev));
   });
+
+  // --- False-positive guardrails: over-broad substring keywords must not cite
+  //     evidence a scenario has nothing to do with (trust in explainability). ---
+  const byId = (id: string) => getBaselineScenarios('authentication').find(s => s.id === id)!;
+
+  it('password-masking does NOT match an unrelated "…icon should be visible" clause', () => {
+    // Regression: the bare keyword `visible` used to match "shopping cart icon
+    // should be visible", producing a password-masking scenario cited against a
+    // completely unrelated acceptance criterion.
+    const ev: NormalizedEvidence = {
+      ...EMPTY,
+      acceptanceClauses: ['And the shopping cart icon should be visible'],
+    };
+    expect(recognizeScenarioEvidence(byId('auth-edge-password-masking'), ev)).toEqual([]);
+  });
+
+  it('password-masking DOES match genuine password-visibility evidence', () => {
+    for (const clause of ['The password must be masked', 'A show password toggle reveals the value']) {
+      const ev: NormalizedEvidence = { ...EMPTY, acceptanceClauses: [clause] };
+      expect(recognizeScenarioEvidence(byId('auth-edge-password-masking'), ev).length).toBeGreaterThan(0);
+    }
+  });
+
+  it('lockout-threshold does NOT match "generate" via the old `rate` substring', () => {
+    const ev: NormalizedEvidence = { ...EMPTY, acceptanceClauses: ['The system will generate a session token'] };
+    expect(recognizeScenarioEvidence(byId('auth-sec-lockout-threshold'), ev)).toEqual([]);
+  });
+
+  it('injection does NOT match "description" via the old `script` substring', () => {
+    const ev: NormalizedEvidence = { ...EMPTY, acceptanceClauses: ['The page shows a description of the account'] };
+    expect(recognizeScenarioEvidence(byId('auth-sec-injection'), ev)).toEqual([]);
+  });
+
+  it('injection DOES still match genuine injection evidence', () => {
+    const ev: NormalizedEvidence = { ...EMPTY, acceptanceClauses: ['SQL injection strings are rejected safely'] };
+    expect(recognizeScenarioEvidence(byId('auth-sec-injection'), ev).length).toBeGreaterThan(0);
+  });
 });
 
 describe('Scenario Planner — planScenarios (single source of truth for existence)', () => {
