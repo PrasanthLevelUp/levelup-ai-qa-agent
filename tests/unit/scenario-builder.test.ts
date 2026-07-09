@@ -137,17 +137,20 @@ describe('buildDraftTestCases — pure transform (no existence decisions)', () =
       .toEqual(plan.scenarios.map(s => s.id).sort());
   });
 
-  it('no invention: a bare login yields ONLY the justified happy path (no phantom negatives)', () => {
-    // The planner justifies only the core valid-login scenario for a bare
-    // requirement; the builder must faithfully emit that and nothing more —
-    // no invented Invalid Login / SQL Injection / Empty Password.
+  it('no invention: a bare login yields ONLY the KB obligations (core + mandatory), no conditional phantoms', () => {
+    // The planner justifies the authentication KB obligations for a bare
+    // requirement (valid login + invalid credentials + required fields); the
+    // builder must faithfully emit exactly those and nothing more — no invented
+    // SQL Injection / lockout / session phantoms (those are conditional).
     const plan = planScenarios(
       { title: 'User Login', description: 'User can log in successfully.' },
       ['positive', 'negative', 'edge_cases', 'security'],
       'authentication',
     );
     const { drafts } = buildDraftTestCases(plan, LOGIN_KNOWLEDGE, LOGIN_REQ);
-    expect(drafts.map(d => d.scenarioId)).toEqual(['auth-pos-valid']);
+    expect(drafts.map(d => d.scenarioId).sort()).toEqual(
+      ['auth-neg-empty-fields', 'auth-neg-wrong-password', 'auth-pos-valid'],
+    );
   });
 
   it('reflects the planner: explicit lockout evidence yields strictly more drafts than a bare login', () => {
@@ -399,11 +402,12 @@ describe('applyPolish — canonical reconciliation', () => {
 });
 
 describe('No invention — authentication (quality over quantity)', () => {
-  it('a bare login does NOT emit ungrounded baseline scenarios (no SQL injection / empty password / masking phantoms)', () => {
+  it('a bare login does NOT emit ungrounded CONDITIONAL scenarios (no SQL injection / lockout / masking phantoms)', () => {
     // This is the exact regression the refactor removes: previously a bare login
     // produced a fixed 8-scenario baseline including scenarios NOTHING in the
-    // requirement justified. Now the planner emits only what the evidence
-    // supports, so those phantoms must be ABSENT.
+    // requirement justified. Now the planner emits the KB obligations (core +
+    // mandatory) plus only the CONDITIONAL scenarios the evidence supports, so
+    // the mechanism-specific phantoms must be ABSENT.
     const plan = planScenarios(
       { title: 'User Login', description: 'User can log in successfully.' },
       ['positive', 'negative', 'edge_cases', 'security'],
@@ -411,12 +415,16 @@ describe('No invention — authentication (quality over quantity)', () => {
     );
     const { drafts } = buildDraftTestCases(plan, LOGIN_KNOWLEDGE, LOGIN_REQ);
     const ids = drafts.map(d => d.scenarioId);
-    // Only the core happy path is justified for a bare requirement.
-    expect(ids).toEqual(['auth-pos-valid']);
-    // The previously-invented baseline scenarios are gone.
+    // The KB obligations for a bare credential login: valid + invalid + required.
+    expect(ids.sort()).toEqual(
+      ['auth-neg-empty-fields', 'auth-neg-wrong-password', 'auth-pos-valid'],
+    );
+    // The conditional (mechanism-specific) scenarios are gone — nothing in the
+    // bare requirement justifies them.
     expect(ids).not.toContain('auth-sec-injection');
     expect(ids).not.toContain('auth-neg-invalid-identifier-format');
     expect(ids).not.toContain('auth-edge-password-masking');
+    expect(ids).not.toContain('auth-neg-locked-user');
   });
 
   it('explicit evidence (acceptance criteria) DOES justify the corresponding scenarios', () => {

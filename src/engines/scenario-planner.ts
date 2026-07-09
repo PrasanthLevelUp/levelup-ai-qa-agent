@@ -10,29 +10,41 @@
  *   Healing — treats the planner's output as IMMUTABLE. They enrich, transform,
  *   validate or consume scenarios; they never create or remove them.
  *
- * A scenario is derived ONLY from explicit evidence, in this priority order:
+ * A scenario earns its place in one of three ways, and the KNOWLEDGE BASE (not
+ * the Planner) decides which — see `getScenarioTier`:
  *
- *   1. Acceptance Criteria      (the strongest, explicit spec)
- *   2. Requirement description
- *   3. App Knowledge            (pages/elements/forms crawled)
- *   4. Test Data                (supplied datasets)
+ *   • core        — the category's happy-path (the requirement itself).
+ *   • mandatory   — a category-universal obligation the KB declares for every
+ *                   feature of the category (e.g. "invalid credentials rejected"
+ *                   for a credential login). Justified by the Requirement
+ *                   establishing the category, NOT by keyword evidence.
+ *   • conditional — justified ONLY by explicit evidence, matched in this
+ *                   priority order:
+ *                     1. Acceptance Criteria   (the strongest, explicit spec)
+ *                     2. Requirement description
+ *                     3. App Knowledge         (pages/elements/forms crawled)
+ *                     4. Test Data             (supplied datasets)
+ *                   A conditional scenario with no recognised evidence is NOT
+ *                   planned — this is where "no invention" is enforced.
  *
  * Separation of concerns (the whole point of this layer):
  *
  *   • The Planner maps EVIDENCE → SCENARIO IDENTITIES. It stays "dumb": it does
- *     NOT know testing heuristics (what "lockout"/"sql injection"/"expired"
- *     mean). That vocabulary + matching lives in the Knowledge layer
- *     (`recognizeScenarioEvidence`), so the Planner never turns into a second
- *     knowledge engine.
+ *     NOT decide which scenarios are obligations, and it does NOT know testing
+ *     heuristics (what "lockout"/"sql injection"/"expired" mean). Both the
+ *     obligation tiers and the recognition vocabulary + matching live in the
+ *     Knowledge layer (`getScenarioTier`, `recognizeScenarioEvidence`), so the
+ *     Planner never turns into a second knowledge engine.
  *   • The Planner emits FACTS (structured `evidence`), NOT scores. Confidence is
  *     computed downstream by the orchestrator (`computeConfidence`) so scoring
  *     is consistent across the whole platform and the Planner has one job.
  *
  * Coverage Types are a FILTER, never a creator. Selecting "negative" asks
- * "include the negative scenarios that the evidence justifies" — it can never
- * conjure a negative scenario the requirement/AC/app/data never mention. A bare
- * "user can log in" requirement therefore yields ONE scenario (valid login),
- * not a padded list of invented failures. Quality over quantity.
+ * "include the negative scenarios that the KB obligations / evidence justify" —
+ * it can never conjure a CONDITIONAL scenario the requirement/AC/app/data never
+ * mention. A bare "user can log in" requirement yields the category's core +
+ * mandatory obligations (valid login, invalid credentials, required fields), not
+ * a padded list of invented failures. Quality over quantity.
  *
  * Every planned scenario carries its provenance:
  *
@@ -49,8 +61,10 @@ import type { CoverageType, RequirementInput } from './test-coverage-engine';
 import {
   classifyQACategory,
   getBaselineScenarios,
+  getScenarioTier,
   recognizeScenarioEvidence,
   QA_KNOWLEDGE_VERSION,
+  type QACategory,
   type PlannedScenario,
   type QACategoryClassification,
   type ScenarioEvidence,
@@ -209,19 +223,34 @@ function buildEvidence(
 /**
  * Derive the provenance for a baseline scenario, or null if the evidence does
  * not justify it (⇒ the scenario is not planned). This is where "no invention"
- * is enforced — a non-core scenario with no recognised evidence simply does not
- * exist.
+ * is enforced — a CONDITIONAL scenario with no recognised evidence simply does
+ * not exist.
  *
- * The Planner does NOT inspect keywords here: it delegates recognition to the
- * Knowledge layer (`recognizeScenarioEvidence`) and only maps the returned
- * evidence into scenario provenance. No numeric confidence is attached — the
- * orchestrator scores the evidence downstream.
+ * The Planner does NOT decide WHICH scenarios are obligations, nor does it
+ * inspect keywords: it asks the Knowledge layer for the scenario's obligation
+ * tier (`getScenarioTier`) and delegates recognition to it
+ * (`recognizeScenarioEvidence`). It only maps the result into provenance. No
+ * numeric confidence is attached — the orchestrator scores the evidence
+ * downstream.
+ *
+ * Three tiers (all owned by the KB, see `getScenarioTier`):
+ *   • core        — the requirement's happy-path; justified by the Requirement.
+ *   • mandatory   — a category-universal obligation; also justified by the
+ *                   Requirement establishing the feature category (no keyword
+ *                   evidence needed — the KB, not the Planner, declares it).
+ *   • conditional — justified ONLY by recognised explicit evidence, else dropped.
  */
-function deriveProvenance(scenario: PlannedScenario, ev: NormalizedEvidence): ScenarioProvenance | null {
+function deriveProvenance(
+  scenario: PlannedScenario,
+  ev: NormalizedEvidence,
+  category: QACategory,
+): ScenarioProvenance | null {
+  const tier = getScenarioTier(scenario);
+
   // The core happy-path is the requirement itself — always justified by it.
   // This is an evidence MAPPING (core scenario ⇒ requirement evidence), not a
   // testing heuristic, so it stays in the Planner.
-  if (scenario.core) {
+  if (tier === 'core') {
     const evidence: ScenarioEvidence[] = [{
       id: `${scenario.id}:req`,
       source: 'requirement',
@@ -237,7 +266,27 @@ function deriveProvenance(scenario: PlannedScenario, ev: NormalizedEvidence): Sc
     };
   }
 
-  // Non-core: ask the Knowledge layer which evidence recognises this scenario.
+  // A mandatory obligation is emitted for ANY feature of this category — the KB
+  // declares it, the Planner just honours it. It is grounded in the Requirement
+  // establishing the feature category (not in keyword evidence), so the citation
+  // is the requirement itself and the reason names the category obligation.
+  if (tier === 'mandatory') {
+    const evidence: ScenarioEvidence[] = [{
+      id: `${scenario.id}:req`,
+      source: 'requirement',
+      reference: 'REQ',
+      excerpt: ev.requirementLabel,
+    }];
+    return {
+      whyExists: `Standard ${category} obligation — expected for any ${category} feature, independent of the specific wording`,
+      source: 'Requirement',
+      derivedFrom: ev.requirementLabel,
+      assumption: false,
+      evidence,
+    };
+  }
+
+  // Conditional: ask the Knowledge layer which evidence recognises this scenario.
   const evidence = recognizeScenarioEvidence(scenario, ev);
   if (!evidence.length) return null; // no recognised evidence → not planned
 
@@ -284,7 +333,7 @@ export function planScenarios(
   const scenarios: PlannedScenarioWithProvenance[] = [];
   for (const s of baseline) {
     if (!selected.has(s.coverageType)) continue;
-    const provenance = deriveProvenance(s, evidence);
+    const provenance = deriveProvenance(s, evidence, classification.category);
     if (!provenance) continue; // unjustified → not planned (no invention)
     scenarios.push({ ...s, provenance });
   }
