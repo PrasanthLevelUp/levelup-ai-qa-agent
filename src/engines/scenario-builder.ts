@@ -42,6 +42,8 @@
  */
 
 import type { QACategory, ScenarioSemantics } from './qa-knowledge-engine';
+import { datasetResolver } from './dataset-resolver';
+import type { Dataset, ResolvedDatasetRecord } from './dataset-resolver';
 import type {
   PlannedScenarioWithProvenance,
   ProvenanceSource,
@@ -744,6 +746,15 @@ export interface FormatterInput {
   readonly title: string;
   readonly steps: readonly string[];
   readonly expected: string;
+  /**
+   * The concrete dataset record the Dataset Resolver matched for `dataRole`, or
+   * absent when no available dataset declares that role (resolution is
+   * best-effort — the formatter must work with or without it). This is ADDITIVE
+   * context: it never replaces `dataRole` and the resolver never mutates the
+   * semantics. The prompt shows the model dataset/record/role with MASKED values
+   * so it writes role-based wording; the LLM never performs a lookup itself.
+   */
+  readonly resolvedDataset?: ResolvedDatasetRecord;
 }
 
 /**
@@ -757,9 +768,19 @@ export interface FormatterInput {
 export function buildFormatterInputs(
   cases: FormatterTestCase[],
   semanticsById?: Map<string, ScenarioSemantics>,
+  availableDatasets?: readonly Dataset[],
 ): FormatterInput[] {
   return cases.map(tc => {
     const sem = semanticsById?.get(tc.scenarioId);
+    const dataRole = sem?.requiredDataRole ?? 'valid_data';
+    // Turn the abstract data ROLE into a concrete dataset record — the ONLY
+    // place resolution happens. Best-effort: `resolve` returns null when no
+    // available dataset declares the role, and the contract stays valid without
+    // it. The resolver is a PURE function of (role, datasets) — it reads no
+    // scenario/semantics and never mutates either input.
+    const resolved = availableDatasets?.length
+      ? datasetResolver.resolve(dataRole, availableDatasets)
+      : null;
     // Deep-freeze: the seed steps array AND the whole object, so the immutable
     // contract is enforced at runtime (a stray mutation throws in strict mode /
     // is silently ignored otherwise — never a hidden semantic edit).
@@ -769,12 +790,13 @@ export function buildFormatterInputs(
       preconditions: tc.preconditions,
       variation: sem?.variation ?? 'none — the primary path is exercised',
       expectedBehavior: sem?.expectedBehavior ?? tc.objective,
-      dataRole: sem?.requiredDataRole ?? 'valid_data',
+      dataRole,
       priority: tc.priority,
       coverageType: tc.tags?.[tc.tags.length - 1] ?? 'positive',
       title: tc.title,
       steps: Object.freeze(tc.steps.slice()),
       expected: tc.expectedResult,
+      ...(resolved ? { resolvedDataset: resolved } : {}),
     };
     return Object.freeze(input);
   });
@@ -797,8 +819,13 @@ export function buildFormatterInputs(
  * "expected"). Everything else is a withheld invariant re-attached by `id`.
  */
 export function buildFormatterPrompt(inputs: FormatterInput[]): string {
-  // Compact, whitespace-free JSON — the FormatterInput contract as data.
-  const payload = JSON.stringify(inputs);
+  // Compact, whitespace-free JSON — the FormatterInput contract as data. The
+  // resolved dataset record is projected with MASKED values: the model sees the
+  // dataset id, record id, role and the field NAMES (so it can write "Enter the
+  // registered username") but NEVER the literal secret values — those never
+  // belong in a manual test case and must not leak into the prompt/output.
+  const projected = inputs.map(maskResolvedDataset);
+  const payload = JSON.stringify(projected);
   return `You are a senior QA engineer writing manual test cases. Each item below is an ALREADY-DECIDED test case: its objective, preconditions, the single variable under test, the expected behavior, the required data role, priority and coverage are FIXED. Do NOT change, restate or second-guess them.
 
 YOUR ONLY JOB: rewrite "title", "steps" and "expected" into natural, human-quality QA wording that faithfully expresses the fixed context.
@@ -808,6 +835,8 @@ Write like a senior tester:
   • Steps: one user action each (never combine with "and"); business language ("Enter the registered username", "Click the Login button"); data ROLES, never literal values.
   • Expected: concrete, observable outcomes a tester can see — never "Login successful" / "works correctly".
 
+DATA: when a case has "resolvedDataset", its "values" are MASKED ("*****") on purpose — refer to the data by ROLE and field name (e.g. "the registered user's username"), never write literal credential values.
+
 CONTRACT: return EXACTLY ${inputs.length} objects, SAME order, SAME "id". Never add, drop, merge or reorder cases. Do not put selectors, element ids or raw URLs in step text.
 
 Return ONLY valid JSON (no prose, no markdown):
@@ -815,6 +844,31 @@ Return ONLY valid JSON (no prose, no markdown):
 
 TEST CASES:
 ${payload}`;
+}
+
+/** Mask token for resolved dataset field values shown in the formatter prompt. */
+const MASKED_VALUE = '*****';
+
+/**
+ * Project a FormatterInput for the prompt, replacing every resolved-dataset
+ * value with a mask while preserving the field NAMES, dataset id, record id,
+ * confidence and reason. Pure — never mutates the input (values are copied into
+ * a fresh object). Inputs without a resolved dataset pass through untouched.
+ */
+function maskResolvedDataset(
+  input: FormatterInput,
+): FormatterInput | (Omit<FormatterInput, 'resolvedDataset'> & {
+  resolvedDataset: Omit<ResolvedDatasetRecord, 'values'> & { values: Record<string, string> };
+}) {
+  if (!input.resolvedDataset) return input;
+  const maskedValues: Record<string, string> = {};
+  for (const key of Object.keys(input.resolvedDataset.values)) {
+    maskedValues[key] = MASKED_VALUE;
+  }
+  return {
+    ...input,
+    resolvedDataset: { ...input.resolvedDataset, values: maskedValues },
+  };
 }
 
 /**

@@ -38,6 +38,7 @@ import {
   type StepGrounding,
   type StructuredExpected,
 } from './scenario-builder';
+import type { Dataset } from './dataset-resolver';
 import { validateCanonicalTestCases } from './canonical-validator';
 import { validateQaStandard, violationsToInstructions } from './qa-standard-validator';
 import type { ScenarioSemantics } from './qa-knowledge-engine';
@@ -989,6 +990,37 @@ Because these datasets exist, you MUST:
 Do NOT invent placeholder data (john@test.com, password123, ABC Product) when a matching dataset above can supply it.`;
   }
 
+  /**
+   * Adapt the token-safe Test Data summaries into the Dataset[] shape the
+   * Dataset Resolver matches against. This is a pure structural projection — it
+   * declares NO roles and reads NO scenario/semantics, so it never smuggles
+   * business logic into the resolver.
+   *
+   * HONEST LIMITATION (Sprint 2C): the generation-time knowledge only carries a
+   * summary (name / environment / recordCount / sampleKeys) — NOT the per-record
+   * values or the role tags the resolver keys off. So today these adapted
+   * datasets declare no roles and the resolver correctly returns `null` for
+   * every case (the formatter still works, unchanged). The wiring is in place
+   * end-to-end; it "lights up" with zero formatter changes the moment the Test
+   * Data Store surfaces role-tagged records here.
+   */
+  private buildResolverDatasets(knowledge?: KnowledgeContext): Dataset[] {
+    const sets = knowledge?.testData;
+    if (!sets?.length) return [];
+    return sets.map(ds => {
+      const values: Record<string, string> = {};
+      for (const key of ds.sampleKeys ?? []) values[key] = '';
+      return {
+        datasetId: ds.name,
+        name: ds.name,
+        // No role tags available from a summary — declares nothing (see note).
+        roles: [],
+        records: [{ recordId: ds.name, values, tags: [] }],
+        metadata: ds.environment ? [ds.environment] : [],
+      };
+    });
+  }
+
   /* ---- Phase 2: Requirement Understanding ---- */
   /* ---- Adaptive complexity classification (heuristic, ZERO LLM calls) ---- */
   /**
@@ -1709,7 +1741,11 @@ Return ONLY valid JSON. Address EVERY selected coverage type, organise scenarios
     // reuse the exact same inputs for the cases it needs to re-ask.
     const formatterInputs: FormatterInput[] | undefined =
       formatterMode && deterministicOutput
-        ? buildFormatterInputs(deterministicOutput.testCases, semanticsById)
+        ? buildFormatterInputs(
+            deterministicOutput.testCases,
+            semanticsById,
+            this.buildResolverDatasets(genKnowledge),
+          )
         : undefined;
     const formatterPrompt = formatterInputs ? buildFormatterPrompt(formatterInputs) : '';
     const prompt = formatterMode ? formatterPrompt : fullPrompt;
@@ -1833,7 +1869,11 @@ Return ONLY valid JSON. Address EVERY selected coverage type, organise scenarios
         );
         if (QA_STANDARD_REPAIR_ENABLED && errorIds.size > 0 && formatterInputs) {
           const failing = polishedCases.filter(c => errorIds.has(c.scenarioId));
-          const repairInputs = buildFormatterInputs(failing, semanticsById);
+          const repairInputs = buildFormatterInputs(
+            failing,
+            semanticsById,
+            this.buildResolverDatasets(genKnowledge),
+          );
           const fixesById: Record<string, string[]> = {};
           for (const c of failing) {
             fixesById[c.scenarioId] = violationsToInstructions(report.byId.get(c.scenarioId) ?? []);
