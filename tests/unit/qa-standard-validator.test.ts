@@ -57,10 +57,49 @@ const byPrinciple = (vs: QaViolation[], p: string) => vs.filter(v => v.principle
 describe('qa-standard-validator — clean baseline', () => {
   it('a fully standard-compliant case passes with zero errors', () => {
     const report = validateQaStandard([mk({})]);
-    expect(report.ok).toBe(true);
+    expect(report.passed).toBe(true);
     expect(report.errors).toBe(0);
     expect(report.checked).toBe(1);
     expect(report.failingIds).not.toContain('auth-valid-login');
+  });
+});
+
+describe('qa-standard-validator — reusable ValidationReport summary', () => {
+  it('a clean batch scores 100 and satisfies every checked principle', () => {
+    const report = validateQaStandard([mk({ scenarioId: 'a' }), mk({ scenarioId: 'b' })]);
+    expect(report.passed).toBe(true);
+    expect(report.score).toBe(100);
+    expect(report.principlesViolated).toEqual([]);
+    // Every principle the validator checks is reported as satisfied.
+    expect(report.principlesSatisfied).toEqual(expect.arrayContaining(['P2 one-action-per-step', 'P6 observable-results']));
+    expect(report.principlesSatisfied.length).toBeGreaterThanOrEqual(8);
+  });
+
+  it('score reflects the % of error-free cases; violated principle leaves satisfied', () => {
+    const report = validateQaStandard([
+      mk({ scenarioId: 'good' }),
+      mk({ scenarioId: 'bad', steps: ['Open the login page.', 'Fill the username selector.'] }), // P5 error
+    ]);
+    expect(report.passed).toBe(false);
+    expect(report.score).toBe(50); // 1 of 2 cases error-free
+    expect(report.principlesViolated).toContain('P5 business-language');
+    expect(report.principlesSatisfied).not.toContain('P5 business-language');
+  });
+
+  it('warnings do NOT reduce the score or fail the gate', () => {
+    // A non-"Verify" title is a P11 WARNING only.
+    const report = validateQaStandard([mk({ title: 'Login works with valid credentials' })]);
+    expect(report.passed).toBe(true);
+    expect(report.score).toBe(100);
+    expect(report.warnings).toBeGreaterThan(0);
+    expect(report.principlesViolated).toContain('P11 title-formula');
+  });
+
+  it('empty input is a clean 100 with no principles violated', () => {
+    const report = validateQaStandard([]);
+    expect(report.passed).toBe(true);
+    expect(report.score).toBe(100);
+    expect(report.principlesViolated).toEqual([]);
   });
 });
 
@@ -73,7 +112,7 @@ describe('qa-standard-validator — P2 one-action-per-step', () => {
     expect(p2.length).toBeGreaterThan(0);
     expect(p2[0].field).toBe('steps');
     expect(p2[0].severity).toBe('error');
-    expect(report.ok).toBe(false);
+    expect(report.passed).toBe(false);
   });
 
   it('does NOT flag a single control label containing "and"', () => {
@@ -146,7 +185,7 @@ describe('qa-standard-validator — P11 title-formula (warn)', () => {
     expect(p11.length).toBe(1);
     expect(p11[0].severity).toBe('warn');
     // A warning alone does NOT fail the batch.
-    expect(report.ok).toBe(true);
+    expect(report.passed).toBe(true);
   });
 });
 
@@ -172,7 +211,7 @@ describe('qa-standard-validator — reporting contract', () => {
 
   it('never throws on empty input', () => {
     const report = validateQaStandard([]);
-    expect(report.ok).toBe(true);
+    expect(report.passed).toBe(true);
     expect(report.checked).toBe(0);
     expect(report.violations).toEqual([]);
   });

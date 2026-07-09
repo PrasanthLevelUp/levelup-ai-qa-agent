@@ -368,6 +368,28 @@ describe('Formatter mode — minimal prompt (FormatterInput contract)', () => {
     expect(noSem[0].variation.length).toBeGreaterThan(0);
   });
 
+  it('FormatterInput is IMMUTABLE — semantic truth cannot be mutated at runtime', () => {
+    const plan = planScenarios(LOGIN_REQ, COVERAGE, 'authentication');
+    const { drafts } = buildDraftTestCases(plan, LOGIN_KNOWLEDGE, LOGIN_REQ);
+    const out = buildDeterministicOutput(drafts);
+    const inputs = buildFormatterInputs(out.testCases);
+    const input: any = inputs[0];
+
+    // The object AND its steps array are frozen.
+    expect(Object.isFrozen(input)).toBe(true);
+    expect(Object.isFrozen(input.steps)).toBe(true);
+
+    // Mutating a semantic field is a no-op (silent in loose mode, throws in
+    // strict mode) — the value never changes either way.
+    const originalObjective = input.objective;
+    try { input.objective = 'HACKED'; } catch { /* strict-mode TypeError is fine */ }
+    expect(input.objective).toBe(originalObjective);
+
+    const originalLen = input.steps.length;
+    try { input.steps.push('injected step'); } catch { /* frozen array */ }
+    expect(input.steps.length).toBe(originalLen);
+  });
+
   it('buildRepairPrompt lists ONLY the failing cases and their specific fixes', () => {
     const plan = planScenarios(LOGIN_REQ, COVERAGE, 'authentication');
     const { drafts } = buildDraftTestCases(plan, LOGIN_KNOWLEDGE, LOGIN_REQ);

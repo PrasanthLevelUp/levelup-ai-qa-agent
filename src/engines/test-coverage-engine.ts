@@ -321,9 +321,17 @@ const QA_STANDARD_VALIDATOR_ENABLED = (process.env.GEN_QA_STANDARD_VALIDATOR || 
  * QA Standard validator flagged, carrying ONLY their specific violations (not the
  * whole standard). If repair is disabled, fails, or does not clear the errors,
  * the previous (already-shipped-quality) wording is kept — coverage is never at
- * risk. Default ON; set GEN_QA_STANDARD_REPAIR=false to disable the extra call.
+ * risk.
+ *
+ * DEFAULT OFF (opt-in via GEN_QA_STANDARD_REPAIR=true). Rationale: repair can
+ * MASK a weak generator. We want to first MEASURE the validator's pass-rate on
+ * the deterministic + formatter output and drive that up by improving the
+ * formatter itself; a high baseline pass-rate is the goal. Repair is a band-aid
+ * we enable only once we have real pass-rate metrics and a deliberate reason —
+ * never as a substitute for a strong generator. The code stays behind the flag,
+ * fully implemented, so turning it on later is a one-line env change.
  */
-const QA_STANDARD_REPAIR_ENABLED = (process.env.GEN_QA_STANDARD_REPAIR || 'true').toLowerCase() !== 'false';
+const QA_STANDARD_REPAIR_ENABLED = (process.env.GEN_QA_STANDARD_REPAIR || 'false').toLowerCase() === 'true';
 
 /**
  * Persistent Scenario Graph — the ONE intelligence source. When ON (default),
@@ -1814,7 +1822,9 @@ Return ONLY valid JSON. Address EVERY selected coverage type, organise scenarios
       if (QA_STANDARD_VALIDATOR_ENABLED) {
         const report = validateQaStandard(polishedCases);
         logger.info(MOD, 'QA Standard validator', {
-          checked: report.checked, ok: report.ok, errors: report.errors, warnings: report.warnings,
+          checked: report.checked, passed: report.passed, score: report.score,
+          errors: report.errors, warnings: report.warnings,
+          principlesViolated: report.principlesViolated.join(' '),
           violations: report.violations.slice(0, 8).map(v => `${v.scenarioId}:${v.principle}`).join(' '),
         });
 

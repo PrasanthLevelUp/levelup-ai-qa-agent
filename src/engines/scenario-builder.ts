@@ -714,29 +714,36 @@ export function buildDeterministicOutput(drafts: DraftTestCase[]): {
  * re-attached to the right invariant object regardless of order. Traceability,
  * selectors, severity, source, automation flags are NEVER sent — the model can
  * therefore never corrupt them.
+ *
+ * IMMUTABLE by contract. Every field is `readonly` and the objects returned by
+ * `buildFormatterInputs` are deep-frozen (see below). The FIXED semantic fields
+ * (objective / variation / expectedBehavior / dataRole …) are SEMANTIC TRUTH
+ * decided upstream by the Planner + ScenarioSemantics — no formatter, prompt
+ * builder or repair step is allowed to mutate them. Freezing makes that
+ * guarantee enforced at runtime, not just by convention.
  */
 export interface FormatterInput {
   /** Canonical scenarioId — round-trip key; the model must echo it back. */
-  id: string;
+  readonly id: string;
   /* ---- FIXED semantic context (model READS, must honor, must NOT alter) ---- */
   /** The ONE thing this case verifies (from the scenario). */
-  objective: string;
+  readonly objective: string;
   /** The valid starting state (deterministic; the model does not rewrite it). */
-  preconditions: string;
+  readonly preconditions: string;
   /** The single variable changed from a valid baseline (ScenarioSemantics). */
-  variation: string;
+  readonly variation: string;
   /** The observable pass/fail behavior to assert (ScenarioSemantics). */
-  expectedBehavior: string;
+  readonly expectedBehavior: string;
   /** The generic data ROLE this case needs, e.g. "registered_user". */
-  dataRole: string;
+  readonly dataRole: string;
   /** Deterministic priority (invariant). */
-  priority: FormatterTestCase['priority'];
+  readonly priority: FormatterTestCase['priority'];
   /** Coverage type, e.g. "positive" / "negative" (invariant). */
-  coverageType: string;
+  readonly coverageType: string;
   /* ---- SEED wording the model REFINES into human-quality prose ---- */
-  title: string;
-  steps: string[];
-  expected: string;
+  readonly title: string;
+  readonly steps: readonly string[];
+  readonly expected: string;
 }
 
 /**
@@ -753,7 +760,10 @@ export function buildFormatterInputs(
 ): FormatterInput[] {
   return cases.map(tc => {
     const sem = semanticsById?.get(tc.scenarioId);
-    return {
+    // Deep-freeze: the seed steps array AND the whole object, so the immutable
+    // contract is enforced at runtime (a stray mutation throws in strict mode /
+    // is silently ignored otherwise — never a hidden semantic edit).
+    const input: FormatterInput = {
       id: tc.scenarioId,
       objective: tc.objective,
       preconditions: tc.preconditions,
@@ -763,9 +773,10 @@ export function buildFormatterInputs(
       priority: tc.priority,
       coverageType: tc.tags?.[tc.tags.length - 1] ?? 'positive',
       title: tc.title,
-      steps: tc.steps.slice(),
+      steps: Object.freeze(tc.steps.slice()),
       expected: tc.expectedResult,
     };
+    return Object.freeze(input);
   });
 }
 

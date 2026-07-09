@@ -57,18 +57,58 @@ export interface QaViolation {
   message: string;
 }
 
-export interface QaStandardReport {
-  /** True when NO error-severity violations remain. */
-  ok: boolean;
+/**
+ * A REUSABLE validation report — deliberately generic so the SAME object is
+ * consumed everywhere the QA Standard is enforced: Test-Case Lab today; Script
+ * Gen, Healing, Review, Export and the Dashboard next. Callers read the summary
+ * (`passed` / `score` / `principlesSatisfied` / `principlesViolated`) for
+ * gating and display, and the detail (`violations` / `byId`) for targeted
+ * repair. Never throws; pure data.
+ */
+export interface ValidationReport {
+  /** True when NO error-severity violations remain (the gate). */
+  passed: boolean;
+  /** 0–100 quality score: % of checked items with zero error-severity violations. */
+  score: number;
+  /** How many items were validated. */
   checked: number;
+  /** Total error-severity violations across all items. */
   errors: number;
+  /** Total warning-severity violations across all items. */
   warnings: number;
+  /** Principle ids satisfied by EVERY checked item (no violation anywhere). */
+  principlesSatisfied: string[];
+  /** Principle ids violated by at least one item. */
+  principlesViolated: string[];
+  /** Every individual violation (detail). */
   violations: QaViolation[];
   /** Violations grouped by scenarioId (for targeted repair). */
   byId: Map<string, QaViolation[]>;
   /** scenarioIds that have at least one violation (any severity). */
   failingIds: string[];
 }
+
+/**
+ * @deprecated Use {@link ValidationReport}. Kept as a type alias for one release
+ * so existing imports keep compiling.
+ */
+export type QaStandardReport = ValidationReport;
+
+/**
+ * The full set of principle ids this validator checks. Used to compute
+ * `principlesSatisfied` (this set minus whatever was violated). Kept in ONE
+ * place so adding a check updates the satisfied/violated accounting for free.
+ */
+export const CHECKED_PRINCIPLES: readonly string[] = [
+  'P2 one-action-per-step',
+  'P3 user-actions-only',
+  'P4 verification-not-action',
+  'P5 business-language',
+  'P6 observable-results',
+  'P9 machine-readable',
+  'P11 title-formula',
+  'P16 independence',
+];
 
 /* ------------------------------------------------------------------ */
 /*  Lexicons — the standard's wording rules, as data                   */
@@ -235,7 +275,7 @@ function checkExpected(tc: FormatterTestCase, out: QaViolation[]): void {
  * subset of the QA Artifact Standard. Pure and non-destructive — returns a
  * structured report; the caller decides whether to repair. Never throws.
  */
-export function validateQaStandard(cases: FormatterTestCase[]): QaStandardReport {
+export function validateQaStandard(cases: FormatterTestCase[]): ValidationReport {
   const violations: QaViolation[] = [];
   for (const tc of cases) {
     checkTitle(tc, violations);
@@ -252,11 +292,25 @@ export function validateQaStandard(cases: FormatterTestCase[]): QaStandardReport
 
   const errors = violations.filter(v => v.severity === 'error').length;
   const warnings = violations.filter(v => v.severity === 'warn').length;
+
+  // Principles violated (distinct) vs. satisfied (checked-set minus violated).
+  const principlesViolated = Array.from(new Set(violations.map(v => v.principle)));
+  const principlesSatisfied = CHECKED_PRINCIPLES.filter(p => !principlesViolated.includes(p));
+
+  // Score = % of items with ZERO error-severity violations (warnings don't fail
+  // the gate, so they don't reduce the score). Empty input scores a clean 100.
+  const errorCaseIds = new Set(violations.filter(v => v.severity === 'error').map(v => v.scenarioId));
+  const clean = cases.length - errorCaseIds.size;
+  const score = cases.length === 0 ? 100 : Math.round((clean / cases.length) * 100);
+
   return {
-    ok: errors === 0,
+    passed: errors === 0,
+    score,
     checked: cases.length,
     errors,
     warnings,
+    principlesSatisfied,
+    principlesViolated,
     violations,
     byId,
     failingIds: Array.from(byId.keys()),
