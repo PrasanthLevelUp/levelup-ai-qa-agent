@@ -39,7 +39,7 @@ import { validateCanonicalTestCases } from './canonical-validator';
 import { assembleScenarioGraph } from '../graph/scenario-graph-builder';
 import { toTestCaseLab } from '../graph/scenario-graph-adapters';
 import type { ScenarioGraph } from '../graph/scenario-graph';
-import { classifyQACategory } from './qa-knowledge-engine';
+import { classifyQACategory, getScenarioSemantics } from './qa-knowledge-engine';
 import {
   optimizeKnowledgeForCategory,
   buildPromptBreakdown,
@@ -1487,6 +1487,11 @@ Return ONLY valid JSON, no markdown fences.`;
       // Impact Analysis read the same structure via the graph service). Output
       // is identical — assembled from the same cases — so it is zero-risk.
       if (SCENARIO_GRAPH_ENABLED) {
+        // Resolve each planned scenario's canonical semantics once, keyed by its
+        // stable scenarioId, so the graph nodes carry the KB-authored semantics.
+        const semanticsById = new Map(
+          (scenarioPlan?.scenarios ?? []).map(s => [s.id, getScenarioSemantics(s)] as const),
+        );
         scenarioGraph = assembleScenarioGraph({
           input,
           coverageTypes,
@@ -1495,6 +1500,7 @@ Return ONLY valid JSON, no markdown fences.`;
             coverageType: built.scenarios[i]?.coverageType ?? d.coverageType,
             grounded: d.grounded,
             objective: d.objective,
+            semantics: semanticsById.get(d.scenarioId),
           })),
           knowledgeVersion: scenarioPlan?.knowledgeVersion ?? '',
           category: scenarioPlan?.classification.category ?? 'generic',

@@ -38,7 +38,7 @@ import {
   type QualitySignals,
 } from './intelligence-provider';
 import { getOrBuildScenarioGraph } from '../graph/scenario-graph-service';
-import type { ScenarioGraph } from '../graph/scenario-graph';
+import type { ScenarioGraph, ScenarioSemantics } from '../graph/scenario-graph';
 
 const MOD = 'ScenarioGraphProvider';
 
@@ -77,6 +77,13 @@ export interface ScenarioSummary {
   automationComplexity: string;
   /** True when grounded in real App Profile / Test Data. */
   grounded: boolean;
+  /**
+   * The scenario's application-neutral semantics (variable under test / valid
+   * preconditions / single variation / expected behavior / required data role).
+   * Present for freshly built graphs; may be undefined for older persisted
+   * graphs built before semantics were carried on the node.
+   */
+  semantics?: ScenarioSemantics;
 }
 
 /**
@@ -271,6 +278,7 @@ export class ScenarioGraphProvider implements IntelligenceProvider<ScenarioConte
       automationReady: n.automationReady,
       automationComplexity: n.automationComplexity,
       grounded: n.grounded,
+      ...(n.semantics ? { semantics: n.semantics } : {}),
     }));
 
     const groundedCount = scenarios.filter(s => s.grounded).length;

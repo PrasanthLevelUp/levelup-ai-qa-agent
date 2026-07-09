@@ -12,10 +12,12 @@ import {
   classifyQACategory,
   getBaselineScenarios,
   getScenarioObligation,
+  getScenarioSemantics,
   recognizeScenarioEvidence,
   QA_KNOWLEDGE_BASE,
   QA_KNOWLEDGE_VERSION,
   type NormalizedEvidence,
+  type PlannedScenario,
 } from '../../src/engines/qa-knowledge-engine';
 import {
   planScenarios,
@@ -393,5 +395,101 @@ describe('Scenario Planner — buildScenarioPlanBlock', () => {
     // Each scenario cites its evidence source.
     expect(block).toContain('(source:');
     expect(block).toContain('authentication');
+  });
+});
+
+/* ================================================================== */
+/*  Scenario Semantics — the immutable "what does this mean?" contract */
+/* ================================================================== */
+
+describe('QA Knowledge Engine — Scenario Semantics (authored authentication)', () => {
+  const authById = new Map(QA_KNOWLEDGE_BASE.authentication.map(s => [s.id, s]));
+
+  it('authors explicit, complete, app-neutral semantics for every authentication scenario', () => {
+    for (const s of QA_KNOWLEDGE_BASE.authentication) {
+      expect(s.semantics).toBeDefined();
+      const sem = s.semantics!;
+      // Every field is present and non-empty — no consumer receives a blank.
+      expect(sem.variableUnderTest.trim().length).toBeGreaterThan(0);
+      expect(sem.preconditions.trim().length).toBeGreaterThan(0);
+      expect(sem.variation.trim().length).toBeGreaterThan(0);
+      expect(sem.expectedBehavior.trim().length).toBeGreaterThan(0);
+      // requiredDataRole is a ROLE, never a dataset/table filename.
+      expect(sem.requiredDataRole.trim().length).toBeGreaterThan(0);
+      expect(sem.requiredDataRole).not.toMatch(/\.(csv|json|xlsx?)$/i);
+    }
+  });
+
+  it('keeps the core happy-path a pure success path (nothing varied)', () => {
+    const valid = authById.get('auth-pos-valid')!;
+    expect(valid.semantics!.variableUnderTest).toBe('none');
+    expect(valid.semantics!.variation.toLowerCase()).toContain('none');
+    expect(valid.semantics!.requiredDataRole).toBe('registered_user');
+  });
+
+  it('follows the single-variable principle: wrong-password varies ONLY the password', () => {
+    const wp = authById.get('auth-neg-wrong-password')!.semantics!;
+    expect(wp.variableUnderTest).toBe('password');
+    // Username is explicitly held valid — the variation touches one variable.
+    expect(wp.variation.toLowerCase()).toContain('password');
+    expect(wp.variation.toLowerCase()).toContain('username stays valid');
+    // Wrong-password draws from the ordinary registered-user role — the wrong
+    // value comes from the variation, not from a special dataset.
+    expect(wp.requiredDataRole).toBe('registered_user');
+  });
+
+  it('follows the single-variable principle: unknown-user varies ONLY the username', () => {
+    const uu = authById.get('auth-neg-unknown-user')!.semantics!;
+    expect(uu.variableUnderTest).toBe('username');
+    expect(uu.variation.toLowerCase()).toContain('password stays valid');
+    // Unknown user needs its OWN data role — not the registered-user role.
+    expect(uu.requiredDataRole).toBe('unregistered_user');
+  });
+
+  it('keeps empty-fields single-variable (exactly ONE required field blank)', () => {
+    const ef = authById.get('auth-neg-empty-fields')!.semantics!;
+    expect(ef.variation.toLowerCase()).toContain('exactly one');
+    expect(ef.variation.toLowerCase()).toContain('other stays valid');
+  });
+
+  it('gives the locked-account scenario its own data role', () => {
+    expect(authById.get('auth-neg-locked-user')!.semantics!.requiredDataRole).toBe('locked_account');
+  });
+
+  it('does NOT invent a dataset role for injection — the payload comes from the variation', () => {
+    const inj = authById.get('auth-sec-injection')!.semantics!;
+    // The malicious value is produced by the variation (a mutation), so the
+    // data role stays the ordinary registered-user role.
+    expect(inj.requiredDataRole).toBe('registered_user');
+    expect(inj.variation.toLowerCase()).toContain('injection');
+  });
+});
+
+describe('QA Knowledge Engine — getScenarioSemantics', () => {
+  it('returns the authored semantics verbatim when present', () => {
+    const wp = QA_KNOWLEDGE_BASE.authentication.find(s => s.id === 'auth-neg-wrong-password')!;
+    expect(getScenarioSemantics(wp)).toBe(wp.semantics);
+  });
+
+  it('derives a safe, total default for an uncurated scenario (never undefined)', () => {
+    // crud-pos-read has no authored semantics yet.
+    const read = QA_KNOWLEDGE_BASE.crud.find(s => s.id === 'crud-pos-read')!;
+    expect(read.semantics).toBeUndefined();
+    const derived = getScenarioSemantics(read);
+    expect(derived.variableUnderTest).toBe('none'); // positive → nothing varied
+    expect(derived.variation.toLowerCase()).toContain('none');
+    expect(derived.expectedBehavior).toBe(read.objective);
+    expect(derived.requiredDataRole).toBe('valid_data');
+  });
+
+  it('derives a single-variable default for an uncurated negative scenario', () => {
+    const neg: PlannedScenario = {
+      id: 'x-neg', title: 'X negative', objective: 'Bad input is rejected.',
+      coverageType: 'negative', priority: 'P1', riskArea: 'Validation',
+    };
+    const derived = getScenarioSemantics(neg);
+    expect(derived.variableUnderTest.length).toBeGreaterThan(0);
+    expect(derived.variation.toLowerCase()).toContain('everything else stays valid');
+    expect(derived.expectedBehavior).toBe(neg.objective);
   });
 });
