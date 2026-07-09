@@ -20,6 +20,7 @@ import {
   type DraftTestCase,
 } from '../engines/scenario-builder';
 import { validateCanonicalTestCases } from '../engines/canonical-validator';
+import { getScenarioSemantics } from '../engines/qa-knowledge-engine';
 import {
   type ScenarioGraph,
   type ScenarioNode,
@@ -27,6 +28,7 @@ import {
   type ScenarioPriority,
   type ScenarioSeverity,
   type ScenarioSource,
+  type ScenarioSemantics,
   SCENARIO_GRAPH_SCHEMA_VERSION,
   computeFingerprint,
 } from './scenario-graph';
@@ -156,6 +158,12 @@ export interface NodeMetaLike {
   coverageType?: string;
   grounded?: boolean;
   objective?: string;
+  /**
+   * The scenario's application-neutral semantics, resolved from the Knowledge
+   * Base (`getScenarioSemantics`) by the caller. Index-aligned with the cases;
+   * carried straight onto the node so consumers read one canonical answer.
+   */
+  semantics?: ScenarioSemantics;
 }
 
 export interface AssembleGraphArgs {
@@ -178,6 +186,7 @@ function nodesFromCases(cases: CanonicalCaseLike[], meta: NodeMetaLike[]): Scena
       id: tc.scenarioId,
       title: tc.title,
       objective: tc.objective ?? m.objective ?? '',
+      ...(m.semantics ? { semantics: m.semantics } : {}),
       coverageType: m.coverageType ?? 'positive',
       priority: tc.priority as ScenarioPriority,
       severity: tc.severity as ScenarioSeverity,
@@ -259,12 +268,18 @@ export function buildScenarioGraph(
   const det = buildDeterministicOutput(drafts);
   const { cases } = validateCanonicalTestCases(det.testCases, knowledge);
 
+  // Resolve each planned scenario's canonical semantics ONCE, keyed by its
+  // stable scenarioId, so the node carries the same answer the KB authored.
+  const semanticsById = new Map<string, ScenarioSemantics>();
+  for (const s of plan.scenarios) semanticsById.set(s.id, getScenarioSemantics(s));
+
   // The arrays are index-aligned (all derived from `drafts` in order):
   // det.scenarios[i] ↔ cases[i] ↔ drafts[i].
   const meta: NodeMetaLike[] = drafts.map((d: DraftTestCase, i) => ({
     coverageType: det.scenarios[i]?.coverageType ?? d.coverageType,
     grounded: d.grounded,
     objective: d.objective,
+    semantics: semanticsById.get(d.scenarioId),
   }));
 
   return assembleScenarioGraph({

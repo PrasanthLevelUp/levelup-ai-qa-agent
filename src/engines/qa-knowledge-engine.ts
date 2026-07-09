@@ -86,6 +86,57 @@ export interface ScenarioObligation {
 }
 
 /**
+ * The SEMANTICS of a scenario — the application-NEUTRAL answer to "what does
+ * this scenario fundamentally mean?" that today is left implicit in the
+ * title/objective and has to be re-inferred (differently, sometimes wrongly) by
+ * every downstream consumer (Test Case Lab, Script Generation, Healing, Dataset
+ * Resolver, Coverage-gap).
+ *
+ * This is KNOWLEDGE, not execution. It is authored ONCE in the Knowledge Base,
+ * next to the scenario definition it describes, and is deliberately expressed in
+ * GENERIC QA CONCEPTS — roles and shapes, never application specifics. Nothing
+ * here belongs to SauceDemo, Salesforce, or SAP; "a wrong password is rejected"
+ * varies the password from a registered-user baseline in EVERY application.
+ *
+ * What is NOT here (by design):
+ *   • No concrete dataset — `requiredDataRole` names a ROLE ('registered_user'),
+ *     never a file/table ('valid_users.csv'). The Dataset Resolver maps role →
+ *     dataset later, so planning is never coupled to data storage.
+ *   • No application policy — app-specific escalations (lock-after-N, OTP,
+ *     captcha) are DIFFERENT scenarios with their own obligation/evidence, not a
+ *     `variation` of wrong-password. This keeps the semantics universal.
+ *
+ * The shape encodes the SINGLE-VARIABLE PRINCIPLE a senior QA engineer applies
+ * to negative/edge design: a scenario starts from valid `preconditions` and
+ * changes EXACTLY ONE thing (`variation`) — the `variableUnderTest`. Everything
+ * else stays valid. That is what makes a negative test diagnostic ("wrong
+ * password only" vs. "wrong password AND unknown user") instead of ambiguous.
+ */
+export interface ScenarioSemantics {
+  /**
+   * The single input/condition this scenario varies from a valid baseline.
+   * `'none'` for a pure positive/observation scenario that changes nothing.
+   */
+  variableUnderTest: string;
+  /** The valid starting state every input/condition is set to. */
+  preconditions: string;
+  /**
+   * The single change applied to the preconditions (the one variable under
+   * test). `'none'` when nothing is varied (positive / pure-observation).
+   */
+  variation: string;
+  /** The observable pass/fail behavior a tester can assert against. */
+  expectedBehavior: string;
+  /**
+   * The generic data ROLE this scenario needs (e.g. 'registered_user',
+   * 'unregistered_user', 'locked_account') — NEVER a concrete dataset. The
+   * Dataset Resolver maps the role to actual rows (valid_users.csv / users.xlsx
+   * / an API fixture) later, so the KB and Planner stay decoupled from storage.
+   */
+  requiredDataRole: string;
+}
+
+/**
  * A single baseline scenario the category implies. This is the deterministic
  * "obligation" — the LLM later expands it into concrete, grounded test cases.
  */
@@ -128,6 +179,15 @@ export interface PlannedScenario {
    * anything depending on a specific mechanism, threshold or option stays `evidence`.
    */
   obligation?: ScenarioObligation;
+  /**
+   * The application-neutral scenario semantics (variable under test / valid
+   * preconditions / single variation / expected behavior / required data role).
+   * Authored here, next to the scenario definition, so every downstream consumer
+   * reads ONE canonical answer instead of re-inferring it. When omitted,
+   * `getScenarioSemantics` derives a safe default from the scenario's shape (see
+   * that function) so uncurated categories keep working unchanged.
+   */
+  semantics?: ScenarioSemantics;
   /**
    * Recognition vocabulary: lowercase terms that let this Knowledge layer
    * RECOGNISE the scenario in the explicit evidence (Acceptance Criteria,
@@ -289,19 +349,32 @@ export function classifyQACategory(
  * ------------------------------------------------------------------------- */
 export const QA_KNOWLEDGE_BASE: Record<Exclude<QACategory, 'generic'>, PlannedScenario[]> = {
   authentication: [
-    { id: 'auth-pos-valid', title: 'Valid credentials log in successfully', objective: 'A registered user with correct credentials is authenticated and lands in the authenticated area.', coverageType: 'positive', priority: 'P0', riskArea: 'Authentication / access', core: true },
-    { id: 'auth-neg-wrong-password', title: 'Invalid password is rejected', objective: 'A wrong password does not authenticate and a clear, non-leaking error is shown.', coverageType: 'negative', priority: 'P0', riskArea: 'Unauthorized access', obligation: { level: 'required', condition: 'always' } },
-    { id: 'auth-neg-empty-fields', title: 'Empty required fields are rejected', objective: 'Submitting with blank username and/or password is blocked with field-level validation.', coverageType: 'negative', priority: 'P1', riskArea: 'Input validation', obligation: { level: 'required', condition: 'always' } },
-    { id: 'auth-neg-unknown-user', title: 'Unknown / non-existent user is rejected', objective: 'An unregistered identifier cannot authenticate and the error does not reveal whether the account exists.', coverageType: 'negative', priority: 'P1', riskArea: 'Account enumeration', conditionalOnKeywords: ['unknown', 'non-existent', 'nonexistent', 'not registered', 'unregistered', 'enumerat', 'no account', 'does not exist'] },
-    { id: 'auth-neg-locked-user', title: 'Locked / disabled account cannot log in', objective: 'A locked or disabled account is refused even with correct credentials.', coverageType: 'negative', priority: 'P1', riskArea: 'Account state enforcement', conditionalOnKeywords: ['lock', 'disable', 'suspend', 'attempt'] },
-    { id: 'auth-edge-whitespace-case', title: 'Whitespace / case handling on identifier', objective: 'Leading/trailing whitespace is trimmed and identifier case is handled per the rule (case-insensitive email, etc.).', coverageType: 'edge_cases', priority: 'P2', riskArea: 'Input normalization', conditionalOnKeywords: ['whitespace', 'trim', 'case-insensitive', 'case sensitive', 'case-sensitive', 'lowercase', 'uppercase', 'normali'] },
-    { id: 'auth-neg-invalid-identifier-format', title: 'Malformed identifier format is rejected', objective: 'A malformed identifier (missing @, spaces, or invalid characters in an email login) is rejected with field-level validation before authentication is attempted.', coverageType: 'negative', priority: 'P2', riskArea: 'Input validation', conditionalOnKeywords: ['email', 'format', 'malformed', 'valid email', 'invalid email', 'identifier'] },
-    { id: 'auth-sec-injection', title: 'Injection-style credentials are handled safely', objective: 'SQL/script injection strings in the username or password neither authenticate nor error out — they are treated as ordinary invalid input.', coverageType: 'security', priority: 'P1', riskArea: 'Injection safety', conditionalOnKeywords: ['injection', 'sql', 'script', 'xss', 'saniti', 'malicious', 'special character'] },
-    { id: 'auth-edge-password-masking', title: 'Password input is masked and not exposed', objective: 'The password field masks entry and the value is not exposed in the DOM, page source, autocomplete, or logs.', coverageType: 'edge_cases', priority: 'P2', riskArea: 'Credential exposure', conditionalOnKeywords: ['mask', 'masked', 'hidden', 'plain text', 'plaintext', 'visible', 'obscure', 'autocomplete'] },
-    { id: 'auth-sec-lockout-threshold', title: 'Account lockout after repeated failures', objective: 'After the configured number of failed attempts the account is locked / throttled.', coverageType: 'security', priority: 'P1', riskArea: 'Brute-force resistance', conditionalOnKeywords: ['lock', 'attempt', 'brute', 'throttle', 'rate'] },
-    { id: 'auth-sec-session', title: 'Session established and protected', objective: 'A session/token is issued on login and protected resources reject requests without it.', coverageType: 'security', priority: 'P1', riskArea: 'Session management', conditionalOnKeywords: ['session', 'token', 'timeout', 'expire'] },
-    { id: 'auth-pos-remember-me', title: 'Remember-me persists the session', objective: 'When remember-me is selected the session persists across browser restarts per policy.', coverageType: 'positive', priority: 'P2', riskArea: 'Session persistence', conditionalOnKeywords: ['remember'] },
-    { id: 'auth-pos-logout', title: 'Logout ends the session', objective: 'Logging out invalidates the session and protected pages are no longer reachable.', coverageType: 'positive', priority: 'P1', riskArea: 'Session termination', conditionalOnKeywords: ['logout', 'log out', 'sign out', 'session'] },
+    { id: 'auth-pos-valid', title: 'Valid credentials log in successfully', objective: 'A registered user with correct credentials is authenticated and lands in the authenticated area.', coverageType: 'positive', priority: 'P0', riskArea: 'Authentication / access', core: true,
+      semantics: { variableUnderTest: 'none', preconditions: 'a registered user with the correct username and correct password', variation: 'none — all credentials are valid', expectedBehavior: 'authentication succeeds and the user reaches the authenticated landing page', requiredDataRole: 'registered_user' } },
+    { id: 'auth-neg-wrong-password', title: 'Invalid password is rejected', objective: 'A wrong password does not authenticate and a clear, non-leaking error is shown.', coverageType: 'negative', priority: 'P0', riskArea: 'Unauthorized access', obligation: { level: 'required', condition: 'always' },
+      semantics: { variableUnderTest: 'password', preconditions: 'a registered user with the correct username and correct password', variation: 'the password is replaced with an incorrect value (the username stays valid)', expectedBehavior: 'authentication is rejected with a generic error and the user stays on the login page', requiredDataRole: 'registered_user' } },
+    { id: 'auth-neg-empty-fields', title: 'Empty required fields are rejected', objective: 'Submitting with blank username and/or password is blocked with field-level validation.', coverageType: 'negative', priority: 'P1', riskArea: 'Input validation', obligation: { level: 'required', condition: 'always' },
+      semantics: { variableUnderTest: 'a required field', preconditions: 'a registered user with the correct username and correct password', variation: 'exactly ONE required field is left blank while the other stays valid', expectedBehavior: 'field-level validation blocks submission before authentication is attempted', requiredDataRole: 'registered_user' } },
+    { id: 'auth-neg-unknown-user', title: 'Unknown / non-existent user is rejected', objective: 'An unregistered identifier cannot authenticate and the error does not reveal whether the account exists.', coverageType: 'negative', priority: 'P1', riskArea: 'Account enumeration', conditionalOnKeywords: ['unknown', 'non-existent', 'nonexistent', 'not registered', 'unregistered', 'enumerat', 'no account', 'does not exist'],
+      semantics: { variableUnderTest: 'username', preconditions: 'a valid password paired with a registered username', variation: 'the username is replaced with an unregistered identifier (the password stays valid)', expectedBehavior: 'authentication is rejected with a non-enumerating error that does not reveal whether the account exists', requiredDataRole: 'unregistered_user' } },
+    { id: 'auth-neg-locked-user', title: 'Locked / disabled account cannot log in', objective: 'A locked or disabled account is refused even with correct credentials.', coverageType: 'negative', priority: 'P1', riskArea: 'Account state enforcement', conditionalOnKeywords: ['lock', 'disable', 'suspend', 'attempt'],
+      semantics: { variableUnderTest: 'account state', preconditions: 'a registered user with the correct username and correct password', variation: 'the account is in a locked / disabled state while the credentials remain correct', expectedBehavior: 'authentication is refused with a locked/disabled-account message despite correct credentials', requiredDataRole: 'locked_account' } },
+    { id: 'auth-edge-whitespace-case', title: 'Whitespace / case handling on identifier', objective: 'Leading/trailing whitespace is trimmed and identifier case is handled per the rule (case-insensitive email, etc.).', coverageType: 'edge_cases', priority: 'P2', riskArea: 'Input normalization', conditionalOnKeywords: ['whitespace', 'trim', 'case-insensitive', 'case sensitive', 'case-sensitive', 'lowercase', 'uppercase', 'normali'],
+      semantics: { variableUnderTest: 'identifier formatting', preconditions: 'a registered user with the correct username and correct password', variation: 'only the identifier formatting is altered (surrounding whitespace or letter case) while the underlying value stays correct', expectedBehavior: 'the identifier is normalized per the rule and authentication succeeds as if entered cleanly', requiredDataRole: 'registered_user' } },
+    { id: 'auth-neg-invalid-identifier-format', title: 'Malformed identifier format is rejected', objective: 'A malformed identifier (missing @, spaces, or invalid characters in an email login) is rejected with field-level validation before authentication is attempted.', coverageType: 'negative', priority: 'P2', riskArea: 'Input validation', conditionalOnKeywords: ['email', 'format', 'malformed', 'valid email', 'invalid email', 'identifier'],
+      semantics: { variableUnderTest: 'identifier format', preconditions: 'a valid password paired with a well-formed registered identifier', variation: 'the identifier is replaced with a malformed value (e.g. missing @ / invalid characters) while the password stays valid', expectedBehavior: 'field-level format validation rejects it before authentication is attempted', requiredDataRole: 'registered_user' } },
+    { id: 'auth-sec-injection', title: 'Injection-style credentials are handled safely', objective: 'SQL/script injection strings in the username or password neither authenticate nor error out — they are treated as ordinary invalid input.', coverageType: 'security', priority: 'P1', riskArea: 'Injection safety', conditionalOnKeywords: ['injection', 'sql', 'script', 'xss', 'saniti', 'malicious', 'special character'],
+      semantics: { variableUnderTest: 'input payload', preconditions: 'a valid credential pair entered into the login form', variation: 'one credential field carries an SQL/script injection payload instead of an ordinary value', expectedBehavior: 'the payload neither authenticates nor triggers an error/crash — it is treated as ordinary invalid input', requiredDataRole: 'registered_user' } },
+    { id: 'auth-edge-password-masking', title: 'Password input is masked and not exposed', objective: 'The password field masks entry and the value is not exposed in the DOM, page source, autocomplete, or logs.', coverageType: 'edge_cases', priority: 'P2', riskArea: 'Credential exposure', conditionalOnKeywords: ['mask', 'masked', 'hidden', 'plain text', 'plaintext', 'visible', 'obscure', 'autocomplete'],
+      semantics: { variableUnderTest: 'none (UI/security property observation)', preconditions: 'a user typing a correct password into the login form', variation: 'none — the entered value is observed, not changed', expectedBehavior: 'the password is masked on screen and never exposed in the DOM, page source, autocomplete, or logs', requiredDataRole: 'registered_user' } },
+    { id: 'auth-sec-lockout-threshold', title: 'Account lockout after repeated failures', objective: 'After the configured number of failed attempts the account is locked / throttled.', coverageType: 'security', priority: 'P1', riskArea: 'Brute-force resistance', conditionalOnKeywords: ['lock', 'attempt', 'brute', 'throttle', 'rate'],
+      semantics: { variableUnderTest: 'number of consecutive failed attempts', preconditions: 'a registered account with correct credentials available', variation: 'authentication is attempted with a wrong password repeatedly up to and past the configured threshold', expectedBehavior: 'after the threshold the account is locked / throttled and further attempts are refused', requiredDataRole: 'registered_user' } },
+    { id: 'auth-sec-session', title: 'Session established and protected', objective: 'A session/token is issued on login and protected resources reject requests without it.', coverageType: 'security', priority: 'P1', riskArea: 'Session management', conditionalOnKeywords: ['session', 'token', 'timeout', 'expire'],
+      semantics: { variableUnderTest: 'presence of a valid session', preconditions: 'a user who has logged in successfully and holds a valid session/token', variation: 'a protected resource is requested WITHOUT the valid session/token', expectedBehavior: 'the request without a session is rejected while the authenticated session can reach the resource', requiredDataRole: 'registered_user' } },
+    { id: 'auth-pos-remember-me', title: 'Remember-me persists the session', objective: 'When remember-me is selected the session persists across browser restarts per policy.', coverageType: 'positive', priority: 'P2', riskArea: 'Session persistence', conditionalOnKeywords: ['remember'],
+      semantics: { variableUnderTest: 'remember-me option', preconditions: 'a valid login with the remember-me option left unselected', variation: 'the remember-me option is selected at login (credentials stay valid)', expectedBehavior: 'the session persists across a browser restart per the remember-me policy', requiredDataRole: 'registered_user' } },
+    { id: 'auth-pos-logout', title: 'Logout ends the session', objective: 'Logging out invalidates the session and protected pages are no longer reachable.', coverageType: 'positive', priority: 'P1', riskArea: 'Session termination', conditionalOnKeywords: ['logout', 'log out', 'sign out', 'session'],
+      semantics: { variableUnderTest: 'session validity after logout', preconditions: 'a user logged in with a valid, active session', variation: 'the user logs out, then a protected page is requested with the now-ended session', expectedBehavior: 'the session is invalidated and protected pages are no longer reachable', requiredDataRole: 'registered_user' } },
   ],
   crud: [
     { id: 'crud-pos-create', title: 'Create a record with valid data', objective: 'A record is created and persisted with valid input and confirmation is shown.', coverageType: 'positive', priority: 'P0', riskArea: 'Data creation', core: true },
@@ -413,6 +486,47 @@ export function getScenarioObligation(scenario: PlannedScenario): ScenarioObliga
   if (scenario.obligation) return scenario.obligation;
   if (scenario.core) return { level: 'required', condition: 'always' };
   return { level: 'optional', condition: 'evidence' };
+}
+
+/**
+ * Resolve a scenario's application-neutral SEMANTICS — the canonical answer to
+ * "what does this scenario fundamentally mean?" that downstream consumers (Test
+ * Case Lab, Script Gen, Healing, Dataset Resolver) should read instead of
+ * re-inferring from the title.
+ *
+ * This is a pure KB lookup with a safe fallback — NOT inference. Authored
+ * `semantics` always wins. When a scenario has not been curated yet, a default
+ * is DERIVED from its shape so uncurated categories keep working unchanged and
+ * no consumer ever receives `undefined`:
+ *   • a `core`/positive happy-path → nothing is varied (`variation: 'none'`),
+ *     expecting the primary success behavior.
+ *   • anything else                → a generic single-variable placeholder that
+ *     names the objective as the behavior, so the shape is always present even
+ *     before the scenario is authored in detail.
+ *
+ * The default is intentionally generic (not a guess at specifics): its job is to
+ * keep the contract total, not to invent domain meaning. Authoring real
+ * semantics in the Knowledge Base is what makes it precise.
+ */
+export function getScenarioSemantics(scenario: PlannedScenario): ScenarioSemantics {
+  if (scenario.semantics) return scenario.semantics;
+  const isHappyPath = scenario.core === true || scenario.coverageType === 'positive';
+  if (isHappyPath) {
+    return {
+      variableUnderTest: 'none',
+      preconditions: 'all inputs and preconditions set to valid values',
+      variation: 'none — the primary success path is exercised',
+      expectedBehavior: scenario.objective,
+      requiredDataRole: 'valid_data',
+    };
+  }
+  return {
+    variableUnderTest: 'the condition described by the scenario objective',
+    preconditions: 'all inputs and preconditions set to valid values',
+    variation: 'the single condition under test is applied while everything else stays valid',
+    expectedBehavior: scenario.objective,
+    requiredDataRole: 'valid_data',
+  };
 }
 
 /* ============================================================================

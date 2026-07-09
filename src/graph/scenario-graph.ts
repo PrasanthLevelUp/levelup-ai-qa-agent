@@ -45,18 +45,54 @@ export type ScenarioSeverity = 'critical' | 'major' | 'minor' | 'trivial';
 export type ScenarioSource = 'requirement' | 'knowledge' | 'test_data' | 'app_profile';
 
 /**
+ * The application-neutral SEMANTICS carried on a node — the canonical answer to
+ * "what does this scenario fundamentally mean?" so no consumer has to re-infer
+ * it from the title. Mirrors `ScenarioSemantics` in the QA knowledge engine; it
+ * is redeclared here (rather than imported) to keep this pure-data graph model
+ * free of a hard dependency on the engine, exactly as `ScenarioCoverageType` is
+ * kept loose.
+ *
+ * The shape encodes the single-variable principle: valid `preconditions`, the
+ * one `variation` applied to them (the `variableUnderTest`), the observable
+ * `expectedBehavior`, and the generic `requiredDataRole` (a data ROLE, never a
+ * resolved dataset — the Dataset Resolver maps role → dataset downstream).
+ */
+export interface ScenarioSemantics {
+  variableUnderTest: string;
+  preconditions: string;
+  variation: string;
+  expectedBehavior: string;
+  requiredDataRole: string;
+}
+
+/**
  * A single canonical scenario — the atomic unit of testable intent. This is the
  * shared "truth" every module reads. It carries everything a module could need:
  * the human-readable intent (title/objective), the grounded execution detail
  * (steps/selectors/testData), and the QA metadata (coverage/priority/severity/
  * grounding provenance). Modules take a PROJECTION of this — none of them
  * re-derive it.
+ *
+ * INVARIANT — every field here must serve at least TWO downstream consumers.
+ * The graph is the canonical contract, not a junk drawer: a field used by only
+ * one module belongs in that module, not on the shared node. This keeps the
+ * graph from slowly accreting single-purpose properties as the platform grows.
+ * (`semantics` qualifies: Test Case Lab, Script Gen, Healing and the Dataset
+ * Resolver all read it.)
  */
 export interface ScenarioNode {
   /** Stable canonical id (the KB scenarioId). Unique within a graph. */
   id: string;
   title: string;
   objective: string;
+  /**
+   * The application-neutral scenario semantics (variable under test / valid
+   * preconditions / single variation / expected behavior / required data role).
+   * Optional so older persisted graphs and uncurated scenarios remain valid; the
+   * builder always populates it from the Knowledge Base (via
+   * `getScenarioSemantics`), so freshly built nodes carry it.
+   */
+  semantics?: ScenarioSemantics;
   coverageType: ScenarioCoverageType;
   priority: ScenarioPriority;
   severity: ScenarioSeverity;

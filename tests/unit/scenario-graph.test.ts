@@ -302,3 +302,41 @@ describe('assembleScenarioGraph — shared core', () => {
     expect(g.edges.some(e => e.type === 'shares_selector' && e.reason === '#email')).toBe(true);
   });
 });
+
+/* ================================================================== */
+/*  Scenario semantics — the node carries the KB-authored semantics    */
+/* ================================================================== */
+
+describe('buildScenarioGraph — scenario semantics on nodes', () => {
+  it('carries explicit, complete semantics on every node', () => {
+    const g = build();
+    expect(g.nodes.length).toBeGreaterThan(0);
+    for (const n of g.nodes) {
+      expect(n.semantics).toBeDefined();
+      const sem = n.semantics!;
+      expect(sem.variableUnderTest.trim().length).toBeGreaterThan(0);
+      expect(sem.preconditions.trim().length).toBeGreaterThan(0);
+      expect(sem.variation.trim().length).toBeGreaterThan(0);
+      expect(sem.expectedBehavior.trim().length).toBeGreaterThan(0);
+      // requiredDataRole is a ROLE, never a dataset/table filename.
+      expect(sem.requiredDataRole.trim().length).toBeGreaterThan(0);
+      expect(sem.requiredDataRole).not.toMatch(/\.(csv|json|xlsx?)$/i);
+    }
+  });
+
+  it('propagates the KB single-variable semantics to the wrong-password node', () => {
+    const g = build();
+    const wp = g.nodes.find(n => n.id === 'auth-neg-wrong-password');
+    expect(wp).toBeDefined();
+    expect(wp!.semantics!.variableUnderTest).toBe('password');
+    // The wrong value is produced by the variation, so the data role stays the
+    // ordinary registered-user role — not a special dataset.
+    expect(wp!.semantics!.requiredDataRole).toBe('registered_user');
+  });
+
+  it('keeps semantics stable across builds (determinism)', () => {
+    const a = build();
+    const b = build();
+    expect(a.nodes.map(n => n.semantics)).toEqual(b.nodes.map(n => n.semantics));
+  });
+});
