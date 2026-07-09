@@ -27,15 +27,20 @@ import {
   buildDraftTestCases,
   buildDraftBlock,
   buildFormatterPrompt,
+  buildFormatterInputs,
+  buildRepairPrompt,
   buildDeterministicOutput,
   buildScenariosFromDrafts,
   applyPolish,
   type DraftTestCase,
   type FormatterTestCase,
+  type FormatterInput,
   type StepGrounding,
   type StructuredExpected,
 } from './scenario-builder';
 import { validateCanonicalTestCases } from './canonical-validator';
+import { validateQaStandard, violationsToInstructions } from './qa-standard-validator';
+import type { ScenarioSemantics } from './qa-knowledge-engine';
 import { assembleScenarioGraph } from '../graph/scenario-graph-builder';
 import { toTestCaseLab } from '../graph/scenario-graph-adapters';
 import type { ScenarioGraph } from '../graph/scenario-graph';
@@ -301,6 +306,32 @@ const FORMATTER_MODE_ENABLED = (process.env.GEN_FORMATTER_MODE || 'true').toLowe
  * sacred). Default ON; set GEN_CANONICAL_VALIDATOR=false to bypass.
  */
 const CANONICAL_VALIDATOR_ENABLED = (process.env.GEN_CANONICAL_VALIDATOR || 'true').toLowerCase() !== 'false';
+
+/**
+ * QA Standard Validator — enforces the machine-checkable subset of the QA
+ * Artifact Standard on the polished cases (atomic steps, business language,
+ * observable results, title formula). The standard lives in CODE
+ * (qa-standard-validator.ts), not in the prompt, so it never drifts and costs
+ * zero prompt tokens. Default ON; set GEN_QA_STANDARD_VALIDATOR=false to bypass.
+ */
+const QA_STANDARD_VALIDATOR_ENABLED = (process.env.GEN_QA_STANDARD_VALIDATOR || 'true').toLowerCase() !== 'false';
+
+/**
+ * QA Standard Repair — a SINGLE, bounded, targeted re-ask for ONLY the cases the
+ * QA Standard validator flagged, carrying ONLY their specific violations (not the
+ * whole standard). If repair is disabled, fails, or does not clear the errors,
+ * the previous (already-shipped-quality) wording is kept — coverage is never at
+ * risk.
+ *
+ * DEFAULT OFF (opt-in via GEN_QA_STANDARD_REPAIR=true). Rationale: repair can
+ * MASK a weak generator. We want to first MEASURE the validator's pass-rate on
+ * the deterministic + formatter output and drive that up by improving the
+ * formatter itself; a high baseline pass-rate is the goal. Repair is a band-aid
+ * we enable only once we have real pass-rate metrics and a deliberate reason —
+ * never as a substitute for a strong generator. The code stays behind the flag,
+ * fully implemented, so turning it on later is a one-line env change.
+ */
+const QA_STANDARD_REPAIR_ENABLED = (process.env.GEN_QA_STANDARD_REPAIR || 'false').toLowerCase() === 'true';
 
 /**
  * Persistent Scenario Graph — the ONE intelligence source. When ON (default),
@@ -1464,7 +1495,16 @@ Return ONLY valid JSON, no markdown fences.`;
       | { scenarios: ReturnType<typeof buildScenariosFromDrafts>; testCases: FormatterTestCase[] }
       | undefined;
     let scenarioGraph: ScenarioGraph | undefined;
+    // KB-authored semantics per scenarioId — the source of the FormatterInput
+    // contract (variation / expectedBehavior / requiredDataRole). Resolved ONCE
+    // here so both the scenario graph and the formatter inputs read the same
+    // canonical answer. This is what lets the formatter prompt stay tiny: the
+    // structural decisions travel as DATA, not as prompt instructions.
+    let semanticsById: Map<string, ScenarioSemantics> | undefined;
     if (formatterMode) {
+      semanticsById = new Map(
+        (scenarioPlan?.scenarios ?? []).map(s => [s.id, getScenarioSemantics(s)] as const),
+      );
       const built = buildDeterministicOutput(draftDrafts);
       let cases = built.testCases;
       if (CANONICAL_VALIDATOR_ENABLED) {
@@ -1487,11 +1527,7 @@ Return ONLY valid JSON, no markdown fences.`;
       // Impact Analysis read the same structure via the graph service). Output
       // is identical — assembled from the same cases — so it is zero-risk.
       if (SCENARIO_GRAPH_ENABLED) {
-        // Resolve each planned scenario's canonical semantics once, keyed by its
-        // stable scenarioId, so the graph nodes carry the KB-authored semantics.
-        const semanticsById = new Map(
-          (scenarioPlan?.scenarios ?? []).map(s => [s.id, getScenarioSemantics(s)] as const),
-        );
+        // Graph nodes carry the SAME KB-authored semantics resolved above.
         scenarioGraph = assembleScenarioGraph({
           input,
           coverageTypes,
@@ -1500,7 +1536,7 @@ Return ONLY valid JSON, no markdown fences.`;
             coverageType: built.scenarios[i]?.coverageType ?? d.coverageType,
             grounded: d.grounded,
             objective: d.objective,
-            semantics: semanticsById.get(d.scenarioId),
+            semantics: semanticsById?.get(d.scenarioId),
           })),
           knowledgeVersion: scenarioPlan?.knowledgeVersion ?? '',
           category: scenarioPlan?.classification.category ?? 'generic',
@@ -1649,31 +1685,11 @@ GROUNDED SCOPE (defines what belongs in "testCases") — a case is GROUNDED if i
 ${expand ? `  ASSUMPTIONS (Gap Analysis ON): ungrounded ideas go in "suggestedTestCases" (source "gap_analysis"), NEVER in "testCases". If an idea needs an unstated value/limit (max length, lockout threshold, session timeout), do NOT invent a test — add a "missingRequirements" question instead. Never emit source "assumption".`
   : `  ASSUMPTIONS (Gap Analysis OFF): "suggestedTestCases" and "missingRequirements" MUST both be []. Staying grounded does NOT mean under-generating — produce every case the requirement + context genuinely support.`}
 
-QA ARTIFACT STANDARD (mandatory quality principles — every test case must comply):
-  CORE PRINCIPLES:
-    • ONE OBJECTIVE: Each test verifies exactly ONE thing. Title: "Verify <expected behavior> when <condition>." (e.g., "Verify successful login with valid credentials" / "Verify login fails with invalid password").
-    • ONE ACTION PER STEP: Never combine actions. Bad: "Enter username and password." Good: two steps ("Enter registered username" + "Enter valid password").
-    • USER ACTIONS ONLY: Write what a human tester does. Bad: "Ensure button is clickable" / "Observe the page." Good: "Click Login button" / "Verify Home page is displayed."
-    • VERIFICATION ≠ ACTION: Separate steps. Bad: "Click Login and verify Home page." Good: "Click Login" (step N) + "Verify Home page is displayed" (step N+1).
-    • BUSINESS LANGUAGE: Product terms, never automation. Bad: "Fill username field" / "Trigger submit." Good: "Enter registered email address" / "Click Login button."
-    • OBSERVABLE EXPECTED RESULTS: Granular, specific outcomes. Never "Login successful" or "System behaves correctly." Always: "Home page is displayed" + "Logged-in username is visible in the header" + "Logout button is available" + "Login form is no longer displayed."
-    • TEST DATA ROLES, NOT VALUES: Steps use roles ("registered username", "valid password"). Never embed "standard_user" or "secret_sauce" in steps. Actual values go in testData field.
-    • PRECONDITIONS ≠ STEPS: Preconditions describe the starting state ("Registered user exists"). Steps describe user actions ("Open Login page").
-    • MACHINE-READABLE: Consistent verbs ("Open", "Enter", "Click", "Select", "Verify"). No ambiguous phrasing. Script Generation parses these deterministically without another LLM.
-  STEP WORDING:
-    • Navigation: "Open <Page> page" (not "Navigate to", "Go to").
-    • Input: "Enter <role> <field>" (e.g., "Enter registered email address"). Never "Fill", "Type into".
-    • Click: "Click <Control>" (e.g., "Click Login button"). Never "Press", "Trigger".
-    • Selection: "Select <Option> from <Dropdown>".
-    • Verification: "Verify <Observable> is <State>" (e.g., "Verify error message is displayed").
-    • Multi-step sequences: SPLIT into separate steps. "Enter email and password and click Login" is 3 steps.
-    • NO meta-actions: Never "Ensure", "Confirm", "Observe", "Check", "Wait for" — these are not user actions.
-  EXPECTED RESULTS:
-    • NEVER abstract: "Login successful" / "Operation completes" / "System behaves correctly."
-    • ALWAYS specific observables: "Home page is displayed" + "Logged-in username visible in header" + "Logout button available."
-    • Failure scenarios: describe WHAT the user sees ("Error message is displayed" + "User remains on Login page" + "No session is created").
-    • Each assertion is a separate bullet for failure diagnosis.
-  NO TRIVIAL DUPLICATES: Reworded restatements of one behavior are forbidden. Different input/role/state/error are DISTINCT — keep them all.
+QA WRITING RULES (concise — the full QA Artifact Standard is enforced in code by the QA Standard validator, not restated here):
+  • Title: "Verify <expected behavior> when <condition>." One objective per case.
+  • Steps: ONE user action each (never combine with "and"); business language, not automation ("Enter the registered username" / "Click the Login button", never "Fill"/"Trigger"/selectors); verification is its OWN step; consistent verbs (Open/Enter/Click/Select/Verify); data ROLES not values ("registered username", never "standard_user").
+  • Expected results: concrete, observable outcomes ("Home page is displayed" + "Logout button is available"), never abstract ("Login successful"/"works correctly"); one assertion per bullet.
+  • NO TRIVIAL DUPLICATES: different input/role/state/error are DISTINCT — keep them all; reworded restatements of one behavior are forbidden.
 
 SOURCE TAGGING: every case sets "source" ("requirement" | "knowledge" | "test_data" | "app_profile"; "gap_analysis" ONLY in suggestedTestCases) and "sourceEvidence" (short exact evidence, e.g. "AC: valid login", "standard_user dataset"). Never use source "assumption".
 
@@ -1687,9 +1703,15 @@ Return ONLY valid JSON. Address EVERY selected coverage type, organise scenarios
     // prompt is the minimal "polish these test cases" payload — NOT the full
     // generation prompt. This is the actual token cut: the whole requirement/
     // app-profile/knowledge/coverage/reasoning scaffold is DROPPED from the call.
-    const formatterPrompt = formatterMode && deterministicOutput
-      ? buildFormatterPrompt(deterministicOutput.testCases)
-      : '';
+    // The FormatterInput contract folds the KB-authored semantics into each
+    // case, so the prompt itself stays tiny (structural decisions travel as
+    // DATA, not instructions). Kept in scope so the QA-Standard repair pass can
+    // reuse the exact same inputs for the cases it needs to re-ask.
+    const formatterInputs: FormatterInput[] | undefined =
+      formatterMode && deterministicOutput
+        ? buildFormatterInputs(deterministicOutput.testCases, semanticsById)
+        : undefined;
+    const formatterPrompt = formatterInputs ? buildFormatterPrompt(formatterInputs) : '';
     const prompt = formatterMode ? formatterPrompt : fullPrompt;
 
     // ── Deterministic prompt breakdown (analytics, ZERO tokens) ──
@@ -1702,7 +1724,7 @@ Return ONLY valid JSON. Address EVERY selected coverage type, organise scenarios
       // Measure the ACTUAL editable-only payload as it appears in the prompt
       // (the canonical formatter sends only the wording fields, not the full
       // 16-field objects), so the breakdown reflects the real, smaller payload.
-      const marker = 'TEST CASES TO POLISH:\n';
+      const marker = 'TEST CASES:\n';
       const idx = prompt.lastIndexOf(marker);
       const draftsPayloadChars = idx >= 0
         ? prompt.length - (idx + marker.length)
@@ -1779,10 +1801,10 @@ Return ONLY valid JSON. Address EVERY selected coverage type, organise scenarios
       // construction because the model never received them. If the model broke
       // the contract (wrong count), the validated deterministic cases ship as-is.
       const { cases: reconciled, contractOk } = applyPolish(deterministicOutput.testCases, parsed);
-      testCases = reconciled as unknown as TestCase[];
+      let polishedCases = reconciled;
       if (contractOk) {
         logger.info(MOD, 'Formatter mode applied (polished wording, deterministic logic)', {
-          cases: testCases.length,
+          cases: polishedCases.length,
         });
       } else {
         logger.warn(MOD, 'Formatter contract violated — shipping validated deterministic cases', {
@@ -1790,6 +1812,70 @@ Return ONLY valid JSON. Address EVERY selected coverage type, organise scenarios
           got: Array.isArray((parsed as any)?.cases) ? (parsed as any).cases.length : 0,
         });
       }
+
+      // ── QA Standard Validator (the standard as CONTRACT, not prompt) ──
+      // The 20 principles are NOT in the prompt; they are enforced HERE, in
+      // deterministic code. We validate the polished wording, and — if enabled —
+      // run ONE bounded, TARGETED repair pass for only the cases that failed,
+      // carrying only their specific violations. Coverage is never at risk: if
+      // repair is off, errors, or does not help, we keep the prior wording.
+      if (QA_STANDARD_VALIDATOR_ENABLED) {
+        const report = validateQaStandard(polishedCases);
+        logger.info(MOD, 'QA Standard validator', {
+          checked: report.checked, passed: report.passed, score: report.score,
+          errors: report.errors, warnings: report.warnings,
+          principlesViolated: report.principlesViolated.join(' '),
+          violations: report.violations.slice(0, 8).map(v => `${v.scenarioId}:${v.principle}`).join(' '),
+        });
+
+        const errorIds = new Set(
+          report.violations.filter(v => v.severity === 'error').map(v => v.scenarioId),
+        );
+        if (QA_STANDARD_REPAIR_ENABLED && errorIds.size > 0 && formatterInputs) {
+          const failing = polishedCases.filter(c => errorIds.has(c.scenarioId));
+          const repairInputs = buildFormatterInputs(failing, semanticsById);
+          const fixesById: Record<string, string[]> = {};
+          for (const c of failing) {
+            fixesById[c.scenarioId] = violationsToInstructions(report.byId.get(c.scenarioId) ?? []);
+          }
+          try {
+            const repairResp = await this.callLLM(
+              buildRepairPrompt(repairInputs, fixesById), maxOutputTokens,
+              { complexity: 'standard', maxPromptChars },
+            );
+            const repairParsed = JSON.parse(repairResp.content);
+            // Overlay ONLY the failing subset (applyPolish enforces the subset
+            // count contract); then splice the repaired cases back by id.
+            const { cases: repairedSubset, contractOk: repairOk } = applyPolish(failing, repairParsed);
+            if (repairOk) {
+              const beforeErrors = report.errors;
+              const merged = polishedCases.map(c => {
+                const fixed = repairedSubset.find(r => r.scenarioId === c.scenarioId);
+                return fixed ?? c;
+              });
+              const after = validateQaStandard(merged);
+              // Only accept the repair if it strictly REDUCES error-severity
+              // violations; otherwise keep the prior wording (never regress).
+              if (after.errors < beforeErrors) {
+                polishedCases = merged;
+                logger.info(MOD, 'QA Standard repair applied', {
+                  repairedCases: failing.length, errorsBefore: beforeErrors, errorsAfter: after.errors,
+                });
+              } else {
+                logger.info(MOD, 'QA Standard repair did not reduce errors — kept prior wording', {
+                  errorsBefore: beforeErrors, errorsAfter: after.errors,
+                });
+              }
+            }
+          } catch (err) {
+            logger.warn(MOD, 'QA Standard repair failed — kept prior wording', {
+              error: err instanceof Error ? err.message : String(err),
+            });
+          }
+        }
+      }
+
+      testCases = polishedCases as unknown as TestCase[];
     }
     // Assumptions (suggestions + missing-requirement questions) are surfaced ONLY
     // when Gap Analysis is ON. In Standard mode both buckets are forced empty so
