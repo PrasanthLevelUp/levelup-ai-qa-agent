@@ -254,6 +254,20 @@ export type PipelineStageName =
   | 'Script Emit'
   | 'Generated';
 
+/**
+ * Common authentication scenario categories used to map a test case to the
+ * correct test dataset (Data Quality). Deterministic — derived from case
+ * signals, never an LLM.
+ */
+type AuthDatasetCategory =
+  | 'valid'
+  | 'locked'
+  | 'invalid_password'
+  | 'unknown_user'
+  | 'empty_username'
+  | 'empty_password'
+  | 'invalid';
+
 /** Per-test-case trace entry — the deepest stage a single case reached. */
 export interface CaseTrace {
   id: string | number | null;
@@ -2261,12 +2275,102 @@ ${testBlocks.join('\n\n')}
   }
 
   /**
-   * Resolve which dataset RECORD a test case consumes, by scanning its
-   * `test_data` field and steps for a dataset name and/or record key that
-   * exist in the index. Returns the matched `{ datasetName, recordKey, value }`
-   * plus a `ref` expression (getRecord('<dataset>', selector?)) for emission.
-   * Returns null when nothing matches (caller falls back to literals/empties).
+   * Deterministic Scenario → Dataset category classifier (Data Quality).
+   *
+   * Maps a common authentication scenario to the category of dataset it should
+   * consume, using ONLY signals already on the case — no LLM. Signals are read
+   * in priority order (explicit test data → canonical scenario → title →
+   * expected result → requirement → steps); the first signal that yields a
+   * category wins. Within a signal the MOST specific categories are tested first
+   * (empty-username/password before generic invalid) so "empty password" never
+   * collapses into the broad "invalid" bucket.
+   *
+   * Returns null when the case is not a recognised auth scenario, leaving the
+   * caller's existing behaviour untouched.
    */
+  private classifyAuthDatasetCategory(text: string): AuthDatasetCategory | null {
+    const t = String(text || '').toLowerCase();
+    if (!t.trim()) return null;
+    const mentionsPassword = /\bpass(word)?\b|\bpwd\b/.test(t);
+    const mentionsUsername = /\buser(\s?name)?\b|\bemail\b|\blogin\s?id\b/.test(t);
+    const isEmpty =
+      /\b(empty|blank|missing)\b/.test(t) ||
+      /\bno\s+(user(name)?|email|login|password|pwd|credential)/.test(t) ||
+      /\bwithout\s+(a\s+|an\s+|any\s+)?(user(name)?|email|login|password|pwd|credential)/.test(t) ||
+      /\bleave[^.]*\b(blank|empty)\b/.test(t);
+    // Most specific first.
+    if (isEmpty && mentionsPassword && !mentionsUsername) return 'empty_password';
+    if (isEmpty && (mentionsUsername || /\blogin\b/.test(t)) && !mentionsPassword) return 'empty_username';
+    if (/\block(ed)?\b|locked[\s-]?out|\bblocked\b|\bsuspended\b|disabled\s+account/.test(t)) return 'locked';
+    if (/\b(unknown|unregistered|non[\s-]?existent|nonexistent|not[\s-]registered|no[\s-]such|never\s+registered)\b/.test(t) ||
+        /\b(user|account)\s+(does\s+not\s+exist|doesn'?t\s+exist)\b/.test(t)) return 'unknown_user';
+    if (/\b(invalid|wrong|incorrect|bad)\b/.test(t) && mentionsPassword && !mentionsUsername) return 'invalid_password';
+    if (/\b(valid|correct|successful|success|positive|happy\s?path|standard|default|primary)\b/.test(t) &&
+        !/\b(invalid|incorrect|wrong|bad|lock|locked|unknown|empty|blank|missing|expired|disabled|blocked)\b/.test(t)) return 'valid';
+    if (/\b(invalid|wrong|incorrect|bad|failure|failed|negative)\b/.test(t)) return 'invalid';
+    return null;
+  }
+
+  /**
+   * Read the priority-ordered case signals and return the first recognised auth
+   * scenario category. Steps are consulted LAST (lowest priority) so an explicit
+   * title/scenario/expected-result always wins over an incidental step keyword.
+   */
+  private classifyCaseDatasetCategory(
+    tc: NonNullable<GenerationConfig['testCase']>,
+    steps: string[],
+  ): AuthDatasetCategory | null {
+    const signals: Array<string | undefined> = [
+      tc.test_data as any,
+      (tc as any).scenario,
+      tc.title,
+      tc.expected_result,
+      (tc as any).requirement_id,
+      (tc as any).requirement,
+    ];
+    for (const sig of signals) {
+      const cat = this.classifyAuthDatasetCategory(String(sig || ''));
+      if (cat) return cat;
+    }
+    return this.classifyAuthDatasetCategory(steps.join('\n'));
+  }
+
+  /**
+   * True when a DATASET NAME belongs to the given scenario category. Matching is
+   * TOKEN-based (de-pluralized words), never substring — so "valid_users" and
+   * "invalid_password_users" are told apart cleanly (the latter tokenizes to
+   * {invalid, password, user}, which does NOT contain the token "valid").
+   */
+  private datasetMatchesCategory(name: string, cat: AuthDatasetCategory): boolean {
+    const toks = new Set(
+      String(name).toLowerCase().split(/[^a-z0-9]+/).filter(Boolean).map((s) => s.replace(/s$/, '')),
+    );
+    const has = (...ws: string[]) => ws.some((w) => toks.has(w));
+    const hasEmpty = has('empty', 'blank', 'missing');
+    const hasPass = has('password', 'pass', 'pwd');
+    const hasUser = has('user', 'username', 'email', 'login', 'account');
+    const hasInvalid = has('invalid', 'wrong', 'incorrect', 'bad');
+    switch (cat) {
+      case 'valid':
+        return has('valid', 'standard', 'correct', 'positive', 'good', 'active', 'happy', 'default', 'primary') &&
+          !hasInvalid && !has('lock', 'locked', 'unknown', 'empty', 'blank', 'missing', 'expired', 'disabled', 'blocked');
+      case 'locked':
+        return has('lock', 'locked', 'blocked', 'disabled', 'suspended');
+      case 'invalid_password':
+        return hasInvalid && hasPass;
+      case 'unknown_user':
+        return has('unknown', 'unregistered', 'nonexistent', 'ghost') || (has('no', 'not') && hasUser);
+      case 'empty_username':
+        return hasEmpty && hasUser && !hasPass;
+      case 'empty_password':
+        return hasEmpty && hasPass;
+      case 'invalid':
+        return hasInvalid && !hasPass;
+      default:
+        return false;
+    }
+  }
+
   private resolveCaseData(
     tc: NonNullable<GenerationConfig['testCase']>,
     steps: string[],
@@ -2371,6 +2475,20 @@ ${testBlocks.join('\n\n')}
     for (const [dsName, recMap] of index) {
       if (isReferenced(dsName)) {
         return bind(dsName, recMap, pickRecord(recMap));
+      }
+    }
+    // 3) No explicit reference — resolve the dataset from the SCENARIO itself.
+    //    Classify the case's auth scenario (valid / locked / invalid_password /
+    //    unknown_user / empty_username / empty_password) from its priority-ordered
+    //    signals and bind to the dataset whose NAME matches that category. This is
+    //    the Data Quality fix: a "Locked user" case with no verbatim dataset
+    //    reference now selects locked_users instead of falling back to env.
+    const category = this.classifyCaseDatasetCategory(tc, steps);
+    if (category) {
+      for (const [dsName, recMap] of index) {
+        if (this.datasetMatchesCategory(dsName, category)) {
+          return bind(dsName, recMap, pickRecord(recMap));
+        }
       }
     }
     return null;
