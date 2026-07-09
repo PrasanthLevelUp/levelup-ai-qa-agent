@@ -95,7 +95,11 @@ describe('buildDraftTestCases — grounding', () => {
     expect(first.expected.observable.length).toBeGreaterThan(0);
     expect(first.expectedResult).toBe(first.expected.observable);
 
-    expect(first.source).toBe('app_profile');
+    // The primary positive is the CORE happy-path for the requirement, so its
+    // provenance is 'core' (always generated, never an assumption). Real
+    // selectors still ground it — grounding and provenance are separate axes.
+    expect(first.source).toBe('core');
+    expect(first.assumption).toBe(false);
     expect(first.grounded).toBe(true);
     expect(first.testData).toContain('standard_user');
   });
@@ -171,11 +175,19 @@ describe('buildDraftTestCases — fail-open', () => {
     const { drafts, groundedCount } = buildDraftTestCases(plan, undefined, LOGIN_REQ);
     expect(drafts.length).toBeGreaterThanOrEqual(plan.groundedCount);
     expect(groundedCount).toBe(0);
+    const PROVENANCE = ['core', 'requirement', 'acceptance_criteria', 'test_data', 'app_knowledge', 'baseline'];
     for (const d of drafts) {
-      expect(d.source).toBe('knowledge');
+      // No App Profile means nothing is GROUNDED, but every draft still carries
+      // a traceable provenance source (derived from the requirement / AC text)
+      // and an explicit assumption flag — the builder never invents silently.
+      expect(PROVENANCE).toContain(d.source);
+      expect(typeof d.assumption).toBe('boolean');
       expect(d.grounded).toBe(false);
       expect(d.steps.length).toBeGreaterThan(0);
     }
+    // The core happy-path is present and is never an assumption.
+    const core = drafts.find(d => d.source === 'core');
+    expect(core && core.assumption).toBe(false);
   });
 
   it('returns an empty result for an empty/undefined plan (never throws)', () => {
@@ -221,8 +233,9 @@ describe('Formatter mode — deterministic output', () => {
       // scenarioIndex is the POSITION in the emitted list so it always aligns
       // with the deterministically-derived scenarios array.
       expect(tc.scenarioIndex).toBe(i);
-      // Never emit 'requirement' as a source in formatter output.
-      expect(['knowledge', 'test_data', 'app_profile']).toContain(tc.source);
+      // Every case carries a traceable provenance source (no silent invention).
+      expect(['core', 'requirement', 'acceptance_criteria', 'test_data', 'app_knowledge', 'baseline'])
+        .toContain(tc.source);
     });
   });
 
@@ -361,15 +374,49 @@ describe('applyPolish — canonical reconciliation', () => {
   });
 });
 
-describe('Coverage floor — authentication baseline', () => {
-  it('a standard login yields 8+ grounded scenarios (raised KB baseline)', () => {
+describe('No invention — scenarios must be justified, not padded', () => {
+  it('a bare login does NOT emit negative/edge scenarios nothing justifies', () => {
+    // Philosophy: the builder may only generate scenarios it can trace to the
+    // requirement, acceptance criteria, app knowledge or supplied test data.
+    // A minimal "log in" requirement (no lockout, no injection, no masking
+    // language, and no matching test data) must therefore NOT fabricate those
+    // negative/edge/security cases just to inflate the count.
     const plan = planScenarios(LOGIN_REQ, ['positive', 'negative', 'edge_cases', 'security'], 'authentication');
     const { drafts } = buildDraftTestCases(plan, LOGIN_KNOWLEDGE, LOGIN_REQ);
-    expect(drafts.length).toBeGreaterThanOrEqual(8);
-    // The new universal login scenarios are present.
     const ids = drafts.map(d => d.scenarioId);
-    expect(ids).toEqual(expect.arrayContaining([
-      'auth-sec-injection', 'auth-neg-invalid-identifier-format', 'auth-edge-password-masking',
-    ]));
+
+    // These are only warranted when the requirement/AC/data mention them.
+    expect(ids).not.toContain('auth-sec-injection');
+    expect(ids).not.toContain('auth-neg-invalid-identifier-format');
+    expect(ids).not.toContain('auth-edge-password-masking');
+    expect(ids).not.toContain('auth-neg-empty-fields');
+    expect(ids).not.toContain('auth-neg-unknown-user');
+
+    // The core happy-path is always present…
+    expect(ids).toContain('auth-pos-valid');
+    // …and the AC ("invalid credentials are rejected") justifies exactly the
+    // wrong-password negative — traceable to the acceptance criteria.
+    const wrong = drafts.find(d => d.scenarioId === 'auth-neg-wrong-password');
+    expect(wrong).toBeTruthy();
+    expect(wrong!.source).toBe('acceptance_criteria');
+    expect(wrong!.assumption).toBe(false);
+  });
+
+  it('pulls in a negative/security scenario ONLY when the requirement justifies it', () => {
+    // The same builder, given a requirement that explicitly mentions lockout,
+    // now legitimately generates the lockout scenarios — because they are
+    // traceable to the requirement text, not invented.
+    const req = {
+      title: 'User Login with lockout',
+      description: 'User logs in with email/password. Account locks after repeated failed attempts.',
+      acceptanceCriteria: 'Lock the account after 3 failed attempts.',
+    };
+    const plan = planScenarios(req, ['positive', 'negative', 'security'], 'authentication');
+    const { drafts } = buildDraftTestCases(plan, LOGIN_KNOWLEDGE, req);
+    const locked = drafts.find(d => d.scenarioId === 'auth-neg-locked-user');
+    expect(locked).toBeTruthy();
+    // Justified by the requirement wording → traceable, not an assumption.
+    expect(locked!.assumption).toBe(false);
+    expect(['requirement', 'acceptance_criteria']).toContain(locked!.source);
   });
 });

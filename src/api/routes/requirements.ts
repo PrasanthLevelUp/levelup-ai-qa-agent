@@ -62,6 +62,8 @@ function projectToManual(dbRows: any[]): any[] {
       selectorAvailability: row.selector_availability || 'unknown',
       source: metadata.source || 'knowledge',
       sourceEvidence: metadata.sourceEvidence || '',
+      provenanceConfidence: metadata.provenanceConfidence,
+      assumption: metadata.assumption,
     };
     // Business projection: clean steps + observable expected (NO selectors).
     const manual: ManualTestCase = renderer.render(canonical);

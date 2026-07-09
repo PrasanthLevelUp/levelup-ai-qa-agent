@@ -21,15 +21,17 @@
  * Design guarantees (same discipline as the planner/optimizer):
  *   • Pure & synchronous — no I/O, no LLM, no randomness. Deterministic output.
  *   • Fail-open — if no App Profile/Test Data is available a draft is still
- *     produced from the scenario objective (source 'knowledge'); the builder
- *     NEVER throws and never returns fewer drafts than grounded scenarios.
- *   • Grounded — steps reference REAL selectors/URLs/datasets when present; a
- *     draft is tagged 'app_profile' when it used real selectors, 'test_data'
- *     when it used a real dataset, else 'knowledge'.
- *   • Coverage-first — emits a draft for EVERY grounded planned scenario, plus
- *     conditional ones the requirement OR the retrieved context supports. This
- *     is what lifts a login requirement off the weak "5 scenarios" floor to the
- *     full senior-QA baseline, WITHOUT inventing ungrounded behaviour.
+ *     produced from the scenario objective; the builder NEVER throws.
+ *   • Grounded — steps reference REAL selectors/URLs/datasets when present
+ *     (`grounded`/`selectorAvailability` record this).
+ *   • No invention — the builder may NOT generate business scenarios out of
+ *     thin air. Every draft carries a traceable `source` (core happy path /
+ *     requirement / acceptance criteria / test data / app knowledge); a
+ *     scenario nothing supports is DROPPED, not padded in to hit a count. So
+ *     for a bare "user can log in" requirement it emits the justified few
+ *     (valid login + whatever the supplied data/criteria warrant), not the
+ *     whole senior-QA catalogue. Quality over quantity — this can and does
+ *     return FEWER drafts than the plan lists, by design.
  */
 
 import type { QACategory } from './qa-knowledge-engine';
@@ -149,11 +151,44 @@ export interface DraftTestCase {
   tags: string[];
   automationReady: boolean;
   selectorAvailability: 'high' | 'medium' | 'low' | 'unknown';
-  source: 'requirement' | 'knowledge' | 'test_data' | 'app_profile';
+  /**
+   * WHY this scenario was generated — its traceable provenance (not where the
+   * selectors came from; that is `grounded`/`selectorAvailability`). The
+   * Scenario Builder is not allowed to invent business scenarios: every draft
+   * points back to the requirement, its acceptance criteria, the supplied test
+   * data, app knowledge, or is the category's core happy path. `baseline` marks
+   * a senior-QA floor scenario in a category we have not yet governed (honest
+   * assumption flag, `assumption: true`).
+   */
+  source: ProvenanceSource;
   sourceEvidence: string;
+  /** 'explicit' = a requirement/AC/data/app signal was matched; 'implicit' = core/baseline. */
+  provenanceConfidence: 'explicit' | 'implicit';
+  /** True when the scenario is NOT justified by any explicit signal (a QA-floor assumption). */
+  assumption: boolean;
   /** True when the draft used at least one REAL selector from the App Profile. */
   grounded: boolean;
 }
+
+/**
+ * The traceable origin of a generated scenario. `core` = the category's primary
+ * happy path (always justified by the requirement itself). `requirement` /
+ * `acceptance_criteria` = an explicit keyword appeared in that text.
+ * `test_data` = a supplied dataset name/key justifies it (e.g. a `locked_users`
+ * set justifies the locked-account scenario). `app_knowledge` = the App Profile
+ * (page/element/button labels) references it. `baseline` = an un-governed
+ * senior-QA floor scenario (assumption). `knowledge`/`app_profile` are retained
+ * for backward compatibility with older records.
+ */
+export type ProvenanceSource =
+  | 'core'
+  | 'requirement'
+  | 'acceptance_criteria'
+  | 'test_data'
+  | 'app_knowledge'
+  | 'baseline'
+  | 'knowledge'
+  | 'app_profile';
 
 export interface BuildDraftsResult {
   drafts: DraftTestCase[];
@@ -228,8 +263,20 @@ export interface FormatterTestCase {
   automationReady: boolean;
   automationComplexity: 'low' | 'medium' | 'high';
   selectorAvailability: 'high' | 'medium' | 'low' | 'unknown';
-  source: 'requirement' | 'knowledge' | 'test_data' | 'app_profile';
+  /** Traceable provenance — see DraftTestCase.source / ProvenanceSource. */
+  source: ProvenanceSource;
   sourceEvidence: string;
+  /**
+   * 'explicit' = a requirement/AC/data/app signal was matched; 'implicit' =
+   * core/baseline. Optional for back-compat with legacy/DB-reconstructed cases;
+   * `draftToTestCase` always sets it.
+   */
+  provenanceConfidence?: 'explicit' | 'implicit';
+  /**
+   * True when the scenario is a QA-floor assumption (no explicit signal).
+   * Optional for the same back-compat reason as `provenanceConfidence`.
+   */
+  assumption?: boolean;
 }
 
 /* ------------------------------------------------------------------ */
@@ -261,6 +308,97 @@ function haystackFromRequirement(input?: RequirementLike): string {
   if (!input) return '';
   return [input.title, input.description, input.acceptanceCriteria, input.businessFlow]
     .filter(Boolean).join(' ').toLowerCase();
+}
+
+/**
+ * The requirement text WITHOUT its acceptance criteria — so provenance can tell
+ * a signal that came from the requirement body apart from one that came from the
+ * acceptance criteria (they are attributed to different sources).
+ */
+function requirementOnlyHaystack(input?: RequirementLike): string {
+  if (!input) return '';
+  return [input.title, input.description, input.businessFlow]
+    .filter(Boolean).join(' ').toLowerCase();
+}
+
+/** Just the acceptance-criteria text (lowercased). */
+function acceptanceHaystack(input?: RequirementLike): string {
+  return lc(input?.acceptanceCriteria);
+}
+
+/**
+ * App-knowledge text a scenario may be justified by — page titles, key-element
+ * labels/roles and form submit labels. Deliberately EXCLUDES raw form-field
+ * names (username/password/email …) so a generic field name can never be
+ * mistaken as justifying a whole scenario.
+ */
+function appKnowledgeHaystack(k?: KnowledgeLike): string {
+  const ap = k?.applicationProfile;
+  if (!ap) return '';
+  const parts: string[] = [];
+  for (const p of ap.pages || []) parts.push(lc(p.title), lc(p.pageType));
+  for (const e of ap.keyElements || []) parts.push(lc(e.label), lc(e.role));
+  for (const f of ap.forms || []) parts.push(lc(f.submitLabel));
+  return parts.filter(Boolean).join(' ');
+}
+
+/** Just the supplied test-data names + sample keys (lowercased). */
+function testDataHaystack(k?: KnowledgeLike): string {
+  const parts: string[] = [];
+  for (const d of k?.testData || []) {
+    parts.push(lc(d.name));
+    for (const key of d.sampleKeys || []) parts.push(lc(key));
+  }
+  return parts.filter(Boolean).join(' ');
+}
+
+/** A resolved provenance decision for one scenario. */
+interface ProvenanceDecision {
+  source: ProvenanceSource;
+  sourceEvidence: string;
+  confidence: 'explicit' | 'implicit';
+  assumption: boolean;
+}
+
+/**
+ * Decide WHY a scenario is being generated — its traceable source — in priority
+ * order: core happy path → requirement text → acceptance criteria → supplied
+ * test data → app knowledge → un-governed QA baseline (assumption). This is the
+ * heart of the "the builder may not invent business scenarios" rule: a scenario
+ * either points back to something the user gave us, or it is honestly flagged as
+ * an assumption. Pure/deterministic.
+ */
+function provenanceFor(
+  scenario: { core?: boolean; conditionalOnKeywords?: string[]; id: string },
+  category: string,
+  hay: { reqOnly: string; ac: string; testData: string; appKnowledge: string },
+): ProvenanceDecision {
+  if (scenario.core) {
+    return {
+      source: 'core',
+      sourceEvidence: 'Core happy-path for the requirement under test',
+      confidence: 'implicit',
+      assumption: false,
+    };
+  }
+  const keywords = (scenario.conditionalOnKeywords || []).map(lc);
+  const hit = (h: string) => keywords.find(k => k && h.includes(k));
+  const reqK = hit(hay.reqOnly);
+  if (reqK) return { source: 'requirement', sourceEvidence: `Requirement references "${reqK}"`, confidence: 'explicit', assumption: false };
+  const acK = hit(hay.ac);
+  if (acK) return { source: 'acceptance_criteria', sourceEvidence: `Acceptance criteria reference "${acK}"`, confidence: 'explicit', assumption: false };
+  const tdK = hit(hay.testData);
+  if (tdK) return { source: 'test_data', sourceEvidence: `Supplied test data references "${tdK}"`, confidence: 'explicit', assumption: false };
+  const akK = hit(hay.appKnowledge);
+  if (akK) return { source: 'app_knowledge', sourceEvidence: `App knowledge references "${akK}"`, confidence: 'explicit', assumption: false };
+  // Emitted but nothing explicitly justifies it (an un-keyworded scenario in a
+  // category we have not governed yet). Honest assumption flag.
+  return {
+    source: 'baseline',
+    sourceEvidence: `Senior-QA baseline for ${category} (no explicit requirement/data signal)`,
+    confidence: 'implicit',
+    assumption: true,
+  };
 }
 
 /** All searchable text from the App Profile + Test Data (for evidence checks). */
@@ -424,8 +562,10 @@ function buildExpected(
 
 /**
  * Assemble deterministic draft test cases from a scenario plan + retrieved
- * context. One draft per planned scenario that is grounded OR whose behaviour is
- * supported by the requirement/App Profile/Test Data. Pure and fail-open.
+ * context. Emits a draft ONLY for a planned scenario that is justified — the
+ * category core happy path, or one whose behaviour is supported by the
+ * requirement / acceptance criteria / supplied test data / app knowledge.
+ * Unjustified scenarios are dropped (no invention). Pure and fail-open.
  */
 export function buildDraftTestCases(
   plan: ScenarioPlan | undefined,
@@ -440,6 +580,14 @@ export function buildDraftTestCases(
   const category = plan.classification.category;
   const reqHay = haystackFromRequirement(input);
   const ctxHay = haystackFromContext(knowledge);
+  // Split haystacks for provenance attribution (requirement body vs acceptance
+  // criteria vs supplied test data vs app knowledge) — see provenanceFor().
+  const provHay = {
+    reqOnly: requirementOnlyHaystack(input),
+    ac: acceptanceHaystack(input),
+    testData: testDataHaystack(knowledge),
+    appKnowledge: appKnowledgeHaystack(knowledge),
+  };
   const baseUrl = ap?.baseUrl;
   const loginUrl = ap?.loginUrl;
 
@@ -449,10 +597,11 @@ export function buildDraftTestCases(
 
   plan.scenarios.forEach((scenario, index) => {
     // ── Decide whether to emit a draft for this scenario ──
-    // Grounded (non-conditional) scenarios are ALWAYS emitted. Conditional
-    // scenarios are emitted only when the requirement OR the retrieved context
-    // actually references the behaviour — this is what raises the count beyond
-    // the weak baseline WITHOUT inventing ungrounded scenarios.
+    // A scenario carrying keywords is CONDITIONAL: it is emitted only when the
+    // requirement OR the retrieved context actually references the behaviour.
+    // Nothing supports it ⇒ it is DROPPED, never invented in to pad a count.
+    // (Core/un-keyworded scenarios remain always-on; provenance below records
+    // WHY each survivor was kept.)
     if (scenario.conditional) {
       const keywords = scenario.conditionalOnKeywords || [];
       const supported = keywords.some(k => reqHay.includes(lc(k)) || ctxHay.includes(lc(k)));
@@ -517,19 +666,13 @@ export function buildDraftTestCases(
       ? `${dataset.name}${dataset.sampleKeys?.length ? ` (keys: ${dataset.sampleKeys.slice(0, 5).join(', ')})` : ''}`
       : 'Use data appropriate to the scenario (no dedicated dataset found).';
 
-    // ── Provenance ──
-    let source: DraftTestCase['source'];
-    let sourceEvidence: string;
-    if (usedRealSelector) {
-      source = 'app_profile';
-      sourceEvidence = `Real selectors from ${form?.page || 'app profile'}`;
-    } else if (dataset?.name) {
-      source = 'test_data';
-      sourceEvidence = `${dataset.name} dataset`;
-    } else {
-      source = 'knowledge';
-      sourceEvidence = `QA baseline for ${category}: ${scenario.id}`;
-    }
+    // ── Provenance ── WHY this scenario exists (traceable to what the user
+    // gave us), NOT where the selectors came from — that is `grounded` /
+    // `selectorAvailability`. The builder may not invent business scenarios, so
+    // every draft points back to the requirement / acceptance criteria / test
+    // data / app knowledge / the core happy path, or is flagged an assumption.
+    const prov = provenanceFor(scenario, category, provHay);
+    const { source, sourceEvidence } = prov;
     if (usedRealSelector) groundedCount += 1;
 
     const expected = buildExpected(scenario, form, ap);
@@ -556,6 +699,8 @@ export function buildDraftTestCases(
       selectorAvailability: usedRealSelector ? 'high' : 'unknown',
       source,
       sourceEvidence,
+      provenanceConfidence: prov.confidence,
+      assumption: prov.assumption,
       grounded: usedRealSelector,
     });
   });
@@ -649,8 +794,12 @@ export function draftToTestCase(draft: DraftTestCase, scenarioIndex: number): Fo
     automationReady: draft.automationReady,
     automationComplexity: draft.grounded ? 'low' : 'medium',
     selectorAvailability: draft.selectorAvailability,
-    source: draft.source === 'requirement' ? 'knowledge' : draft.source,
+    // Provenance passes through verbatim — it is a deterministic invariant the
+    // formatter is never allowed to touch (it explains WHY the case exists).
+    source: draft.source,
     sourceEvidence: draft.sourceEvidence,
+    provenanceConfidence: draft.provenanceConfidence,
+    assumption: draft.assumption,
   };
 }
 

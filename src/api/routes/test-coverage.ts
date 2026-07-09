@@ -132,6 +132,8 @@ function projectToManual(dbRows: any[]): any[] {
       selectorAvailability: row.selector_availability || 'unknown',
       source: metadata.source || 'knowledge',
       sourceEvidence: metadata.sourceEvidence || '',
+      provenanceConfidence: metadata.provenanceConfidence,
+      assumption: metadata.assumption,
     };
     // Business projection: clean steps + observable expected (NO selectors).
     const manual: ManualTestCase = renderer.render(canonical);
@@ -605,6 +607,11 @@ export function createTestCoverageRouter(): Router {
                 riskArea: (tc as any).riskArea,
                 grounding: (tc as any).grounding,
                 expected: (tc as any).expected,
+                // Traceable provenance — how confident we are the scenario is
+                // justified, and whether it is a QA-floor assumption. Surfaced
+                // back on read so a reviewer can see WHY each case exists.
+                provenanceConfidence: (tc as any).provenanceConfidence,
+                assumption: (tc as any).assumption,
                 // Sprint 1.5 — read-only integrity certification. Diagnostic
                 // only; never blocks (generationAllowed is always true) and
                 // never mutates the case. See SCRIPT_COMPOSER_EVOLUTION.md.
