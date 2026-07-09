@@ -1,6 +1,6 @@
 # LevelUp AI — Human-Quality Test Case Writing Standard
 
-**Version:** 1.0  
+**Version:** 1.0.0  
 **Date:** July 9, 2026  
 **Status:** Canonical
 
@@ -33,7 +33,7 @@ This standard applies to:
 
 ---
 
-## The 15 Principles
+## The 20 Principles
 
 ### Principle 1 — One Test Case = One Objective
 
@@ -370,6 +370,96 @@ Every generated test case should pass these 10 checks:
 
 ---
 
+### Principle 16 — Test Case Independence
+
+Every test case must be executable in isolation without depending on the execution of other test cases.
+
+**Bad:**
+```
+Execute login testcase first.
+Then execute checkout.
+```
+
+**Good:**
+```
+Every testcase declares its own preconditions.
+Execution order should never be assumed.
+```
+
+**Rule:** Test cases must be independent. Script Generation may optimize execution order later (e.g., session reuse), but manual test cases should remain independently executable. No test case should reference "run X first" or "after executing Y".
+
+---
+
+### Principle 17 — Traceability
+
+Every test case must be traceable to its source.
+
+**Required metadata:**
+```
+Requirement: REQ-12
+Acceptance Criteria: AC-4
+Scenario ID: auth-neg-invalid-password
+```
+
+**Rule:** Traceability is mandatory for audit, impact analysis, and requirement coverage reporting. This metadata is not displayed to end users but is required in the canonical test case artifact. The Scenario Graph already provides this information; the artifact standard requires it to be preserved.
+
+---
+
+### Principle 18 — Failure Diagnosis
+
+Expected results must enable rapid failure diagnosis, not just binary pass/fail.
+
+**Instead of:**
+```
+Login fails.
+```
+
+**Prefer:**
+```
+Authentication error message is displayed.
+Login page remains visible.
+No authenticated session is created.
+```
+
+**Rule:** Expected results should be granular enough that when a test fails, the tester immediately knows *which* assertion broke. This accelerates debugging and root cause analysis. Avoid single-assertion expected results like "operation succeeds" or "system behaves correctly".
+
+---
+
+### Principle 19 — Stable Artifact Structure
+
+Every test case artifact must follow a fixed, stable structure.
+
+**Canonical order:**
+```
+1. Title
+2. Preconditions
+3. Test Data
+4. Steps
+5. Expected Results
+6. Traceability
+```
+
+**Rule:** This order is **mandatory** and must never be reordered by exporters, formatters, or presentation layers. Consistency across thousands of test cases is more valuable than format customization. Tooling (parsers, validators, Script Generation) depends on this stable structure.
+
+---
+
+### Principle 20 — Machine Readability
+
+Every human-readable test case must also be machine-consumable **without requiring another LLM**.
+
+**What this means:**
+- Steps use consistent, parseable action verbs ("Open", "Enter", "Click", "Verify").
+- Data roles are explicit and mappable to datasets.
+- Expected results are structured, not prose.
+- No ambiguous phrasing that requires interpretation.
+
+**Why this matters:**
+This is one of LevelUp AI's biggest differentiators. Most AI QA tools generate test cases that *look* good to humans but require another AI to parse them. LevelUp AI test cases are consumable by deterministic parsers in Script Generation, enabling reliable automation without LLM round-trips.
+
+**Rule:** If a test case step cannot be parsed by a rule-based system (with domain knowledge like the Scenario Graph + Repository Intelligence), it does not meet this standard.
+
+---
+
 ## Implementation Guidance
 
 ### For LLM Prompts
@@ -423,6 +513,11 @@ When exporting to Jira, CSV, or other formats:
 - Purpose: Valid credentials for successful authentication
 - Dataset: valid_users
 
+**Traceability:**
+- Requirement: REQ-AUTH-001
+- Acceptance Criteria: AC-1 (Valid user can log in)
+- Scenario ID: auth-pos-valid
+
 ---
 
 ### ✅ Good — Invalid Password
@@ -450,6 +545,11 @@ When exporting to Jira, CSV, or other formats:
 - Purpose: Valid username paired with an incorrect password
 - Dataset: valid_users
 - Variation: Password replaced with an invalid value
+
+**Traceability:**
+- Requirement: REQ-AUTH-001
+- Acceptance Criteria: AC-3 (Invalid password is rejected)
+- Scenario ID: auth-neg-wrong-password
 
 ---
 
@@ -530,15 +630,55 @@ This standard is **mandatory** for:
 - All manual test case exports.
 - All human-facing QA artifacts.
 
-If a generated test case does not pass the 15 principles + 10-question checklist, it is **not production-ready**.
+If a generated test case does not pass the 20 principles + 10-question checklist, it is **not production-ready**.
+
+---
+
+## Governance
+
+### The Constitution Rule
+
+> **No feature may change test case output unless it still complies with the QA Artifact Standard.**
+
+This document is the **constitution** of LevelUp AI's QA platform.
+
+### Development Flow
+
+Every change affecting Test Case Lab or Script Generation must follow this workflow:
+
+1. **Update the QA Artifact Standard** (if the change requires new principles or modifications).
+2. **Implement code to satisfy the standard.**
+3. **Validate generated artifacts against the standard** (via the 10-question checklist + principle compliance).
+4. **Merge only if the generated output complies.**
+
+### PR Validation Requirement
+
+Every PR that modifies test case generation, formatting, or export logic must include:
+- Evidence that the output complies with all 20 principles.
+- Confirmation that the 10-question Senior QA Review checklist passes.
+- If the PR introduces new wording patterns or structure changes, an explicit mapping showing how they align with the standard.
+
+### Standard Evolution
+
+This standard is **versioned** (semantic versioning: MAJOR.MINOR.PATCH).
+- **PATCH** (e.g., 1.0.1): Clarifications, typo fixes, examples added — no behavior change.
+- **MINOR** (e.g., 1.1.0): New principles added, or existing principles refined — backward-compatible.
+- **MAJOR** (e.g., 2.0.0): Breaking changes to structure, required fields, or fundamental principles — requires migration plan.
+
+Before changing the standard:
+1. Discuss the change with stakeholders (LevelUp AI Product / Engineering).
+2. Update this document first, increment the version.
+3. Then implement code changes to match the new standard.
+
+**Never allow implementation to drift from the standard.** The standard defines quality; code enforces it.
 
 ---
 
 ## Version History
 
-| Version | Date       | Changes                          |
-|---------|------------|----------------------------------|
-| 1.0     | 2026-07-09 | Initial standard (Sprint 2B)     |
+| Version | Date       | Changes                                                                 |
+|---------|------------|-------------------------------------------------------------------------|
+| 1.0.0   | 2026-07-09 | Initial standard (Sprint 2B foundation). 20 principles established.     |
 
 ---
 
