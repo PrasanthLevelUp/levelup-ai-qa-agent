@@ -105,19 +105,86 @@ describe('QA Knowledge Engine — knowledge base integrity', () => {
   });
 });
 
-describe('Scenario Planner — planScenarios', () => {
-  it('plans authentication scenarios for a login requirement', () => {
+describe('Scenario Planner — planScenarios (single source of truth for existence)', () => {
+  it('plans the core happy-path for a login requirement (derived from the Requirement)', () => {
     const plan = planScenarios(
       { title: 'User Login', description: 'Login with email and password.' },
       ['positive', 'negative'],
     );
     expect(plan.classification.category).toBe('authentication');
     expect(plan.isEmpty).toBe(false);
+    // The core valid-login scenario is ALWAYS derived from the requirement.
+    const valid = plan.scenarios.find(s => s.id === 'auth-pos-valid');
+    expect(valid).toBeDefined();
+    expect(valid!.provenance.source).toBe('Requirement');
+  });
+
+  it('coverage types are a FILTER, never a creator — a bare requirement yields ONLY the justified happy path', () => {
+    // "user can log in successfully" with positive+negative+edge+security selected
+    // must NOT invent Invalid Login / SQL Injection / Empty Password / Session
+    // Timeout. Selecting a coverage type does not conjure a scenario; only
+    // explicit evidence does.
+    const plan = planScenarios(
+      { title: 'User Login', description: 'User can log in successfully.' },
+      ['positive', 'negative', 'edge_cases', 'security'],
+    );
+    expect(plan.justifiedCount).toBe(1);
+    expect(plan.scenarios.map(s => s.id)).toEqual(['auth-pos-valid']);
+    // No invented negatives/security scenarios.
+    expect(plan.scenarios.some(s => s.coverageType === 'negative')).toBe(false);
+    expect(plan.scenarios.some(s => s.coverageType === 'security')).toBe(false);
+  });
+
+  it('acceptance criteria justify a scenario and the provenance cites the exact clause', () => {
+    const plan = planScenarios(
+      {
+        title: 'User Login',
+        description: 'User can log in.',
+        acceptanceCriteria: '- Valid users can log in\n- Account is locked after 5 failed attempts',
+      },
+      ['positive', 'negative', 'security'],
+    );
+    const locked = plan.scenarios.find(s => s.id === 'auth-neg-locked-user');
+    expect(locked).toBeDefined();
+    expect(locked!.provenance.source).toBe('Acceptance Criteria');
+    expect(locked!.provenance.confidence).toBe(1);
+    // The citation quotes the AC clause that justified it.
+    expect(locked!.provenance.derivedFrom.toLowerCase()).toContain('locked after 5 failed');
+  });
+
+  it('test data justifies a scenario via the Test Data evidence bucket', () => {
+    const plan = planScenarios(
+      { title: 'User Login', description: 'User can log in.' },
+      ['positive', 'negative', 'security'],
+      undefined,
+      { testData: [{ name: 'locked_out_user', sampleKeys: ['username', 'password'] }] },
+    );
+    const locked = plan.scenarios.find(s => s.id === 'auth-neg-locked-user');
+    expect(locked).toBeDefined();
+    expect(locked!.provenance.source).toBe('Test Data');
+    expect(locked!.provenance.confidence).toBe(0.7);
+  });
+
+  it('every planned scenario carries fully populated provenance {whyExists, source, confidence, derivedFrom}', () => {
+    const plan = planScenarios(
+      {
+        title: 'User Login',
+        description: 'User can log in.',
+        acceptanceCriteria: '- Account is locked after repeated failed attempts',
+      },
+      ['positive', 'negative', 'security'],
+    );
     expect(plan.scenarios.length).toBeGreaterThan(0);
-    // Must include the canonical valid-login + invalid-password obligations.
-    const titles = plan.scenarios.map(s => s.title.toLowerCase());
-    expect(titles.some(t => t.includes('valid credentials'))).toBe(true);
-    expect(titles.some(t => t.includes('invalid password'))).toBe(true);
+    for (const s of plan.scenarios) {
+      expect(s.provenance).toBeDefined();
+      expect(typeof s.provenance.whyExists).toBe('string');
+      expect(s.provenance.whyExists.length).toBeGreaterThan(0);
+      expect(['Requirement', 'Acceptance Criteria', 'App Knowledge', 'Test Data'])
+        .toContain(s.provenance.source);
+      expect(s.provenance.confidence).toBeGreaterThan(0);
+      expect(typeof s.provenance.derivedFrom).toBe('string');
+      expect(s.provenance.derivedFrom.length).toBeGreaterThan(0);
+    }
   });
 
   it('respects the user coverage selection — never plans a type the user did not pick (Priority 1)', () => {
@@ -129,30 +196,8 @@ describe('Scenario Planner — planScenarios', () => {
     for (const s of plan.scenarios) {
       expect(selected).toContain(s.coverageType);
     }
-    // security/negative scenarios must NOT appear when only positive is selected.
     expect(plan.scenarios.some(s => s.coverageType === 'security')).toBe(false);
     expect(plan.scenarios.some(s => s.coverageType === 'negative')).toBe(false);
-  });
-
-  it('flags conditional scenarios when their keywords are absent from the requirement', () => {
-    // No mention of "remember me" / "logout" → those planned positive scenarios are conditional.
-    const plan = planScenarios(
-      { title: 'User Login', description: 'A user signs in with valid credentials.' },
-      ['positive'],
-    );
-    const rememberMe = plan.scenarios.find(s => s.id === 'auth-pos-remember-me');
-    expect(rememberMe).toBeDefined();
-    expect(rememberMe!.conditional).toBe(true);
-  });
-
-  it('marks a conditional scenario as NOT conditional when its keyword is present', () => {
-    const plan = planScenarios(
-      { title: 'User Login', description: 'Login supports a remember-me option to persist the session.' },
-      ['positive'],
-    );
-    const rememberMe = plan.scenarios.find(s => s.id === 'auth-pos-remember-me');
-    expect(rememberMe).toBeDefined();
-    expect(rememberMe!.conditional).toBe(false);
   });
 
   it('returns an empty plan for a generic (unrecognised) requirement', () => {
@@ -182,16 +227,19 @@ describe('Scenario Planner — buildScenarioPlanBlock', () => {
     expect(buildScenarioPlanBlock(plan)).toBe('');
   });
 
-  it('renders a plan block that instructs the LLM to EXPAND (not invent) and lists planned scenarios', () => {
+  it('renders a plan block that forbids invention, forbids dropping, and cites provenance', () => {
     const plan = planScenarios(
       { title: 'User Login', description: 'Login with email and password; lock after failed attempts.' },
       ['positive', 'negative', 'security'],
     );
     const block = buildScenarioPlanBlock(plan);
-    expect(block).toContain('DETERMINISTIC SCENARIO PLAN');
-    expect(block).toContain('EXPAND');
+    expect(block).toContain('DERIVED SCENARIO PLAN');
+    // The block instructs the LLM NOT to invent and NOT to drop scenarios.
+    expect(block).toContain('DO NOT invent');
+    expect(block).toContain('DO NOT drop');
     expect(block.toLowerCase()).toContain('valid credentials');
-    // The category + confidence are surfaced for transparency.
+    // Each scenario cites its evidence source.
+    expect(block).toContain('(source:');
     expect(block).toContain('authentication');
   });
 });

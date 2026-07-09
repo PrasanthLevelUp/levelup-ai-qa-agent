@@ -60,6 +60,17 @@ const LOGIN_KNOWLEDGE: any = {
 
 const COVERAGE: CoverageType[] = ['positive', 'negative', 'edge_cases'];
 
+// A requirement whose Acceptance Criteria explicitly justify a negative +
+// security scenario (account lockout). Used to exercise multi-scenario builds
+// now that the planner only emits scenarios the evidence justifies.
+const LOGIN_REQ_LOCKOUT = {
+  title: 'User Login with lockout',
+  description: 'A registered user logs in with email and password.',
+  acceptanceCriteria:
+    'Valid credentials authenticate; the account is locked after 5 failed attempts.',
+  businessFlow: 'Open login page → enter email + password → submit → land on dashboard.',
+};
+
 describe('buildDraftTestCases — grounding', () => {
   it('keeps step text business-readable and captures REAL selectors in grounding (not in prose)', () => {
     const plan = planScenarios(LOGIN_REQ, COVERAGE, 'authentication');
@@ -95,14 +106,19 @@ describe('buildDraftTestCases — grounding', () => {
     expect(first.expected.observable.length).toBeGreaterThan(0);
     expect(first.expectedResult).toBe(first.expected.observable);
 
-    expect(first.source).toBe('app_profile');
+    // `source` relays the planner's evidence source (the core valid-login
+    // scenario is derived from the Requirement) — NOT a grounding echo. Whether
+    // a real selector was used is the SEPARATE `grounded` axis.
+    expect(first.source).toBe('requirement');
     expect(first.grounded).toBe(true);
+    expect(first.provenance.source).toBe('Requirement');
     expect(first.testData).toContain('standard_user');
   });
 
-  it('varies the DATA intent by coverage type (valid vs invalid vs boundary)', () => {
-    const plan = planScenarios(LOGIN_REQ, COVERAGE, 'authentication');
-    const { drafts } = buildDraftTestCases(plan, LOGIN_KNOWLEDGE, LOGIN_REQ);
+  it('varies the DATA intent by coverage type (valid vs invalid)', () => {
+    // The lockout AC justifies a negative scenario alongside the core positive.
+    const plan = planScenarios(LOGIN_REQ_LOCKOUT, ['positive', 'negative'], 'authentication');
+    const { drafts } = buildDraftTestCases(plan, LOGIN_KNOWLEDGE, LOGIN_REQ_LOCKOUT);
 
     const pos = drafts.find(d => d.coverageType === 'positive');
     const neg = drafts.find(d => d.coverageType === 'negative');
@@ -111,39 +127,49 @@ describe('buildDraftTestCases — grounding', () => {
   });
 });
 
-describe('buildDraftTestCases — coverage floor', () => {
-  it('emits at least one draft per grounded (non-conditional) scenario', () => {
+describe('buildDraftTestCases — pure transform (no existence decisions)', () => {
+  it('emits EXACTLY one draft per planned scenario — never creates or drops', () => {
     const plan = planScenarios(LOGIN_REQ, COVERAGE, 'authentication');
     const { drafts } = buildDraftTestCases(plan, LOGIN_KNOWLEDGE, LOGIN_REQ);
-    expect(drafts.length).toBeGreaterThanOrEqual(plan.groundedCount);
+    expect(drafts.length).toBe(plan.scenarios.length);
+    // Each draft corresponds 1:1 (by id) to a planned scenario — no invention.
+    expect(drafts.map(d => d.scenarioId).sort())
+      .toEqual(plan.scenarios.map(s => s.id).sort());
   });
 
-  it('drops unsupported conditional scenarios but keeps them when the requirement supports them', () => {
-    // A plain login must NOT emit drafts for conditional scenarios (lockout,
-    // session, remember-me…) that nothing in the requirement/context supports.
-    // A requirement that explicitly mentions lockout + logout should pull those
-    // scenarios in — raising the draft count above the plain baseline.
-    const req = {
-      title: 'User Login with lockout',
-      description: 'User logs in with email/password. Account locks after repeated failed attempts. User can log out.',
-      acceptanceCriteria: 'Lock the account after 3 failed attempts; logout ends the session.',
-    };
-    const planPlain = planScenarios(LOGIN_REQ, ['positive', 'negative', 'security'], 'authentication');
-    const planLock = planScenarios(req, ['positive', 'negative', 'security'], 'authentication');
+  it('no invention: a bare login yields ONLY the justified happy path (no phantom negatives)', () => {
+    // The planner justifies only the core valid-login scenario for a bare
+    // requirement; the builder must faithfully emit that and nothing more —
+    // no invented Invalid Login / SQL Injection / Empty Password.
+    const plan = planScenarios(
+      { title: 'User Login', description: 'User can log in successfully.' },
+      ['positive', 'negative', 'edge_cases', 'security'],
+      'authentication',
+    );
+    const { drafts } = buildDraftTestCases(plan, LOGIN_KNOWLEDGE, LOGIN_REQ);
+    expect(drafts.map(d => d.scenarioId)).toEqual(['auth-pos-valid']);
+  });
 
-    const plain = buildDraftTestCases(planPlain, LOGIN_KNOWLEDGE, LOGIN_REQ);
-    const lock = buildDraftTestCases(planLock, LOGIN_KNOWLEDGE, req);
+  it('reflects the planner: explicit lockout evidence yields strictly more drafts than a bare login', () => {
+    const planBare = planScenarios(
+      { title: 'User Login', description: 'User can log in successfully.' },
+      ['positive', 'negative', 'security'],
+      'authentication',
+    );
+    const planLock = planScenarios(LOGIN_REQ_LOCKOUT, ['positive', 'negative', 'security'], 'authentication');
 
-    // The lockout requirement supports more scenarios → strictly more drafts.
-    expect(lock.drafts.length).toBeGreaterThan(plain.drafts.length);
-    // Every draft is either a grounded scenario or a conditional one the
-    // requirement/context supported — nothing else leaks through.
-    expect(plain.drafts.length).toBe(planPlain.groundedCount + plain.conditionalKept);
-    expect(lock.drafts.length).toBe(planLock.groundedCount + lock.conditionalKept);
-    // A lockout-related draft is present only in the lockout build.
+    const bare = buildDraftTestCases(planBare, LOGIN_KNOWLEDGE, LOGIN_REQ);
+    const lock = buildDraftTestCases(planLock, LOGIN_KNOWLEDGE, LOGIN_REQ_LOCKOUT);
+
+    // Each build is a faithful 1:1 transform of its plan…
+    expect(bare.drafts.length).toBe(planBare.scenarios.length);
+    expect(lock.drafts.length).toBe(planLock.scenarios.length);
+    // …and the lockout evidence justified more scenarios upstream.
+    expect(lock.drafts.length).toBeGreaterThan(bare.drafts.length);
     const hasLockout = (r: typeof lock) =>
-      r.drafts.some(d => /lock|logout|session/i.test(`${d.title} ${d.riskArea}`));
+      r.drafts.some(d => /lock/i.test(`${d.title} ${d.riskArea}`));
     expect(hasLockout(lock)).toBe(true);
+    expect(hasLockout(bare)).toBe(false);
   });
 });
 
@@ -169,10 +195,13 @@ describe('buildDraftTestCases — fail-open', () => {
   it('still produces drafts from the objective when there is NO App Profile', () => {
     const plan = planScenarios(LOGIN_REQ, COVERAGE, 'authentication');
     const { drafts, groundedCount } = buildDraftTestCases(plan, undefined, LOGIN_REQ);
-    expect(drafts.length).toBeGreaterThanOrEqual(plan.groundedCount);
+    expect(drafts.length).toBe(plan.scenarios.length);
     expect(groundedCount).toBe(0);
     for (const d of drafts) {
-      expect(d.source).toBe('knowledge');
+      // Even with no App Profile, `source` still relays the planner's evidence
+      // source (here the core scenario is derived from the Requirement) —
+      // grounding absence is reflected only in `grounded`.
+      expect(d.source).toBe('requirement');
       expect(d.grounded).toBe(false);
       expect(d.steps.length).toBeGreaterThan(0);
     }
@@ -180,7 +209,7 @@ describe('buildDraftTestCases — fail-open', () => {
 
   it('returns an empty result for an empty/undefined plan (never throws)', () => {
     expect(buildDraftTestCases(undefined, LOGIN_KNOWLEDGE, LOGIN_REQ)).toEqual({
-      drafts: [], groundedCount: 0, conditionalKept: 0,
+      drafts: [], groundedCount: 0,
     });
   });
 });
@@ -193,7 +222,9 @@ describe('buildDraftBlock', () => {
     expect(block).toContain('PRE-BUILT DRAFT TEST CASES');
     expect(block).toContain('scenarioIndex');
     expect(block).toContain(`DRAFTS (${drafts.length})`);
-    expect(block).toContain('FLOOR, not a ceiling');
+    // The block forbids invention and forbids dropping drafts (no-invention).
+    expect(block).toContain('DO NOT invent');
+    expect(block).toContain('DO NOT drop');
   });
 
   it('returns empty string for no drafts', () => {
@@ -221,8 +252,10 @@ describe('Formatter mode — deterministic output', () => {
       // scenarioIndex is the POSITION in the emitted list so it always aligns
       // with the deterministically-derived scenarios array.
       expect(tc.scenarioIndex).toBe(i);
-      // Never emit 'requirement' as a source in formatter output.
-      expect(['knowledge', 'test_data', 'app_profile']).toContain(tc.source);
+      // `source` is the slug of the planner's evidence source (one of the four
+      // evidence buckets) — carried through, never a grounding echo.
+      expect(['requirement', 'acceptance_criteria', 'app_knowledge', 'test_data'])
+        .toContain(tc.source);
     });
   });
 
@@ -270,8 +303,10 @@ describe('Formatter mode — minimal prompt', () => {
   });
 
   it('sends ONLY the editable wording fields — invariants are withheld from the model', () => {
-    const plan = planScenarios(LOGIN_REQ, COVERAGE, 'authentication');
-    const { drafts } = buildDraftTestCases(plan, LOGIN_KNOWLEDGE, LOGIN_REQ);
+    // Use the lockout requirement so the plan justifies >1 scenario and the
+    // compact JSON array actually contains multiple objects.
+    const plan = planScenarios(LOGIN_REQ_LOCKOUT, ['positive', 'negative'], 'authentication');
+    const { drafts } = buildDraftTestCases(plan, LOGIN_KNOWLEDGE, LOGIN_REQ_LOCKOUT);
     const out = buildDeterministicOutput(drafts);
     const formatterPrompt = buildFormatterPrompt(out.testCases);
     // The editable payload carries the canonical id + wording fields...
@@ -342,8 +377,10 @@ describe('applyPolish — canonical reconciliation', () => {
   });
 
   it('ships the deterministic cases unchanged when the model breaks the count contract', () => {
-    const plan = planScenarios(LOGIN_REQ, COVERAGE, 'authentication');
-    const { drafts } = buildDraftTestCases(plan, LOGIN_KNOWLEDGE, LOGIN_REQ);
+    // Lockout requirement justifies >1 scenario, so a single returned case is a
+    // genuine count-contract violation.
+    const plan = planScenarios(LOGIN_REQ_LOCKOUT, ['positive', 'negative'], 'authentication');
+    const { drafts } = buildDraftTestCases(plan, LOGIN_KNOWLEDGE, LOGIN_REQ_LOCKOUT);
     const det = buildDeterministicOutput(drafts).testCases;
     const { cases, contractOk } = applyPolish(det, { cases: [{ id: det[0].scenarioId, title: 'only one' }] });
     expect(contractOk).toBe(false);
@@ -361,15 +398,40 @@ describe('applyPolish — canonical reconciliation', () => {
   });
 });
 
-describe('Coverage floor — authentication baseline', () => {
-  it('a standard login yields 8+ grounded scenarios (raised KB baseline)', () => {
-    const plan = planScenarios(LOGIN_REQ, ['positive', 'negative', 'edge_cases', 'security'], 'authentication');
+describe('No invention — authentication (quality over quantity)', () => {
+  it('a bare login does NOT emit ungrounded baseline scenarios (no SQL injection / empty password / masking phantoms)', () => {
+    // This is the exact regression the refactor removes: previously a bare login
+    // produced a fixed 8-scenario baseline including scenarios NOTHING in the
+    // requirement justified. Now the planner emits only what the evidence
+    // supports, so those phantoms must be ABSENT.
+    const plan = planScenarios(
+      { title: 'User Login', description: 'User can log in successfully.' },
+      ['positive', 'negative', 'edge_cases', 'security'],
+      'authentication',
+    );
     const { drafts } = buildDraftTestCases(plan, LOGIN_KNOWLEDGE, LOGIN_REQ);
-    expect(drafts.length).toBeGreaterThanOrEqual(8);
-    // The new universal login scenarios are present.
     const ids = drafts.map(d => d.scenarioId);
-    expect(ids).toEqual(expect.arrayContaining([
-      'auth-sec-injection', 'auth-neg-invalid-identifier-format', 'auth-edge-password-masking',
-    ]));
+    // Only the core happy path is justified for a bare requirement.
+    expect(ids).toEqual(['auth-pos-valid']);
+    // The previously-invented baseline scenarios are gone.
+    expect(ids).not.toContain('auth-sec-injection');
+    expect(ids).not.toContain('auth-neg-invalid-identifier-format');
+    expect(ids).not.toContain('auth-edge-password-masking');
+  });
+
+  it('explicit evidence (acceptance criteria) DOES justify the corresponding scenarios', () => {
+    // When the requirement actually states a lockout rule, the matching
+    // scenarios ARE planned — evidence, not a fixed baseline, drives coverage.
+    const plan = planScenarios(LOGIN_REQ_LOCKOUT, ['positive', 'negative', 'security'], 'authentication');
+    const { drafts } = buildDraftTestCases(plan, LOGIN_KNOWLEDGE, LOGIN_REQ_LOCKOUT);
+    const ids = drafts.map(d => d.scenarioId);
+    expect(ids).toContain('auth-pos-valid');
+    expect(ids).toContain('auth-neg-locked-user');
+    // Each is justified by the acceptance criteria clause.
+    for (const d of drafts) {
+      if (d.scenarioId === 'auth-neg-locked-user') {
+        expect(d.provenance.source).toBe('Acceptance Criteria');
+      }
+    }
   });
 });

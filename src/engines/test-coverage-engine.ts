@@ -1301,14 +1301,13 @@ Return ONLY valid JSON, no markdown fences.`;
     let scenarioPlanBlock = '';
     let scenarioPlan: ScenarioPlan | undefined;
     if (SCENARIO_PLANNER_ENABLED) {
-      scenarioPlan = planScenarios(input, coverageTypes, analysis.featureType);
+      scenarioPlan = planScenarios(input, coverageTypes, analysis.featureType, knowledge);
       scenarioPlanBlock = buildScenarioPlanBlock(scenarioPlan);
       logger.info(MOD, 'Scenario plan built', {
         category: scenarioPlan.classification.category,
         confidence: scenarioPlan.classification.confidence,
         planned: scenarioPlan.scenarios.length,
-        grounded: scenarioPlan.groundedCount,
-        conditional: scenarioPlan.conditionalCount,
+        justified: scenarioPlan.justifiedCount,
         knowledgeVersion: scenarioPlan.knowledgeVersion,
         applied: scenarioPlanBlock.length > 0,
       });
@@ -1381,7 +1380,6 @@ Return ONLY valid JSON, no markdown fences.`;
         planned: scenarioPlan.scenarios.length,
         drafts: built.drafts.length,
         grounded: built.groundedCount,
-        conditionalKept: built.conditionalKept,
         applied: draftBlock.length > 0,
       });
     }
@@ -1391,23 +1389,29 @@ Return ONLY valid JSON, no markdown fences.`;
     // to "format": it will receive ONLY the finished test-case objects (no
     // requirement/app-profile/knowledge/coverage/reasoning), cutting the input
     // prompt to the drafts + a short polish instruction. Scoped to STANDARD mode
-    // (Gap Analysis still reasons over assumptions). Coverage is guaranteed by
-    // the deterministic fallback below, never by the model.
+    // (Gap Analysis still reasons over assumptions).
     //
-    // CRITICAL coverage guard: only engage formatter mode when the drafts cover
-    // EVERY selected coverage type. If the user selected a type the plan/KB does
-    // not yet cover (e.g. "boundary" or "performance" on a login), we must NOT
-    // silently drop it — we fall back to the full reasoning prompt so the LLM
-    // fills that gap. This preserves the "never reduce coverage" contract: the
-    // formatter path can only ever match or exceed the selected-type coverage.
+    // ARCHITECTURAL BOUNDARY: the Scenario Planner is the SINGLE SOURCE OF TRUTH
+    // for scenario existence. If a selected coverage type has NO justified
+    // scenario (e.g. "security" selected on a bare "user can log in" with no
+    // evidence of lockout/injection behaviour), that is a DELIBERATE, correct
+    // outcome — the type is intentionally empty because nothing in the
+    // requirement / acceptance criteria / app knowledge / test data justifies a
+    // scenario for it. We must NOT fall back to the full-reasoning prompt to
+    // "fill the gap", because that path re-invents ungrounded scenarios — the
+    // exact quality-over-quantity regression this refactor removes. So formatter
+    // mode now engages whenever the planner produced ANY drafts, regardless of
+    // whether every selected type is covered. Uncovered selected types are
+    // logged for transparency, never back-filled by invention.
     const draftCoverageTypes = new Set(draftDrafts.map(d => d.coverageType));
-    const allSelectedTypesCovered = coverageTypes.every(ct => draftCoverageTypes.has(ct));
+    const uncoveredSelectedTypes = coverageTypes.filter(ct => !draftCoverageTypes.has(ct));
     const formatterMode =
-      FORMATTER_MODE_ENABLED && !expand && draftDrafts.length > 0 && allSelectedTypesCovered;
-    if (FORMATTER_MODE_ENABLED && !expand && draftDrafts.length > 0 && !allSelectedTypesCovered) {
-      logger.info(MOD, 'Formatter mode skipped — drafts do not cover all selected types', {
+      FORMATTER_MODE_ENABLED && !expand && draftDrafts.length > 0;
+    if (formatterMode && uncoveredSelectedTypes.length > 0) {
+      logger.info(MOD, 'Selected coverage types with no justified scenario (intentionally empty — no invention)', {
         selected: coverageTypes.join(','),
-        draftTypes: Array.from(draftCoverageTypes).join(','),
+        uncovered: uncoveredSelectedTypes.join(','),
+        justifiedTypes: Array.from(draftCoverageTypes).join(','),
       });
     }
 
@@ -1977,7 +1981,7 @@ Return ONLY valid JSON array.`;
     // drop scenarios/cases to fit a fixed budget (user directive). Zero-token:
     // planScenarios is pure/deterministic.
     const plannedForBudget = SCENARIO_PLANNER_ENABLED
-      ? planScenarios(input, coverageTypes, analysis.featureType).scenarios.length
+      ? planScenarios(input, coverageTypes, analysis.featureType, knowledge).scenarios.length
       : 0;
     const outputBudget = coverageDrivenOutputBudget(
       plannedForBudget, coverageTypes.length, tierCfg.maxOutputTokens,

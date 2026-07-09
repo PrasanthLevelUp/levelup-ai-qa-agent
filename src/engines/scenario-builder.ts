@@ -16,24 +16,51 @@
  * varies run to run). So instead of inventing, this builder ASSEMBLES a concrete
  * draft test case for every planned scenario, grounded in the retrieved App
  * Profile (real selectors) and Test Data (real datasets). The LLM then only
- * REFINES the wording and may add cases the requirement clearly implies.
+ * REFINES the wording.
+ *
+ * ARCHITECTURAL BOUNDARY — the builder is a PURE TRANSFORM, never a decider.
+ * The Scenario Planner is the SINGLE SOURCE OF TRUTH for whether a business
+ * scenario exists; every scenario it emits already carries a justification
+ * (`provenance: { whyExists, source, confidence, derivedFrom }`). The builder
+ * treats that plan as IMMUTABLE: it emits exactly one draft per planned
+ * scenario, enriching it with real selectors/URLs/datasets, and NEVER creates,
+ * drops, gates, or second-guesses a scenario. The old keyword-gated
+ * "conditional" emission lived here; it has been removed — existence is now
+ * decided (and provenance-justified) upstream in the planner.
  *
  * Design guarantees (same discipline as the planner/optimizer):
  *   • Pure & synchronous — no I/O, no LLM, no randomness. Deterministic output.
  *   • Fail-open — if no App Profile/Test Data is available a draft is still
- *     produced from the scenario objective (source 'knowledge'); the builder
- *     NEVER throws and never returns fewer drafts than grounded scenarios.
- *   • Grounded — steps reference REAL selectors/URLs/datasets when present; a
- *     draft is tagged 'app_profile' when it used real selectors, 'test_data'
- *     when it used a real dataset, else 'knowledge'.
- *   • Coverage-first — emits a draft for EVERY grounded planned scenario, plus
- *     conditional ones the requirement OR the retrieved context supports. This
- *     is what lifts a login requirement off the weak "5 scenarios" floor to the
- *     full senior-QA baseline, WITHOUT inventing ungrounded behaviour.
+ *     produced from the scenario objective; the builder NEVER throws and always
+ *     emits exactly one draft per planned scenario.
+ *   • Grounded — steps reference REAL selectors/URLs/datasets when present. The
+ *     `grounded` flag records WHETHER a real selector was used; this is a
+ *     SEPARATE axis from `source`, which relays the planner's evidence source.
+ *   • Provenance-preserving — each draft carries the planner's provenance
+ *     verbatim; `source` is the slug of `provenance.source`, not a grounding
+ *     echo.
  */
 
 import type { QACategory } from './qa-knowledge-engine';
-import type { AnnotatedPlannedScenario, ScenarioPlan } from './scenario-planner';
+import type {
+  PlannedScenarioWithProvenance,
+  ProvenanceSource,
+  ScenarioPlan,
+  ScenarioProvenance,
+} from './scenario-planner';
+
+/**
+ * Slug map: planner evidence source → the draft's `source` tag. This keeps the
+ * draft `source` a faithful relay of WHY the planner justified the scenario
+ * (its evidence source), rather than the old grounding echo ('app_profile' when
+ * a selector happened to be found). Grounding is tracked separately.
+ */
+const PROVENANCE_SOURCE_SLUG: Record<ProvenanceSource, DraftTestCase['source']> = {
+  Requirement: 'requirement',
+  'Acceptance Criteria': 'acceptance_criteria',
+  'App Knowledge': 'app_knowledge',
+  'Test Data': 'test_data',
+};
 
 /* ------------------------------------------------------------------ */
 /*  Loose structural shapes (decoupled from the engine types)          */
@@ -149,8 +176,20 @@ export interface DraftTestCase {
   tags: string[];
   automationReady: boolean;
   selectorAvailability: 'high' | 'medium' | 'low' | 'unknown';
-  source: 'requirement' | 'knowledge' | 'test_data' | 'app_profile';
+  /**
+   * Provenance slug, derived from the PLANNER's authoritative provenance (see
+   * `provenance` below). 'knowledge' / 'app_profile' are retained only for
+   * backward compatibility with cases reconstructed from older DB rows.
+   */
+  source: 'requirement' | 'acceptance_criteria' | 'app_knowledge' | 'test_data' | 'knowledge' | 'app_profile';
   sourceEvidence: string;
+  /**
+   * The planner's authoritative provenance for this scenario ({ whyExists,
+   * source, confidence, derivedFrom }). The builder does NOT compute this — it
+   * carries through whatever the Scenario Planner decided. The builder never
+   * decides whether a scenario exists.
+   */
+  provenance: ScenarioProvenance;
   /** True when the draft used at least one REAL selector from the App Profile. */
   grounded: boolean;
 }
@@ -159,8 +198,6 @@ export interface BuildDraftsResult {
   drafts: DraftTestCase[];
   /** How many drafts were grounded in real selectors (analytics). */
   groundedCount: number;
-  /** How many conditional scenarios were kept because context supported them. */
-  conditionalKept: number;
 }
 
 /**
@@ -228,8 +265,11 @@ export interface FormatterTestCase {
   automationReady: boolean;
   automationComplexity: 'low' | 'medium' | 'high';
   selectorAvailability: 'high' | 'medium' | 'low' | 'unknown';
-  source: 'requirement' | 'knowledge' | 'test_data' | 'app_profile';
+  source: 'requirement' | 'acceptance_criteria' | 'app_knowledge' | 'test_data' | 'knowledge' | 'app_profile';
   sourceEvidence: string;
+  /** Planner provenance carried through for explainability (optional: absent on
+   * cases reconstructed from older DB rows). */
+  provenance?: ScenarioProvenance;
 }
 
 /* ------------------------------------------------------------------ */
@@ -255,31 +295,6 @@ function extractSelectors(steps: string[]): string[] {
     }
   }
   return Array.from(out);
-}
-
-function haystackFromRequirement(input?: RequirementLike): string {
-  if (!input) return '';
-  return [input.title, input.description, input.acceptanceCriteria, input.businessFlow]
-    .filter(Boolean).join(' ').toLowerCase();
-}
-
-/** All searchable text from the App Profile + Test Data (for evidence checks). */
-function haystackFromContext(k?: KnowledgeLike): string {
-  const ap = k?.applicationProfile;
-  const parts: string[] = [];
-  if (ap) {
-    for (const p of ap.pages || []) parts.push(lc(p.url), lc(p.title), lc(p.pageType));
-    for (const f of ap.forms || []) {
-      parts.push(lc(f.page), lc(f.action));
-      for (const fd of f.fields || []) parts.push(lc(fd.name), lc(fd.label), lc(fd.type));
-    }
-    for (const e of ap.keyElements || []) parts.push(lc(e.label), lc(e.role), lc(e.selector));
-  }
-  for (const d of k?.testData || []) {
-    parts.push(lc(d.name));
-    for (const key of d.sampleKeys || []) parts.push(lc(key));
-  }
-  return parts.filter(Boolean).join(' ');
 }
 
 /**
@@ -369,7 +384,7 @@ function dataPhraseFor(coverageType: string, field: FieldLike): string {
  * No new interpretation engine — this is a data-shape change, per the plan.
  */
 function buildExpected(
-  scenario: AnnotatedPlannedScenario,
+  scenario: PlannedScenarioWithProvenance,
   form: FormLike | undefined,
   ap: ProfileLike | undefined,
 ): StructuredExpected {
@@ -433,33 +448,23 @@ export function buildDraftTestCases(
   input?: RequirementLike,
 ): BuildDraftsResult {
   if (!plan || plan.isEmpty || !plan.scenarios.length) {
-    return { drafts: [], groundedCount: 0, conditionalKept: 0 };
+    return { drafts: [], groundedCount: 0 };
   }
 
   const ap = knowledge?.applicationProfile;
   const category = plan.classification.category;
-  const reqHay = haystackFromRequirement(input);
-  const ctxHay = haystackFromContext(knowledge);
   const baseUrl = ap?.baseUrl;
   const loginUrl = ap?.loginUrl;
 
   const drafts: DraftTestCase[] = [];
   let groundedCount = 0;
-  let conditionalKept = 0;
 
+  // The builder is a PURE TRANSFORM. It emits exactly one draft per planned
+  // scenario and NEVER decides whether a scenario should exist — that decision
+  // was already made (and justified with provenance) by the Scenario Planner,
+  // the single source of truth for scenario existence. The builder only
+  // enriches each immutable planned scenario into a concrete, grounded draft.
   plan.scenarios.forEach((scenario, index) => {
-    // ── Decide whether to emit a draft for this scenario ──
-    // Grounded (non-conditional) scenarios are ALWAYS emitted. Conditional
-    // scenarios are emitted only when the requirement OR the retrieved context
-    // actually references the behaviour — this is what raises the count beyond
-    // the weak baseline WITHOUT inventing ungrounded scenarios.
-    if (scenario.conditional) {
-      const keywords = scenario.conditionalOnKeywords || [];
-      const supported = keywords.some(k => reqHay.includes(lc(k)) || ctxHay.includes(lc(k)));
-      if (!supported) return; // skip — nothing supports it
-      conditionalKept += 1;
-    }
-
     const scenarioTerms = toTerms(`${scenario.title} ${scenario.objective} ${scenario.riskArea}`);
     const form = pickForm(ap?.forms, scenarioTerms);
     const dataset = pickDataset(knowledge?.testData, scenarioTerms);
@@ -517,19 +522,13 @@ export function buildDraftTestCases(
       ? `${dataset.name}${dataset.sampleKeys?.length ? ` (keys: ${dataset.sampleKeys.slice(0, 5).join(', ')})` : ''}`
       : 'Use data appropriate to the scenario (no dedicated dataset found).';
 
-    // ── Provenance ──
-    let source: DraftTestCase['source'];
-    let sourceEvidence: string;
-    if (usedRealSelector) {
-      source = 'app_profile';
-      sourceEvidence = `Real selectors from ${form?.page || 'app profile'}`;
-    } else if (dataset?.name) {
-      source = 'test_data';
-      sourceEvidence = `${dataset.name} dataset`;
-    } else {
-      source = 'knowledge';
-      sourceEvidence = `QA baseline for ${category}: ${scenario.id}`;
-    }
+    // ── Provenance ── carried through VERBATIM from the planner. The builder
+    // does not decide (or second-guess) why a scenario exists; it only relays
+    // the planner's justification. `source` is the slug of the planner's
+    // evidence source — NOT a grounding echo. Whether we found a real selector
+    // is a SEPARATE axis captured by `grounded`/`groundedCount` below.
+    const source = PROVENANCE_SOURCE_SLUG[scenario.provenance.source];
+    const sourceEvidence = scenario.provenance.whyExists;
     if (usedRealSelector) groundedCount += 1;
 
     const expected = buildExpected(scenario, form, ap);
@@ -556,11 +555,12 @@ export function buildDraftTestCases(
       selectorAvailability: usedRealSelector ? 'high' : 'unknown',
       source,
       sourceEvidence,
+      provenance: scenario.provenance,
       grounded: usedRealSelector,
     });
   });
 
-  return { drafts, groundedCount, conditionalKept };
+  return { drafts, groundedCount };
 }
 
 /* ------------------------------------------------------------------ */
@@ -590,13 +590,13 @@ export function buildDraftBlock(drafts: DraftTestCase[]): string {
 
   return `
 --- PRE-BUILT DRAFT TEST CASES (assembled DETERMINISTICALLY from the scenario plan + REAL app structure) ---
-These drafts were built by the platform from the crawled App Profile (real selectors), the Test Data sets, and the QA knowledge base — NOT guessed. Your job is to REFINE them into final, polished test cases, NOT to re-derive coverage from scratch.
+These drafts were derived by the Scenario Planner — the single source of truth for WHICH business scenarios exist — from the explicit Requirement, Acceptance Criteria, App Knowledge and Test Data, then grounded in the crawled App Profile (real selectors) and Test Data sets. Each draft is already justified; each carries the source that justifies it. Your job is to REFINE the wording, NOT to decide coverage.
 
 Rules for using the drafts:
-  • Produce one testCase per draft as the baseline, keeping its "scenarioIndex", the REAL dataset references, priority, riskArea and source. Improve ONLY the wording/specificity (sharper title, concrete values, crisp expected result). Keep steps business-readable — do NOT put selectors, element ids or raw URLs in the step text (technical grounding is tracked separately).
-  • You MAY split a draft into multiple concrete test cases when it genuinely covers distinct inputs/states (e.g. wrong-password vs unknown-user), and you MAY add further cases the requirement or context clearly implies. The drafts are a FLOOR, not a ceiling — never emit FEWER cases than there are drafts.
-  • Do NOT invent selectors, pages or datasets not present in the drafts/context. Do NOT drop a draft unless it is truly unsupported by the requirement.
-  • Keep the deterministic grounding: a draft tagged source "app_profile"/"test_data" must stay grounded in that evidence.
+  • Produce EXACTLY one testCase per draft, keeping its "scenarioIndex", the REAL dataset references, priority, riskArea and source. Improve ONLY the wording/specificity (sharper title, concrete values, crisp expected result). Keep steps business-readable — do NOT put selectors, element ids or raw URLs in the step text (technical grounding is tracked separately).
+  • DO NOT invent additional test cases or scenarios. These drafts are the COMPLETE set the evidence justifies — if a failure mode or edge case is not represented below, the requirement / acceptance criteria / app knowledge / test data did not justify it, so leave it out.
+  • DO NOT drop a draft. Every draft below is justified and must be written up.
+  • Do NOT invent selectors, pages or datasets not present in the drafts/context. Keep the deterministic grounding: a grounded draft must stay grounded in its evidence.
 
 DRAFTS (${drafts.length}):
 ${lines.join('\n')}
@@ -649,8 +649,9 @@ export function draftToTestCase(draft: DraftTestCase, scenarioIndex: number): Fo
     automationReady: draft.automationReady,
     automationComplexity: draft.grounded ? 'low' : 'medium',
     selectorAvailability: draft.selectorAvailability,
-    source: draft.source === 'requirement' ? 'knowledge' : draft.source,
+    source: draft.source,
     sourceEvidence: draft.sourceEvidence,
+    provenance: draft.provenance,
   };
 }
 

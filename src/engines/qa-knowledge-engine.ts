@@ -73,11 +73,20 @@ export interface PlannedScenario {
   /** The product risk this scenario guards against. */
   riskArea: string;
   /**
-   * Optional soft guard: lowercase keywords that hint this scenario is only
-   * relevant when the requirement/context mentions them (e.g. "remember me",
-   * "2fa"). The planner still INCLUDES the scenario but flags it as conditional
-   * so the LLM only expands it when the requirement actually supports it — we
-   * never hard-drop knowledge, we let grounding decide.
+   * The category's PRIMARY happy-path. A core scenario is the direct expression
+   * of the requirement itself (e.g. "valid login" for a login requirement), so
+   * the Scenario Planner always derives it from the Requirement — it needs no
+   * keyword evidence. Exactly one scenario per category should be `core`.
+   */
+  core?: boolean;
+  /**
+   * Recognition vocabulary: lowercase terms that let the Scenario Planner
+   * RECOGNISE this scenario in the explicit evidence (Acceptance Criteria,
+   * Requirement description, App Knowledge, Test Data). A NON-core scenario is
+   * derived ONLY when one of these terms appears in that evidence; if none do,
+   * the scenario is NOT planned (the Planner never invents from coverage type
+   * alone). This is not a soft "hint" flag anymore — it is the deterministic
+   * evidence-match key that decides existence.
    */
   conditionalOnKeywords?: string[];
 }
@@ -230,7 +239,7 @@ export function classifyQACategory(
  * ------------------------------------------------------------------------- */
 export const QA_KNOWLEDGE_BASE: Record<Exclude<QACategory, 'generic'>, PlannedScenario[]> = {
   authentication: [
-    { id: 'auth-pos-valid', title: 'Valid credentials log in successfully', objective: 'A registered user with correct credentials is authenticated and lands in the authenticated area.', coverageType: 'positive', priority: 'P0', riskArea: 'Authentication / access' },
+    { id: 'auth-pos-valid', title: 'Valid credentials log in successfully', objective: 'A registered user with correct credentials is authenticated and lands in the authenticated area.', coverageType: 'positive', priority: 'P0', riskArea: 'Authentication / access', core: true },
     { id: 'auth-neg-wrong-password', title: 'Invalid password is rejected', objective: 'A wrong password does not authenticate and a clear, non-leaking error is shown.', coverageType: 'negative', priority: 'P0', riskArea: 'Unauthorized access' },
     { id: 'auth-neg-unknown-user', title: 'Unknown / non-existent user is rejected', objective: 'An unregistered identifier cannot authenticate and the error does not reveal whether the account exists.', coverageType: 'negative', priority: 'P1', riskArea: 'Account enumeration' },
     { id: 'auth-neg-empty-fields', title: 'Empty required fields are rejected', objective: 'Submitting with blank username and/or password is blocked with field-level validation.', coverageType: 'negative', priority: 'P1', riskArea: 'Input validation' },
@@ -245,7 +254,7 @@ export const QA_KNOWLEDGE_BASE: Record<Exclude<QACategory, 'generic'>, PlannedSc
     { id: 'auth-pos-logout', title: 'Logout ends the session', objective: 'Logging out invalidates the session and protected pages are no longer reachable.', coverageType: 'positive', priority: 'P1', riskArea: 'Session termination', conditionalOnKeywords: ['logout', 'log out', 'sign out', 'session'] },
   ],
   crud: [
-    { id: 'crud-pos-create', title: 'Create a record with valid data', objective: 'A record is created and persisted with valid input and confirmation is shown.', coverageType: 'positive', priority: 'P0', riskArea: 'Data creation' },
+    { id: 'crud-pos-create', title: 'Create a record with valid data', objective: 'A record is created and persisted with valid input and confirmation is shown.', coverageType: 'positive', priority: 'P0', riskArea: 'Data creation', core: true },
     { id: 'crud-pos-read', title: 'Read / view an existing record', objective: 'A created record is retrievable and displays the persisted values.', coverageType: 'positive', priority: 'P1', riskArea: 'Data retrieval' },
     { id: 'crud-pos-update', title: 'Update an existing record', objective: 'Editing a record persists the change and reflects it on next read.', coverageType: 'positive', priority: 'P0', riskArea: 'Data mutation' },
     { id: 'crud-pos-delete', title: 'Delete a record', objective: 'Deleting a record removes it and it is no longer retrievable.', coverageType: 'positive', priority: 'P1', riskArea: 'Data deletion' },
@@ -256,7 +265,7 @@ export const QA_KNOWLEDGE_BASE: Record<Exclude<QACategory, 'generic'>, PlannedSc
     { id: 'crud-neg-delete-nonexistent', title: 'Operate on a non-existent / already-deleted record', objective: 'Update/delete of a missing record fails gracefully (404/appropriate message).', coverageType: 'negative', priority: 'P2', riskArea: 'State handling' },
   ],
   search: [
-    { id: 'search-pos-match', title: 'Search returns matching results', objective: 'A query with known matches returns the expected results.', coverageType: 'positive', priority: 'P0', riskArea: 'Search correctness' },
+    { id: 'search-pos-match', title: 'Search returns matching results', objective: 'A query with known matches returns the expected results.', coverageType: 'positive', priority: 'P0', riskArea: 'Search correctness', core: true },
     { id: 'search-pos-no-results', title: 'No-results state for non-matching query', objective: 'A query with no matches shows a clear empty state, not an error.', coverageType: 'positive', priority: 'P1', riskArea: 'Empty-state handling' },
     { id: 'search-edge-empty-query', title: 'Empty / whitespace-only query', objective: 'An empty or whitespace query is handled per spec (all results, prompt, or blocked).', coverageType: 'edge_cases', priority: 'P2', riskArea: 'Input handling' },
     { id: 'search-edge-special-chars', title: 'Special characters / injection-like input', objective: 'Special characters and injection-like strings are handled safely and do not break search.', coverageType: 'edge_cases', priority: 'P2', riskArea: 'Robustness' },
@@ -266,7 +275,7 @@ export const QA_KNOWLEDGE_BASE: Record<Exclude<QACategory, 'generic'>, PlannedSc
     { id: 'search-perf-large', title: 'Search performance on large datasets', objective: 'Query returns within the acceptable time on a realistically large dataset.', coverageType: 'performance', priority: 'P2', riskArea: 'Performance at scale' },
   ],
   checkout: [
-    { id: 'checkout-pos-happy', title: 'Complete checkout with valid cart', objective: 'A user completes checkout end-to-end and receives an order confirmation.', coverageType: 'positive', priority: 'P0', riskArea: 'Revenue / order completion' },
+    { id: 'checkout-pos-happy', title: 'Complete checkout with valid cart', objective: 'A user completes checkout end-to-end and receives an order confirmation.', coverageType: 'positive', priority: 'P0', riskArea: 'Revenue / order completion', core: true },
     { id: 'checkout-neg-empty-cart', title: 'Checkout blocked for empty cart', objective: 'Attempting checkout with an empty cart is prevented with clear messaging.', coverageType: 'negative', priority: 'P1', riskArea: 'Order integrity' },
     { id: 'checkout-neg-invalid-address', title: 'Invalid / incomplete shipping address is rejected', objective: 'Missing or invalid address fields block progression with validation.', coverageType: 'negative', priority: 'P1', riskArea: 'Fulfilment integrity' },
     { id: 'checkout-edge-out-of-stock', title: 'Out-of-stock item during checkout', objective: 'An item going out of stock mid-checkout is surfaced and handled gracefully.', coverageType: 'edge_cases', priority: 'P1', riskArea: 'Inventory consistency', conditionalOnKeywords: ['stock', 'inventory', 'availability'] },
@@ -277,7 +286,7 @@ export const QA_KNOWLEDGE_BASE: Record<Exclude<QACategory, 'generic'>, PlannedSc
     { id: 'checkout-int-payment', title: 'Payment integration completes the order', objective: 'A successful payment transitions the order to confirmed/paid.', coverageType: 'integration', priority: 'P0', riskArea: 'Payment-order consistency' },
   ],
   payment: [
-    { id: 'pay-pos-success', title: 'Successful payment with valid card', objective: 'A valid payment is authorised and captured and the order/record is marked paid.', coverageType: 'positive', priority: 'P0', riskArea: 'Revenue capture' },
+    { id: 'pay-pos-success', title: 'Successful payment with valid card', objective: 'A valid payment is authorised and captured and the order/record is marked paid.', coverageType: 'positive', priority: 'P0', riskArea: 'Revenue capture', core: true },
     { id: 'pay-neg-declined', title: 'Declined card is handled', objective: 'A declined card shows a clear error and does not mark the order paid.', coverageType: 'negative', priority: 'P0', riskArea: 'Payment integrity' },
     { id: 'pay-neg-expired-card', title: 'Expired / invalid card details are rejected', objective: 'Expired or malformed card details are rejected at validation.', coverageType: 'negative', priority: 'P1', riskArea: 'Payment validation' },
     { id: 'pay-edge-insufficient-funds', title: 'Insufficient funds', objective: 'An insufficient-funds response is surfaced and the order is not completed.', coverageType: 'edge_cases', priority: 'P1', riskArea: 'Payment integrity' },
@@ -287,7 +296,7 @@ export const QA_KNOWLEDGE_BASE: Record<Exclude<QACategory, 'generic'>, PlannedSc
     { id: 'pay-int-timeout', title: 'Gateway timeout / failure is handled', objective: 'A gateway timeout leaves the system in a consistent state (no orphaned paid order).', coverageType: 'integration', priority: 'P1', riskArea: 'Payment-order consistency' },
   ],
   admin: [
-    { id: 'admin-pos-authorized', title: 'Authorized admin can perform the action', objective: 'A user with the required role completes the privileged action successfully.', coverageType: 'positive', priority: 'P0', riskArea: 'Authorized access' },
+    { id: 'admin-pos-authorized', title: 'Authorized admin can perform the action', objective: 'A user with the required role completes the privileged action successfully.', coverageType: 'positive', priority: 'P0', riskArea: 'Authorized access', core: true },
     { id: 'admin-sec-unauthorized', title: 'Unauthorized role is denied', objective: 'A user without the required role/permission is denied (403) and no state changes.', coverageType: 'role_based', priority: 'P0', riskArea: 'Privilege escalation' },
     { id: 'admin-sec-direct-access', title: 'Direct URL/API access is enforced', objective: 'Bypassing the UI by hitting the endpoint/URL directly is still authorization-checked.', coverageType: 'security', priority: 'P1', riskArea: 'Broken access control' },
     { id: 'admin-pos-grant-revoke', title: 'Granting and revoking access take effect', objective: 'Granting a permission enables the action and revoking it disables the action.', coverageType: 'positive', priority: 'P1', riskArea: 'Access-control correctness', conditionalOnKeywords: ['grant', 'revoke', 'permission', 'role'] },
@@ -295,7 +304,7 @@ export const QA_KNOWLEDGE_BASE: Record<Exclude<QACategory, 'generic'>, PlannedSc
     { id: 'admin-edge-self-lockout', title: 'Admin cannot lock themselves out', objective: 'Removing the last admin / self-revoking critical access is prevented or warned.', coverageType: 'edge_cases', priority: 'P2', riskArea: 'Operational safety', conditionalOnKeywords: ['admin', 'role', 'last'] },
   ],
   workflow: [
-    { id: 'wf-pos-happy-path', title: 'Complete the workflow end-to-end', objective: 'The multi-step workflow completes through every stage to the terminal state.', coverageType: 'positive', priority: 'P0', riskArea: 'Process completion' },
+    { id: 'wf-pos-happy-path', title: 'Complete the workflow end-to-end', objective: 'The multi-step workflow completes through every stage to the terminal state.', coverageType: 'positive', priority: 'P0', riskArea: 'Process completion', core: true },
     { id: 'wf-pos-valid-transition', title: 'Valid state transitions are allowed', objective: 'Each permitted stage-to-stage transition succeeds and updates state.', coverageType: 'positive', priority: 'P1', riskArea: 'State-machine correctness' },
     { id: 'wf-neg-invalid-transition', title: 'Invalid state transitions are blocked', objective: 'A transition not permitted from the current stage is rejected.', coverageType: 'negative', priority: 'P0', riskArea: 'State-machine integrity' },
     { id: 'wf-pos-approve', title: 'Approval advances the workflow', objective: 'An approver approving moves the item to the next stage.', coverageType: 'positive', priority: 'P1', riskArea: 'Approval correctness', conditionalOnKeywords: ['approve', 'approval'] },
@@ -304,7 +313,7 @@ export const QA_KNOWLEDGE_BASE: Record<Exclude<QACategory, 'generic'>, PlannedSc
     { id: 'wf-edge-interrupt-resume', title: 'Interrupted workflow resumes correctly', objective: 'Leaving mid-workflow and returning preserves progress/state.', coverageType: 'edge_cases', priority: 'P2', riskArea: 'Flow resilience' },
   ],
   reporting: [
-    { id: 'rep-pos-accurate', title: 'Report shows accurate data', objective: 'Figures/aggregations match the underlying source data for a known dataset.', coverageType: 'positive', priority: 'P0', riskArea: 'Data accuracy' },
+    { id: 'rep-pos-accurate', title: 'Report shows accurate data', objective: 'Figures/aggregations match the underlying source data for a known dataset.', coverageType: 'positive', priority: 'P0', riskArea: 'Data accuracy', core: true },
     { id: 'rep-pos-filters', title: 'Filters / date ranges scope the report', objective: 'Applying filters and date ranges scopes the results correctly.', coverageType: 'positive', priority: 'P1', riskArea: 'Filtering correctness', conditionalOnKeywords: ['filter', 'date range', 'range', 'period'] },
     { id: 'rep-edge-empty', title: 'Empty-data / no-rows state', objective: 'A report with no matching data shows a clear empty state, not an error or zeros mistaken for data.', coverageType: 'edge_cases', priority: 'P1', riskArea: 'Empty-state handling' },
     { id: 'rep-edge-large', title: 'Large-dataset rendering', objective: 'A large result set renders/paginates without failure within acceptable time.', coverageType: 'performance', priority: 'P2', riskArea: 'Performance at scale' },
@@ -312,7 +321,7 @@ export const QA_KNOWLEDGE_BASE: Record<Exclude<QACategory, 'generic'>, PlannedSc
     { id: 'rep-pos-export', title: 'Report export matches on-screen data', objective: 'Exported file content matches the displayed/ filtered report.', coverageType: 'positive', priority: 'P2', riskArea: 'Export fidelity', conditionalOnKeywords: ['export', 'download', 'csv', 'pdf', 'excel'] },
   ],
   import: [
-    { id: 'imp-pos-valid-file', title: 'Import a valid file successfully', objective: 'A well-formed file imports all rows and reports success counts.', coverageType: 'positive', priority: 'P0', riskArea: 'Data ingestion' },
+    { id: 'imp-pos-valid-file', title: 'Import a valid file successfully', objective: 'A well-formed file imports all rows and reports success counts.', coverageType: 'positive', priority: 'P0', riskArea: 'Data ingestion', core: true },
     { id: 'imp-neg-invalid-format', title: 'Reject unsupported file format', objective: 'An unsupported file type/extension is rejected with a clear message.', coverageType: 'negative', priority: 'P1', riskArea: 'Input validation' },
     { id: 'imp-neg-malformed-rows', title: 'Handle malformed / partial rows', objective: 'Invalid rows are reported (row-level errors) without corrupting valid rows per spec.', coverageType: 'negative', priority: 'P0', riskArea: 'Data integrity' },
     { id: 'imp-edge-empty-file', title: 'Empty file / no data rows', objective: 'An empty file or header-only file is handled gracefully.', coverageType: 'edge_cases', priority: 'P2', riskArea: 'Edge handling' },
@@ -321,7 +330,7 @@ export const QA_KNOWLEDGE_BASE: Record<Exclude<QACategory, 'generic'>, PlannedSc
     { id: 'imp-sec-malicious-content', title: 'Malicious content is handled safely', objective: 'Formula-injection/script content in cells is neutralised (no CSV injection).', coverageType: 'security', priority: 'P2', riskArea: 'Injection safety' },
   ],
   export: [
-    { id: 'exp-pos-content', title: 'Exported file content is correct', objective: 'The exported file contains exactly the expected rows/columns for the current view/filters.', coverageType: 'positive', priority: 'P0', riskArea: 'Export fidelity' },
+    { id: 'exp-pos-content', title: 'Exported file content is correct', objective: 'The exported file contains exactly the expected rows/columns for the current view/filters.', coverageType: 'positive', priority: 'P0', riskArea: 'Export fidelity', core: true },
     { id: 'exp-pos-format', title: 'Export produces the correct format', objective: 'The generated file is valid and opens in the target format (CSV/PDF/XLSX).', coverageType: 'positive', priority: 'P1', riskArea: 'Format correctness' },
     { id: 'exp-edge-empty', title: 'Export with no data', objective: 'Exporting an empty result yields a valid file with headers / a clear empty state.', coverageType: 'edge_cases', priority: 'P2', riskArea: 'Empty-state handling' },
     { id: 'exp-edge-special-chars', title: 'Special characters / encoding are preserved', objective: 'Unicode, commas, quotes and newlines are escaped/encoded correctly.', coverageType: 'edge_cases', priority: 'P2', riskArea: 'Encoding correctness' },
