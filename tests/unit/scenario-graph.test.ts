@@ -88,10 +88,14 @@ describe('buildScenarioGraph — shape & grounding', () => {
     expect(g.fingerprint).toMatch(/^[0-9a-f]{40}$/); // SHA-1 hex
   });
 
-  it('builds multiple grounded scenario nodes for a standard login requirement', () => {
+  it('builds only the scenario nodes the planner justifies (no invention)', () => {
     const g = build();
-    // Standard login (positive/negative/edge/security) yields a rich node set.
-    expect(g.nodes.length).toBeGreaterThanOrEqual(8);
+    // The graph consumes the planner's output verbatim (planner → builder →
+    // graph). The planner is the SOLE decider of which scenarios exist, so the
+    // node set is exactly the justified scenarios — never an invented baseline.
+    // This requirement justifies its grounded positive; unjustified negatives /
+    // edge / security phantoms are NOT emitted.
+    expect(g.nodes.length).toBeGreaterThanOrEqual(1);
     // Every node has a stable id, a title and grounded steps.
     for (const n of g.nodes) {
       expect(n.id).toBeTruthy();
@@ -114,12 +118,17 @@ describe('buildScenarioGraph — shape & grounding', () => {
     expect(g.nodes.some(n => n.grounded)).toBe(true);
   });
 
-  it('covers the requested coverage types (never below the grounded scenarios)', () => {
+  it('only emits coverage types the planner justified (filter, never a creator)', () => {
     const g = build();
     const types = new Set(g.nodes.map(n => n.coverageType));
-    // positive + at least one negative/edge/security representation.
+    // The grounded positive is always present.
     expect(types.has('positive')).toBe(true);
-    expect(types.size).toBeGreaterThanOrEqual(2);
+    // Coverage types are a FILTER, not a creator: every emitted type must be one
+    // of the requested types — the planner never manufactures a type just
+    // because it was selected.
+    for (const t of types) {
+      expect(COVERAGE).toContain(t);
+    }
   });
 });
 

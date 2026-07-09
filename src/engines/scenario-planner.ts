@@ -1,122 +1,308 @@
 /**
- * Scenario Planner — the deterministic "what to test" stage.
+ * Scenario Planner — the SINGLE SOURCE OF TRUTH for "what scenarios exist".
  * ============================================================================
  *
- * This is the first half of the QA-first, AI-assisted architecture: BEFORE any
- * LLM call, the planner decides which baseline scenarios a requirement should
- * cover, using the QA Knowledge Engine. The generation prompt then instructs the
- * LLM to EXPAND this plan into concrete, grounded test cases rather than
- * inventing the scenario list from scratch.
+ * Architectural boundary (do not blur it):
  *
- * Why this matters:
- *   • Consistency  — "User Login" always gets the same senior-QA baseline
- *     (valid login, invalid password, locked user, empty fields, logout, …),
- *     regardless of prompt phrasing or model temperature.
- *   • Lower tokens — the LLM spends output on EXPANDING known scenarios, not on
- *     re-deriving the obvious ones; we can run a tighter output budget.
- *   • The moat     — deterministic QA intelligence is the differentiator; the
- *     LLM becomes the last enrichment step, not the first inventor.
+ *   The Scenario Planner is the ONLY component allowed to decide whether a
+ *   business scenario exists. Everything downstream — the QA Knowledge Engine
+ *   (enrichment), the Scenario Builder (transformation), the Script Composer,
+ *   Healing — treats the planner's output as IMMUTABLE. They enrich, transform,
+ *   validate or consume scenarios; they never create or remove them.
  *
- * The planner is PURE + synchronous (ZERO LLM tokens) and never overrides
- * grounding: planned scenarios are CANDIDATES the LLM keeps only if the concrete
- * requirement/context supports them.
+ * A scenario is derived ONLY from explicit evidence, in this priority order:
+ *
+ *   1. Acceptance Criteria      (the strongest, explicit spec)
+ *   2. Requirement description
+ *   3. App Knowledge            (pages/elements/forms crawled)
+ *   4. Test Data                (supplied datasets)
+ *
+ * Separation of concerns (the whole point of this layer):
+ *
+ *   • The Planner maps EVIDENCE → SCENARIO IDENTITIES. It stays "dumb": it does
+ *     NOT know testing heuristics (what "lockout"/"sql injection"/"expired"
+ *     mean). That vocabulary + matching lives in the Knowledge layer
+ *     (`recognizeScenarioEvidence`), so the Planner never turns into a second
+ *     knowledge engine.
+ *   • The Planner emits FACTS (structured `evidence`), NOT scores. Confidence is
+ *     computed downstream by the orchestrator (`computeConfidence`) so scoring
+ *     is consistent across the whole platform and the Planner has one job.
+ *
+ * Coverage Types are a FILTER, never a creator. Selecting "negative" asks
+ * "include the negative scenarios that the evidence justifies" — it can never
+ * conjure a negative scenario the requirement/AC/app/data never mention. A bare
+ * "user can log in" requirement therefore yields ONE scenario (valid login),
+ * not a padded list of invented failures. Quality over quantity.
+ *
+ * Every planned scenario carries its provenance:
+ *
+ *   { whyExists, source, derivedFrom, assumption, evidence[] }
+ *
+ * If the planner cannot attach at least one piece of evidence to a scenario,
+ * that scenario is NOT planned — it does not exist. This gives explainability,
+ * not just a filter.
+ *
+ * The planner is PURE + synchronous (ZERO LLM tokens).
  */
 
 import type { CoverageType, RequirementInput } from './test-coverage-engine';
 import {
   classifyQACategory,
   getBaselineScenarios,
+  recognizeScenarioEvidence,
   QA_KNOWLEDGE_VERSION,
   type PlannedScenario,
-  type QACategory,
   type QACategoryClassification,
+  type ScenarioEvidence,
+  type EvidenceSource,
+  type NormalizedEvidence,
 } from './qa-knowledge-engine';
 
-/** A planned scenario annotated with whether it looks conditionally relevant. */
-export interface AnnotatedPlannedScenario extends PlannedScenario {
+export type { ScenarioEvidence, EvidenceSource } from './qa-knowledge-engine';
+
+/** Where a scenario's justification came from (explicit evidence only). */
+export type ProvenanceSource =
+  | 'Requirement'
+  | 'Acceptance Criteria'
+  | 'App Knowledge'
+  | 'Test Data';
+
+/** Map the machine evidence source to the human-readable provenance bucket. */
+const SOURCE_LABEL: Record<EvidenceSource, ProvenanceSource> = {
+  acceptanceCriteria: 'Acceptance Criteria',
+  requirement: 'Requirement',
+  appKnowledge: 'App Knowledge',
+  testData: 'Test Data',
+};
+
+/**
+ * Why a scenario exists. This is the planner's contract: a scenario without at
+ * least one piece of `evidence` is never emitted.
+ *
+ * NOTE: there is deliberately NO numeric confidence here. The Planner emits
+ * facts (evidence); the orchestrator scores them (`computeConfidence`).
+ */
+export interface ScenarioProvenance {
+  /** Human sentence explaining why this scenario was derived. */
+  whyExists: string;
+  /** The (highest-priority) evidence bucket that justified it. */
+  source: ProvenanceSource;
+  /** The exact evidence text of the highest-priority match (readable citation). */
+  derivedFrom: string;
   /**
-   * True when the scenario has `conditionalOnKeywords` but NONE of them appear
-   * in the requirement/context. The scenario is still shown to the LLM, but
-   * flagged so the LLM only expands it if the requirement genuinely supports it
-   * — we surface knowledge without forcing invention.
+   * By construction the planner ONLY emits evidence-backed scenarios, so this is
+   * always false. Retained (salvaged from the earlier provenance model) so any
+   * future inferred scenario could be flagged honestly instead of silently.
    */
-  conditional: boolean;
+  assumption: boolean;
+  /**
+   * The structured, strongly-typed evidence that justifies this scenario — every
+   * matching AC clause / requirement / app-knowledge / test-data item, in
+   * priority order. This is the reusable contract downstream modules (Script
+   * Gen, Healing, RCA, Impact Analysis, Explainability) consume so they can
+   * explain WHY a scenario exists without reparsing the requirement.
+   */
+  evidence: ScenarioEvidence[];
+}
+
+/** A planned scenario annotated with the provenance that justifies it. */
+export interface PlannedScenarioWithProvenance extends PlannedScenario {
+  provenance: ScenarioProvenance;
 }
 
 export interface ScenarioPlan {
   /** Detected QA category + confidence + the signals that drove it. */
   classification: QACategoryClassification;
-  /** Planned scenarios, filtered to the user's SELECTED coverage types. */
-  scenarios: AnnotatedPlannedScenario[];
-  /** Count of scenarios that are directly relevant (not conditional). */
-  groundedCount: number;
-  /** Count flagged as conditional (shown but only-if-supported). */
-  conditionalCount: number;
+  /** The justified scenarios (filtered to the user's selected coverage types). */
+  scenarios: PlannedScenarioWithProvenance[];
+  /** Count of justified scenarios (== scenarios.length; all are evidence-backed). */
+  justifiedCount: number;
   /** KB version for telemetry correlation. */
   knowledgeVersion: string;
-  /** Whether the plan is empty (generic category or no selected type overlap). */
+  /** Whether the plan is empty (generic category or nothing justified). */
   isEmpty: boolean;
+}
+
+/**
+ * Minimal shape of the knowledge context the planner reads for evidence.
+ * Deliberately permissive (index signatures) so the richer engine
+ * `KnowledgeContext` is structurally assignable without a cast — the planner
+ * only reads the handful of fields below and ignores the rest.
+ */
+interface PlannerKnowledge {
+  applicationProfile?: {
+    name?: string;
+    pages?: Array<{ title?: string; pageType?: string; [k: string]: any }>;
+    keyElements?: Array<{ label?: string; role?: string; tag?: string; [k: string]: any }>;
+    forms?: Array<{ submitLabel?: string; [k: string]: any }>;
+    [k: string]: any;
+  };
+  testData?: Array<{ name?: string; sampleKeys?: string[]; [k: string]: any }>;
+  [k: string]: any;
+}
+
+const lc = (s?: string) => (s || '').toLowerCase();
+
+/**
+ * Split acceptance criteria into individual clauses so a matched scenario can
+ * cite the SPECIFIC criterion it came from (not the whole blob). Splits on
+ * newlines, bullets, semicolons and numbered markers — no NLP, fully
+ * deterministic.
+ */
+function splitAcceptanceClauses(ac?: string): string[] {
+  if (!ac) return [];
+  return ac
+    .split(/\r?\n|;|•|\u2022|\u2023|\u25E6|(?:^|\s)[-*]\s+|\d+[.)]\s+/)
+    .map(c => c.trim())
+    .filter(c => c.length > 0);
+}
+
+/** Cap evidence text so provenance stays a readable citation, not a dump. */
+function cap(s: string, n = 160): string {
+  const t = s.trim();
+  return t.length > n ? `${t.slice(0, n - 1)}…` : t;
+}
+
+/** All searchable App Knowledge text — page titles/types, element labels/roles,
+ * form submit labels. Deliberately EXCLUDES field names so a password/username
+ * field never false-matches a security/negative keyword. */
+function appKnowledgeText(k?: PlannerKnowledge): string {
+  const ap = k?.applicationProfile;
+  if (!ap) return '';
+  const parts: string[] = [];
+  if (ap.name) parts.push(ap.name);
+  for (const p of ap.pages || []) { if (p.title) parts.push(p.title); if (p.pageType) parts.push(p.pageType); }
+  for (const e of ap.keyElements || []) { if (e.label) parts.push(e.label); if (e.role) parts.push(e.role); }
+  for (const f of ap.forms || []) { if (f.submitLabel) parts.push(f.submitLabel); }
+  return lc(parts.join(' '));
+}
+
+/** All searchable Test Data text — dataset names + sample keys. */
+function testDataText(k?: PlannerKnowledge): string {
+  const parts: string[] = [];
+  for (const d of k?.testData || []) {
+    if (d.name) parts.push(d.name);
+    for (const key of d.sampleKeys || []) parts.push(key);
+  }
+  return lc(parts.join(' '));
+}
+
+/**
+ * Assemble the normalized evidence buckets for a requirement. This is evidence
+ * COLLECTION (which the Planner owns for now — a dedicated Evidence Collector is
+ * a later stage). The MATCHING against this evidence is owned by the Knowledge
+ * layer (`recognizeScenarioEvidence`), never here.
+ */
+function buildEvidence(
+  input: Pick<RequirementInput, 'title' | 'description' | 'module' | 'businessFlow' | 'acceptanceCriteria'>,
+  knowledge?: PlannerKnowledge,
+): NormalizedEvidence {
+  return {
+    requirementText: lc([input.title, input.description, input.module, input.businessFlow].filter(Boolean).join(' ')),
+    requirementLabel: cap((input.title || input.description || 'the requirement').trim()),
+    acceptanceClauses: splitAcceptanceClauses(input.acceptanceCriteria),
+    appKnowledge: appKnowledgeText(knowledge),
+    testData: testDataText(knowledge),
+  };
+}
+
+/**
+ * Derive the provenance for a baseline scenario, or null if the evidence does
+ * not justify it (⇒ the scenario is not planned). This is where "no invention"
+ * is enforced — a non-core scenario with no recognised evidence simply does not
+ * exist.
+ *
+ * The Planner does NOT inspect keywords here: it delegates recognition to the
+ * Knowledge layer (`recognizeScenarioEvidence`) and only maps the returned
+ * evidence into scenario provenance. No numeric confidence is attached — the
+ * orchestrator scores the evidence downstream.
+ */
+function deriveProvenance(scenario: PlannedScenario, ev: NormalizedEvidence): ScenarioProvenance | null {
+  // The core happy-path is the requirement itself — always justified by it.
+  // This is an evidence MAPPING (core scenario ⇒ requirement evidence), not a
+  // testing heuristic, so it stays in the Planner.
+  if (scenario.core) {
+    const evidence: ScenarioEvidence[] = [{
+      id: `${scenario.id}:req`,
+      source: 'requirement',
+      reference: 'REQ',
+      excerpt: ev.requirementLabel,
+    }];
+    return {
+      whyExists: 'Primary happy-path stated by the requirement',
+      source: 'Requirement',
+      derivedFrom: ev.requirementLabel,
+      assumption: false,
+      evidence,
+    };
+  }
+
+  // Non-core: ask the Knowledge layer which evidence recognises this scenario.
+  const evidence = recognizeScenarioEvidence(scenario, ev);
+  if (!evidence.length) return null; // no recognised evidence → not planned
+
+  // The highest-priority match (evidence is returned AC → REQ → AK → TD) drives
+  // the human-readable provenance summary.
+  const primary = evidence[0];
+  return {
+    whyExists: `Justified by ${SOURCE_LABEL[primary.source]}: "${primary.excerpt}"`,
+    source: SOURCE_LABEL[primary.source],
+    derivedFrom: primary.excerpt,
+    assumption: false,
+    evidence,
+  };
 }
 
 /**
  * Build a deterministic scenario plan for a requirement.
  *
  * @param input          The requirement.
- * @param coverageTypes  The user's SELECTED coverage types (Priority 1 —
- *                       we only plan scenarios for types the user picked).
+ * @param coverageTypes  The user's SELECTED coverage types (a FILTER — we only
+ *                       keep justified scenarios whose type the user picked).
  * @param featureTypeHint Optional upstream analysis featureType hint.
+ * @param knowledge      Optional App Knowledge / Test Data — additional evidence
+ *                       the planner may derive scenarios from.
  */
 export function planScenarios(
   input: Pick<RequirementInput, 'title' | 'description' | 'module' | 'businessFlow' | 'acceptanceCriteria'>,
   coverageTypes: CoverageType[],
   featureTypeHint?: string,
+  knowledge?: PlannerKnowledge,
 ): ScenarioPlan {
   const classification = classifyQACategory(input, featureTypeHint);
   const baseline = getBaselineScenarios(classification.category);
 
-  // Respect the user's coverage selection: never plan a scenario for a type the
+  // Respect the user's coverage selection: never keep a scenario for a type the
   // user did not select. If nothing is selected, fall back to positive so a plan
   // can still form (matches the engine's own default).
   const selected = new Set<CoverageType>(coverageTypes.length ? coverageTypes : ['positive']);
 
-  const haystack = [
-    input.title,
-    input.description,
-    input.module,
-    input.businessFlow,
-    input.acceptanceCriteria,
-  ]
-    .filter(Boolean)
-    .join(' ')
-    .toLowerCase();
+  const evidence = buildEvidence(input, knowledge);
 
-  const scenarios: AnnotatedPlannedScenario[] = baseline
-    .filter(s => selected.has(s.coverageType))
-    .map(s => {
-      const conditional =
-        Array.isArray(s.conditionalOnKeywords) &&
-        s.conditionalOnKeywords.length > 0 &&
-        !s.conditionalOnKeywords.some(k => haystack.includes(k.toLowerCase()));
-      return { ...s, conditional };
-    });
-
-  const conditionalCount = scenarios.filter(s => s.conditional).length;
-  const groundedCount = scenarios.length - conditionalCount;
+  // Derive ONLY the scenarios explicit evidence justifies. Coverage type filters;
+  // provenance decides existence.
+  const scenarios: PlannedScenarioWithProvenance[] = [];
+  for (const s of baseline) {
+    if (!selected.has(s.coverageType)) continue;
+    const provenance = deriveProvenance(s, evidence);
+    if (!provenance) continue; // unjustified → not planned (no invention)
+    scenarios.push({ ...s, provenance });
+  }
 
   return {
     classification,
     scenarios,
-    groundedCount,
-    conditionalCount,
+    justifiedCount: scenarios.length,
     knowledgeVersion: QA_KNOWLEDGE_VERSION,
     isEmpty: scenarios.length === 0,
   };
 }
 
 /**
- * Render a scenario plan into a compact prompt block. The block tells the LLM to
- * EXPAND the plan (not re-invent it) while staying grounded — conditional
- * scenarios are only expanded if the requirement/context supports them.
+ * Render a scenario plan into a compact prompt block. Because the planner is now
+ * the single source of truth for scenario existence, the block tells the LLM to
+ * REFINE the wording of these scenarios — it must NOT invent additional
+ * scenarios. Each line cites its provenance so the instruction is self-evident.
  *
  * Returns '' for an empty plan so the caller can cleanly fall back to the legacy
  * (plan-free) prompt with no dangling section.
@@ -125,7 +311,7 @@ export function buildScenarioPlanBlock(plan: ScenarioPlan): string {
   if (plan.isEmpty) return '';
 
   // Group by coverage type for a clean, senior-QA-style checklist.
-  const byType = new Map<CoverageType, AnnotatedPlannedScenario[]>();
+  const byType = new Map<CoverageType, PlannedScenarioWithProvenance[]>();
   for (const s of plan.scenarios) {
     const arr = byType.get(s.coverageType) || [];
     arr.push(s);
@@ -136,22 +322,20 @@ export function buildScenarioPlanBlock(plan: ScenarioPlan): string {
   for (const [type, items] of byType) {
     lines.push(`  [${type}]`);
     for (const s of items) {
-      const flag = s.conditional ? ' (CONDITIONAL — expand only if the requirement/context supports it)' : '';
-      lines.push(`    • ${s.title} — ${s.objective}${flag}`);
+      lines.push(`    • ${s.title} — ${s.objective}  (source: ${s.provenance.source})`);
     }
   }
 
   return `
---- DETERMINISTIC SCENARIO PLAN (QA Knowledge Engine — category: ${plan.classification.category}, confidence: ${plan.classification.confidence}) ---
-A senior-QA baseline of scenarios for this feature category has ALREADY been planned deterministically. Your job is to EXPAND this plan into concrete, grounded test cases — NOT to re-derive what to test from scratch.
+--- DERIVED SCENARIO PLAN (QA Knowledge Engine — category: ${plan.classification.category}, confidence: ${plan.classification.confidence}) ---
+These are the ONLY business scenarios justified by the explicit Requirement, Acceptance Criteria, App Knowledge and Test Data. They were derived deterministically and each cites the evidence that justifies it.
 
-Rules for using the plan:
-  • Treat each planned scenario below as a REQUIRED starting point for its coverage type. Expand each into one or more concrete, grounded test cases with real steps/data.
-  • You MAY add further scenarios the concrete requirement or provided context implies — the plan is a floor, not a ceiling.
-  • DROP or DE-PRIORITISE a planned scenario ONLY if the requirement/context clearly does not support it (grounding always wins). Never fabricate behaviour just to satisfy a planned line.
-  • Items marked CONDITIONAL are included only if the requirement/context actually mentions the relevant behaviour — otherwise skip them.
+Your job is to write each scenario up as a concrete, grounded test case — NOT to change WHICH scenarios exist:
+  • Produce exactly one (or more, if a scenario genuinely needs multiple data variations) test case per planned scenario below.
+  • DO NOT invent additional scenarios. If a failure mode / edge case is not listed here, the evidence did not justify it — leave it out.
+  • DO NOT drop a planned scenario. Every line below is justified and must be written up.
 
-PLANNED SCENARIOS (${plan.groundedCount} direct, ${plan.conditionalCount} conditional):
+PLANNED SCENARIOS (${plan.justifiedCount} justified):
 ${lines.join('\n')}
 --- END SCENARIO PLAN ---`;
 }
