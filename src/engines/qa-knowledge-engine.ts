@@ -80,13 +80,14 @@ export interface PlannedScenario {
    */
   core?: boolean;
   /**
-   * Recognition vocabulary: lowercase terms that let the Scenario Planner
-   * RECOGNISE this scenario in the explicit evidence (Acceptance Criteria,
+   * Recognition vocabulary: lowercase terms that let this Knowledge layer
+   * RECOGNISE the scenario in the explicit evidence (Acceptance Criteria,
    * Requirement description, App Knowledge, Test Data). A NON-core scenario is
    * derived ONLY when one of these terms appears in that evidence; if none do,
    * the scenario is NOT planned (the Planner never invents from coverage type
-   * alone). This is not a soft "hint" flag anymore — it is the deterministic
-   * evidence-match key that decides existence.
+   * alone). The matching itself is performed by `recognizeScenarioEvidence` in
+   * THIS module — the vocabulary and the matching are co-located here so the
+   * Planner never has to know testing heuristics.
    */
   conditionalOnKeywords?: string[];
 }
@@ -343,4 +344,135 @@ export const QA_KNOWLEDGE_BASE: Record<Exclude<QACategory, 'generic'>, PlannedSc
 export function getBaselineScenarios(category: QACategory): PlannedScenario[] {
   if (category === 'generic') return [];
   return QA_KNOWLEDGE_BASE[category] ?? [];
+}
+
+/* ============================================================================
+ *  Scenario recognition — the Knowledge layer owns the vocabulary + matching.
+ * ============================================================================
+ *
+ * The Scenario Planner decides WHICH scenarios exist, but it must not itself
+ * know testing heuristics (what "lockout", "sql injection" or "expired" mean).
+ * That vocabulary lives HERE, with the knowledge base that defines it. The
+ * Planner assembles normalized evidence and asks this layer "does the evidence
+ * recognise this scenario?"; it never inspects keywords on its own.
+ *
+ * This keeps the Planner dumb (evidence → scenario ids) and prevents it from
+ * slowly turning into a second knowledge engine.
+ */
+
+/** The evidence bucket a piece of recognised evidence came from. */
+export type EvidenceSource = 'acceptanceCriteria' | 'requirement' | 'appKnowledge' | 'testData';
+
+/**
+ * A single, strongly-typed piece of evidence that justifies a scenario. This is
+ * a FOUNDATIONAL contract shared across the platform (Planner, Script Gen,
+ * Healing, RCA, Impact Analysis, Explainability), so it is typed from the start
+ * rather than a loose { type, value } pair:
+ *
+ *   • reference — a short stable code (AC-3, REQ, AK-<term>, TD-<term>) so UIs
+ *     can deep-link to the originating criterion / dataset / app-knowledge rule.
+ *   • excerpt   — the human-readable evidence text for explainability.
+ */
+export interface ScenarioEvidence {
+  /** Stable id, unique within a scenario (e.g. "auth-neg-locked-user:ac-2"). */
+  id: string;
+  /** Which evidence bucket this came from. */
+  source: EvidenceSource;
+  /** Short stable reference code (AC-3, REQ, AK-lock, TD-locked_users). */
+  reference: string;
+  /** Human-readable evidence text. */
+  excerpt: string;
+}
+
+/**
+ * Normalized evidence buckets the recogniser matches against. The Planner
+ * assembles this (it owns evidence COLLECTION); the Knowledge layer owns only
+ * the vocabulary + MATCHING against it.
+ */
+export interface NormalizedEvidence {
+  /** Lowercased requirement text (title + description + module + flow). */
+  requirementText: string;
+  /** Human-readable requirement label for citation. */
+  requirementLabel: string;
+  /** Acceptance-criteria split into individual clauses (original case). */
+  acceptanceClauses: string[];
+  /** Lowercased App-Knowledge text (page titles/types, element labels/roles). */
+  appKnowledge: string;
+  /** Lowercased Test-Data text (dataset names + sample keys). */
+  testData: string;
+}
+
+const kbLc = (s?: string) => (s || '').toLowerCase();
+
+/** Cap evidence text so an excerpt stays a readable citation, not a dump. */
+function kbCap(s: string, n = 160): string {
+  const t = s.trim();
+  return t.length > n ? `${t.slice(0, n - 1)}...` : t;
+}
+
+/** First keyword that appears in `haystack`, else null. */
+function kbFirstHit(haystack: string, keywords: string[]): string | null {
+  for (const k of keywords) if (k && haystack.includes(k)) return k;
+  return null;
+}
+
+/**
+ * Recognise which evidence (if any) justifies a NON-core scenario. Returns
+ * EVERY matching evidence item, in strict priority order (Acceptance Criteria →
+ * Requirement → App Knowledge → Test Data). An empty array means the evidence
+ * does not justify the scenario, so the Planner must not emit it.
+ *
+ * The recognition vocabulary (`conditionalOnKeywords`) lives on the scenario in
+ * this knowledge base — the matching logic and the vocabulary are co-located
+ * here, never in the Planner.
+ */
+export function recognizeScenarioEvidence(
+  scenario: PlannedScenario,
+  ev: NormalizedEvidence,
+): ScenarioEvidence[] {
+  const keywords = (scenario.conditionalOnKeywords || []).map(kbLc).filter(Boolean);
+  if (!keywords.length) return [];
+
+  const out: ScenarioEvidence[] = [];
+  // 1. Acceptance Criteria — cite each specific matching clause.
+  ev.acceptanceClauses.forEach((clause, i) => {
+    if (kbFirstHit(kbLc(clause), keywords)) {
+      out.push({
+        id: `${scenario.id}:ac-${i + 1}`,
+        source: 'acceptanceCriteria',
+        reference: `AC-${i + 1}`,
+        excerpt: kbCap(clause),
+      });
+    }
+  });
+  // 2. Requirement description.
+  if (kbFirstHit(ev.requirementText, keywords)) {
+    out.push({
+      id: `${scenario.id}:req`,
+      source: 'requirement',
+      reference: 'REQ',
+      excerpt: ev.requirementLabel,
+    });
+  }
+  // 3. App Knowledge.
+  const ak = kbFirstHit(ev.appKnowledge, keywords);
+  if (ak) {
+    out.push({
+      id: `${scenario.id}:ak-${ak}`,
+      source: 'appKnowledge',
+      reference: `AK-${ak}`,
+      excerpt: `App knowledge references "${ak}"`,
+    });
+  }
+  // 4. Test Data.
+  const td = kbFirstHit(ev.testData, keywords);
+  if (td) {
+    out.push({
+      id: `${scenario.id}:td-${td}`,
+      source: 'testData',
+      reference: `TD-${td}`,
+      excerpt: `Test data references "${td}"`,
+    });
+  }
+  return out;
 }

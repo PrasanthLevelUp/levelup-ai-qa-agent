@@ -11,8 +11,10 @@
 import {
   classifyQACategory,
   getBaselineScenarios,
+  recognizeScenarioEvidence,
   QA_KNOWLEDGE_BASE,
   QA_KNOWLEDGE_VERSION,
+  type NormalizedEvidence,
 } from '../../src/engines/qa-knowledge-engine';
 import {
   planScenarios,
@@ -105,6 +107,51 @@ describe('QA Knowledge Engine — knowledge base integrity', () => {
   });
 });
 
+describe('Knowledge layer — recognizeScenarioEvidence (owns vocabulary + matching)', () => {
+  const EMPTY: NormalizedEvidence = {
+    requirementText: '', requirementLabel: 'the requirement',
+    acceptanceClauses: [], appKnowledge: '', testData: '',
+  };
+  const locked = getBaselineScenarios('authentication').find(s => s.id === 'auth-neg-locked-user')!;
+  const bareValid = getBaselineScenarios('authentication').find(s => s.id === 'auth-pos-valid')!;
+
+  it('returns [] when the evidence contains none of the scenario vocabulary (no invention)', () => {
+    expect(recognizeScenarioEvidence(locked, EMPTY)).toEqual([]);
+  });
+
+  it('returns [] for a scenario with no recognition vocabulary (e.g. a core scenario)', () => {
+    // auth-pos-valid is core and carries no conditionalOnKeywords, so the
+    // Knowledge layer never recognises it from evidence — the Planner derives it
+    // structurally instead.
+    expect(recognizeScenarioEvidence(bareValid, {
+      ...EMPTY, acceptanceClauses: ['Account is locked after 5 attempts'],
+    })).toEqual([]);
+  });
+
+  it('matches an acceptance-criteria clause and cites it with a stable AC-n reference', () => {
+    const ev: NormalizedEvidence = {
+      ...EMPTY,
+      acceptanceClauses: ['Valid users can log in', 'Account is locked after 5 failed attempts'],
+    };
+    const hits = recognizeScenarioEvidence(locked, ev);
+    expect(hits.length).toBeGreaterThan(0);
+    expect(hits[0].source).toBe('acceptanceCriteria');
+    expect(hits[0].reference).toBe('AC-2');
+    expect(hits[0].excerpt.toLowerCase()).toContain('locked after 5 failed');
+  });
+
+  it('matches test data and cites the dataset with a TD- reference', () => {
+    const ev: NormalizedEvidence = { ...EMPTY, testData: 'locked_out_user username password' };
+    const hits = recognizeScenarioEvidence(locked, ev);
+    expect(hits.some(h => h.source === 'testData' && h.reference.startsWith('TD-'))).toBe(true);
+  });
+
+  it('is deterministic', () => {
+    const ev: NormalizedEvidence = { ...EMPTY, acceptanceClauses: ['locked after failed attempts'] };
+    expect(recognizeScenarioEvidence(locked, ev)).toEqual(recognizeScenarioEvidence(locked, ev));
+  });
+});
+
 describe('Scenario Planner — planScenarios (single source of truth for existence)', () => {
   it('plans the core happy-path for a login requirement (derived from the Requirement)', () => {
     const plan = planScenarios(
@@ -117,6 +164,10 @@ describe('Scenario Planner — planScenarios (single source of truth for existen
     const valid = plan.scenarios.find(s => s.id === 'auth-pos-valid');
     expect(valid).toBeDefined();
     expect(valid!.provenance.source).toBe('Requirement');
+    // Its evidence is a single requirement item with a REQ reference.
+    expect(valid!.provenance.evidence).toHaveLength(1);
+    expect(valid!.provenance.evidence[0].source).toBe('requirement');
+    expect(valid!.provenance.evidence[0].reference).toBe('REQ');
   });
 
   it('coverage types are a FILTER, never a creator — a bare requirement yields ONLY the justified happy path', () => {
@@ -147,9 +198,17 @@ describe('Scenario Planner — planScenarios (single source of truth for existen
     const locked = plan.scenarios.find(s => s.id === 'auth-neg-locked-user');
     expect(locked).toBeDefined();
     expect(locked!.provenance.source).toBe('Acceptance Criteria');
-    expect(locked!.provenance.confidence).toBe(1);
     // The citation quotes the AC clause that justified it.
     expect(locked!.provenance.derivedFrom.toLowerCase()).toContain('locked after 5 failed');
+    // The planner emits FACTS (structured evidence), not a numeric confidence.
+    // The highest-priority evidence item is the AC clause, with a stable AC-n ref.
+    const acItem = locked!.provenance.evidence[0];
+    expect(acItem.source).toBe('acceptanceCriteria');
+    expect(acItem.reference).toMatch(/^AC-\d+$/);
+    expect(acItem.excerpt.toLowerCase()).toContain('locked after 5 failed');
+    expect(acItem.id.startsWith('auth-neg-locked-user')).toBe(true);
+    // There is deliberately NO confidence on the planner's provenance.
+    expect((locked!.provenance as any).confidence).toBeUndefined();
   });
 
   it('test data justifies a scenario via the Test Data evidence bucket', () => {
@@ -162,10 +221,13 @@ describe('Scenario Planner — planScenarios (single source of truth for existen
     const locked = plan.scenarios.find(s => s.id === 'auth-neg-locked-user');
     expect(locked).toBeDefined();
     expect(locked!.provenance.source).toBe('Test Data');
-    expect(locked!.provenance.confidence).toBe(0.7);
+    // Evidence carries a stable TD- reference into the originating dataset.
+    const tdItem = locked!.provenance.evidence.find(e => e.source === 'testData');
+    expect(tdItem).toBeDefined();
+    expect(tdItem!.reference.startsWith('TD-')).toBe(true);
   });
 
-  it('every planned scenario carries fully populated provenance {whyExists, source, confidence, derivedFrom}', () => {
+  it('every planned scenario carries fully populated provenance {whyExists, source, derivedFrom, evidence[]}', () => {
     const plan = planScenarios(
       {
         title: 'User Login',
@@ -181,9 +243,23 @@ describe('Scenario Planner — planScenarios (single source of truth for existen
       expect(s.provenance.whyExists.length).toBeGreaterThan(0);
       expect(['Requirement', 'Acceptance Criteria', 'App Knowledge', 'Test Data'])
         .toContain(s.provenance.source);
-      expect(s.provenance.confidence).toBeGreaterThan(0);
       expect(typeof s.provenance.derivedFrom).toBe('string');
       expect(s.provenance.derivedFrom.length).toBeGreaterThan(0);
+      // Structured evidence is the planner's contract: at least one strongly-typed
+      // item, each with an id / machine source / stable reference / excerpt.
+      expect(Array.isArray(s.provenance.evidence)).toBe(true);
+      expect(s.provenance.evidence.length).toBeGreaterThan(0);
+      for (const e of s.provenance.evidence) {
+        expect(typeof e.id).toBe('string');
+        expect(e.id.length).toBeGreaterThan(0);
+        expect(['acceptanceCriteria', 'requirement', 'appKnowledge', 'testData']).toContain(e.source);
+        expect(typeof e.reference).toBe('string');
+        expect(e.reference.length).toBeGreaterThan(0);
+        expect(typeof e.excerpt).toBe('string');
+        expect(e.excerpt.length).toBeGreaterThan(0);
+      }
+      // The planner attaches NO numeric confidence — the orchestrator scores it.
+      expect((s.provenance as any).confidence).toBeUndefined();
     }
   });
 

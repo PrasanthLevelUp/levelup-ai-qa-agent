@@ -21,7 +21,7 @@
  * ARCHITECTURAL BOUNDARY — the builder is a PURE TRANSFORM, never a decider.
  * The Scenario Planner is the SINGLE SOURCE OF TRUTH for whether a business
  * scenario exists; every scenario it emits already carries a justification
- * (`provenance: { whyExists, source, confidence, derivedFrom }`). The builder
+ * (`provenance: { whyExists, source, derivedFrom, evidence[] }`). The builder
  * treats that plan as IMMUTABLE: it emits exactly one draft per planned
  * scenario, enriching it with real selectors/URLs/datasets, and NEVER creates,
  * drops, gates, or second-guesses a scenario. The old keyword-gated
@@ -185,7 +185,7 @@ export interface DraftTestCase {
   sourceEvidence: string;
   /**
    * The planner's authoritative provenance for this scenario ({ whyExists,
-   * source, confidence, derivedFrom }). The builder does NOT compute this — it
+   * source, derivedFrom, evidence[] }). The builder does NOT compute this — it
    * carries through whatever the Scenario Planner decided. The builder never
    * decides whether a scenario exists.
    */

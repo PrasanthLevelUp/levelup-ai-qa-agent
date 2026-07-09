@@ -12,10 +12,21 @@
  *
  * A scenario is derived ONLY from explicit evidence, in this priority order:
  *
- *   1. Acceptance Criteria      (confidence 1.0 — the strongest, explicit spec)
- *   2. Requirement description  (confidence 0.9 / 0.95 for the core happy-path)
- *   3. App Knowledge            (confidence 0.8 — pages/elements/forms crawled)
- *   4. Test Data                (confidence 0.7 — supplied datasets)
+ *   1. Acceptance Criteria      (the strongest, explicit spec)
+ *   2. Requirement description
+ *   3. App Knowledge            (pages/elements/forms crawled)
+ *   4. Test Data                (supplied datasets)
+ *
+ * Separation of concerns (the whole point of this layer):
+ *
+ *   • The Planner maps EVIDENCE → SCENARIO IDENTITIES. It stays "dumb": it does
+ *     NOT know testing heuristics (what "lockout"/"sql injection"/"expired"
+ *     mean). That vocabulary + matching lives in the Knowledge layer
+ *     (`recognizeScenarioEvidence`), so the Planner never turns into a second
+ *     knowledge engine.
+ *   • The Planner emits FACTS (structured `evidence`), NOT scores. Confidence is
+ *     computed downstream by the orchestrator (`computeConfidence`) so scoring
+ *     is consistent across the whole platform and the Planner has one job.
  *
  * Coverage Types are a FILTER, never a creator. Selecting "negative" asks
  * "include the negative scenarios that the evidence justifies" — it can never
@@ -25,10 +36,11 @@
  *
  * Every planned scenario carries its provenance:
  *
- *   { whyExists, source, confidence, derivedFrom }
+ *   { whyExists, source, derivedFrom, assumption, evidence[] }
  *
- * If the planner cannot populate those fields for a scenario, that scenario is
- * NOT planned — it does not exist. This gives explainability, not just a filter.
+ * If the planner cannot attach at least one piece of evidence to a scenario,
+ * that scenario is NOT planned — it does not exist. This gives explainability,
+ * not just a filter.
  *
  * The planner is PURE + synchronous (ZERO LLM tokens).
  */
@@ -37,10 +49,16 @@ import type { CoverageType, RequirementInput } from './test-coverage-engine';
 import {
   classifyQACategory,
   getBaselineScenarios,
+  recognizeScenarioEvidence,
   QA_KNOWLEDGE_VERSION,
   type PlannedScenario,
   type QACategoryClassification,
+  type ScenarioEvidence,
+  type EvidenceSource,
+  type NormalizedEvidence,
 } from './qa-knowledge-engine';
+
+export type { ScenarioEvidence, EvidenceSource } from './qa-knowledge-engine';
 
 /** Where a scenario's justification came from (explicit evidence only). */
 export type ProvenanceSource =
@@ -49,18 +67,27 @@ export type ProvenanceSource =
   | 'App Knowledge'
   | 'Test Data';
 
+/** Map the machine evidence source to the human-readable provenance bucket. */
+const SOURCE_LABEL: Record<EvidenceSource, ProvenanceSource> = {
+  acceptanceCriteria: 'Acceptance Criteria',
+  requirement: 'Requirement',
+  appKnowledge: 'App Knowledge',
+  testData: 'Test Data',
+};
+
 /**
- * Why a scenario exists. This is the planner's contract: a scenario without a
- * populated provenance is never emitted.
+ * Why a scenario exists. This is the planner's contract: a scenario without at
+ * least one piece of `evidence` is never emitted.
+ *
+ * NOTE: there is deliberately NO numeric confidence here. The Planner emits
+ * facts (evidence); the orchestrator scores them (`computeConfidence`).
  */
 export interface ScenarioProvenance {
   /** Human sentence explaining why this scenario was derived. */
   whyExists: string;
-  /** The evidence bucket that justified it. */
+  /** The (highest-priority) evidence bucket that justified it. */
   source: ProvenanceSource;
-  /** Deterministic confidence 0–1 keyed off the evidence bucket. */
-  confidence: number;
-  /** The exact evidence text (AC clause / requirement / element / dataset). */
+  /** The exact evidence text of the highest-priority match (readable citation). */
   derivedFrom: string;
   /**
    * By construction the planner ONLY emits evidence-backed scenarios, so this is
@@ -68,6 +95,14 @@ export interface ScenarioProvenance {
    * future inferred scenario could be flagged honestly instead of silently.
    */
   assumption: boolean;
+  /**
+   * The structured, strongly-typed evidence that justifies this scenario — every
+   * matching AC clause / requirement / app-knowledge / test-data item, in
+   * priority order. This is the reusable contract downstream modules (Script
+   * Gen, Healing, RCA, Impact Analysis, Explainability) consume so they can
+   * explain WHY a scenario exists without reparsing the requirement.
+   */
+  evidence: ScenarioEvidence[];
 }
 
 /** A planned scenario annotated with the provenance that justifies it. */
@@ -107,15 +142,6 @@ interface PlannerKnowledge {
 }
 
 const lc = (s?: string) => (s || '').toLowerCase();
-
-/** Confidence per evidence bucket (deterministic). */
-const CONFIDENCE = {
-  acceptanceCriteria: 1.0,
-  requirementCore: 0.95,
-  requirement: 0.9,
-  appKnowledge: 0.8,
-  testData: 0.7,
-} as const;
 
 /**
  * Split acceptance criteria into individual clauses so a matched scenario can
@@ -161,18 +187,16 @@ function testDataText(k?: PlannerKnowledge): string {
   return lc(parts.join(' '));
 }
 
-interface Evidence {
-  requirementText: string;
-  requirementLabel: string;
-  acceptanceClauses: string[];
-  appKnowledge: string;
-  testData: string;
-}
-
+/**
+ * Assemble the normalized evidence buckets for a requirement. This is evidence
+ * COLLECTION (which the Planner owns for now — a dedicated Evidence Collector is
+ * a later stage). The MATCHING against this evidence is owned by the Knowledge
+ * layer (`recognizeScenarioEvidence`), never here.
+ */
 function buildEvidence(
   input: Pick<RequirementInput, 'title' | 'description' | 'module' | 'businessFlow' | 'acceptanceCriteria'>,
   knowledge?: PlannerKnowledge,
-): Evidence {
+): NormalizedEvidence {
   return {
     requirementText: lc([input.title, input.description, input.module, input.businessFlow].filter(Boolean).join(' ')),
     requirementLabel: cap((input.title || input.description || 'the requirement').trim()),
@@ -182,75 +206,51 @@ function buildEvidence(
   };
 }
 
-/** First keyword that appears in `haystack`, else null. */
-function firstHit(haystack: string, keywords: string[]): string | null {
-  for (const k of keywords) if (k && haystack.includes(k)) return k;
-  return null;
-}
-
 /**
  * Derive the provenance for a baseline scenario, or null if the evidence does
  * not justify it (⇒ the scenario is not planned). This is where "no invention"
- * is enforced — a non-core scenario with no evidence match simply does not exist.
+ * is enforced — a non-core scenario with no recognised evidence simply does not
+ * exist.
+ *
+ * The Planner does NOT inspect keywords here: it delegates recognition to the
+ * Knowledge layer (`recognizeScenarioEvidence`) and only maps the returned
+ * evidence into scenario provenance. No numeric confidence is attached — the
+ * orchestrator scores the evidence downstream.
  */
-function deriveProvenance(scenario: PlannedScenario, ev: Evidence): ScenarioProvenance | null {
+function deriveProvenance(scenario: PlannedScenario, ev: NormalizedEvidence): ScenarioProvenance | null {
   // The core happy-path is the requirement itself — always justified by it.
+  // This is an evidence MAPPING (core scenario ⇒ requirement evidence), not a
+  // testing heuristic, so it stays in the Planner.
   if (scenario.core) {
+    const evidence: ScenarioEvidence[] = [{
+      id: `${scenario.id}:req`,
+      source: 'requirement',
+      reference: 'REQ',
+      excerpt: ev.requirementLabel,
+    }];
     return {
       whyExists: 'Primary happy-path stated by the requirement',
       source: 'Requirement',
-      confidence: CONFIDENCE.requirementCore,
       derivedFrom: ev.requirementLabel,
       assumption: false,
+      evidence,
     };
   }
 
-  const keywords = (scenario.conditionalOnKeywords || []).map(lc).filter(Boolean);
-  // Without a recognition vocabulary a non-core scenario cannot be tied to
-  // evidence, so it is never planned (coverage type alone never creates it).
-  if (!keywords.length) return null;
+  // Non-core: ask the Knowledge layer which evidence recognises this scenario.
+  const evidence = recognizeScenarioEvidence(scenario, ev);
+  if (!evidence.length) return null; // no recognised evidence → not planned
 
-  // 1. Acceptance Criteria — cite the specific clause.
-  for (const clause of ev.acceptanceClauses) {
-    const hit = firstHit(lc(clause), keywords);
-    if (hit) return {
-      whyExists: `Acceptance criteria specify "${hit}"`,
-      source: 'Acceptance Criteria',
-      confidence: CONFIDENCE.acceptanceCriteria,
-      derivedFrom: cap(clause),
-      assumption: false,
-    };
-  }
-  // 2. Requirement description.
-  const rq = firstHit(ev.requirementText, keywords);
-  if (rq) return {
-    whyExists: `Requirement mentions "${rq}"`,
-    source: 'Requirement',
-    confidence: CONFIDENCE.requirement,
-    derivedFrom: ev.requirementLabel,
+  // The highest-priority match (evidence is returned AC → REQ → AK → TD) drives
+  // the human-readable provenance summary.
+  const primary = evidence[0];
+  return {
+    whyExists: `Justified by ${SOURCE_LABEL[primary.source]}: "${primary.excerpt}"`,
+    source: SOURCE_LABEL[primary.source],
+    derivedFrom: primary.excerpt,
     assumption: false,
+    evidence,
   };
-  // 3. App Knowledge.
-  const ak = firstHit(ev.appKnowledge, keywords);
-  if (ak) return {
-    whyExists: `App knowledge references "${ak}"`,
-    source: 'App Knowledge',
-    confidence: CONFIDENCE.appKnowledge,
-    derivedFrom: `App knowledge references "${ak}"`,
-    assumption: false,
-  };
-  // 4. Test Data.
-  const td = firstHit(ev.testData, keywords);
-  if (td) return {
-    whyExists: `Supplied test data references "${td}"`,
-    source: 'Test Data',
-    confidence: CONFIDENCE.testData,
-    derivedFrom: `Test data references "${td}"`,
-    assumption: false,
-  };
-
-  // Nothing explicit justifies it → it does not exist.
-  return null;
 }
 
 /**

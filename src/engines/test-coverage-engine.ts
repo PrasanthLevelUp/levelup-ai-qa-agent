@@ -16,7 +16,13 @@ import {
   type OrchestratorSource,
   type IntelligenceScore,
 } from '../services/intelligence-orchestrator';
-import { planScenarios, buildScenarioPlanBlock, type ScenarioPlan } from './scenario-planner';
+import {
+  planScenarios,
+  buildScenarioPlanBlock,
+  type ScenarioPlan,
+  type ScenarioEvidence,
+  type EvidenceSource,
+} from './scenario-planner';
 import {
   buildDraftTestCases,
   buildDraftBlock,
@@ -43,6 +49,32 @@ import {
 } from './prompt-optimizer';
 
 const MOD = 'test-coverage-engine';
+
+/**
+ * Confidence weight per evidence source. Scoring lives HERE, in the orchestrator
+ * — NOT in the Planner. The Planner emits facts (structured evidence); the
+ * orchestrator turns those facts into a score. Centralising it means every
+ * consumer (this engine today; Script Gen, Healing, RCA, Impact Analysis
+ * tomorrow) inherits one consistent scoring model instead of each re-deriving it.
+ */
+const EVIDENCE_CONFIDENCE_WEIGHT: Record<EvidenceSource, number> = {
+  acceptanceCriteria: 1.0,
+  requirement: 0.9,
+  appKnowledge: 0.8,
+  testData: 0.7,
+};
+
+/**
+ * Compute a deterministic 0–1 confidence for a scenario from its evidence. The
+ * score is the strongest evidence source present (Acceptance Criteria beats a
+ * Requirement mention beats App Knowledge beats Test Data). Empty evidence ⇒ 0
+ * (the Planner never emits such a scenario, but the function is total). Pure and
+ * reusable across the platform.
+ */
+export function computeConfidence(evidence: ScenarioEvidence[]): number {
+  if (!evidence || evidence.length === 0) return 0;
+  return Math.max(...evidence.map(e => EVIDENCE_CONFIDENCE_WEIGHT[e.source] ?? 0));
+}
 
 /**
  * Prompt version identifier — increment when the generation prompt logic changes.
@@ -1303,11 +1335,18 @@ Return ONLY valid JSON, no markdown fences.`;
     if (SCENARIO_PLANNER_ENABLED) {
       scenarioPlan = planScenarios(input, coverageTypes, analysis.featureType, knowledge);
       scenarioPlanBlock = buildScenarioPlanBlock(scenarioPlan);
+      // The orchestrator (not the Planner) scores the evidence. Average evidence
+      // confidence is a cheap, honest signal of how well-grounded the plan is.
+      const confidences = scenarioPlan.scenarios.map(s => computeConfidence(s.provenance.evidence));
+      const avgEvidenceConfidence = confidences.length
+        ? Math.round((confidences.reduce((a, b) => a + b, 0) / confidences.length) * 100) / 100
+        : 0;
       logger.info(MOD, 'Scenario plan built', {
         category: scenarioPlan.classification.category,
         confidence: scenarioPlan.classification.confidence,
         planned: scenarioPlan.scenarios.length,
         justified: scenarioPlan.justifiedCount,
+        avgEvidenceConfidence,
         knowledgeVersion: scenarioPlan.knowledgeVersion,
         applied: scenarioPlanBlock.length > 0,
       });
