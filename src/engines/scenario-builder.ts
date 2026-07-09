@@ -721,16 +721,49 @@ function toEditable(tc: FormatterTestCase): EditablePolishFields {
 export function buildFormatterPrompt(testCases: FormatterTestCase[]): string {
   // Compact, whitespace-free JSON of the editable fields only.
   const payload = JSON.stringify(testCases.map(toEditable));
-  return `You are a senior QA technical editor. Below are ${testCases.length} test cases that were assembled DETERMINISTICALLY from the real application. The logic, selectors, data and coverage are FINAL — only the English needs polishing.
+  return `You are a senior QA technical editor enforcing the LevelUp AI QA Artifact Standard. Below are ${testCases.length} test cases assembled DETERMINISTICALLY from the real application. Logic, selectors, data and coverage are FINAL — only the English wording needs polishing.
 
-YOUR ONLY JOB: sharpen the wording of "title", "objective", "preconditions", "expected" and re-phrase each step for clarity.
+YOUR JOB: Rewrite "title", "objective", "preconditions", "steps", and "expected" to comply with the QA Artifact Standard principles below. The SAME test logic, the SAME selectors, the SAME coverage — only the wording changes.
 
-STRICT RULES (violating any is a failure):
+CONTRACT (violating any is a failure):
   • Return EXACTLY ${testCases.length} objects in the SAME order, each with the SAME "id". Never add, remove, split, merge or reorder.
-  • Keep the SAME number of steps per case and the SAME action per step — reword only. Keep every step business-readable: do NOT add CSS/XPath selectors, element ids, or raw URLs — those live outside the step text.
-  • Do not add fields. Do not invent steps, selectors, pages or data.
+  • Keep the SAME number of steps per case. If a step combines multiple actions ("Enter username and password"), SPLIT it into separate steps ("Enter registered username" / "Enter valid password"). If the result is MORE steps than the input, that is CORRECT (the input violated the standard).
+  • Do NOT add CSS/XPath selectors, element ids, or raw URLs to step text — those are hidden in grounding.
+  • Do NOT invent new test logic, selectors, pages or data.
 
-Return ONLY valid JSON (no prose):
+QA ARTIFACT STANDARD (enforce these principles):
+
+CORE PRINCIPLES:
+1. ONE OBJECTIVE: Each test verifies exactly ONE thing. Title: "Verify <behavior> when <condition>."
+2. ONE ACTION PER STEP: Never combine. Bad: "Enter username and password." Good: "Enter registered username." (step N) + "Enter valid password." (step N+1).
+3. USER ACTIONS ONLY: What a human does. Bad: "Ensure button is clickable." Good: "Click Login button."
+4. VERIFICATION ≠ ACTION: Separate steps. Bad: "Click Login and verify Home page." Good: "Click Login." + "Verify Home page is displayed."
+5. BUSINESS LANGUAGE: Product terms, never automation. Bad: "Fill username field" / "Trigger submit." Good: "Enter registered email address" / "Click Login button."
+6. OBSERVABLE EXPECTED RESULTS: Granular, specific. Never "Login successful." Always: "Home page is displayed." + "Logged-in username visible in header." + "Logout button available."
+7. TEST DATA ROLES, NOT VALUES: Steps say "registered username" / "valid password" (roles). Never "standard_user" or "secret_sauce" (values).
+8. PRECONDITIONS ≠ STEPS: Preconditions = starting state. Steps = user actions.
+9. MACHINE-READABLE: Consistent verbs ("Open", "Enter", "Click", "Select", "Verify"). Script Generation parses these deterministically.
+
+STEP WORDING:
+• Navigation: "Open <Page> page" (not "Navigate to", "Go to").
+• Input: "Enter <role> <field>" (e.g., "Enter registered email address"). Never "Fill", "Type into".
+• Click: "Click <Control>" (e.g., "Click Login button"). Never "Press", "Trigger".
+• Selection: "Select <Option> from <Dropdown>".
+• Verification: "Verify <Observable> is <State>" (e.g., "Verify error message is displayed").
+• SPLIT multi-action steps: "Enter email and password and click Login" → 3 steps.
+• NO meta-actions: Never "Ensure", "Confirm", "Observe", "Check", "Wait for".
+
+EXPECTED RESULTS:
+• NEVER abstract: "Login successful" / "Operation completes" / "System behaves correctly."
+• ALWAYS specific observables: "Home page is displayed." + "Logged-in username visible in header." + "Login form no longer displayed."
+• Failure scenarios: describe WHAT the user sees ("Error message displayed." + "User remains on Login page." + "No session created.").
+• Each assertion is a separate bullet for failure diagnosis.
+
+TITLE FORMULA (no creativity):
+"Verify <expected behavior> when <condition>."
+Examples: "Verify successful login with valid credentials." / "Verify login fails with an invalid password." / "Verify validation message when password is empty."
+
+Return ONLY valid JSON (no prose, no markdown):
 { "cases": ${'[{ "id": string, "title": string, "objective": string, "preconditions": string, "steps": string[], "expected": string }]'} }
 
 TEST CASES TO POLISH:
@@ -742,10 +775,15 @@ ${payload}`;
  *
  * Coverage/logic NEVER depend on the model: we start from the deterministic
  * cases (the source of truth) and overlay ONLY the wording fields, matched by
- * canonical `id` (falling back to positional order when ids are absent). Any
- * field the model omitted, blanked, or returned with a changed step-count is
- * kept from the deterministic object. If the model broke the contract (wrong
- * count), the caller ships the deterministic output unchanged.
+ * canonical `id` (falling back to positional order when ids are absent).
+ *
+ * **QA Standard adaptation (Sprint 2B):** The formatter prompt now explicitly
+ * instructs the model to SPLIT combined-action steps ("Enter username and password"
+ * → 2 steps) to comply with Principle 2 (One Action Per Step). This means the
+ * polished step count can LEGITIMATELY exceed the deterministic count. We accept
+ * this (splitting is a quality improvement), but still reject count DECREASES
+ * (merging/dropping steps is a contract violation). Any field the model omitted
+ * or blanked falls back to the deterministic value.
  */
 export function applyPolish(
   deterministic: FormatterTestCase[],
@@ -767,12 +805,18 @@ export function applyPolish(
     const p: any = byId.get(det.scenarioId) ?? arr[i] ?? {};
     const str = (v: unknown, fallback: string) =>
       typeof v === 'string' && v.trim() ? v : fallback;
-    const steps =
+
+    // Step count adaptation (QA Standard Sprint 2B):
+    // Accept polished steps if:
+    //   (a) same count AND all valid strings (original behavior), OR
+    //   (b) MORE steps than deterministic (splitting combined actions is allowed), OR
+    //   (c) if count decreased or any step is blank → fall back to deterministic
+    const stepsValid =
       Array.isArray(p.steps) &&
-      p.steps.length === det.steps.length &&
-      p.steps.every((s: unknown) => typeof s === 'string' && (s as string).trim().length > 0)
-        ? (p.steps as string[])
-        : det.steps;
+      p.steps.length >= det.steps.length &&
+      p.steps.every((s: unknown) => typeof s === 'string' && (s as string).trim().length > 0);
+    const steps = stepsValid ? (p.steps as string[]) : det.steps;
+
     return {
       ...det, // all deterministic invariants preserved verbatim
       title: str(p.title, det.title),

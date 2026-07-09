@@ -1649,7 +1649,31 @@ GROUNDED SCOPE (defines what belongs in "testCases") — a case is GROUNDED if i
 ${expand ? `  ASSUMPTIONS (Gap Analysis ON): ungrounded ideas go in "suggestedTestCases" (source "gap_analysis"), NEVER in "testCases". If an idea needs an unstated value/limit (max length, lockout threshold, session timeout), do NOT invent a test — add a "missingRequirements" question instead. Never emit source "assumption".`
   : `  ASSUMPTIONS (Gap Analysis OFF): "suggestedTestCases" and "missingRequirements" MUST both be []. Staying grounded does NOT mean under-generating — produce every case the requirement + context genuinely support.`}
 
-QUALITY: specific actionable title (not "Verify login works"); clear preconditions; 3-6 numbered steps; precise expected result; realistic testData from AVAILABLE TEST DATA when relevant; honest automation fields. No trivial duplicates (reworded restatements of one behaviour) — but different input/role/state/error are DISTINCT, keep them all.
+QA ARTIFACT STANDARD (mandatory quality principles — every test case must comply):
+  CORE PRINCIPLES:
+    • ONE OBJECTIVE: Each test verifies exactly ONE thing. Title: "Verify <expected behavior> when <condition>." (e.g., "Verify successful login with valid credentials" / "Verify login fails with invalid password").
+    • ONE ACTION PER STEP: Never combine actions. Bad: "Enter username and password." Good: two steps ("Enter registered username" + "Enter valid password").
+    • USER ACTIONS ONLY: Write what a human tester does. Bad: "Ensure button is clickable" / "Observe the page." Good: "Click Login button" / "Verify Home page is displayed."
+    • VERIFICATION ≠ ACTION: Separate steps. Bad: "Click Login and verify Home page." Good: "Click Login" (step N) + "Verify Home page is displayed" (step N+1).
+    • BUSINESS LANGUAGE: Product terms, never automation. Bad: "Fill username field" / "Trigger submit." Good: "Enter registered email address" / "Click Login button."
+    • OBSERVABLE EXPECTED RESULTS: Granular, specific outcomes. Never "Login successful" or "System behaves correctly." Always: "Home page is displayed" + "Logged-in username is visible in the header" + "Logout button is available" + "Login form is no longer displayed."
+    • TEST DATA ROLES, NOT VALUES: Steps use roles ("registered username", "valid password"). Never embed "standard_user" or "secret_sauce" in steps. Actual values go in testData field.
+    • PRECONDITIONS ≠ STEPS: Preconditions describe the starting state ("Registered user exists"). Steps describe user actions ("Open Login page").
+    • MACHINE-READABLE: Consistent verbs ("Open", "Enter", "Click", "Select", "Verify"). No ambiguous phrasing. Script Generation parses these deterministically without another LLM.
+  STEP WORDING:
+    • Navigation: "Open <Page> page" (not "Navigate to", "Go to").
+    • Input: "Enter <role> <field>" (e.g., "Enter registered email address"). Never "Fill", "Type into".
+    • Click: "Click <Control>" (e.g., "Click Login button"). Never "Press", "Trigger".
+    • Selection: "Select <Option> from <Dropdown>".
+    • Verification: "Verify <Observable> is <State>" (e.g., "Verify error message is displayed").
+    • Multi-step sequences: SPLIT into separate steps. "Enter email and password and click Login" is 3 steps.
+    • NO meta-actions: Never "Ensure", "Confirm", "Observe", "Check", "Wait for" — these are not user actions.
+  EXPECTED RESULTS:
+    • NEVER abstract: "Login successful" / "Operation completes" / "System behaves correctly."
+    • ALWAYS specific observables: "Home page is displayed" + "Logged-in username visible in header" + "Logout button available."
+    • Failure scenarios: describe WHAT the user sees ("Error message is displayed" + "User remains on Login page" + "No session is created").
+    • Each assertion is a separate bullet for failure diagnosis.
+  NO TRIVIAL DUPLICATES: Reworded restatements of one behavior are forbidden. Different input/role/state/error are DISTINCT — keep them all.
 
 SOURCE TAGGING: every case sets "source" ("requirement" | "knowledge" | "test_data" | "app_profile"; "gap_analysis" ONLY in suggestedTestCases) and "sourceEvidence" (short exact evidence, e.g. "AC: valid login", "standard_user dataset"). Never use source "assumption".
 
