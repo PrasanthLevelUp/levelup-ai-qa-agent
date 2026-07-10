@@ -209,11 +209,20 @@ export type ScenarioActionKind =
  * graph exposes to Script Gen — nothing more. It is deliberately tiny: an
  * ordered verb + semantic target + optional value.
  *
- *   • `id`       — stable identity for the action within its node (diffs, healing,
- *                  impact analysis can reference a specific step).
+ *   • `id`       — STABLE SEMANTIC identity, derived from the step's business
+ *                  meaning (`<scenarioId>.<action>.<target>`, e.g.
+ *                  `auth-pos-valid.click.login_button`), NOT its array position.
+ *                  It survives insertions/reordering so diffs, healing, impact
+ *                  analysis, replay and analytics can reference a specific step by
+ *                  a durable name — and an assertion's `afterAction` points at
+ *                  exactly this value. The builder assigns it (see
+ *                  `materializeActionTemplate`); collisions within a node get a
+ *                  deterministic `#2`/`#3` suffix. This is the action's ONE and
+ *                  ONLY identity — there is no separate slug/derived key.
  *   • `order`    — 0-based execution order. The array is authoritative, but the
  *                  explicit ordinal makes the contract self-describing and lets
  *                  consumers sort defensively without relying on array order.
+ *                  (Identity lives in `id`, sequence in `order` — decoupled.)
  *   • `action`   — the verb (see {@link ScenarioActionKind}).
  *   • `target`   — a SEMANTIC element identity (e.g. `username`, `login_button`,
  *                  `error_message`). NEVER a CSS selector, XPath, page-object

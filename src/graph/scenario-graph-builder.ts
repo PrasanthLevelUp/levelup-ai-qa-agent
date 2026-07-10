@@ -149,8 +149,16 @@ export function deriveEdges(nodes: ScenarioNode[]): ScenarioEdge[] {
  *
  * This is the ONLY thing the builder does with actions, and it is deliberately
  * minimal — it adds STRUCTURE (identity + order), nothing else:
- *   • assigns a deterministic `id` (`<scenarioId>:<n>`) and `order` (the array
- *     index — a faithful copy of the KB order, never a re-sort);
+ *   • assigns a STABLE SEMANTIC `id` (`<scenarioId>.<action>.<target>`, e.g.
+ *     `auth-pos-valid.click.login_button`) derived from the step's business
+ *     meaning, NOT its array position — so the id survives insertions/reordering
+ *     and an assertion's `afterAction` can reference the step by a durable name.
+ *     Duplicate meanings within one scenario get a deterministic `#n` suffix
+ *     (encounter order), exactly like {@link materializeAssertionTemplate}. The
+ *     `<action>.<target>` shape is INLINED, never a separate exported helper —
+ *     an action has exactly ONE identity (`id`), never a second derived key;
+ *   • sets `order` to the array index (a faithful copy of the KB order, never a
+ *     re-sort — identity lives in `id`, sequence in `order`);
  *   • copies `target`, `value` and `optional` VERBATIM.
  *
  * It does NOT invent, add, drop, or reorder steps (the sequence is the KB's —
@@ -168,9 +176,19 @@ export function materializeActionTemplate(
   scenarioId: string,
   template: readonly ScenarioActionTemplate[],
 ): ScenarioAction[] {
+  // Count semantic-identity occurrences so a repeated `<action>.<target>` gets a
+  // stable `#n` suffix instead of silently colliding — the SAME disambiguation
+  // rule assertions use. Login flows never collide (navigate.login_page /
+  // fill.username / fill.password / click.login_button are all distinct), but the
+  // rule keeps every id UNIQUE and DETERMINISTIC for any input.
+  const seen = new Map<string, number>();
   return template.map((step, i) => {
+    const slug = `${step.action}.${step.target}`;
+    const n = (seen.get(slug) ?? 0) + 1;
+    seen.set(slug, n);
+    const id = n === 1 ? `${scenarioId}.${slug}` : `${scenarioId}.${slug}#${n}`;
     const action: ScenarioAction = {
-      id: `${scenarioId}:${i}`,
+      id,
       order: i,
       action: step.action,
       target: step.target,

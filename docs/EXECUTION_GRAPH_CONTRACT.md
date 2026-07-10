@@ -89,8 +89,16 @@ ScenarioNode {
 
   // ── 5. ACTIONS  (landed in 2D.3) ────────────  immutable, "the executable steps"
   actions[] {
-    id                        // stable identity for this step within the node
-    order                     // 0-based execution order (array is authoritative)
+    id                        // STABLE SEMANTIC identity — `<scenarioId>.<action>.<target>`
+                              //   (e.g. `auth-pos-valid.click.login_button`). DERIVED FROM
+                              //   MEANING, never from array position — so diffs / healing /
+                              //   replay / analytics can reference a step durably even when
+                              //   `order` changes, and an assertion's `afterAction` points at
+                              //   exactly this value. Collisions within a node get a
+                              //   deterministic `#2`/`#3` suffix. ONE identity per step — no
+                              //   separate slug/derived key.
+    order                     // 0-based execution order (array is authoritative for SEQUENCE
+                              //   only — identity lives in `id`, NOT here)
     action                    // navigate | fill | click | check | uncheck | select | upload
                               //   (STATE-CHANGING verbs ONLY — no `verify`; assertions are §6)
     target                    // CANONICAL element identity (app-neutral semantic key, e.g.
