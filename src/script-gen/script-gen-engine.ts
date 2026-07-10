@@ -2623,10 +2623,15 @@ ${testBlocks.join('\n\n')}
     // ("locked_user") into a dataset category is Dataset-Resolver knowledge, not
     // Script-Gen knowledge. Keeping it out prevents business rules from creeping
     // back into the emitter. Until the graph carries `datasetCategory`, we fall
-    // through to the pre-existing, text-based legacy heuristic below (unchanged).
+    // through to the legacy compatibility mode below.
     const candidateDatasets = [...index.entries()];
 
-    // ── Legacy text-matching heuristic (backward-compatible fallback) ────────
+    // ── Legacy Compatibility Mode (for pre–Execution Graph test cases) ───────
+    // This text-based inference path exists ONLY for backward compatibility with
+    // test cases authored before the Execution Graph. New graph-based scenarios
+    // must NEVER depend on text inference — the graph carries resolvedDataset,
+    // and Script Gen consumes it. Remove this path after all legacy generators
+    // are migrated to the graph-based pipeline.
     const haystack = `${tc.test_data || ''}\n${steps.join('\n')}`.toLowerCase();
     // Token set for tolerant matching: a free-text reference like "locked_user"
     // should still bind to a dataset named "locked_users" (singular/plural,
