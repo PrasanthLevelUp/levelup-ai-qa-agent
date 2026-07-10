@@ -1287,11 +1287,15 @@ export class ScriptGenEngine {
     // and keep the tracking so we can emit a truthful Locator Grounding Report.
     const { sel, tracked } = this.buildGroundedSelectors(crawl);
 
-    // When a record was resolved, expose it as `user` (const ref in the test
-    // body) so fills read `user.username` / `user.password`.
+    // When a record was resolved, expose it as a business-named const in the
+    // test body (Sprint 3.5) so fills read e.g. `registeredUser.username` /
+    // `lockedAccount.password`. The name comes from the graph node's declared
+    // data role via the single deterministic resolver — never inferred — and
+    // falls back to the neutral `user` for legacy/greenfield cases (no node).
+    const datasetVarName = this.resolveDatasetVarName(scenarioNode);
     const dataRef = caseData
       ? {
-          varName: 'user',
+          varName: datasetVarName,
           ref: caseData.ref,
           hasUsername: caseData.value?.username != null || caseData.value?.user != null,
           // Review fix: treat a record as "having password" when the password field
@@ -2577,6 +2581,77 @@ ${testBlocks.join('\n\n')}
       default:
         return false;
     }
+  }
+
+  /**
+   * Sprint 3.5 (Variable Naming) — THE single, deterministic resolver for the
+   * name of the dataset variable bound in a generated spec (`const <name> =
+   * getRecord(...)`). This is the emitter-quality change: a human reading the
+   * script should see WHICH business actor it exercises, not a generic `user`.
+   *
+   * It NEVER infers. The name is derived purely from existing metadata — the
+   * data ROLE the scenario declared it needs (e.g. `registered_user`,
+   * `locked_account`, `unregistered_user`) — via a purely mechanical
+   * {@link toVariableName} of that role token:
+   *
+   *   registered_user   → registeredUser
+   *   locked_account    → lockedAccount
+   *   unregistered_user → unregisteredUser
+   *
+   * There is NO synonym/dictionary/NLP step (`account` is NOT rewritten to
+   * `user`), NO keyword guessing, NO AI — just the role, camelCased, so the name
+   * stays faithful to the metadata and adds zero intelligence.
+   *
+   * ROLE SOURCE — read {@link readDataRole}, which prefers the Graph Schema 2.0
+   * home (`resources.dataRoles`) and falls back to the deprecated
+   * `semantics.requiredDataRole`. This means the deprecated field can be deleted
+   * once the `resources` section lands WITHOUT touching Script Gen again.
+   *
+   * Fallbacks (Rule: business role → neutral default):
+   *   • the generic {@link GENERIC_DATA_ROLE} is NOT a business actor, so it
+   *     keeps the historical neutral {@link DEFAULT_DATASET_VAR_NAME} (`user`);
+   *   • an absent node / empty role (legacy or greenfield, no graph) also keeps
+   *     `user` — so every pre-graph test and existing golden is byte-identical.
+   *
+   * Because the returned name is threaded through the SINGLE `dataRef.varName`,
+   * one object gets ONE consistent name across the whole spec (declaration and
+   * every `.username`/`.password` read), with no collisions or `user2` suffixes.
+   * Deterministic: same node in ⇒ same name out.
+   */
+  private resolveDatasetVarName(scenarioNode?: DatasetVarNamingNode): string {
+    const role = this.readDataRole(scenarioNode);
+    // The GENERIC role (not a business entity) reads no better as `validData`
+    // than the neutral default, so keep `user`.
+    if (!role || role === GENERIC_DATA_ROLE) return DEFAULT_DATASET_VAR_NAME;
+    return toVariableName(role) || DEFAULT_DATASET_VAR_NAME;
+  }
+
+  /**
+   * Sprint 3.5 — resolve the declared data ROLE for a scenario node, from the
+   * canonical source in precedence order (Execution Graph contract §3):
+   *
+   *   resources.dataRoles[0]        ← Graph Schema 2.0 home (once `resources` lands)
+   *        ↓ (absent)
+   *   semantics.requiredDataRole    ← @deprecated, kept only during migration
+   *        ↓ (absent)
+   *   ''                            ← no role → caller uses the neutral default
+   *
+   * Reading the future home FIRST means the deprecated `requiredDataRole` field
+   * can be removed later with zero Script Gen changes. `resources` is not yet in
+   * the typed node (reserved), so it is read structurally; when it lands as a
+   * `string[]` (e.g. `["registered_user"]`) the first non-empty role wins. This
+   * is pure metadata reading — never inference.
+   */
+  private readDataRole(scenarioNode?: DatasetVarNamingNode): string {
+    const dataRoles = scenarioNode?.resources?.dataRoles;
+    const fromResources = Array.isArray(dataRoles)
+      ? dataRoles.find((r) => typeof r === 'string' && r.trim())
+      : dataRoles;
+    if (typeof fromResources === 'string' && fromResources.trim()) {
+      return fromResources.trim().toLowerCase();
+    }
+    // Deprecated fallback for pre-2.0 graphs that still carry the role on semantics.
+    return (scenarioNode?.semantics?.requiredDataRole ?? '').trim().toLowerCase();
   }
 
   private resolveCaseData(
@@ -7086,6 +7161,59 @@ function toKebab(s: string): string {
     .replace(/[^a-zA-Z0-9]+/g, '-')
     .toLowerCase()
     .replace(/^-|-$/g, '');
+}
+
+/**
+ * Sprint 3.5 (Variable Naming) — the ONE generic data role that is not a business
+ * actor. A scenario that only needs "some valid data" (`valid_data`) resolves to
+ * the neutral default variable name rather than a meaningless `validData`. Named
+ * once here so the sentinel is never repeated as a bare string literal.
+ */
+const GENERIC_DATA_ROLE = 'valid_data';
+
+/**
+ * Sprint 3.5 — neutral default dataset variable name, used when there is no
+ * business role to name after (legacy/greenfield node, empty role, or the
+ * generic {@link GENERIC_DATA_ROLE}). This is the historical name, so every
+ * pre-Sprint-3.5 spec and golden snapshot stays byte-identical.
+ */
+const DEFAULT_DATASET_VAR_NAME = 'user';
+
+/**
+ * Sprint 3.5 — the minimal, forward-compatible shape the variable-naming resolver
+ * reads off a scenario node. `resources` is the reserved Graph Schema 2.0 section
+ * (not yet in the typed `ScenarioNode`), declared here structurally so Script Gen
+ * can prefer `resources.dataRoles` today and needs no change when it lands.
+ */
+type DatasetVarNamingNode = {
+  semantics?: import('../graph/scenario-graph').ScenarioSemantics;
+  resources?: { dataRoles?: string[] | string };
+};
+
+/**
+ * Sprint 3.5 (Variable Naming) — turn a data-role token into a language-idiomatic
+ * variable identifier. TODAY it returns lowerCamelCase (the TypeScript/JS target),
+ * e.g. `registered_user` → `registeredUser`. It is deliberately the SINGLE place
+ * that decides identifier casing, so a future language target changes ONLY this
+ * function — never the resolver or the emitter:
+ *
+ *   registered_user  →  registeredUser   (TypeScript / JS / Java / C# — today)
+ *   registered_user  →  registered_user  (Python — a one-line change here later)
+ *
+ * PURELY MECHANICAL: split on non-alphanumerics + camelCase word boundaries,
+ * lowercase every word, then join lowerCamelCase. It is NOT a synonym/dictionary/
+ * NLP transform — `locked_account` becomes `lockedAccount` (NOT `lockedUser`);
+ * nothing is rewritten, abbreviated, or inferred. Returns '' for an empty/garbage
+ * token so callers can fall back to a neutral default.
+ */
+function toVariableName(s: string): string {
+  const words = String(s)
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .split(/[^a-zA-Z0-9]+/)
+    .map((w) => w.trim().toLowerCase())
+    .filter(Boolean);
+  if (!words.length) return '';
+  return words[0] + words.slice(1).map((w) => w.charAt(0).toUpperCase() + w.slice(1)).join('');
 }
 
 /* ────────────────────────────────────────────────────────────────────────── */
