@@ -3446,17 +3446,23 @@ ${gotoB}${sessionLogin('pageB')}
     if (!reusablePOs.length) return [];
 
     const text = `${tc.title || ''} ${steps.join(' ')} ${tc.expected_result || ''}`.toLowerCase();
-    // Map a semantic kind → keyword test + PO-name matcher.
-    const kinds: Array<{ kind: string; inText: RegExp; poName: RegExp }> = [
+    
+    // ── Sprint 3.3: Data-driven page object matching ──
+    // Instead of hardcoded patterns, derive keywords from EVERY page object name
+    // in the catalogue and match against test case text. This discovers and makes
+    // available ALL repository page objects, not just login/cart/checkout.
+    const out: Array<{ name: string; varName: string; filePath: string; methods: string[]; importPath: string; kind: string }> = [];
+    const seen = new Set<string>();
+    
+    // First, try exact hardcoded semantic kinds (backward compatible, highest priority)
+    const knownKinds: Array<{ kind: string; inText: RegExp; poName: RegExp }> = [
       { kind: 'login',    inText: /\blogin|sign.?in|log.?in|auth|credential/i,           poName: /login|signin|auth/i },
       { kind: 'inventory',inText: /inventory|products?|catalog|item list|browse/i,        poName: /inventory|product|catalog/i },
       { kind: 'cart',     inText: /\bcart\b|basket|shopping.?cart|add to cart/i,          poName: /cart|basket/i },
       { kind: 'checkout', inText: /checkout|purchase|payment|place order|complete order/i, poName: /checkout|payment|order/i },
     ];
-
-    const out: Array<{ name: string; varName: string; filePath: string; methods: string[]; importPath: string; kind: string }> = [];
-    const seen = new Set<string>();
-    for (const k of kinds) {
+    
+    for (const k of knownKinds) {
       if (!k.inText.test(text)) continue;
       const po = reusablePOs.find((p) => k.poName.test(p.name));
       if (!po || seen.has(po.name)) continue;
@@ -3468,6 +3474,38 @@ ${gotoB}${sessionLogin('pageB')}
         methods: po.methods || [],
         importPath: this.buildPageObjectImportPath(po.path, testDir),
         kind: k.kind,
+      });
+    }
+    
+    // Then, discover OTHER page objects by deriving keywords from their names.
+    // Example: "InventoryPage" → keywords ["inventory", "page"] → matches test
+    // cases mentioning "inventory" even when not in the hardcoded list above.
+    for (const po of reusablePOs) {
+      if (seen.has(po.name)) continue; // already matched above
+      
+      // Derive keywords from the PO class name (camelCase/PascalCase → words).
+      // "InventoryPage" → ["inventory", "page"]
+      // "UserProfileSettings" → ["user", "profile", "settings"]
+      const keywords = po.name
+        .replace(/Page$/, '') // strip trailing "Page"
+        .split(/(?=[A-Z])/)   // split on capital letters
+        .map((w) => w.toLowerCase())
+        .filter((w) => w.length > 2); // ignore tiny words like "to", "of"
+      
+      // Match when ANY keyword appears in the test case text
+      const matched = keywords.some((kw) => text.includes(kw));
+      if (!matched) continue;
+      
+      seen.add(po.name);
+      // Derive a generic kind from the first keyword
+      const kind = keywords[0] || 'page';
+      out.push({
+        name: po.name,
+        varName: po.name.charAt(0).toLowerCase() + po.name.slice(1),
+        filePath: po.path,
+        methods: po.methods || [],
+        importPath: this.buildPageObjectImportPath(po.path, testDir),
+        kind,
       });
     }
     return out;
