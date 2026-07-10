@@ -612,6 +612,46 @@ export function createScriptGenRouter(): Router {
         }
       }
 
+      // ── Sprint 2D: load the Scenario Graph for requirement-based generation ──
+      // When generating from a requirement that has a persisted/buildable Scenario
+      // Graph, load it once and match each test case to its canonical node (by
+      // title) so Script Gen can consume the graph's semantics + resolvedDataset
+      // instead of re-inferring them. Best-effort — if graph load fails or a case
+      // has no matching node, generation falls back to legacy inference for that case.
+      let scenarioGraphNodes: Map<string, any> | undefined;
+      if (requirementId != null && (testCase || requirementTestCases.length > 0)) {
+        try {
+          const { getOrBuildScenarioGraph } = await import('../../graph/scenario-graph-service');
+          const reqIdNum = typeof requirementId === 'string' ? parseInt(requirementId, 10) : requirementId;
+          const graphResult = await getOrBuildScenarioGraph(
+            { title: '', description: '' }, // Minimal input; graph is loaded by fingerprint
+            [], // Coverage types not needed for load
+            undefined, // Knowledge
+            { requirementId: reqIdNum, companyId, projectId },
+          );
+          if (graphResult.graph && graphResult.graph.nodes.length > 0) {
+            // Project nodes to {semantics, execution} only — Script Gen reads ONLY
+            // these two fields from the node, never the full graph structure.
+            scenarioGraphNodes = new Map(
+              graphResult.graph.nodes.map((n: any) => [
+                n.title,
+                {
+                  ...(n.semantics ? { semantics: n.semantics } : {}),
+                  ...(n.execution ? { execution: n.execution } : {}),
+                },
+              ]),
+            );
+            console.log(
+              `[ScriptGen] 📊 Scenario Graph ${graphResult.origin} for requirement ${requirementId} — ${scenarioGraphNodes.size} node(s) threaded`,
+            );
+          }
+        } catch (graphErr: any) {
+          console.warn(
+            `[ScriptGen] Could not load Scenario Graph (non-blocking, falling back to legacy inference): ${graphErr?.message}`,
+          );
+        }
+      }
+
       const config: GenerationConfig = {
         url,
         instructions: instructions || undefined,
@@ -640,6 +680,8 @@ export function createScriptGenRouter(): Router {
         ...(requirementTestCases.length > 0 ? { testCases: requirementTestCases } : {}),
         // Resolved dataset records → enables getUser('<key>') traceability.
         ...(resolvedTestData.length > 0 ? { resolvedTestData } : {}),
+        // Sprint 2D: Scenario Graph nodes keyed by title for semantics consumption.
+        ...(scenarioGraphNodes ? { scenarioGraphNodes } : {}),
         ...(companyId != null ? { companyId } : {}),
         ...(projectId != null ? { projectId } : {}),
       };
