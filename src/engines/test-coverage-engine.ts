@@ -38,6 +38,7 @@ import {
   type StepGrounding,
   type StructuredExpected,
 } from './scenario-builder';
+import type { Dataset } from './dataset-resolver';
 import { validateCanonicalTestCases } from './canonical-validator';
 import { validateQaStandard, violationsToInstructions } from './qa-standard-validator';
 import type { ScenarioSemantics } from './qa-knowledge-engine';
@@ -777,6 +778,16 @@ export interface KnowledgeContext {
    * checkout_data) instead of inventing placeholder credentials/products.
    */
   testData?: Array<{ name: string; environment: string; recordCount: number; sampleKeys: string[] }>;
+  /**
+   * The REAL, rich project datasets (dataset + records + role tags + values)
+   * used by the Dataset Resolver to turn a scenario's required data role into a
+   * concrete record at Scenario Graph build time. Unlike `testData` (token-safe
+   * summaries that dropped the role tags and values), these are the actual
+   * dataset objects from the Test Data Store, so Sprint 2C resolves against the
+   * source of truth. Values are used internally only and are always masked before
+   * any prompt/display boundary. Absent when the project has no datasets.
+   */
+  datasets?: Dataset[];
   /**
    * Optional scope for intent-scoped retrieval via the shared
    * IntelligenceOrchestrator (Phase 2). When present AND the orchestrator flag
@@ -1540,6 +1551,10 @@ Return ONLY valid JSON, no markdown fences.`;
           })),
           knowledgeVersion: scenarioPlan?.knowledgeVersion ?? '',
           category: scenarioPlan?.classification.category ?? 'generic',
+          // The REAL project datasets — role resolution runs ONCE here, at graph
+          // build, and the winning record is carried on each node (then masked by
+          // the Test Case Lab projection). Absent → nodes carry no resolved record.
+          availableDatasets: genKnowledge?.datasets,
         });
         const projection = toTestCaseLab(scenarioGraph);
         logger.info(MOD, 'Scenario graph assembled (Test Case Lab consuming)', {
@@ -1709,7 +1724,10 @@ Return ONLY valid JSON. Address EVERY selected coverage type, organise scenarios
     // reuse the exact same inputs for the cases it needs to re-ask.
     const formatterInputs: FormatterInput[] | undefined =
       formatterMode && deterministicOutput
-        ? buildFormatterInputs(deterministicOutput.testCases, semanticsById)
+        ? // Resolution already ran at graph build; the resolved record rides on
+          // deterministicOutput.testCases (from the Test Case Lab projection), so
+          // buildFormatterInputs just reads it — no datasets passed here.
+          buildFormatterInputs(deterministicOutput.testCases, semanticsById)
         : undefined;
     const formatterPrompt = formatterInputs ? buildFormatterPrompt(formatterInputs) : '';
     const prompt = formatterMode ? formatterPrompt : fullPrompt;
@@ -1833,6 +1851,8 @@ Return ONLY valid JSON. Address EVERY selected coverage type, organise scenarios
         );
         if (QA_STANDARD_REPAIR_ENABLED && errorIds.size > 0 && formatterInputs) {
           const failing = polishedCases.filter(c => errorIds.has(c.scenarioId));
+          // Same as above — the resolved record already rides on each case; no
+          // datasets passed, no re-resolution.
           const repairInputs = buildFormatterInputs(failing, semanticsById);
           const fixesById: Record<string, string[]> = {};
           for (const c of failing) {

@@ -24,8 +24,30 @@ import {
   nodesUsingPage,
   outgoingEdges,
 } from './scenario-graph';
+import {
+  type ResolvedDatasetRecord,
+  maskResolvedDataset,
+} from '../engines/dataset-resolver';
 
 const norm = (s?: string) => (s || '').trim().toLowerCase();
+
+/**
+ * Build the human-readable Test Case Lab "Test Data" line that makes Sprint 2C
+ * VISIBLE: it surfaces the role, the dataset it resolved to, and the winning
+ * record, while keeping the concrete values masked. The node's original
+ * `testData` (if any) is preserved on its own line so nothing is lost.
+ */
+function composeResolvedTestData(node: ScenarioNode): string {
+  const r = node.execution?.resolvedDataset;
+  if (!r) return node.testData;
+  const role = node.semantics?.requiredDataRole || 'n/a';
+  const fields = Object.keys(r.values);
+  // Values stay masked; we only show the field NAMES so the structure is clear.
+  const fieldNote = fields.length ? ` · Fields: ${fields.join(', ')} (values masked)` : '';
+  const line = `Role: ${role} · Resolved Dataset: ${r.datasetId} · Record: ${r.recordId}${fieldNote}`;
+  const base = (node.testData || '').trim();
+  return base ? `${base}\n${line}` : line;
+}
 
 /* ================================================================== */
 /*  1. Test Case Lab                                                   */
@@ -57,6 +79,14 @@ export interface TestCaseLabCase {
   source: string;
   sourceEvidence: string;
   scenarioIndex: number;
+  /**
+   * The dataset record resolved for this case's required data role, with every
+   * value MASKED (field names preserved). Present only when the graph node
+   * carried a resolved record. This is what makes Sprint 2C visible in the Test
+   * Case Lab without leaking credentials; the same info is also folded into the
+   * human-readable `testData` line.
+   */
+  resolvedDataset?: ResolvedDatasetRecord;
 }
 
 export interface TestCaseLabProjection {
@@ -84,7 +114,9 @@ export function toTestCaseLab(graph: ScenarioGraph): TestCaseLabProjection {
     preconditions: n.preconditions,
     steps: n.steps.slice(),
     expectedResult: n.expectedResult,
-    testData: n.testData,
+    // Enrich the visible Test Data line with the resolved role/dataset/record
+    // (values masked). Falls back to the node's raw testData when unresolved.
+    testData: composeResolvedTestData(n),
     selectors: n.selectors.slice(),
     priority: n.priority,
     severity: n.severity,
@@ -95,6 +127,11 @@ export function toTestCaseLab(graph: ScenarioGraph): TestCaseLabProjection {
     source: n.source,
     sourceEvidence: n.sourceEvidence,
     scenarioIndex: i,
+    // Mask at the projection boundary — the node keeps the real values under
+    // `execution`. The projection flattens it onto the case for the Lab view.
+    ...(n.execution?.resolvedDataset
+      ? { resolvedDataset: maskResolvedDataset(n.execution.resolvedDataset) }
+      : {}),
   }));
   return { scenarios, testCases };
 }

@@ -34,6 +34,14 @@
  */
 
 import { createHash } from 'crypto';
+// Type-only import: `ResolvedDatasetRecord` is the single source of truth for a
+// resolved dataset record (defined in the Dataset Resolver). Importing it as a
+// TYPE keeps this pure-data graph model free of any runtime dependency — the
+// import is erased at compile time — and dataset-resolver imports nothing, so
+// there is no module cycle. We deliberately do NOT redeclare the shape here (as
+// we do for `ScenarioSemantics`) because it is an exact, stable contract we want
+// to stay identical everywhere it travels.
+import type { ResolvedDatasetRecord } from '../engines/dataset-resolver';
 
 /* ------------------------------------------------------------------ */
 /*  Node                                                               */
@@ -111,6 +119,38 @@ export interface ScenarioNode {
   sourceEvidence: string;
   /** True when the scenario is grounded in the requirement/app profile/test data. */
   grounded: boolean;
+  /**
+   * Per-EXECUTION facts for this node — everything that can change from run to run
+   * without changing the scenario's identity. A single scenario (e.g. "Login")
+   * may execute against `standard_user`, `problem_user` or `premium_user`, in
+   * different environments/browsers/locales; none of that alters what the
+   * scenario *is*. Keeping it under `execution` (rather than flattened onto the
+   * node) means future consumers — Script Gen, Healing, Replay, Scheduler —
+   * extend one clearly-scoped object instead of accreting sibling fields, and it
+   * keeps execution data out of the scenario identity / fingerprint.
+   *
+   * Optional so older persisted graphs and unresolved nodes remain valid.
+   */
+  execution?: ScenarioExecution;
+}
+
+/**
+ * Execution-scoped facts attached to a {@link ScenarioNode}. Distinct from
+ * `semantics` (what the scenario means) — this is *how a particular run is
+ * parameterised*. Today it carries the resolved dataset record; environment,
+ * browser and locale are the natural next members (added by future sprints).
+ */
+export interface ScenarioExecution {
+  /**
+   * The concrete dataset record resolved for this node's `semantics.requiredDataRole`,
+   * or absent when the role is empty or no available dataset declares it. Resolved
+   * EXACTLY ONCE, deterministically, at graph-build time (see scenario-graph-builder),
+   * then carried here so every downstream consumer (Test Case Lab, Script Gen, the
+   * LLM formatter) reuses the same record instead of re-resolving. The node holds the
+   * REAL (unmasked) values — it is the internal source of truth; masking happens only
+   * at the projection boundaries (adapters / prompt) via `maskResolvedDataset`.
+   */
+  resolvedDataset?: ResolvedDatasetRecord;
 }
 
 /* ------------------------------------------------------------------ */

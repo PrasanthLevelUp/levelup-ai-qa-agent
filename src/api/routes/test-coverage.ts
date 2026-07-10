@@ -42,12 +42,37 @@ import {
   getApplicationProfileForGeneration,
   getProfileById,
   getTestDataSetSummaries,
+  getTestDataSetsWithRecords,
 } from '../../db/postgres';
+import type { Dataset } from '../../engines/dataset-resolver';
 import { buildApplicationProfileContext } from '../../utils/application-profile-context';
 import { ExportService } from '../../services/export-service';
 import { TemplateService } from '../../services/template-service';
 
 const MOD = 'test-coverage-routes';
+
+/**
+ * Coerce a Test Data record's `value_jsonb` into the resolver's flat
+ * `Record<string,string>` value shape. The DB stores an opaque JSONB value: it
+ * may be an object of fields ({ username, password }), or a scalar/array. We
+ * normalise so the resolver (which treats values as opaque, never interpreting
+ * them) always receives string fields:
+ *   • object (non-array)  → each own key coerced to a String value
+ *   • scalar / array      → wrapped as { [recordKey]: String(value) }
+ * Pure and deterministic; values are only used internally and masked before any
+ * display/prompt boundary.
+ */
+function coerceRecordValues(recordKey: string, value: any): Record<string, string> {
+  if (value !== null && typeof value === 'object' && !Array.isArray(value)) {
+    const out: Record<string, string> = {};
+    for (const k of Object.keys(value)) {
+      const v = (value as Record<string, unknown>)[k];
+      out[k] = typeof v === 'string' ? v : JSON.stringify(v);
+    }
+    return out;
+  }
+  return { [recordKey]: typeof value === 'string' ? value : JSON.stringify(value) };
+}
 
 /**
  * Build the AI-metadata JSONB bag for a scenario/test case, dropping any
@@ -395,6 +420,53 @@ export function createTestCoverageRouter(): Router {
           }
         } catch (tdErr: any) {
           logger.warn(MOD, 'Could not load test data (continuing)', { error: tdErr.message });
+        }
+
+        // ── Rich datasets for the Dataset Resolver (Sprint 2C) ──
+        // In addition to the token-safe summaries above (which power the prompt's
+        // "AVAILABLE TEST DATA" block), load the REAL dataset objects — full
+        // records, values and role `tags` — and map them into the resolver's
+        // Dataset[] contract. This is what makes Sprint 2C resolve against the
+        // SOURCE OF TRUTH: the Scenario Graph builder turns each scenario's
+        // required data role into a concrete record from THIS data (not summaries).
+        // Values are carried for internal resolution only; they are masked at every
+        // display/prompt boundary. Roles come from the records' own `tags`.
+        try {
+          const ids = Array.isArray(testDataIds)
+            ? testDataIds.map((n: any) => parseInt(String(n), 10)).filter((n: number) => Number.isFinite(n))
+            : undefined;
+          const rich = await getTestDataSetsWithRecords(companyId, projectId, undefined, ids);
+          if (rich.length > 0) {
+            const datasets: Dataset[] = rich.slice(0, 12).map(ds => ({
+              datasetId: ds.name,
+              name: ds.name,
+              // Dataset-level roles: the union of every role its records declare,
+              // so a role can match at the dataset level too. Record-level `tags`
+              // still drive which specific record wins.
+              roles: Array.from(new Set(ds.records.flatMap(r => r.tags ?? []))),
+              records: ds.records.map(r => ({
+                recordId: r.key,
+                values: coerceRecordValues(r.key, r.value),
+                tags: r.tags ?? [],
+              })),
+              metadata: ds.environment ? [ds.environment] : [],
+            }));
+            knowledge.datasets = datasets;
+            const roleCount = datasets.reduce((n, d) => n + (d.roles?.length ?? 0), 0);
+            logger.info(MOD, '🗃️ Rich datasets loaded for role resolution', {
+              datasets: datasets.length,
+              recordsTotal: datasets.reduce((n, d) => n + d.records.length, 0),
+              roleTagsDeclared: roleCount,
+            });
+            if (roleCount === 0) {
+              // Honest, actionable signal: the resolver can only produce a match
+              // when records are role-tagged. Wiring is complete end-to-end; this
+              // is the remaining DATA-side step, not a code gap.
+              logger.info(MOD, 'Datasets present but no role tags — resolver will return null until records are role-tagged in the Test Data Store');
+            }
+          }
+        } catch (dsErr: any) {
+          logger.warn(MOD, 'Could not load rich datasets for resolver (continuing)', { error: dsErr.message });
         }
       }
 

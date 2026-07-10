@@ -312,7 +312,10 @@ describe('Formatter mode — minimal prompt (FormatterInput contract)', () => {
     // fixed-size — it does not grow with the number of cases or re-teach the
     // standard. Only the data payload after "TEST CASES:" scales with input.
     const instructions = formatterPrompt.split('TEST CASES:')[0];
-    expect(instructions.length).toBeLessThan(1200);
+    // Fixed-size preamble: it must not grow per-case or re-teach the standard.
+    // (Includes one short, fixed DATA line describing the masked resolvedDataset
+    // added in Sprint 2C — still a few lines, still principle-free.)
+    expect(instructions.length).toBeLessThan(1400);
   });
 
   it('sends the FIXED semantic context as DATA + only the editable wording fields', () => {
@@ -388,6 +391,70 @@ describe('Formatter mode — minimal prompt (FormatterInput contract)', () => {
     const originalLen = input.steps.length;
     try { input.steps.push('injected step'); } catch { /* frozen array */ }
     expect(input.steps.length).toBe(originalLen);
+  });
+
+  it('carries the resolvedDataset already on a case (resolved upstream at graph build) onto the FormatterInput', () => {
+    const plan = planScenarios(LOGIN_REQ, COVERAGE, 'authentication');
+    const { drafts } = buildDraftTestCases(plan, LOGIN_KNOWLEDGE, LOGIN_REQ);
+    const out = buildDeterministicOutput(drafts);
+    const semantics = new Map([
+      [out.testCases[0].scenarioId, {
+        variation: 'valid credentials',
+        expectedBehavior: 'the user is authenticated and lands on the dashboard',
+        requiredDataRole: 'registered_user',
+      } as any],
+    ]);
+    // Resolution no longer happens in buildFormatterInputs — it runs ONCE at
+    // Scenario Graph build time and the winning record is carried down onto the
+    // case (via the Test Case Lab projection). Simulate that here.
+    out.testCases[0].resolvedDataset = {
+      datasetId: 'valid_users',
+      recordId: 'standard_user',
+      values: { username: 'standard_user', password: 'secret_sauce' },
+      reason: "role 'registered_user' matched dataset 'valid_users' → record 'standard_user'",
+    };
+    const inputs = buildFormatterInputs(out.testCases, semantics);
+    const resolved = inputs[0].resolvedDataset;
+    expect(resolved).toBeDefined();
+    expect(resolved!.datasetId).toBe('valid_users');
+    expect(resolved!.recordId).toBe('standard_user');
+    // A resolved record has NO confidence — deterministic, binary (see Sprint 2C).
+    expect((resolved as any).confidence).toBeUndefined();
+    // Additive: dataRole is untouched and the semantics map is not mutated.
+    expect(inputs[0].dataRole).toBe('registered_user');
+    expect(semantics.get(out.testCases[0].scenarioId)!.requiredDataRole).toBe('registered_user');
+  });
+
+  it('buildFormatterPrompt shows dataset/record/role but MASKS literal values', () => {
+    const plan = planScenarios(LOGIN_REQ, COVERAGE, 'authentication');
+    const { drafts } = buildDraftTestCases(plan, LOGIN_KNOWLEDGE, LOGIN_REQ);
+    const out = buildDeterministicOutput(drafts);
+    const semantics = new Map([
+      [out.testCases[0].scenarioId, {
+        variation: 'valid credentials',
+        expectedBehavior: 'the user is authenticated and lands on the dashboard',
+        requiredDataRole: 'registered_user',
+      } as any],
+    ]);
+    // Feed an UNMASKED resolved record (as the graph node holds internally) to
+    // prove the prompt boundary masks the values.
+    out.testCases[0].resolvedDataset = {
+      datasetId: 'valid_users',
+      recordId: 'standard_user',
+      values: { username: 'standard_user', password: 'secret_sauce' },
+      reason: "role 'registered_user' matched dataset 'valid_users' → record 'standard_user'",
+    };
+    const inputs = buildFormatterInputs(out.testCases, semantics);
+    const prompt = buildFormatterPrompt(inputs);
+    // The dataset id, record id and role are surfaced for role-based wording...
+    expect(prompt).toContain('valid_users');
+    expect(prompt).toContain('standard_user');
+    expect(prompt).toContain('"resolvedDataset"');
+    // ...but the literal secret value must NEVER leak into the prompt.
+    expect(prompt).not.toContain('secret_sauce');
+    expect(prompt).toContain('*****');
+    // Masking must not have mutated the resolved values on the frozen input.
+    expect(inputs[0].resolvedDataset!.values.password).toBe('secret_sauce');
   });
 
   it('buildRepairPrompt lists ONLY the failing cases and their specific fixes', () => {
