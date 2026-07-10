@@ -314,10 +314,17 @@ export type AssertionType =
  * the graph exposes to Script Gen. Mirrors {@link ScenarioAction}: an ordered,
  * typed check over a semantic target, nothing more.
  *
- *   • `id`       — stable identity for the assertion within its node (diffs,
- *                  healing, impact analysis can reference a specific check).
- *   • `order`    — 0-based order. The array is authoritative; the ordinal makes
- *                  the contract self-describing and lets consumers sort defensively.
+ *   • `id`       — STABLE SEMANTIC identity, derived from the check's business
+ *                  meaning (`<scenarioId>.<type>.<subject>`, e.g.
+ *                  `auth-neg-password.text.login_error`), NOT its array position.
+ *                  It survives insertions/reordering so diffs, healing, impact
+ *                  analysis, replay and analytics can reference a specific check
+ *                  by a durable name. The builder assigns it (see
+ *                  `materializeAssertionTemplate`); it is never position-based.
+ *   • `order`    — 0-based EXECUTION order. The array is authoritative; the
+ *                  ordinal makes the contract self-describing and lets consumers
+ *                  sort defensively. (Identity lives in `id`, sequence in `order` —
+ *                  the two are deliberately decoupled.)
  *   • `type`     — the checkable property (see {@link AssertionType}).
  *   • `target`   — optional SEMANTIC element identity (e.g. `logout_button`,
  *                  `login_error`). Absent for page-level checks (`url`). NEVER a

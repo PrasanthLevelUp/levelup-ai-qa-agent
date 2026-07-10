@@ -111,8 +111,15 @@ ScenarioNode {
 
   // ── 6. ASSERTIONS  (landed in 2D.4) ─────────  immutable, "the executable expected outcomes"
   assertions[] {
-    id                        // stable identity for this check within the node
-    order                     // 0-based verification order (array is authoritative)
+    id                        // STABLE SEMANTIC identity — `<scenarioId>.<type>.<subject>`
+                              //   (e.g. `auth-neg-wrong-password.text.login_error`). `subject`
+                              //   is the canonical `target`, else the `@page.*`/`@messages.*`
+                              //   ref name, else the bare type. DERIVED FROM MEANING, never from
+                              //   array position — so Coverage / Healing / Replay / Analytics can
+                              //   reference a check durably even when `order` changes. Collisions
+                              //   within a node get a deterministic `#2`/`#3` suffix.
+    order                     // 0-based verification order (array is authoritative for SEQUENCE
+                              //   only — identity lives in `id`, NOT here)
     type                      // FROZEN grammar (11): url | visible | hidden | enabled | disabled
                               //   | checked | unchecked | text | value | count | attribute
                               //   (success/failure/login/logout are SCENARIOS, never assertion types)
@@ -156,7 +163,7 @@ ScenarioNode {
 | **resources**  | ✅ immutable    | *What does it NEED to run?*        | `dataRoles: ["registered_user"]` | resolved/selected values (those are execution) |
 | **execution**  | ❌ runtime      | *What did THIS run actually use?* | `resolvedDataset: {username,…}` | anything that changes identity |
 | **actions**    | ✅ immutable    | *What steps execute, in order?*   | `{action:"fill", target:"username"}` | resolved values inline (use `@dataset.*`) |
-| **assertions** | ✅ immutable    | *What outcomes are verified?*     | `{type:"url", expected:"/inventory"}` | prose like "login succeeds" |
+| **assertions** | ✅ immutable    | *What outcomes are verified?*     | `{type:"url", expected:"@page.inventory"}` | prose like "login succeeds"; concrete URLs/copy (`/inventory`, `"Bad password"`) |
 | **metadata**   | ❌ diagnostic   | *How confident / how measured?*   | `confidence: 0.82`              | anything behaviour-bearing |
 
 **The three-question separation** — the reason `resources` and `execution` are distinct sections:
@@ -214,6 +221,12 @@ If a field seems to fit two sections, it is probably two fields. Split it. (The 
   assertion set works for any app, and rewording a message or renaming a route re-runs only the resolver.
   For `attribute`, `expected` is encoded `name=value` (e.g. `type=password`). An unresolved reference
   DEGRADES safely (a `text` check falls back to a visibility check) rather than emitting invented copy.
+- **Assertion `id` is STABLE and SEMANTIC, never positional.** The builder derives `id` from the check's
+  *meaning* — `<scenarioId>.<type>.<subject>` — not its array index. So a durable consumer (Coverage,
+  Healing, Replay, Analytics) can reference "the login-error text check" by id and keep hitting the same
+  check even after assertions are reordered, inserted, or removed. `order` carries sequence ONLY; identity
+  lives in `id`. This is why `order` is free to change without breaking references, and why the builder must
+  never fall back to `:a:<index>` ids.
 - **Assertions store CANONICAL business meaning, never Playwright.** The graph holds `{type:"visible",
   target:"login_error"}`, never `expect(...)`, `toBeVisible()`, or a CSS locator. Script Gen is a pure
   `switch(type)` renderer + resolver — it NEVER infers an assertion from prose. The KB authors the check;

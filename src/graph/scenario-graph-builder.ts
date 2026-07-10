@@ -203,12 +203,46 @@ export function materializeActionTemplate(
 }
 
 /**
+ * Derive the STABLE SEMANTIC slug for an assertion from its business meaning —
+ * NOT its position. This is what makes an assertion id survive reordering, so
+ * Coverage / Healing / Replay / Analytics can reference a specific check
+ * (`auth-neg-password.text.login_error`) that stays valid even when the KB
+ * inserts a new check before it. The slug is `<type>.<subject>` where `subject`
+ * is, in priority order:
+ *   • the canonical `target` (`login_error`, `authenticated_landing`), else
+ *   • the reference NAME behind a `@page.*` / `@messages.*` `expected`
+ *     (`inventory`, `invalid_credentials`) — the semantic identity of a
+ *     page-level check that carries no element target, else
+ *   • the bare `type` (a structural check with neither target nor reference).
+ * App vocabulary never enters the slug: a `@page.*` / `@messages.*` reference
+ * contributes only its symbolic NAME, never a resolved URL/message.
+ */
+function assertionSlug(check: ScenarioAssertionTemplate): string {
+  const ref = (prefix: string): string | null => {
+    const raw = typeof check.expected === 'string' ? check.expected : '';
+    return raw.startsWith(prefix) ? raw.slice(prefix.length).trim().toLowerCase() : null;
+  };
+  const subject =
+    check.target ??
+    ref('@page.') ??
+    ref('@messages.') ??
+    null;
+  return subject ? `${check.type}.${subject}` : check.type;
+}
+
+/**
  * MATERIALIZE a KB-authored assertion TEMPLATE into the graph's canonical
  * {@link ScenarioAssertion}[]. The EXACT mirror of {@link materializeActionTemplate}
  * for verifications — the builder's only job with assertions, and deliberately
  * minimal. It adds STRUCTURE (identity + order), nothing else:
- *   • assigns a deterministic `id` (`<scenarioId>:a:<n>`) and `order` (the array
- *     index — a faithful copy of the KB order, never a re-sort);
+ *   • assigns a STABLE SEMANTIC `id` (`<scenarioId>.<type>.<subject>`, see
+ *     {@link assertionSlug}) derived from the check's business meaning, NOT its
+ *     array position — so the id survives insertions/reordering and downstream
+ *     consumers (Coverage, Healing, Replay, Analytics) can reference a specific
+ *     check by a durable name. Duplicate slugs within one scenario are
+ *     disambiguated with a deterministic `#n` suffix (encounter order);
+ *   • sets `order` to the array index (a faithful copy of the KB order, the
+ *     authoritative EXECUTION order — never a re-sort);
  *   • copies `type`, `target`, `expected` and `optional` VERBATIM.
  *
  * It does NOT invent, add, drop, or reorder checks (the set is the KB's — "the
@@ -225,9 +259,18 @@ export function materializeAssertionTemplate(
   scenarioId: string,
   template: readonly ScenarioAssertionTemplate[],
 ): ScenarioAssertion[] {
+  // Count slug occurrences so a repeated semantic identity gets a stable `#n`
+  // suffix instead of silently colliding. Two byte-identical checks are
+  // semantically the same assertion, so which one wins `#1` is irrelevant; the
+  // point is that every id is UNIQUE and DETERMINISTIC for a given input.
+  const seen = new Map<string, number>();
   return template.map((check, i) => {
+    const slug = assertionSlug(check);
+    const n = (seen.get(slug) ?? 0) + 1;
+    seen.set(slug, n);
+    const id = n === 1 ? `${scenarioId}.${slug}` : `${scenarioId}.${slug}#${n}`;
     const assertion: ScenarioAssertion = {
-      id: `${scenarioId}:a:${i}`,
+      id,
       order: i,
       type: check.type,
     };

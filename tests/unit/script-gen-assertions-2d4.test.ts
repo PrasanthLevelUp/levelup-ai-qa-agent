@@ -72,15 +72,52 @@ describe('Sprint 2D.4 — builder.materializeAssertionTemplate', () => {
     { type: 'url', expected: '@page.login' },
   ];
 
-  it('assigns stable ids and array-index order without reordering', () => {
+  it('assigns STABLE SEMANTIC ids (from meaning, not position) + array-index order', () => {
     const mat = materializeAssertionTemplate('auth-neg-wrong-password', template);
+    // ids encode the business meaning: <scenarioId>.<type>.<subject>. `subject`
+    // is the canonical target, or the @page/@messages reference NAME when there
+    // is no element target (the url check). NO array index appears in an id.
     expect(mat.map((a) => a.id)).toEqual([
-      'auth-neg-wrong-password:a:0',
-      'auth-neg-wrong-password:a:1',
-      'auth-neg-wrong-password:a:2',
+      'auth-neg-wrong-password.visible.login_error',
+      'auth-neg-wrong-password.text.login_error',
+      'auth-neg-wrong-password.url.login',
     ]);
     expect(mat.map((a) => a.order)).toEqual([0, 1, 2]);
     expect(mat.map((a) => a.type)).toEqual(template.map((t) => t.type));
+  });
+
+  it('semantic ids are STABLE under reordering — same check keeps its id', () => {
+    const forward = materializeAssertionTemplate('s', template);
+    const reversed = materializeAssertionTemplate('s', [...template].reverse());
+    const idOf = (arr: any[], type: string, target?: string) =>
+      arr.find((a) => a.type === type && a.target === target)!.id;
+    // The `visible login_error` check has the SAME id regardless of its position.
+    expect(idOf(forward, 'visible', 'login_error')).toBe(idOf(reversed, 'visible', 'login_error'));
+    expect(idOf(forward, 'url', undefined)).toBe(idOf(reversed, 'url', undefined));
+    // …but `order` still reflects the new position (identity ≠ sequence).
+    expect(forward[0].order).toBe(0);
+    expect(reversed[0].order).toBe(0);
+  });
+
+  it('disambiguates a repeated semantic identity with a deterministic #n suffix', () => {
+    const dup: ScenarioAssertionTemplate[] = [
+      { type: 'visible', target: 'login_error' },
+      { type: 'visible', target: 'login_error' },
+    ];
+    const mat = materializeAssertionTemplate('s', dup);
+    expect(mat.map((a) => a.id)).toEqual([
+      's.visible.login_error',
+      's.visible.login_error#2',
+    ]);
+    // Unique + deterministic.
+    expect(new Set(mat.map((a) => a.id)).size).toBe(2);
+  });
+
+  it('page-level url check with no target derives its subject from the @page reference', () => {
+    const mat = materializeAssertionTemplate('auth-pos-valid', [
+      { type: 'url', expected: '@page.inventory' },
+    ]);
+    expect(mat[0].id).toBe('auth-pos-valid.url.inventory');
   });
 
   it('copies target/expected VERBATIM — no translation to app vocabulary', () => {

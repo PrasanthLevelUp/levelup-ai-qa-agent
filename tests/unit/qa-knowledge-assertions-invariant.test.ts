@@ -36,6 +36,7 @@ import {
   QA_KNOWLEDGE_BASE,
   getScenarioAssertionTemplate,
 } from '../../src/engines/qa-knowledge-engine';
+import { materializeAssertionTemplate } from '../../src/graph/scenario-graph-builder';
 
 // The FROZEN assertion grammar (Sprint 2D.4). Adding a type here is a deliberate
 // contract change — mirror it in `AssertionType` (graph + KB) and the renderer.
@@ -119,6 +120,22 @@ describe('Sprint 2D.4 — assertion-template coverage ratchet', () => {
       const tmpl = getScenarioAssertionTemplate(s);
       expect(tmpl).not.toBeNull();
       expect(tmpl).toBe(s.assertionTemplate); // same reference — a pure lookup, no copy/derive
+    }
+  });
+
+  // Stable semantic ids — durable references for Coverage / Healing / Replay.
+  it('every authored auth scenario materializes to UNIQUE, position-independent ids', () => {
+    for (const s of auth) {
+      const tmpl = s.assertionTemplate;
+      if (!tmpl || tmpl.length === 0) continue;
+      const ids = materializeAssertionTemplate(s.id, tmpl).map((a) => a.id);
+      // Unique within the scenario (Coverage/Healing key on these).
+      expect(new Set(ids).size).toBe(ids.length);
+      // Semantic, namespaced by scenario — never a bare array index.
+      for (const id of ids) {
+        expect(id.startsWith(`${s.id}.`)).toBe(true);
+        expect(id).not.toMatch(/:a:\d+$/); // the old position-based scheme is gone
+      }
     }
   });
 
