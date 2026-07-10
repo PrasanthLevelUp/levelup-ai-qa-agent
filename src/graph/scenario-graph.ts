@@ -88,14 +88,19 @@ export interface ScenarioSemantics {
  * (`semantics` qualifies: Test Case Lab, Script Gen, Healing and the Dataset
  * Resolver all read it.)
  *
- * CONTRACT — this node's shape is FROZEN. It is organised into ownership
- * sections (identity / semantics / execution / actions / assertions / metadata)
- * with strict placement rules. Before adding, moving, or repurposing any field,
- * read docs/EXECUTION_GRAPH_CONTRACT.md and bump SCENARIO_GRAPH_SCHEMA_VERSION.
- * In particular: `requiredDataRole` is a ROLE (belongs in `semantics`); a
- * RESOLVED dataset record belongs in `execution`, never in `semantics`. The
- * reserved `actions[]` (Sprint 2D.3) and `assertions[]` (Sprint 2D.4) slots are
- * documented there and are added alongside their first consumers.
+ * CONTRACT — this node's shape is FROZEN. It is organised into seven ownership
+ * sections (identity / semantics / resources / execution / actions / assertions
+ * / metadata) with strict placement rules. Before adding, moving, or repurposing
+ * any field, read docs/EXECUTION_GRAPH_CONTRACT.md and bump
+ * SCENARIO_GRAPH_SCHEMA_VERSION. Three-question separation to keep straight:
+ * `semantics` = what the scenario MEANS; `resources` = what it NEEDS (immutable
+ * requirement, e.g. a data ROLE, browser, locale); `execution` = what THIS run
+ * actually USED (the resolved dataset/browser/locale). So `requiredDataRole` is
+ * a ROLE requirement (belongs in `semantics` today, `resources.dataRoles` once
+ * that section lands); a RESOLVED dataset record belongs in `execution`, never
+ * in `semantics` or `resources`. The reserved `resources`, `actions[]` (Sprint
+ * 2D.3) and `assertions[]` (Sprint 2D.4) slots are documented there and are
+ * added alongside their first consumers.
  */
 export interface ScenarioNode {
   /** Stable canonical id (the KB scenarioId). Unique within a graph. */
