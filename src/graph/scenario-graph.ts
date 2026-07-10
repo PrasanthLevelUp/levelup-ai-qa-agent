@@ -177,6 +177,30 @@ export interface ScenarioNode {
    * or changes its selectors — only the resolver's grounding changes.
    */
   actions?: ScenarioAction[];
+  /**
+   * The canonical, ORDERED executable ASSERTIONS for this scenario — the graph's
+   * answer to "what must be TRUE afterwards?" so Script Gen never has to infer a
+   * verification back out of the natural-language `expectedResult`. Each entry is
+   * an application-neutral {@link ScenarioAssertion}: a `type` (`url`/`visible`/
+   * `text`/…), an optional semantic `target` (an element identity, NEVER a
+   * locator/CSS), and an optional `expected` (a literal OR a `@page.*` /
+   * `@messages.*` semantic reference the Execution Resolver grounds).
+   *
+   * OWNERSHIP — mirrors {@link actions} EXACTLY. The Knowledge Base owns the
+   * assertion SET (it knows a valid login lands on the inventory page and shows
+   * the logout control). The builder only MATERIALIZES the template (assigns a
+   * stable `id` + `order`); it does NOT invent assertions and does NOT translate
+   * targets/expected into the application's vocabulary. When the KB has no
+   * authored template this stays undefined and Script Gen falls back to its
+   * legacy assertion inference — so the field is purely additive/back-compatible.
+   *
+   * INVARIANT — the graph stores PURE BUSINESS MEANING, never Playwright code,
+   * locators, or CSS. `{type:'visible', target:'logout_button', expected:true}`,
+   * never `expect(page.locator('#logout')).toBeVisible()`. Grounding a canonical
+   * target to a locator, and a `@page.*`/`@messages.*` reference to a concrete
+   * URL/message, is the Execution Resolver's job inside Script Gen at emit time.
+   */
+  assertions?: ScenarioAssertion[];
 }
 
 /* ------------------------------------------------------------------ */
@@ -243,6 +267,100 @@ export interface ScenarioAction {
   target: string;
   value?: string;
   optional?: boolean;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Assertions                                                         */
+/* ------------------------------------------------------------------ */
+
+/**
+ * The FROZEN, closed set of assertion types the graph may carry. Chosen to
+ * cover "almost everything" without ever growing into scenario vocabulary:
+ * these describe a CHECKABLE PROPERTY of the page/element, framework-neutral.
+ * Script Gen maps each to a concrete `expect(...)` at emit time.
+ *
+ * DELIBERATELY DOES NOT INCLUDE scenario-shaped values like `success`,
+ * `failure`, `login`, `logout`. Those are SCENARIOS, not assertions — encoding
+ * them here would drag business meaning back into the check vocabulary and
+ * re-open the "Script Gen guesses what success looks like" hole 2D.4 closes.
+ *
+ *   • `url`        — the page URL matches `expected` (a path/fragment/@page.*).
+ *   • `visible`    — the target element is visible.
+ *   • `hidden`     — the target element is present but hidden.
+ *   • `enabled`    — the target element is enabled.
+ *   • `disabled`   — the target element is disabled.
+ *   • `checked`    — the target checkbox/radio is checked.
+ *   • `unchecked`  — the target checkbox/radio is NOT checked.
+ *   • `text`       — the target contains `expected` text (a literal/@messages.*).
+ *   • `value`      — the target input has form value `expected`.
+ *   • `count`      — the target matches `expected` (a number) of elements.
+ *   • `attribute`  — the target has attribute `expected`, encoded `name=value`.
+ */
+export type AssertionType =
+  | 'url'
+  | 'visible'
+  | 'hidden'
+  | 'enabled'
+  | 'disabled'
+  | 'checked'
+  | 'unchecked'
+  | 'text'
+  | 'value'
+  | 'count'
+  | 'attribute';
+
+/**
+ * A single canonical executable assertion — the exact, minimal, FROZEN contract
+ * the graph exposes to Script Gen. Mirrors {@link ScenarioAction}: an ordered,
+ * typed check over a semantic target, nothing more.
+ *
+ *   • `id`       — STABLE SEMANTIC identity, derived from the check's business
+ *                  meaning (`<scenarioId>.<type>.<subject>`, e.g.
+ *                  `auth-neg-password.text.login_error`), NOT its array position.
+ *                  It survives insertions/reordering so diffs, healing, impact
+ *                  analysis, replay and analytics can reference a specific check
+ *                  by a durable name. The builder assigns it (see
+ *                  `materializeAssertionTemplate`); it is never position-based.
+ *   • `order`    — 0-based EXECUTION order. The array is authoritative; the
+ *                  ordinal makes the contract self-describing and lets consumers
+ *                  sort defensively. (Identity lives in `id`, sequence in `order` —
+ *                  the two are deliberately decoupled.)
+ *   • `type`     — the checkable property (see {@link AssertionType}).
+ *   • `target`   — optional SEMANTIC element identity (e.g. `logout_button`,
+ *                  `login_error`). Absent for page-level checks (`url`). NEVER a
+ *                  CSS selector, XPath, page-object path, or raw locator —
+ *                  grounding to a locator is the Execution Resolver's job.
+ *   • `expected` — optional. A literal (`'/inventory'`, `true`, `6`) OR a
+ *                  semantic reference the Execution Resolver grounds:
+ *                    · `@page.<name>`     → a concrete URL/route from App Knowledge
+ *                    · `@messages.<name>` → a concrete UI message from App Knowledge
+ *                  For `type:'attribute'`, `expected` is `'<name>=<value>'`.
+ *                  Structural types (`visible`/`hidden`/`enabled`/`disabled`/
+ *                  `checked`/`unchecked`) need no `expected` — the type carries it.
+ *   • `optional` — when true the check is skipped if its target is absent (e.g.
+ *                  a control some apps omit). Defaults to false / required.
+ *   • `afterAction` — optional reference to the action this check is evaluated
+ *                  *after* — the producing step's EXACT {@link ScenarioAction} `id`
+ *                  (`<scenarioId>.<action>.<target>`, e.g.
+ *                  `auth-pos-valid.click.login_button`). It answers "which step
+ *                  produced this outcome?", so Replay, Healing, the execution
+ *                  timeline, and root-cause explanations can say "after clicking
+ *                  Login, expected the inventory page" instead of a bare "assertion
+ *                  failed". Because it IS the action's id, a consumer resolves it
+ *                  with a plain `node.actions.find(a => a.id === assertion.afterAction)`
+ *                  — no helper, no slug, no computation: one identity everywhere.
+ *                  Identity, not position — it survives action reordering exactly
+ *                  as `id` does. Absent when the check is not tied to a specific
+ *                  step (e.g. a scenario with no materialized actions).
+ */
+export interface ScenarioAssertion {
+  id: string;
+  order: number;
+  type: AssertionType;
+  target?: string;
+  expected?: string | number | boolean;
+  optional?: boolean;
+  afterAction?: string;
 }
 
 /**
@@ -326,9 +444,15 @@ export interface ScenarioGraph {
 }
 
 // 1.1.0 — Sprint 2D.3 populated the reserved `actions[]` section for the first
-// time (MINOR bump per the contract's versioning rule: a new section slot
-// populated for the first time is backward-compatible/additive).
-export const SCENARIO_GRAPH_SCHEMA_VERSION = '1.1.0';
+//         time (MINOR bump per the contract's versioning rule).
+// 1.2.0 — Sprint 2D.4 populated the reserved `assertions[]` section for the
+//         first time (MINOR bump — a new section slot populated for the first
+//         time is backward-compatible/additive).
+// 1.2.1 — Sprint 2D.4 review: added the optional `assertions[].afterAction`
+//         semantic action reference. PATCH (not MINOR) per the contract's own
+//         versioning rule: an ADDITIVE OPTIONAL FIELD within an already-populated
+//         section is backward-compatible — a reader that omits it is unaffected.
+export const SCENARIO_GRAPH_SCHEMA_VERSION = '1.2.1';
 
 /* ------------------------------------------------------------------ */
 /*  Pure helpers                                                       */

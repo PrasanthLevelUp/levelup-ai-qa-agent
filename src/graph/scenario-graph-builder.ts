@@ -23,7 +23,9 @@ import { validateCanonicalTestCases } from '../engines/canonical-validator';
 import {
   getScenarioSemantics,
   getScenarioActionTemplate,
+  getScenarioAssertionTemplate,
   type ScenarioActionTemplate,
+  type ScenarioAssertionTemplate,
 } from '../engines/qa-knowledge-engine';
 import { datasetResolver, type Dataset } from '../engines/dataset-resolver';
 import {
@@ -35,6 +37,7 @@ import {
   type ScenarioSource,
   type ScenarioSemantics,
   type ScenarioAction,
+  type ScenarioAssertion,
   SCENARIO_GRAPH_SCHEMA_VERSION,
   computeFingerprint,
 } from './scenario-graph';
@@ -199,6 +202,96 @@ export function materializeActionTemplate(
   });
 }
 
+/**
+ * Derive the STABLE SEMANTIC slug for an assertion from its business meaning —
+ * NOT its position. This is what makes an assertion id survive reordering, so
+ * Coverage / Healing / Replay / Analytics can reference a specific check
+ * (`auth-neg-password.text.login_error`) that stays valid even when the KB
+ * inserts a new check before it. The slug is `<type>.<subject>` where `subject`
+ * is, in priority order:
+ *   • the canonical `target` (`login_error`, `authenticated_landing`), else
+ *   • the reference NAME behind a `@page.*` / `@messages.*` `expected`
+ *     (`inventory`, `invalid_credentials`) — the semantic identity of a
+ *     page-level check that carries no element target, else
+ *   • the bare `type` (a structural check with neither target nor reference).
+ * App vocabulary never enters the slug: a `@page.*` / `@messages.*` reference
+ * contributes only its symbolic NAME, never a resolved URL/message.
+ */
+function assertionSlug(check: ScenarioAssertionTemplate): string {
+  const ref = (prefix: string): string | null => {
+    const raw = typeof check.expected === 'string' ? check.expected : '';
+    return raw.startsWith(prefix) ? raw.slice(prefix.length).trim().toLowerCase() : null;
+  };
+  const subject =
+    check.target ??
+    ref('@page.') ??
+    ref('@messages.') ??
+    null;
+  return subject ? `${check.type}.${subject}` : check.type;
+}
+
+/**
+ * MATERIALIZE a KB-authored assertion TEMPLATE into the graph's canonical
+ * {@link ScenarioAssertion}[]. The EXACT mirror of {@link materializeActionTemplate}
+ * for verifications — the builder's only job with assertions, and deliberately
+ * minimal. It adds STRUCTURE (identity + order), nothing else:
+ *   • assigns a STABLE SEMANTIC `id` (`<scenarioId>.<type>.<subject>`, see
+ *     {@link assertionSlug}) derived from the check's business meaning, NOT its
+ *     array position — so the id survives insertions/reordering and downstream
+ *     consumers (Coverage, Healing, Replay, Analytics) can reference a specific
+ *     check by a durable name. Duplicate slugs within one scenario are
+ *     disambiguated with a deterministic `#n` suffix (encounter order);
+ *   • sets `order` to the array index (a faithful copy of the KB order, the
+ *     authoritative EXECUTION order — never a re-sort);
+ *   • copies `type`, `target`, `expected`, `optional` and `afterAction` VERBATIM
+ *     (`afterAction` is the KB's reference to the producing action — the EXACT
+ *     `ScenarioAction.id` (`<scenarioId>.<action>.<target>`) that
+ *     {@link materializeActionTemplate} assigns; the builder copies it, never
+ *     re-derives it, and a consumer resolves it with a plain
+ *     `node.actions.find(a => a.id === assertion.afterAction)` — no helper).
+ *
+ * It does NOT invent, add, drop, or reorder checks (the set is the KB's — "the
+ * builder may materialize assertions, but it must never invent them"), and it
+ * does NOT translate targets or resolve `@page.*` / `@messages.*` references into
+ * the application's vocabulary. Targets stay CANONICAL (`login_error`, not
+ * `[data-test="error"]`) and references stay symbolic: grounding a canonical
+ * target to a locator, and a reference to a concrete URL/message, is the
+ * Execution Resolver's job inside Script Gen, at emit time.
+ *
+ * Pure and deterministic: identical inputs ⇒ identical output.
+ */
+export function materializeAssertionTemplate(
+  scenarioId: string,
+  template: readonly ScenarioAssertionTemplate[],
+): ScenarioAssertion[] {
+  // Count slug occurrences so a repeated semantic identity gets a stable `#n`
+  // suffix instead of silently colliding. Two byte-identical checks are
+  // semantically the same assertion, so which one wins `#1` is irrelevant; the
+  // point is that every id is UNIQUE and DETERMINISTIC for a given input.
+  const seen = new Map<string, number>();
+  return template.map((check, i) => {
+    const slug = assertionSlug(check);
+    const n = (seen.get(slug) ?? 0) + 1;
+    seen.set(slug, n);
+    const id = n === 1 ? `${scenarioId}.${slug}` : `${scenarioId}.${slug}#${n}`;
+    const assertion: ScenarioAssertion = {
+      id,
+      order: i,
+      type: check.type,
+    };
+    if (check.target !== undefined) assertion.target = check.target;
+    if (check.expected !== undefined) assertion.expected = check.expected;
+    if (check.optional !== undefined) assertion.optional = check.optional;
+    // The action reference is COPIED VERBATIM (like target/expected) — the
+    // builder never invents or re-derives it. It is the producing step's EXACT
+    // `ScenarioAction.id`; integrity (it matches a real action id in this
+    // scenario) is the KB's responsibility, enforced by the qa-knowledge
+    // assertions invariant test.
+    if (check.afterAction !== undefined) assertion.afterAction = check.afterAction;
+    return assertion;
+  });
+}
+
 /* ------------------------------------------------------------------ */
 /*  Builder                                                            */
 /* ------------------------------------------------------------------ */
@@ -244,6 +337,15 @@ export interface NodeMetaLike {
    * its legacy step parser.
    */
   actions?: ScenarioAction[];
+  /**
+   * The scenario's canonical executable assertions, materialized from the KB
+   * assertion template (`getScenarioAssertionTemplate` → `materializeAssertionTemplate`)
+   * by the caller. Targets stay CANONICAL and `@page.*` / `@messages.*` references
+   * stay symbolic; the Execution Resolver in Script Gen grounds them. Absent when
+   * the KB has no authored template — the node then carries no `assertions` and
+   * Script Gen falls back to its legacy assertion inference.
+   */
+  assertions?: ScenarioAssertion[];
 }
 
 export interface AssembleGraphArgs {
@@ -289,6 +391,7 @@ function nodesFromCases(
       objective: tc.objective ?? m.objective ?? '',
       ...(m.semantics ? { semantics: m.semantics } : {}),
       ...(m.actions && m.actions.length ? { actions: m.actions } : {}),
+      ...(m.assertions && m.assertions.length ? { assertions: m.assertions } : {}),
       coverageType: m.coverageType ?? 'positive',
       priority: tc.priority as ScenarioPriority,
       severity: tc.severity as ScenarioSeverity,
@@ -386,10 +489,21 @@ export function buildScenarioGraph(
   // Resolver's job in Script Gen. Scenarios with no authored template get no
   // entry, so their nodes carry no `actions`.
   const actionsById = new Map<string, ScenarioAction[]>();
+  // Materialize each planned scenario's KB assertion TEMPLATE ONCE, same keying.
+  // Exactly mirrors actions: the KB owns the verification set
+  // (`getScenarioAssertionTemplate`, authored-or-null — never invented); the
+  // builder only materializes structure (`id`/`order`) via
+  // `materializeAssertionTemplate` and copies type/target/expected VERBATIM. It
+  // does NOT translate targets or resolve `@page.*` / `@messages.*` references —
+  // that grounding is the Execution Resolver's job in Script Gen. Scenarios with
+  // no authored template get no entry, so their nodes carry no `assertions`.
+  const assertionsById = new Map<string, ScenarioAssertion[]>();
   for (const s of plan.scenarios) {
     semanticsById.set(s.id, getScenarioSemantics(s));
     const template = getScenarioActionTemplate(s);
     if (template) actionsById.set(s.id, materializeActionTemplate(s.id, template));
+    const assertionTemplate = getScenarioAssertionTemplate(s);
+    if (assertionTemplate) assertionsById.set(s.id, materializeAssertionTemplate(s.id, assertionTemplate));
   }
 
   // The arrays are index-aligned (all derived from `drafts` in order):
@@ -400,6 +514,7 @@ export function buildScenarioGraph(
     objective: d.objective,
     semantics: semanticsById.get(d.scenarioId),
     actions: actionsById.get(d.scenarioId),
+    assertions: assertionsById.get(d.scenarioId),
   }));
 
   return assembleScenarioGraph({

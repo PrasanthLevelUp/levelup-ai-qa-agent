@@ -182,6 +182,77 @@ export interface ScenarioActionTemplate {
 }
 
 /**
+ * The FROZEN, closed set of assertion types a KB assertion template entry may
+ * carry. Redeclared here — identical to the graph's `AssertionType` — to keep
+ * the Knowledge Base decoupled from the graph module, exactly as
+ * `ScenarioActionKind` is redeclared rather than imported. These describe a
+ * checkable PROPERTY of the page/element (never a Playwright call); Script Gen
+ * maps each to a concrete `expect(...)` at emit time. Deliberately excludes
+ * scenario-shaped values (`success`/`failure`/`login`/`logout`) — those are
+ * SCENARIOS, not assertions.
+ */
+export type AssertionType =
+  | 'url'
+  | 'visible'
+  | 'hidden'
+  | 'enabled'
+  | 'disabled'
+  | 'checked'
+  | 'unchecked'
+  | 'text'
+  | 'value'
+  | 'count'
+  | 'attribute';
+
+/**
+ * One authored entry of a scenario's canonical VERIFICATION set — the KB's
+ * expression of "what must be TRUE after the actions run?". The Knowledge Base
+ * owns this because it — not a natural-language `expectedResult` parser — is the
+ * authority on what a valid login, a rejected login, or a logout PROVES.
+ *
+ * The builder turns each template entry into a graph `ScenarioAssertion` by
+ * assigning a deterministic `id`/`order` from the array position — never
+ * reordering, never translating the target/expected into the app's vocabulary.
+ * Targets stay CANONICAL (`login_error`, `logout_button`) and `@page.*` /
+ * `@messages.*` references stay symbolic; the Execution Resolver in Script Gen
+ * grounds them to a concrete locator/URL/message at emit time. Deliberately
+ * carries NO id/order (structural, assigned by the builder) and NO locator/CSS.
+ */
+export interface ScenarioAssertionTemplate {
+  /** The checkable property (see {@link AssertionType}). */
+  type: AssertionType;
+  /**
+   * Abstract SEMANTIC target — an element identity (e.g. `login_error`,
+   * `logout_button`, `authenticated_landing`, `password`). Absent for page-level
+   * checks (`url`). NEVER a locator or CSS selector.
+   */
+  target?: string;
+  /**
+   * Optional literal (`true`, `6`, `type=password`) OR a semantic reference the
+   * Execution Resolver grounds: `@page.<name>` → a concrete URL/route, or
+   * `@messages.<name>` → a concrete UI message. Structural types
+   * (`visible`/`hidden`/…) need no `expected`.
+   */
+  expected?: string | number | boolean;
+  /** When true the check is skipped if its target is absent in the app. */
+  optional?: boolean;
+  /**
+   * Optional reference to the action this check runs *after* — the EXACT
+   * `ScenarioAction.id` of a step in THIS scenario's `actionTemplate`
+   * (`<scenarioId>.<action>.<target>`, e.g. `auth-pos-valid.click.login_button`).
+   * The KB — the authority on the sequence — declares it; the builder copies it
+   * VERBATIM onto the graph `ScenarioAssertion.afterAction`. It is identity, not
+   * position: it is the step's ONE canonical id, never an array index and never a
+   * separate slug — so a consumer resolves it with a plain
+   * `node.actions.find(a => a.id === afterAction)`, no computation. Author it only
+   * when the scenario HAS an `actionTemplate` to reference; omit it otherwise. The
+   * qa-knowledge assertions invariant test rejects any afterAction that does not
+   * match a real action id in the same scenario (no dangling references).
+   */
+  afterAction?: string;
+}
+
+/**
  * A single baseline scenario the category implies. This is the deterministic
  * "obligation" — the LLM later expands it into concrete, grounded test cases.
  */
@@ -245,6 +316,19 @@ export interface PlannedScenario {
    * a guessed action sequence is worse than none.
    */
   actionTemplate?: ScenarioActionTemplate[];
+  /**
+   * The canonical VERIFICATION set for this scenario — what must be TRUE after
+   * the actions run. Authored here because the Knowledge Base — not a prose
+   * `expectedResult` parser — is the authority on what a valid login, a rejected
+   * login, or a logout PROVES. When present the builder materializes each entry
+   * onto the node's `assertions[]` and Script Gen renders them directly (no
+   * inference). When omitted, `getScenarioAssertionTemplate` returns `null` and
+   * Script Gen falls back to its legacy assertion inference — so this is purely
+   * additive. Entries carry CANONICAL targets (`login_error`, `logout_button`)
+   * and symbolic `@page.*` / `@messages.*` references; grounding them to concrete
+   * locators/URLs/messages happens downstream (Execution Resolver), never here.
+   */
+  assertionTemplate?: ScenarioAssertionTemplate[];
   /**
    * Recognition vocabulary: lowercase terms that let this Knowledge layer
    * RECOGNISE the scenario in the explicit evidence (Acceptance Criteria,
@@ -413,6 +497,10 @@ export const QA_KNOWLEDGE_BASE: Record<Exclude<QACategory, 'generic'>, PlannedSc
         { action: 'fill', target: 'username', value: '@dataset.username' },
         { action: 'fill', target: 'password', value: '@dataset.password' },
         { action: 'click', target: 'login_button' },
+      ],
+      assertionTemplate: [
+        { type: 'url', expected: '@page.inventory', afterAction: 'auth-pos-valid.click.login_button' },
+        { type: 'visible', target: 'authenticated_landing', afterAction: 'auth-pos-valid.click.login_button' },
       ] },
     { id: 'auth-neg-wrong-password', title: 'Invalid password is rejected', objective: 'A wrong password does not authenticate and a clear, non-leaking error is shown.', coverageType: 'negative', priority: 'P0', riskArea: 'Unauthorized access', obligation: { level: 'required', condition: 'always' },
       semantics: { variableUnderTest: 'password', preconditions: 'a registered user with the correct username and correct password', variation: 'the password is replaced with an incorrect value (the username stays valid)', expectedBehavior: 'authentication is rejected with a generic error and the user stays on the login page', requiredDataRole: 'registered_user' },
@@ -421,6 +509,11 @@ export const QA_KNOWLEDGE_BASE: Record<Exclude<QACategory, 'generic'>, PlannedSc
         { action: 'fill', target: 'username', value: '@dataset.username' },
         { action: 'fill', target: 'password', value: 'wrong-password' },
         { action: 'click', target: 'login_button' },
+      ],
+      assertionTemplate: [
+        { type: 'visible', target: 'login_error', afterAction: 'auth-neg-wrong-password.click.login_button' },
+        { type: 'text', target: 'login_error', expected: '@messages.invalid_credentials', afterAction: 'auth-neg-wrong-password.click.login_button' },
+        { type: 'url', expected: '@page.login', afterAction: 'auth-neg-wrong-password.click.login_button' },
       ] },
     { id: 'auth-neg-empty-fields', title: 'Empty required fields are rejected', objective: 'Submitting with blank username and/or password is blocked with field-level validation.', coverageType: 'negative', priority: 'P1', riskArea: 'Input validation', obligation: { level: 'required', condition: 'always' },
       semantics: { variableUnderTest: 'a required field', preconditions: 'a registered user with the correct username and correct password', variation: 'exactly ONE required field is left blank while the other stays valid', expectedBehavior: 'field-level validation blocks submission before authentication is attempted', requiredDataRole: 'registered_user' },
@@ -428,6 +521,11 @@ export const QA_KNOWLEDGE_BASE: Record<Exclude<QACategory, 'generic'>, PlannedSc
         { action: 'navigate', target: 'login_page' },
         { action: 'fill', target: 'username', value: '@dataset.username' },
         { action: 'click', target: 'login_button' },
+      ],
+      assertionTemplate: [
+        { type: 'visible', target: 'login_error', afterAction: 'auth-neg-empty-fields.click.login_button' },
+        { type: 'text', target: 'login_error', expected: '@messages.password_required', afterAction: 'auth-neg-empty-fields.click.login_button' },
+        { type: 'url', expected: '@page.login', afterAction: 'auth-neg-empty-fields.click.login_button' },
       ] },
     { id: 'auth-neg-unknown-user', title: 'Unknown / non-existent user is rejected', objective: 'An unregistered identifier cannot authenticate and the error does not reveal whether the account exists.', coverageType: 'negative', priority: 'P1', riskArea: 'Account enumeration', conditionalOnKeywords: ['unknown', 'non-existent', 'nonexistent', 'not registered', 'unregistered', 'enumerat', 'no account', 'does not exist'],
       semantics: { variableUnderTest: 'username', preconditions: 'a valid password paired with a registered username', variation: 'the username is replaced with an unregistered identifier (the password stays valid)', expectedBehavior: 'authentication is rejected with a non-enumerating error that does not reveal whether the account exists', requiredDataRole: 'unregistered_user' },
@@ -440,25 +538,66 @@ export const QA_KNOWLEDGE_BASE: Record<Exclude<QACategory, 'generic'>, PlannedSc
         { action: 'fill', target: 'username', value: 'unregistered_user' },
         { action: 'fill', target: 'password', value: '@dataset.password' },
         { action: 'click', target: 'login_button' },
+      ],
+      assertionTemplate: [
+        { type: 'visible', target: 'login_error', afterAction: 'auth-neg-unknown-user.click.login_button' },
+        { type: 'text', target: 'login_error', expected: '@messages.invalid_credentials', afterAction: 'auth-neg-unknown-user.click.login_button' },
+        { type: 'url', expected: '@page.login', afterAction: 'auth-neg-unknown-user.click.login_button' },
       ] },
     { id: 'auth-neg-locked-user', title: 'Locked / disabled account cannot log in', objective: 'A locked or disabled account is refused even with correct credentials.', coverageType: 'negative', priority: 'P1', riskArea: 'Account state enforcement', conditionalOnKeywords: ['lock', 'disable', 'suspend', 'attempt'],
-      semantics: { variableUnderTest: 'account state', preconditions: 'a registered user with the correct username and correct password', variation: 'the account is in a locked / disabled state while the credentials remain correct', expectedBehavior: 'authentication is refused with a locked/disabled-account message despite correct credentials', requiredDataRole: 'locked_account' } },
+      semantics: { variableUnderTest: 'account state', preconditions: 'a registered user with the correct username and correct password', variation: 'the account is in a locked / disabled state while the credentials remain correct', expectedBehavior: 'authentication is refused with a locked/disabled-account message despite correct credentials', requiredDataRole: 'locked_account' },
+      assertionTemplate: [
+        { type: 'visible', target: 'login_error' },
+        { type: 'text', target: 'login_error', expected: '@messages.locked_out' },
+        { type: 'url', expected: '@page.login' },
+      ] },
     { id: 'auth-edge-whitespace-case', title: 'Whitespace / case handling on identifier', objective: 'Leading/trailing whitespace is trimmed and identifier case is handled per the rule (case-insensitive email, etc.).', coverageType: 'edge_cases', priority: 'P2', riskArea: 'Input normalization', conditionalOnKeywords: ['whitespace', 'trim', 'case-insensitive', 'case sensitive', 'case-sensitive', 'lowercase', 'uppercase', 'normali'],
-      semantics: { variableUnderTest: 'identifier formatting', preconditions: 'a registered user with the correct username and correct password', variation: 'only the identifier formatting is altered (surrounding whitespace or letter case) while the underlying value stays correct', expectedBehavior: 'the identifier is normalized per the rule and authentication succeeds as if entered cleanly', requiredDataRole: 'registered_user' } },
+      semantics: { variableUnderTest: 'identifier formatting', preconditions: 'a registered user with the correct username and correct password', variation: 'only the identifier formatting is altered (surrounding whitespace or letter case) while the underlying value stays correct', expectedBehavior: 'the identifier is normalized per the rule and authentication succeeds as if entered cleanly', requiredDataRole: 'registered_user' },
+      assertionTemplate: [
+        { type: 'url', expected: '@page.inventory' },
+        { type: 'visible', target: 'authenticated_landing' },
+      ] },
     { id: 'auth-neg-invalid-identifier-format', title: 'Malformed identifier format is rejected', objective: 'A malformed identifier (missing @, spaces, or invalid characters in an email login) is rejected with field-level validation before authentication is attempted.', coverageType: 'negative', priority: 'P2', riskArea: 'Input validation', conditionalOnKeywords: ['email', 'format', 'malformed', 'valid email', 'invalid email', 'identifier'],
-      semantics: { variableUnderTest: 'identifier format', preconditions: 'a valid password paired with a well-formed registered identifier', variation: 'the identifier is replaced with a malformed value (e.g. missing @ / invalid characters) while the password stays valid', expectedBehavior: 'field-level format validation rejects it before authentication is attempted', requiredDataRole: 'registered_user' } },
+      semantics: { variableUnderTest: 'identifier format', preconditions: 'a valid password paired with a well-formed registered identifier', variation: 'the identifier is replaced with a malformed value (e.g. missing @ / invalid characters) while the password stays valid', expectedBehavior: 'field-level format validation rejects it before authentication is attempted', requiredDataRole: 'registered_user' },
+      assertionTemplate: [
+        { type: 'visible', target: 'login_error' },
+        { type: 'url', expected: '@page.login' },
+      ] },
     { id: 'auth-sec-injection', title: 'Injection-style credentials are handled safely', objective: 'SQL/script injection strings in the username or password neither authenticate nor error out — they are treated as ordinary invalid input.', coverageType: 'security', priority: 'P1', riskArea: 'Injection safety', conditionalOnKeywords: ['injection', 'sql', 'script', 'xss', 'saniti', 'malicious', 'special character'],
-      semantics: { variableUnderTest: 'input payload', preconditions: 'a valid credential pair entered into the login form', variation: 'one credential field carries an SQL/script injection payload instead of an ordinary value', expectedBehavior: 'the payload neither authenticates nor triggers an error/crash — it is treated as ordinary invalid input', requiredDataRole: 'registered_user' } },
+      semantics: { variableUnderTest: 'input payload', preconditions: 'a valid credential pair entered into the login form', variation: 'one credential field carries an SQL/script injection payload instead of an ordinary value', expectedBehavior: 'the payload neither authenticates nor triggers an error/crash — it is treated as ordinary invalid input', requiredDataRole: 'registered_user' },
+      assertionTemplate: [
+        { type: 'visible', target: 'login_error' },
+        { type: 'url', expected: '@page.login' },
+      ] },
     { id: 'auth-edge-password-masking', title: 'Password input is masked and not exposed', objective: 'The password field masks entry and the value is not exposed in the DOM, page source, autocomplete, or logs.', coverageType: 'edge_cases', priority: 'P2', riskArea: 'Credential exposure', conditionalOnKeywords: ['mask', 'masked', 'hidden', 'plain text', 'plaintext', 'visible', 'obscure', 'autocomplete'],
-      semantics: { variableUnderTest: 'none (UI/security property observation)', preconditions: 'a user typing a correct password into the login form', variation: 'none — the entered value is observed, not changed', expectedBehavior: 'the password is masked on screen and never exposed in the DOM, page source, autocomplete, or logs', requiredDataRole: 'registered_user' } },
+      semantics: { variableUnderTest: 'none (UI/security property observation)', preconditions: 'a user typing a correct password into the login form', variation: 'none — the entered value is observed, not changed', expectedBehavior: 'the password is masked on screen and never exposed in the DOM, page source, autocomplete, or logs', requiredDataRole: 'registered_user' },
+      assertionTemplate: [
+        { type: 'attribute', target: 'password', expected: 'type=password' },
+      ] },
     { id: 'auth-sec-lockout-threshold', title: 'Account lockout after repeated failures', objective: 'After the configured number of failed attempts the account is locked / throttled.', coverageType: 'security', priority: 'P1', riskArea: 'Brute-force resistance', conditionalOnKeywords: ['lock', 'attempt', 'brute', 'throttle', 'rate'],
-      semantics: { variableUnderTest: 'number of consecutive failed attempts', preconditions: 'a registered account with correct credentials available', variation: 'authentication is attempted with a wrong password repeatedly up to and past the configured threshold', expectedBehavior: 'after the threshold the account is locked / throttled and further attempts are refused', requiredDataRole: 'registered_user' } },
+      semantics: { variableUnderTest: 'number of consecutive failed attempts', preconditions: 'a registered account with correct credentials available', variation: 'authentication is attempted with a wrong password repeatedly up to and past the configured threshold', expectedBehavior: 'after the threshold the account is locked / throttled and further attempts are refused', requiredDataRole: 'registered_user' },
+      assertionTemplate: [
+        { type: 'visible', target: 'login_error' },
+        { type: 'text', target: 'login_error', expected: '@messages.locked_out' },
+        { type: 'url', expected: '@page.login' },
+      ] },
     { id: 'auth-sec-session', title: 'Session established and protected', objective: 'A session/token is issued on login and protected resources reject requests without it.', coverageType: 'security', priority: 'P1', riskArea: 'Session management', conditionalOnKeywords: ['session', 'token', 'timeout', 'expire'],
-      semantics: { variableUnderTest: 'presence of a valid session', preconditions: 'a user who has logged in successfully and holds a valid session/token', variation: 'a protected resource is requested WITHOUT the valid session/token', expectedBehavior: 'the request without a session is rejected while the authenticated session can reach the resource', requiredDataRole: 'registered_user' } },
+      semantics: { variableUnderTest: 'presence of a valid session', preconditions: 'a user who has logged in successfully and holds a valid session/token', variation: 'a protected resource is requested WITHOUT the valid session/token', expectedBehavior: 'the request without a session is rejected while the authenticated session can reach the resource', requiredDataRole: 'registered_user' },
+      assertionTemplate: [
+        { type: 'url', expected: '@page.login' },
+      ] },
     { id: 'auth-pos-remember-me', title: 'Remember-me persists the session', objective: 'When remember-me is selected the session persists across browser restarts per policy.', coverageType: 'positive', priority: 'P2', riskArea: 'Session persistence', conditionalOnKeywords: ['remember'],
-      semantics: { variableUnderTest: 'remember-me option', preconditions: 'a valid login with the remember-me option left unselected', variation: 'the remember-me option is selected at login (credentials stay valid)', expectedBehavior: 'the session persists across a browser restart per the remember-me policy', requiredDataRole: 'registered_user' } },
+      semantics: { variableUnderTest: 'remember-me option', preconditions: 'a valid login with the remember-me option left unselected', variation: 'the remember-me option is selected at login (credentials stay valid)', expectedBehavior: 'the session persists across a browser restart per the remember-me policy', requiredDataRole: 'registered_user' },
+      assertionTemplate: [
+        { type: 'url', expected: '@page.inventory' },
+        { type: 'visible', target: 'authenticated_landing' },
+      ] },
     { id: 'auth-pos-logout', title: 'Logout ends the session', objective: 'Logging out invalidates the session and protected pages are no longer reachable.', coverageType: 'positive', priority: 'P1', riskArea: 'Session termination', conditionalOnKeywords: ['logout', 'log out', 'sign out', 'session'],
-      semantics: { variableUnderTest: 'session validity after logout', preconditions: 'a user logged in with a valid, active session', variation: 'the user logs out, then a protected page is requested with the now-ended session', expectedBehavior: 'the session is invalidated and protected pages are no longer reachable', requiredDataRole: 'registered_user' } },
+      semantics: { variableUnderTest: 'session validity after logout', preconditions: 'a user logged in with a valid, active session', variation: 'the user logs out, then a protected page is requested with the now-ended session', expectedBehavior: 'the session is invalidated and protected pages are no longer reachable', requiredDataRole: 'registered_user' },
+      assertionTemplate: [
+        { type: 'url', expected: '@page.login' },
+        { type: 'visible', target: 'login_button' },
+      ] },
   ],
   crud: [
     { id: 'crud-pos-create', title: 'Create a record with valid data', objective: 'A record is created and persisted with valid input and confirmation is shown.', coverageType: 'positive', priority: 'P0', riskArea: 'Data creation', core: true },
@@ -633,6 +772,30 @@ export function getScenarioSemantics(scenario: PlannedScenario): ScenarioSemanti
 export function getScenarioActionTemplate(scenario: PlannedScenario): ScenarioActionTemplate[] | null {
   if (scenario.actionTemplate && scenario.actionTemplate.length > 0) {
     return scenario.actionTemplate;
+  }
+  return null;
+}
+
+/**
+ * Resolve a scenario's canonical VERIFICATION set — the KB's answer to "what must
+ * be TRUE after the actions run?" that Script Gen renders directly instead of
+ * inferring it back out of the natural-language `expectedResult`.
+ *
+ * Like {@link getScenarioActionTemplate}, this is a pure KB lookup — NOT inference
+ * and NOT a fallible default. A guessed assertion is worse than none: it would make
+ * Script Gen assert the wrong thing and pass/fail for the wrong reason. So this
+ * returns the authored template when present and `null` otherwise — the KB never
+ * invents a check. On `null`, Script Gen keeps using its legacy assertion inference,
+ * so uncurated scenarios are unaffected.
+ *
+ * The returned entries carry CANONICAL targets (`login_error`, `logout_button`, …)
+ * and symbolic `@page.*` / `@messages.*` references; grounding targets to the app
+ * and resolving those references to concrete URLs/messages happens downstream
+ * (Execution Resolver in Script Gen), never here.
+ */
+export function getScenarioAssertionTemplate(scenario: PlannedScenario): ScenarioAssertionTemplate[] | null {
+  if (scenario.assertionTemplate && scenario.assertionTemplate.length > 0) {
+    return scenario.assertionTemplate;
   }
   return null;
 }
