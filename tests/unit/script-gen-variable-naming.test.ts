@@ -11,10 +11,14 @@
  *   after  →  const lockedAccount = getRecord("locked_users")
  *
  * How the name is chosen (Rule #1 — never infer):
- *   • The name comes ONLY from existing metadata — the graph node's declared
- *     `requiredDataRole` — mechanically camelCased by the single resolver
+ *   • The name comes ONLY from existing metadata — the scenario's declared data
+ *     ROLE — mechanically converted to an identifier by the single resolver
  *     `resolveDatasetVarName`. There is NO synonym/dictionary/NLP/AI step:
  *     `locked_account` → `lockedAccount` (NOT `lockedUser`).
+ *   • The role source is read future-first: the Graph Schema 2.0 home
+ *     `resources.dataRoles` is preferred, falling back to the @deprecated
+ *     `semantics.requiredDataRole`, so the deprecated field can be removed later
+ *     without touching Script Gen.
  *   • The generic `valid_data` role is not a business actor, so it keeps the
  *     historical neutral `user`.
  *   • Legacy / greenfield cases with no graph node also keep `user`, so every
@@ -23,10 +27,12 @@
  * The invariants this suite locks in:
  *   (1) the resolver maps each real role to its camelCase name, deterministically
  *   (2) generic `valid_data`, empty, and absent nodes fall back to `user`
+ *   (2c) `resources.dataRoles` is preferred over the deprecated `requiredDataRole`
  *   (3) end-to-end: the declaration AND every read use the SAME business name
  *   (4) no collisions / no `user2` suffixes, one object → one name (Rule #3/#5)
  *   (5) legacy path (no scenarioGraphNodes) still emits `const user` (back-compat)
  *   (6) deterministic — same node in ⇒ same name out
+ *   (7) the same role resolved twice never gains a numeric suffix (registeredUser1)
  */
 
 import { ScriptGenEngine } from '../../src/script-gen/script-gen-engine';
@@ -68,6 +74,15 @@ const mkNode = (role: string): any => ({
     variation: 'valid',
     expectedBehavior: 'the account is locked out',
   },
+});
+
+// A Graph Schema 2.0 node that carries the role in the future `resources` home
+// (an array, per the Execution Graph contract §3, e.g. ["registered_user"]).
+const mkResourcesNode = (roles: string[] | string, semanticsRole?: string): any => ({
+  resources: { dataRoles: roles },
+  semantics: semanticsRole
+    ? { requiredDataRole: semanticsRole, variableUnderTest: 'x', variation: 'y', expectedBehavior: 'z' }
+    : undefined,
 });
 
 // The "locked valid-credentials" case forces the getRecord READ path (login
@@ -125,6 +140,23 @@ describe('Sprint 3.5 — ScriptGen dataset variable naming (role → camelCase)'
     expect(resolve('  locked_account  ')).toBe('lockedAccount');
   });
 
+  // (2c) FUTURE-PROOF source: the resolver reads the Graph Schema 2.0 home
+  //      (`resources.dataRoles`) FIRST, and only falls back to the deprecated
+  //      `semantics.requiredDataRole`. This lets the deprecated field be deleted
+  //      later without touching Script Gen.
+  it('(2c) resources.dataRoles is preferred over the deprecated requiredDataRole', () => {
+    const R = (node: any) => (engine as any).resolveDatasetVarName(node);
+    // array form (contract shape) — first non-empty role wins
+    expect(R(mkResourcesNode(['registered_user']))).toBe('registeredUser');
+    // resources present → deprecated field is ignored even if it disagrees
+    expect(R(mkResourcesNode(['locked_account'], 'registered_user'))).toBe('lockedAccount');
+    // empty/garbage resources → fall back to the deprecated field
+    expect(R(mkResourcesNode([], 'registered_user'))).toBe('registeredUser');
+    expect(R(mkResourcesNode([''], 'unregistered_user'))).toBe('unregisteredUser');
+    // string form (defensive) is also accepted
+    expect(R({ resources: { dataRoles: 'locked_account' } })).toBe('lockedAccount');
+  });
+
   // (3) end-to-end: the DECLARATION and the READS both use the business name.
   it('(3) end-to-end: declaration and reads both use the business-role name', async () => {
     const spec = await generateLocked('locked_account');
@@ -158,5 +190,18 @@ describe('Sprint 3.5 — ScriptGen dataset variable naming (role → camelCase)'
       .toBe((b as any).resolveDatasetVarName(mkNode('registered_user')));
     const [s1, s2] = await Promise.all([generateLocked('locked_account'), generateLocked('locked_account')]);
     expect(s1).toBe(s2);
+  });
+
+  // (7) the SAME role resolved twice yields the IDENTICAL name — never a
+  //     disambiguating numeric suffix (`registeredUser1`). The resolver is a pure
+  //     function of the role, so repetition is stable by construction: two calls
+  //     both return `registeredUser`, proving no hidden counter/uniquifier state.
+  it('(7) the same role never gains a numeric suffix on repeat resolution', () => {
+    const first = resolve('registered_user');
+    const second = resolve('registered_user');
+    expect(first).toBe('registeredUser');
+    expect(second).toBe('registeredUser'); // NOT registeredUser1
+    expect(first).toBe(second);
+    expect(second).not.toMatch(/\d$/); // categorically no trailing digit
   });
 });
