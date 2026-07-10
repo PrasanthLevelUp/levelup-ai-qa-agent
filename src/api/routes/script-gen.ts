@@ -59,6 +59,7 @@ import { KnowledgeOptimizer, type KnowledgeItem } from '../../ai/knowledge-optim
 import { AIReviewEngine } from '../../script-gen/ai-review-engine';
 import { ValidationRunner, computeReliabilityBreakdown, toPublicReliability } from '../../script-gen/validation-runner';
 import { ProjectExportEngine } from '../../script-gen/project-export-engine';
+import { deterministicMetrics } from '../../ai/generation-metrics';
 import {
   createBranch,
   commitAll,
@@ -1149,6 +1150,12 @@ export function createScriptGenRouter(): Router {
           // frozen public contract.
           reliability: toPublicReliability(reliabilityBreakdown),
           stats: result.stats,
+          // Structured token/usage metrics captured from the provider's own
+          // `usage` object (never estimated). `null` totals mean the provider
+          // returned no usage (unknown); `0` with cacheHit means a genuine
+          // deterministic/cached generation. The UI derives cost from current
+          // pricing — we persist tokens, not a frozen cost.
+          generationMetrics: result.generationMetrics,
           generationTimeMs,
           errors: result.errors,
           // Auth metadata — never includes credential values
@@ -1538,6 +1545,8 @@ export function createScriptGenRouter(): Router {
           tokensUsed: 0,
           model: 'unknown',
         },
+        // Reconstructed from stored content — no LLM call happens here.
+        generationMetrics: deterministicMetrics({ model: 'export-reconstruction' }),
         errors: [],
       };
 
@@ -1611,6 +1620,8 @@ export function createScriptGenRouter(): Router {
         testPlan: script.test_plan || { name: 'export', description: '', baseUrl: script.url, pageType: 'unknown', flows: [], fixtures: [], pageObjects: [], metadata: { generatedAt: '', crawlTimeMs: 0, totalElements: 0, selectorQuality: 0, model: 'unknown', tokensUsed: 0 } },
         generatedFiles,
         stats: { totalTests: 0, totalAssertions: 0, avgSelectorScore: 0, pageObjectsGenerated: 0, crawlTimeMs: 0, generationTimeMs: 0, tokensUsed: 0, model: 'unknown' },
+        // Reconstructed from stored content — no LLM call happens here.
+        generationMetrics: deterministicMetrics({ model: 'export-reconstruction' }),
         errors: [],
       };
 
