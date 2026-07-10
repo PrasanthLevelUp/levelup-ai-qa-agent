@@ -610,6 +610,37 @@ export class ScriptGenEngine {
    * This is the core 2D.1 goal: Script Gen becomes a pure adapter FROM the graph,
    * not a re-inferencer.
    */
+  /**
+   * Sprint 2D.2 — Execution Graph owns the resolved dataset.
+   *
+   * Maps a graph-resolved dataset record's (opaque) field names onto a canonical
+   * `username` / `password` VALUE. The Execution Graph's `execution.resolvedDataset`
+   * is the single canonical source for the credential VALUES actually used by a
+   * run; Script Gen consumes it instead of re-deriving the valid baseline from
+   * step text or environment variables.
+   *
+   * Returns the raw string value (NOT yet escaped/quoted) or `null` when the
+   * dataset is absent or carries no field for the requested credential — in which
+   * case callers fall back to the legacy record / env chain (backward compatible).
+   *
+   * Kept as a named method (not just an inline closure) so the field-name mapping
+   * is unit-testable in isolation.
+   */
+  private resolveDatasetCredential(
+    values: Record<string, string> | null | undefined,
+    kind: 'username' | 'password',
+  ): string | null {
+    if (!values || typeof values !== 'object') return null;
+    const keys = kind === 'username'
+      ? ['username', 'user', 'email', 'userName', 'login', 'user_name']
+      : ['password', 'pass', 'pwd', 'passWord', 'pass_word'];
+    for (const k of keys) {
+      const v = values[k];
+      if (typeof v === 'string' && v.length > 0) return v;
+    }
+    return null;
+  }
+
   private deriveFromSemantics(
     semantics: import('../graph/scenario-graph').ScenarioSemantics,
     credentialResolver: ScenarioCredentialResolver,
@@ -3436,6 +3467,23 @@ ${gotoB}${sessionLogin('pageB')}
         const passFillVal = extractFillValue(passFillLine);
 
         const localDecls: string[] = [];
+        // Sprint 2D.2: the Execution Graph owns the dataset actually resolved
+        // for THIS run (execution.resolvedDataset). When present, the VALID
+        // baseline credential VALUES come from that single canonical source
+        // instead of being re-derived from step text / env vars. The
+        // semantics-driven variation logic (wrong / empty / valid) is
+        // unchanged — only the SOURCE of the valid baseline changes. Legacy
+        // extraction stays as the fallback for older graphs / non-graph runs,
+        // so this is purely additive.
+        const resolvedDatasetValues: Record<string, string> | null = (() => {
+          const rd = (tc as any).__scenarioNode?.execution?.resolvedDataset;
+          const values = rd?.values;
+          return values && typeof values === 'object' ? (values as Record<string, string>) : null;
+        })();
+        const resolvedCred = (kind: 'username' | 'password'): string | null => {
+          const raw = this.resolveDatasetCredential(resolvedDatasetValues, kind);
+          return raw != null ? `'${escapeStr(raw)}'` : null;
+        };
         // Resolve the BASE (data-bound) username/password expressions LAZILY.
         // Priority #2: if a record was loaded into `ctx.data.varName` (e.g. the
         // locked_users record → `user`), bind to it — even when the record has
@@ -3448,6 +3496,17 @@ ${gotoB}${sessionLogin('pageB')}
         const ensureBase = (): void => {
           if (baseComputed) return;
           baseComputed = true;
+          // Sprint 2D.2: prefer the graph-resolved dataset values as the valid
+          // baseline. Only taken when BOTH credentials are resolvable so the
+          // emitted login stays coherent; otherwise fall through to the legacy
+          // record / env chain untouched.
+          const rdUser = resolvedCred('username');
+          const rdPass = resolvedCred('password');
+          if (rdUser && rdPass) {
+            baseUser = rdUser;
+            basePass = rdPass;
+            return;
+          }
           if (ctx.data?.varName && ctx.data.hasUsername) {
             baseUser = `${ctx.data.varName}.username ?? ''`;
             basePass = ctx.data.hasPassword
@@ -3472,6 +3531,13 @@ ${gotoB}${sessionLogin('pageB')}
         // field is deliberately invalid and the OTHER must stay valid. Declared
         // as `validUser` for clarity in the emitted spec.
         const validCounterpart = (): { u?: string; p?: string } => {
+          // Sprint 2D.2: the graph-resolved dataset is the canonical valid
+          // counterpart when present (negative cases keep the OTHER field valid).
+          const rdUser = resolvedCred('username');
+          const rdPass = resolvedCred('password');
+          if (rdUser || rdPass) {
+            return { u: rdUser ?? undefined, p: rdPass ?? undefined };
+          }
           const valid = this.resolveValidUserRecord(index);
           const val = valid?.value && typeof valid.value === 'object' ? valid.value : null;
           if (valid && val && ('username' in val || 'password' in val)) {
