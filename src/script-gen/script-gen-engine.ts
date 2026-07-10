@@ -1253,7 +1253,7 @@ export class ScriptGenEngine {
     // via getRecord('<dataset>', selector?) and reads user.username/.password
     // from the schema. When no resolved data is supplied, fall back to literals.
     const dataIndex = this.buildTestDataIndexWithFallback(config, [tc]);
-    const caseData = this.resolveCaseData(tc, steps, dataIndex);
+    const caseData = this.resolveCaseData(tc, steps, dataIndex, scenarioNode);
     if (caseData) {
       // Hydrate creds from the resolved record so any literal fallbacks (and the
       // grounded selector parsing) have the real values too.
@@ -2542,6 +2542,32 @@ ${testBlocks.join('\n\n')}
   }
 
   /**
+   * Map a Scenario Graph requiredDataRole (a business role) to a dataset category.
+   * Example: "locked_user" → "locked", "registered_user" → "valid".
+   * Returns null when the role doesn't cleanly map to a known category (e.g.
+   * "guest" or "admin" roles that aren't standard auth fixtures).
+   */
+  private mapRoleToCategory(role: string): AuthDatasetCategory | null {
+    const r = role.toLowerCase();
+    // Locked / blocked / suspended accounts
+    if (/lock|blocked|suspended|disabled/.test(r)) return 'locked';
+    // Invalid password scenarios
+    if (/invalid.*pass|wrong.*pass|incorrect.*pass/.test(r)) return 'invalid_password';
+    // Unknown / unregistered user scenarios
+    if (/unknown|unregistered|nonexistent|ghost/.test(r)) return 'unknown_user';
+    // Empty username scenarios
+    if (/empty.*user|blank.*user|missing.*user/.test(r) && !/pass/.test(r)) return 'empty_username';
+    // Empty password scenarios
+    if (/empty.*pass|blank.*pass|missing.*pass/.test(r)) return 'empty_password';
+    // Generic invalid (not password-specific)
+    if (/invalid|wrong|incorrect/.test(r) && !/pass/.test(r)) return 'invalid';
+    // Valid / registered / standard user (positive path)
+    if (/valid|registered|standard|correct|active|happy|default|primary/.test(r)) return 'valid';
+    // No clean mapping
+    return null;
+  }
+
+  /**
    * True when a DATASET NAME belongs to the given scenario category. Matching is
    * TOKEN-based (de-pluralized words), never substring — so "valid_users" and
    * "invalid_password_users" are told apart cleanly (the latter tokenizes to
@@ -2581,8 +2607,57 @@ ${testBlocks.join('\n\n')}
     tc: NonNullable<GenerationConfig['testCase']>,
     steps: string[],
     index: Map<string, Map<string, any>>,
+    scenarioNode?: { semantics?: import('../graph/scenario-graph').ScenarioSemantics; execution?: import('../graph/scenario-graph').ScenarioExecution },
   ): { datasetName: string; recordKey: string; value: any; ref: string; representative: boolean } | null {
     if (!this.hasResolvedData(index)) return null;
+
+    // ── Sprint 3 · PR 3.2 — Business Intent Correctness ──────────────────────
+    // When the Scenario Graph has already resolved the correct dataset record
+    // (via the Dataset Resolver at graph-build time), REUSE it. The graph is the
+    // source of truth; Script Gen must not re-infer and risk binding the wrong
+    // dataset (e.g. "locked user" scenario → `invalid_users` instead of
+    // `locked_users`). This is THE fix for the business-correctness defect.
+    if (scenarioNode?.execution?.resolvedDataset) {
+      const resolved = scenarioNode.execution.resolvedDataset;
+      const dsName = resolved.datasetId;
+      const recKey = resolved.recordId;
+      const recMap = index.get(dsName);
+      if (recMap?.has(recKey)) {
+        // The graph-resolved record exists in our index — bind to it directly.
+        const representative = this.isRepresentativeRecord(recMap, recKey);
+        return {
+          datasetName: dsName,
+          recordKey: recKey,
+          value: recMap.get(recKey),
+          representative,
+          ref: this.datasetRef(dsName, representative ? undefined : recKey),
+        };
+      }
+    }
+
+    // ── Semantic guidance: use requiredDataRole to filter datasets ───────────
+    // Even when the graph didn't resolve a specific record (thin fixtures, etc.),
+    // its `semantics.requiredDataRole` tells us the INTENT (locked_user vs
+    // valid_user). Use that to constrain which datasets we consider, preventing
+    // "locked user" from silently falling back to `invalid_users`.
+    const requiredRole = scenarioNode?.semantics?.requiredDataRole;
+    let candidateDatasets = [...index.entries()];
+    if (requiredRole) {
+      // Map requiredDataRole to the dataset category it implies.
+      const roleCategory = this.mapRoleToCategory(requiredRole);
+      if (roleCategory) {
+        // Filter to datasets matching this category.
+        const filtered = candidateDatasets.filter(([name]) =>
+          this.datasetMatchesCategory(name, roleCategory),
+        );
+        // Only apply the filter if it yields results; otherwise fall back to all
+        // datasets (backward-compatible for edge cases where the role doesn't
+        // cleanly map or the dataset naming doesn't follow conventions).
+        if (filtered.length > 0) candidateDatasets = filtered;
+      }
+    }
+
+    // ── Legacy text-matching heuristic (backward-compatible fallback) ────────
     const haystack = `${tc.test_data || ''}\n${steps.join('\n')}`.toLowerCase();
     // Token set for tolerant matching: a free-text reference like "locked_user"
     // should still bind to a dataset named "locked_users" (singular/plural,
@@ -2671,14 +2746,15 @@ ${testBlocks.join('\n\n')}
     };
 
     // 1) A record key is referenced verbatim → bind that exact record.
-    for (const [dsName, recMap] of index) {
+    // Sprint 3.2: search within candidateDatasets (already filtered by role).
+    for (const [dsName, recMap] of candidateDatasets) {
       for (const key of recMap.keys()) {
         if (isKeyReferenced(key)) return bind(dsName, recMap, key);
       }
     }
     // 2) A dataset name is referenced (exact or tolerant) → bind to the record
     //    whose key best matches the case intent (locked/invalid/…), else first.
-    for (const [dsName, recMap] of index) {
+    for (const [dsName, recMap] of candidateDatasets) {
       if (isReferenced(dsName)) {
         return bind(dsName, recMap, pickRecord(recMap));
       }
@@ -2691,7 +2767,7 @@ ${testBlocks.join('\n\n')}
     //    reference now selects locked_users instead of falling back to env.
     const category = this.classifyCaseDatasetCategory(tc, steps);
     if (category) {
-      for (const [dsName, recMap] of index) {
+      for (const [dsName, recMap] of candidateDatasets) {
         if (this.datasetMatchesCategory(dsName, category)) {
           return bind(dsName, recMap, pickRecord(recMap));
         }
