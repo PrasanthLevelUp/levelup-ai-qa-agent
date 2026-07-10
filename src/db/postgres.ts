@@ -5110,6 +5110,22 @@ export interface GeneratedScriptRecord {
   tokens_used?: number;
   model?: string;
   generation_time_ms?: number;
+  /**
+   * Structured token/usage telemetry captured from the provider's own `usage`
+   * object (never estimated). { llmCalls, promptTokens, completionTokens,
+   * totalTokens, durationMs, cacheHit, provider, model }. `null` totals = provider
+   * returned no usage (unknown); `0` + cacheHit = genuine deterministic/cached run.
+   */
+  generation_metrics?: {
+    llmCalls: number;
+    promptTokens: number | null;
+    completionTokens: number | null;
+    totalTokens: number | null;
+    durationMs: number;
+    cacheHit: boolean;
+    provider: string;
+    model: string;
+  } | null;
   files_generated?: any;
   negative_tests_included?: boolean;
   created_at?: string;
@@ -5180,10 +5196,10 @@ export async function logGeneratedScript(data: GeneratedScriptRecord, companyId?
     `INSERT INTO generated_scripts
       (url, test_case_id, page_type, workflow_graph, instructions, script_content, test_plan,
        validation_status, reliability_score, review_score, review_issues,
-       tokens_used, model, generation_time_ms, files_generated, negative_tests_included,
+       tokens_used, model, generation_time_ms, generation_metrics, files_generated, negative_tests_included,
        company_id, project_id, intelligence_metadata, environment_id, sprint_id,
        requirement_id, generation_source, locator_report)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)
     RETURNING id`,
     [
       data.url,
@@ -5200,6 +5216,7 @@ export async function logGeneratedScript(data: GeneratedScriptRecord, companyId?
       data.tokens_used ?? 0,
       data.model ?? null,
       data.generation_time_ms ?? null,
+      data.generation_metrics ? JSON.stringify(data.generation_metrics) : null,
       data.files_generated ? JSON.stringify(data.files_generated) : null,
       data.negative_tests_included ?? false,
       companyId ?? null,
@@ -5261,7 +5278,7 @@ export async function getScriptHistory(
 
   const dataR = await getPool().query(
     `SELECT id, url, page_type, validation_status, reliability_score, tokens_used, model,
-            generation_time_ms, files_generated, negative_tests_included, created_at, project_id,
+            generation_time_ms, generation_metrics, files_generated, negative_tests_included, created_at, project_id,
             script_content, instructions, intelligence_metadata
      FROM generated_scripts WHERE ${where}
      ORDER BY ${col} ${dir}
