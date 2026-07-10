@@ -1287,11 +1287,15 @@ export class ScriptGenEngine {
     // and keep the tracking so we can emit a truthful Locator Grounding Report.
     const { sel, tracked } = this.buildGroundedSelectors(crawl);
 
-    // When a record was resolved, expose it as `user` (const ref in the test
-    // body) so fills read `user.username` / `user.password`.
+    // When a record was resolved, expose it as a business-named const in the
+    // test body (Sprint 3.5) so fills read e.g. `registeredUser.username` /
+    // `lockedAccount.password`. The name comes from the graph node's declared
+    // data role via the single deterministic resolver — never inferred — and
+    // falls back to the neutral `user` for legacy/greenfield cases (no node).
+    const datasetVarName = this.resolveDatasetVarName(scenarioNode);
     const dataRef = caseData
       ? {
-          varName: 'user',
+          varName: datasetVarName,
           ref: caseData.ref,
           hasUsername: caseData.value?.username != null || caseData.value?.user != null,
           // Review fix: treat a record as "having password" when the password field
@@ -2577,6 +2581,46 @@ ${testBlocks.join('\n\n')}
       default:
         return false;
     }
+  }
+
+  /**
+   * Sprint 3.5 (Variable Naming) — THE single, deterministic resolver for the
+   * name of the dataset variable bound in a generated spec (`const <name> =
+   * getRecord(...)`). This is the emitter-quality change: a human reading the
+   * script should see WHICH business actor it exercises, not a generic `user`.
+   *
+   * It NEVER infers. The name is derived purely from existing metadata — the
+   * graph node's `semantics.requiredDataRole` (the role the scenario declared it
+   * needs, e.g. `registered_user`, `locked_account`, `unregistered_user`) — via
+   * a purely mechanical {@link toCamelCase} of that role token:
+   *
+   *   registered_user   → registeredUser
+   *   locked_account    → lockedAccount
+   *   unregistered_user → unregisteredUser
+   *
+   * There is NO synonym/dictionary/NLP step (`account` is NOT rewritten to
+   * `user`), NO keyword guessing, NO AI — just the role, camelCased, so the name
+   * stays faithful to the metadata and adds zero intelligence.
+   *
+   * Fallbacks (Rule: business role → neutral default):
+   *   • the generic `valid_data` role is NOT a business actor, so it keeps the
+   *     historical neutral `user`;
+   *   • an absent node / empty role (legacy or greenfield, no graph) also keeps
+   *     `user` — so every pre-graph test and existing golden is byte-identical.
+   *
+   * Because the returned name is threaded through the SINGLE `dataRef.varName`,
+   * one object gets ONE consistent name across the whole spec (declaration and
+   * every `.username`/`.password` read), with no collisions or `user2` suffixes.
+   * Deterministic: same node in ⇒ same name out.
+   */
+  private resolveDatasetVarName(
+    scenarioNode?: { semantics?: import('../graph/scenario-graph').ScenarioSemantics },
+  ): string {
+    const role = (scenarioNode?.semantics?.requiredDataRole ?? '').trim().toLowerCase();
+    // `valid_data` is a GENERIC role (not a business entity) — a `validData`
+    // variable would read no better than the neutral default, so keep `user`.
+    if (!role || role === 'valid_data') return 'user';
+    return toCamelCase(role) || 'user';
   }
 
   private resolveCaseData(
@@ -7086,6 +7130,24 @@ function toKebab(s: string): string {
     .replace(/[^a-zA-Z0-9]+/g, '-')
     .toLowerCase()
     .replace(/^-|-$/g, '');
+}
+
+/**
+ * Sprint 3.5 (Variable Naming) — turn a snake/kebab/space token into a
+ * lowerCamelCase identifier. PURELY MECHANICAL: split on non-alphanumerics,
+ * lowercase the first word, capitalize the rest, join. It is NOT a
+ * synonym/dictionary/NLP transform — `locked_account` becomes `lockedAccount`
+ * (NOT `lockedUser`); nothing is rewritten, abbreviated, or inferred. Returns ''
+ * for an empty/garbage token so callers can fall back to a neutral default.
+ */
+function toCamelCase(s: string): string {
+  const words = String(s)
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .split(/[^a-zA-Z0-9]+/)
+    .map((w) => w.trim().toLowerCase())
+    .filter(Boolean);
+  if (!words.length) return '';
+  return words[0] + words.slice(1).map((w) => w.charAt(0).toUpperCase() + w.slice(1)).join('');
 }
 
 /* ────────────────────────────────────────────────────────────────────────── */
