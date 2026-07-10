@@ -109,13 +109,22 @@ ScenarioNode {
     optional?                 // step may be skipped when its target is absent
   }
 
-  // ── 6. ASSERTIONS  (added in 2D.4) ──────────  immutable, "the executable expected outcomes"
+  // ── 6. ASSERTIONS  (landed in 2D.4) ─────────  immutable, "the executable expected outcomes"
   assertions[] {
-    type                      // url | visible | hidden | text | value | enabled | disabled | count | error
-    target                    // stable element identity (when the assertion is element-scoped)
-    expected                  // the EXPECTED literal / pattern. Named `expected` (not `value`)
-                              //   because assertions compare actual-vs-expected; actions consume
-                              //   `value`, assertions verify `expected`.
+    id                        // stable identity for this check within the node
+    order                     // 0-based verification order (array is authoritative)
+    type                      // FROZEN grammar (11): url | visible | hidden | enabled | disabled
+                              //   | checked | unchecked | text | value | count | attribute
+                              //   (success/failure/login/logout are SCENARIOS, never assertion types)
+    target?                   // CANONICAL element identity (app-neutral semantic key, e.g.
+                              //   `login_error` — NOT a raw locator). Absent for page-level
+                              //   checks (`url`). The Execution Resolver grounds it at emit time.
+    expected?                 // the EXPECTED literal (`type=password`, `6`) OR a symbolic reference
+                              //   the resolver grounds: `@page.<name>` → a concrete URL/route, or
+                              //   `@messages.<name>` → concrete UI copy. Named `expected` (not
+                              //   `value`) because assertions compare actual-vs-expected; actions
+                              //   consume `value`, assertions verify `expected`.
+    optional?                 // check is skipped (count-guarded) when its target is absent
   }
 
   // ── 7. QA METADATA + PROVENANCE ─────────────  diagnostic / classification
@@ -128,13 +137,13 @@ ScenarioNode {
 }
 ```
 
-> **Note on reserved slots (`resources`, `actions[]`, `assertions[]`):** these are **reserved, not yet in
-> code**. The node's existing invariant ("every field must serve ≥2 consumers") means each is added in the
-> PR that also adds its first consumer — `resources` when a second consumer beyond the Dataset Resolver
-> needs it (env/browser/locale requirements), `actions[]` in 2D.3, `assertions[]` in 2D.4. Today the data
-> ROLE requirement still lives in `semantics.requiredDataRole`; it migrates to `resources.dataRoles` when
-> the `resources` section lands. This document freezes *where each will go and what it will contain* so
-> those PRs are pure fills, not redesigns.
+> **Note on section slots:** `actions[]` (2D.3) and `assertions[]` (2D.4) are now **populated in code**;
+> `resources` remains **reserved, not yet in code**. The node's invariant ("every field must serve ≥2
+> consumers") means each lands in the PR that also adds its first consumer — `actions[]` in 2D.3,
+> `assertions[]` in 2D.4, and `resources` when a second consumer beyond the Dataset Resolver needs it
+> (env/browser/locale requirements). Today the data ROLE requirement still lives in
+> `semantics.requiredDataRole`; it migrates to `resources.dataRoles` when the `resources` section lands.
+> This document froze *where each goes and what it contains* so those PRs are pure fills, not redesigns.
 
 ---
 
@@ -194,6 +203,21 @@ If a field seems to fit two sections, it is probably two fields. Split it. (The 
   concern. Actions *do*; assertions *check*. Mixing them was explicitly rejected.
 - **`value` may be a `@dataset.*` reference.** Actions reference execution data symbolically so the same
   action list is reusable across datasets — the value is bound from `execution.resolvedDataset` at emit time.
+- **Assertions use a FROZEN grammar of 11 types** (`url` / `visible` / `hidden` / `enabled` / `disabled` /
+  `checked` / `unchecked` / `text` / `value` / `count` / `attribute`). This is a checkable-property
+  vocabulary, NOT a scenario vocabulary: there is deliberately no `success`, `failure`, `login`, or `logout`
+  type — those are *scenarios* whose outcome decomposes into these primitive checks. Adding a type is a
+  reviewed schema change, never an ad-hoc edit.
+- **Assertion `expected` may be a SYMBOLIC reference the resolver grounds.** `@page.<name>` resolves to a
+  concrete URL/route and `@messages.<name>` to concrete UI copy — both via the Execution Resolver's App
+  Knowledge map in Script Gen, never in the graph. This keeps the graph application-neutral: the same
+  assertion set works for any app, and rewording a message or renaming a route re-runs only the resolver.
+  For `attribute`, `expected` is encoded `name=value` (e.g. `type=password`). An unresolved reference
+  DEGRADES safely (a `text` check falls back to a visibility check) rather than emitting invented copy.
+- **Assertions store CANONICAL business meaning, never Playwright.** The graph holds `{type:"visible",
+  target:"login_error"}`, never `expect(...)`, `toBeVisible()`, or a CSS locator. Script Gen is a pure
+  `switch(type)` renderer + resolver — it NEVER infers an assertion from prose. The KB authors the check;
+  the graph carries it; the renderer grounds and emits it.
 - **Every shared-node field serves ≥2 consumers.** Single-consumer data belongs in that consumer, not on
   the node. The graph is a contract, not a junk drawer.
 - **Identity / semantics / resources / actions / assertions are immutable per scenario.** Only `execution`
@@ -204,8 +228,8 @@ If a field seems to fit two sections, it is probably two fields. Split it. (The 
 
 ## 4. Schema-version governance
 
-`SCENARIO_GRAPH_SCHEMA_VERSION` (currently `'1.1.0'` — bumped from `1.0.0` when 2D.3 populated `actions`) is
-the contract version. Bump it when the shape changes:
+`SCENARIO_GRAPH_SCHEMA_VERSION` (currently `'1.2.0'` — `1.0.0` → `1.1.0` when 2D.3 populated `actions`,
+`1.1.0` → `1.2.0` when 2D.4 populated `assertions`) is the contract version. Bump it when the shape changes:
 
 - **PATCH** — additive optional field within an existing section, backward-compatible.
 - **MINOR** — new section slot populated for the first time (`resources`, 2D.3 `actions`, 2D.4 `assertions`).
@@ -225,7 +249,7 @@ graphs (as they already do for `semantics` and `execution`).
 | **resources** | 🔲 reserved (role req. in `semantics.requiredDataRole` today) | builder ← KB | Dataset Resolver (+ future env/browser consumers) |
 | execution   | ✅ (optional; `resolvedDataset`) | builder ← Dataset Resolver | Test Case Lab, Script Gen (2D.2) |
 | **actions** | ✅ (optional) | builder ← KB (`getScenarioActionTemplate`) | Script Gen (`generateFromTestCase` + `generateFromTestCases`) |
-| **assertions** | 🔲 reserved | builder (2D.4) | Script Gen (2D.4) |
+| **assertions** | ✅ (optional) | builder ← KB (`getScenarioAssertionTemplate`) | Script Gen (`emitGraphAssertionLines`) |
 | metadata    | ✅ (scattered) | builder / validator | RTM, telemetry |
 
 **The rule for the rest of Sprint 2D:** additions land in the reserved slots above, in the PR that also
@@ -257,6 +281,8 @@ forces it (which is then a reviewed MAJOR schema change, per §4).
 
 ---
 
-**Next step:** Sprint 2D.4 — graph owns executable **assertions** (`assertions[]`: `type` / `target` /
-`expected`). (2D.3 — graph owns executable `actions[]`, consumed by Script Gen — is implemented and in
-review as PR #274; 2D.2 — consume `execution.resolvedDataset` — merged as PR #273.)
+**Next step:** Sprint 2D.5 — DELETE the legacy assertion inference now that the graph owns assertions,
+making Script Gen a pure renderer with no fallback. (2D.4 — graph owns executable `assertions[]`
+(`id`/`order`/`type`/`target`/`expected`/`optional`), rendered by Script Gen's `emitGraphAssertionLines` —
+is implemented and in review; 2D.3 — graph owns executable `actions[]` — is in review as PR #274; 2D.2 —
+consume `execution.resolvedDataset` — merged as PR #273.)

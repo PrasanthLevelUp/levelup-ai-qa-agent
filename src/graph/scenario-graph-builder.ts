@@ -23,7 +23,9 @@ import { validateCanonicalTestCases } from '../engines/canonical-validator';
 import {
   getScenarioSemantics,
   getScenarioActionTemplate,
+  getScenarioAssertionTemplate,
   type ScenarioActionTemplate,
+  type ScenarioAssertionTemplate,
 } from '../engines/qa-knowledge-engine';
 import { datasetResolver, type Dataset } from '../engines/dataset-resolver';
 import {
@@ -35,6 +37,7 @@ import {
   type ScenarioSource,
   type ScenarioSemantics,
   type ScenarioAction,
+  type ScenarioAssertion,
   SCENARIO_GRAPH_SCHEMA_VERSION,
   computeFingerprint,
 } from './scenario-graph';
@@ -199,6 +202,42 @@ export function materializeActionTemplate(
   });
 }
 
+/**
+ * MATERIALIZE a KB-authored assertion TEMPLATE into the graph's canonical
+ * {@link ScenarioAssertion}[]. The EXACT mirror of {@link materializeActionTemplate}
+ * for verifications — the builder's only job with assertions, and deliberately
+ * minimal. It adds STRUCTURE (identity + order), nothing else:
+ *   • assigns a deterministic `id` (`<scenarioId>:a:<n>`) and `order` (the array
+ *     index — a faithful copy of the KB order, never a re-sort);
+ *   • copies `type`, `target`, `expected` and `optional` VERBATIM.
+ *
+ * It does NOT invent, add, drop, or reorder checks (the set is the KB's — "the
+ * builder may materialize assertions, but it must never invent them"), and it
+ * does NOT translate targets or resolve `@page.*` / `@messages.*` references into
+ * the application's vocabulary. Targets stay CANONICAL (`login_error`, not
+ * `[data-test="error"]`) and references stay symbolic: grounding a canonical
+ * target to a locator, and a reference to a concrete URL/message, is the
+ * Execution Resolver's job inside Script Gen, at emit time.
+ *
+ * Pure and deterministic: identical inputs ⇒ identical output.
+ */
+export function materializeAssertionTemplate(
+  scenarioId: string,
+  template: readonly ScenarioAssertionTemplate[],
+): ScenarioAssertion[] {
+  return template.map((check, i) => {
+    const assertion: ScenarioAssertion = {
+      id: `${scenarioId}:a:${i}`,
+      order: i,
+      type: check.type,
+    };
+    if (check.target !== undefined) assertion.target = check.target;
+    if (check.expected !== undefined) assertion.expected = check.expected;
+    if (check.optional !== undefined) assertion.optional = check.optional;
+    return assertion;
+  });
+}
+
 /* ------------------------------------------------------------------ */
 /*  Builder                                                            */
 /* ------------------------------------------------------------------ */
@@ -244,6 +283,15 @@ export interface NodeMetaLike {
    * its legacy step parser.
    */
   actions?: ScenarioAction[];
+  /**
+   * The scenario's canonical executable assertions, materialized from the KB
+   * assertion template (`getScenarioAssertionTemplate` → `materializeAssertionTemplate`)
+   * by the caller. Targets stay CANONICAL and `@page.*` / `@messages.*` references
+   * stay symbolic; the Execution Resolver in Script Gen grounds them. Absent when
+   * the KB has no authored template — the node then carries no `assertions` and
+   * Script Gen falls back to its legacy assertion inference.
+   */
+  assertions?: ScenarioAssertion[];
 }
 
 export interface AssembleGraphArgs {
@@ -289,6 +337,7 @@ function nodesFromCases(
       objective: tc.objective ?? m.objective ?? '',
       ...(m.semantics ? { semantics: m.semantics } : {}),
       ...(m.actions && m.actions.length ? { actions: m.actions } : {}),
+      ...(m.assertions && m.assertions.length ? { assertions: m.assertions } : {}),
       coverageType: m.coverageType ?? 'positive',
       priority: tc.priority as ScenarioPriority,
       severity: tc.severity as ScenarioSeverity,
@@ -386,10 +435,21 @@ export function buildScenarioGraph(
   // Resolver's job in Script Gen. Scenarios with no authored template get no
   // entry, so their nodes carry no `actions`.
   const actionsById = new Map<string, ScenarioAction[]>();
+  // Materialize each planned scenario's KB assertion TEMPLATE ONCE, same keying.
+  // Exactly mirrors actions: the KB owns the verification set
+  // (`getScenarioAssertionTemplate`, authored-or-null — never invented); the
+  // builder only materializes structure (`id`/`order`) via
+  // `materializeAssertionTemplate` and copies type/target/expected VERBATIM. It
+  // does NOT translate targets or resolve `@page.*` / `@messages.*` references —
+  // that grounding is the Execution Resolver's job in Script Gen. Scenarios with
+  // no authored template get no entry, so their nodes carry no `assertions`.
+  const assertionsById = new Map<string, ScenarioAssertion[]>();
   for (const s of plan.scenarios) {
     semanticsById.set(s.id, getScenarioSemantics(s));
     const template = getScenarioActionTemplate(s);
     if (template) actionsById.set(s.id, materializeActionTemplate(s.id, template));
+    const assertionTemplate = getScenarioAssertionTemplate(s);
+    if (assertionTemplate) assertionsById.set(s.id, materializeAssertionTemplate(s.id, assertionTemplate));
   }
 
   // The arrays are index-aligned (all derived from `drafts` in order):
@@ -400,6 +460,7 @@ export function buildScenarioGraph(
     objective: d.objective,
     semantics: semanticsById.get(d.scenarioId),
     actions: actionsById.get(d.scenarioId),
+    assertions: assertionsById.get(d.scenarioId),
   }));
 
   return assembleScenarioGraph({

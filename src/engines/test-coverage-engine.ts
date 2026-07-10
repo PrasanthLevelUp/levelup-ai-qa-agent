@@ -42,10 +42,10 @@ import type { Dataset } from './dataset-resolver';
 import { validateCanonicalTestCases } from './canonical-validator';
 import { validateQaStandard, violationsToInstructions } from './qa-standard-validator';
 import type { ScenarioSemantics } from './qa-knowledge-engine';
-import { assembleScenarioGraph, materializeActionTemplate } from '../graph/scenario-graph-builder';
+import { assembleScenarioGraph, materializeActionTemplate, materializeAssertionTemplate } from '../graph/scenario-graph-builder';
 import { toTestCaseLab } from '../graph/scenario-graph-adapters';
 import type { ScenarioGraph } from '../graph/scenario-graph';
-import { classifyQACategory, getScenarioSemantics, getScenarioActionTemplate } from './qa-knowledge-engine';
+import { classifyQACategory, getScenarioSemantics, getScenarioActionTemplate, getScenarioAssertionTemplate } from './qa-knowledge-engine';
 import {
   optimizeKnowledgeForCategory,
   buildPromptBreakdown,
@@ -1550,6 +1550,17 @@ Return ONLY valid JSON, no markdown fences.`;
             return template ? [[s.id, materializeActionTemplate(s.id, template)] as const] : [];
           }),
         );
+        // Materialize each scenario's KB assertion TEMPLATE ONCE, same keying.
+        // Exactly mirrors actions: KB owns the verification set (authored-or-null);
+        // the builder only materializes structure and copies type/target/expected
+        // VERBATIM — it does NOT resolve `@page.*` / `@messages.*` references or
+        // translate targets. Scenarios with no authored template get no assertions.
+        const assertionsById = new Map(
+          (scenarioPlan?.scenarios ?? []).flatMap(s => {
+            const template = getScenarioAssertionTemplate(s);
+            return template ? [[s.id, materializeAssertionTemplate(s.id, template)] as const] : [];
+          }),
+        );
         // Graph nodes carry the SAME KB-authored semantics resolved above.
         scenarioGraph = assembleScenarioGraph({
           input,
@@ -1561,6 +1572,7 @@ Return ONLY valid JSON, no markdown fences.`;
             objective: d.objective,
             semantics: semanticsById?.get(d.scenarioId),
             actions: actionsById.get(d.scenarioId),
+            assertions: assertionsById.get(d.scenarioId),
           })),
           knowledgeVersion: scenarioPlan?.knowledgeVersion ?? '',
           category: scenarioPlan?.classification.category ?? 'generic',

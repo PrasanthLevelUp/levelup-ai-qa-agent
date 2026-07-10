@@ -517,6 +517,11 @@ export interface GenerationConfig {
     // (KB authors the sequence, the Builder binds targets). When present, Script
     // Gen EXECUTES these directly — it never parses the NL steps to derive them.
     actions?: import('../graph/scenario-graph').ScenarioAction[];
+    // Sprint 2D.4: the canonical, ordered assertion list the graph owns (KB
+    // authors the checks, the Builder materializes them). When present, Script
+    // Gen RENDERS these directly — it never infers a verification from the NL
+    // expected result.
+    assertions?: import('../graph/scenario-graph').ScenarioAssertion[];
   }>;
   /**
    * How to treat a test-case STEP that the deterministic engine cannot map to a
@@ -1382,7 +1387,17 @@ export class ScriptGenEngine {
       applied.used.forEach((v) => usedPOVars.add(v));
     }
 
-    const assertions = this.buildTcAssertions(`${tc.expected_result || ''}`, ctx, tc, matchedPOs, usedPOVars);
+    // ── Sprint 2D.4: graph owns the executable assertions ───────────────────
+    // When the resolved Scenario Graph node carries a canonical `assertions[]`
+    // list, RENDER it directly (deterministic adapter) instead of inferring the
+    // verification back out of the natural-language expected result. This is the
+    // "graph owns assertions" path — no regex over prose, no heuristics. When
+    // absent (legacy test cases / no graph), fall back to the historical
+    // assertion inference so behaviour is 100% backward compatible.
+    const graphAssertions = scenarioNode?.assertions;
+    const assertions = (graphAssertions && graphAssertions.length)
+      ? this.emitGraphAssertionLines(graphAssertions, ctx, resolvedDatasetValues)
+      : this.buildTcAssertions(`${tc.expected_result || ''}`, ctx, tc, matchedPOs, usedPOVars);
 
     // ── Page-Object-based assertions (e.g. inventoryPage.verifyLoaded()) ──
     if (matchedPOs.length) {
@@ -4072,6 +4087,164 @@ ${gotoB}${sessionLogin('pageB')}
       }
     }
     return { lines: out };
+  }
+
+  /**
+   * Emit the Playwright verification lines for a graph node's canonical
+   * `assertions[]`. THIS METHOD IS THE ASSERTION-SIDE EXECUTION RESOLVER — the
+   * exact mirror of {@link emitGraphActionLines} for checks, and the single place
+   * a canonical assertion becomes a concrete `expect(...)`.
+   *
+   * It is a PURE `switch(assertion.type)` renderer: no regex over the
+   * natural-language `expectedResult`, no heuristics, no inference. That is the
+   * whole point of Sprint 2D.4 — "Script Gen never invents a verification again."
+   * The graph already decided WHAT to check; this method only decides how to
+   * WRITE it for Playwright. Two — and only two — kinds of grounding happen here,
+   * NEVER in the graph:
+   *   1. canonical target → locator  (the SAME pre-grounded `ctx.sel` lookup the
+   *      action resolver uses, so no double-counting in the Grounding Report);
+   *   2. semantic reference → literal — a `@page.<name>` reference becomes a
+   *      concrete URL matcher and a `@messages.<name>` reference becomes concrete
+   *      UI copy, via a small App Knowledge map keyed off the app under test
+   *      (SauceDemo today; a config override tomorrow). An UNRESOLVED reference
+   *      degrades gracefully (a `text` check falls back to a visibility check, a
+   *      `url` reference falls back to a route regex) — it NEVER emits invented
+   *      copy or a guessed URL.
+   *
+   * This is the deterministic counterpart to the legacy {@link buildTcAssertions};
+   * that inference path stays as the fallback (Rule 6) for nodes that carry no
+   * authored assertions, and is deleted in a later sprint.
+   */
+  private emitGraphAssertionLines(
+    assertions: import('../graph/scenario-graph').ScenarioAssertion[],
+    ctx: { url: string; creds: { username: string; password: string }; sel: Record<string, string>; data?: { varName: string; ref: string; hasUsername: boolean; hasPassword: boolean }; crawl?: CrawlResult; stepTracked?: LocatorGroundingEntry[] },
+    _resolvedValues: Record<string, string> | null,
+  ): string[] {
+    // Canonical target → pre-grounded semantic selector key (ctx.sel). Mirrors
+    // the action resolver's map, plus `login_error` (an assertion-only target).
+    const SELECTOR_KEY: Record<string, string> = {
+      login_error: 'error', error_message: 'error', error: 'error',
+      authenticated_landing: 'title', landing: 'title', title: 'title',
+      logout_button: 'logout', logout: 'logout', menu: 'menu',
+      login_button: 'login', submit: 'login', sign_in: 'login', login: 'login',
+      username: 'username', email: 'username', user: 'username',
+      password: 'password', cart: 'cart', product: 'product',
+    };
+    const locatorFor = (target: string): string => {
+      const key = SELECTOR_KEY[target] ?? target;
+      return ctx.sel[key] ?? `page.getByLabel('${escapeStr(target.split('_').join(' '))}')`;
+    };
+
+    // ── App Knowledge (the resolver's, NOT the graph's) ──────────────────────
+    // Resolve `@page.*` / `@messages.*` references to concrete URLs/copy for THIS
+    // app. Kept here so the graph stays application-neutral: renaming a route or
+    // rewording a message re-runs only this resolver, never the graph build.
+    const sauce = this.isSauceLikeApp(ctx.url, ctx.crawl);
+    const PAGE_PREFIX = '@page.';
+    const MSG_PREFIX = '@messages.';
+    // SauceDemo message copy (fragments — matched with toContainText so the
+    // leading "Epic sadface:" prefix is irrelevant). Empty for unknown apps, so
+    // an unresolved reference degrades instead of emitting invented copy.
+    const MESSAGES: Record<string, string> = sauce
+      ? {
+          invalid_credentials: 'Username and password do not match',
+          username_required: 'Username is required',
+          password_required: 'Password is required',
+          locked_out: 'locked out',
+        }
+      : {};
+
+    // A `@page.*` reference → the argument for `toHaveURL(...)`. Login/entry pages
+    // resolve to the app's base URL (exact); SauceDemo's inventory resolves to the
+    // canonical `/inventory\.html/` regex (matches the historical golden output);
+    // any other route degrades to an app-neutral route-fragment regex. A literal
+    // expected value (no `@page.` prefix) is emitted as an exact string.
+    const resolveUrlArg = (expected: string | number | boolean | undefined): string => {
+      const raw = expected == null ? '' : String(expected);
+      if (raw.startsWith(PAGE_PREFIX)) {
+        const name = raw.slice(PAGE_PREFIX.length).trim().toLowerCase();
+        if (name === 'login' || name === 'base' || name === 'home' || name === 'root') {
+          return `'${escapeStr(ctx.url)}'`;
+        }
+        if (sauce && name === 'inventory') return `/inventory\\.html/`;
+        return `new RegExp(${JSON.stringify(name)})`;
+      }
+      return `'${escapeStr(raw)}'`;
+    };
+
+    // A `@messages.*` reference → concrete UI copy, or null when unresolved. A
+    // literal expected value (no `@messages.` prefix) is used as-is.
+    const resolveMessage = (expected: string | number | boolean | undefined): string | null => {
+      const raw = expected == null ? '' : String(expected);
+      if (!raw.startsWith(MSG_PREFIX)) return raw.length ? raw : null;
+      const name = raw.slice(MSG_PREFIX.length).trim().toLowerCase();
+      return MESSAGES[name] ?? null;
+    };
+
+    const out: string[] = [];
+    // Defensive: honor the canonical `order` even if the array arrived unsorted.
+    const ordered = [...assertions].sort((a, b) => a.order - b.order);
+    for (const a of ordered) {
+      let stmts: string[] = [];
+      const loc = a.target ? locatorFor(a.target) : '';
+      switch (a.type) {
+        case 'url':
+          stmts = [`await expect(page).toHaveURL(${resolveUrlArg(a.expected)});`];
+          break;
+        case 'visible':
+          stmts = [`await expect(${loc}).toBeVisible();`];
+          break;
+        case 'hidden':
+          stmts = [`await expect(${loc}).toBeHidden();`];
+          break;
+        case 'enabled':
+          stmts = [`await expect(${loc}).toBeEnabled();`];
+          break;
+        case 'disabled':
+          stmts = [`await expect(${loc}).toBeDisabled();`];
+          break;
+        case 'checked':
+          stmts = [`await expect(${loc}).toBeChecked();`];
+          break;
+        case 'unchecked':
+          stmts = [`await expect(${loc}).not.toBeChecked();`];
+          break;
+        case 'text': {
+          const msg = resolveMessage(a.expected);
+          // Resolved copy → assert it; unresolved reference → degrade to a
+          // visibility check (never invent the copy).
+          stmts = msg
+            ? [`await expect(${loc}).toContainText('${escapeStr(msg)}');`]
+            : [`await expect(${loc}).toBeVisible();`];
+          break;
+        }
+        case 'value':
+          stmts = [`await expect(${loc}).toHaveValue('${escapeStr(String(a.expected ?? ''))}');`];
+          break;
+        case 'count':
+          stmts = [`await expect(${loc}).toHaveCount(${Number(a.expected) || 0});`];
+          break;
+        case 'attribute': {
+          // `expected` is encoded `name=value` (see the frozen contract).
+          const raw = String(a.expected ?? '');
+          const eq = raw.indexOf('=');
+          const name = eq >= 0 ? raw.slice(0, eq) : raw;
+          const val = eq >= 0 ? raw.slice(eq + 1) : '';
+          stmts = [`await expect(${loc}).toHaveAttribute('${escapeStr(name)}', '${escapeStr(val)}');`];
+          break;
+        }
+        default:
+          continue;
+      }
+      // An `optional` check must not fail the run when its target is absent —
+      // guard it behind a count check (page-level `url` checks are never guarded).
+      if (a.optional && a.target) {
+        out.push(`if (await ${loc}.count() > 0) {`, ...stmts.map((s) => `  ${s}`), `}`);
+      } else {
+        out.push(...stmts);
+      }
+    }
+    return out;
   }
 
   /**
