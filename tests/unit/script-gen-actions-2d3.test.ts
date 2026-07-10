@@ -88,14 +88,41 @@ describe('Sprint 2D.3 — builder.materializeActionTemplate', () => {
     { action: 'click', target: 'login_button' },
   ];
 
-  it('assigns stable ids and array-index order without reordering', () => {
+  it('assigns STABLE SEMANTIC ids (<scenarioId>.<action>.<target>) and array-index order', () => {
     const mat = materializeActionTemplate('auth-pos-valid', template);
+    // Identity is the step's business meaning, NOT its position — so the id
+    // survives insertion/reordering and `afterAction` can point straight at it.
     expect(mat.map((a) => a.id)).toEqual([
-      'auth-pos-valid:0', 'auth-pos-valid:1', 'auth-pos-valid:2', 'auth-pos-valid:3',
+      'auth-pos-valid.navigate.login_page',
+      'auth-pos-valid.fill.username',
+      'auth-pos-valid.fill.password',
+      'auth-pos-valid.click.login_button',
     ]);
     expect(mat.map((a) => a.order)).toEqual([0, 1, 2, 3]);
     // Sequence of verbs is preserved 1:1 with the authored template.
     expect(mat.map((a) => a.action)).toEqual(template.map((t) => t.action));
+  });
+
+  it('id survives reordering — the same step keeps the same identity', () => {
+    const reordered = [template[3], template[0], template[1], template[2]];
+    const mat = materializeActionTemplate('auth-pos-valid', reordered);
+    // The click keeps `auth-pos-valid.click.login_button` even though it moved to
+    // index 0; only `order` reflects the new position. (Position ≠ identity.)
+    const click = mat.find((a) => a.action === 'click')!;
+    expect(click.id).toBe('auth-pos-valid.click.login_button');
+    expect(click.order).toBe(0);
+  });
+
+  it('disambiguates duplicate <action>.<target> with a deterministic #n suffix', () => {
+    const dup: ScenarioActionTemplate[] = [
+      { action: 'fill', target: 'username', value: 'a' },
+      { action: 'fill', target: 'username', value: 'b' },
+    ];
+    const mat = materializeActionTemplate('s', dup);
+    expect(mat.map((a) => a.id)).toEqual([
+      's.fill.username',
+      's.fill.username#2',
+    ]);
   });
 
   it('copies each target VERBATIM — it does NOT translate to app vocabulary', () => {
