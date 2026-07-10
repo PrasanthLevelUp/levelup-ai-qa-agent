@@ -501,10 +501,12 @@ export interface GenerationConfig {
   /**
    * Sprint 2D — the canonical Scenario Graph nodes, keyed by test case title.
    * When present, Script Generation reads the scenario semantics
-   * (variableUnderTest, variation, preconditions, expectedBehavior,
-   * requiredDataRole) and execution context (resolvedDataset) directly from the
-   * graph instead of re-inferring them, making Script Gen a pure adapter from
-   * Scenario Graph → Playwright code.
+   * (variableUnderTest, variation, preconditions, expectedBehavior) and, above
+   * all, the execution context (resolvedDataset) directly from the graph instead
+   * of re-inferring them, making Script Gen a pure adapter from Scenario Graph →
+   * Playwright code. Dataset selection is owned entirely by the graph: Script Gen
+   * consumes `execution.resolvedDataset` and never translates business roles
+   * (e.g. `requiredDataRole`, which is deprecated) into datasets itself.
    *
    * Optional and fully backward-compatible: when absent or when a test case has
    * no matching node, generation uses legacy inference. Threaded by the route
@@ -1253,7 +1255,7 @@ export class ScriptGenEngine {
     // via getRecord('<dataset>', selector?) and reads user.username/.password
     // from the schema. When no resolved data is supplied, fall back to literals.
     const dataIndex = this.buildTestDataIndexWithFallback(config, [tc]);
-    const caseData = this.resolveCaseData(tc, steps, dataIndex);
+    const caseData = this.resolveCaseData(tc, steps, dataIndex, scenarioNode);
     if (caseData) {
       // Hydrate creds from the resolved record so any literal fallbacks (and the
       // grounded selector parsing) have the real values too.
@@ -2581,8 +2583,55 @@ ${testBlocks.join('\n\n')}
     tc: NonNullable<GenerationConfig['testCase']>,
     steps: string[],
     index: Map<string, Map<string, any>>,
+    scenarioNode?: { semantics?: import('../graph/scenario-graph').ScenarioSemantics; execution?: import('../graph/scenario-graph').ScenarioExecution },
   ): { datasetName: string; recordKey: string; value: any; ref: string; representative: boolean } | null {
     if (!this.hasResolvedData(index)) return null;
+
+    // ── Sprint 3 · PR 3.2 — Business Intent Correctness ──────────────────────
+    // When the Scenario Graph has already resolved the correct dataset record
+    // (via the Dataset Resolver at graph-build time), REUSE it. The graph is the
+    // source of truth; Script Gen must not re-infer and risk binding the wrong
+    // dataset (e.g. "locked user" scenario → `invalid_users` instead of
+    // `locked_users`). This is THE fix for the business-correctness defect.
+    if (scenarioNode?.execution?.resolvedDataset) {
+      const resolved = scenarioNode.execution.resolvedDataset;
+      const dsName = resolved.datasetId;
+      const recKey = resolved.recordId;
+      const recMap = index.get(dsName);
+      if (recMap?.has(recKey)) {
+        // The graph-resolved record exists in our index — bind to it directly.
+        const representative = this.isRepresentativeRecord(recMap, recKey);
+        return {
+          datasetName: dsName,
+          recordKey: recKey,
+          value: recMap.get(recKey),
+          representative,
+          ref: this.datasetRef(dsName, representative ? undefined : recKey),
+        };
+      }
+    }
+
+    // ── Future: consume the graph's resolved dataset CATEGORY when present ───
+    // The graph is the single source of dataset knowledge (Sprint 2 removed all
+    // business-role inference from Script Gen). When the Dataset Resolver later
+    // exposes `execution.datasetCategory` (the resolved bucket — e.g.
+    // "locked_users" — for thin fixtures where a specific record wasn't pinned),
+    // Script Gen should bind to that category directly, WITHOUT re-deriving it.
+    //
+    // We deliberately do NOT map `semantics.requiredDataRole` here: that field is
+    // deprecated in the graph contract, and translating a business role
+    // ("locked_user") into a dataset category is Dataset-Resolver knowledge, not
+    // Script-Gen knowledge. Keeping it out prevents business rules from creeping
+    // back into the emitter. Until the graph carries `datasetCategory`, we fall
+    // through to the legacy compatibility mode below.
+    const candidateDatasets = [...index.entries()];
+
+    // ── Legacy Compatibility Mode (for pre–Execution Graph test cases) ───────
+    // This text-based inference path exists ONLY for backward compatibility with
+    // test cases authored before the Execution Graph. New graph-based scenarios
+    // must NEVER depend on text inference — the graph carries resolvedDataset,
+    // and Script Gen consumes it. Remove this path after all legacy generators
+    // are migrated to the graph-based pipeline.
     const haystack = `${tc.test_data || ''}\n${steps.join('\n')}`.toLowerCase();
     // Token set for tolerant matching: a free-text reference like "locked_user"
     // should still bind to a dataset named "locked_users" (singular/plural,
@@ -2671,14 +2720,15 @@ ${testBlocks.join('\n\n')}
     };
 
     // 1) A record key is referenced verbatim → bind that exact record.
-    for (const [dsName, recMap] of index) {
+    // Sprint 3.2: search within candidateDatasets (already filtered by role).
+    for (const [dsName, recMap] of candidateDatasets) {
       for (const key of recMap.keys()) {
         if (isKeyReferenced(key)) return bind(dsName, recMap, key);
       }
     }
     // 2) A dataset name is referenced (exact or tolerant) → bind to the record
     //    whose key best matches the case intent (locked/invalid/…), else first.
-    for (const [dsName, recMap] of index) {
+    for (const [dsName, recMap] of candidateDatasets) {
       if (isReferenced(dsName)) {
         return bind(dsName, recMap, pickRecord(recMap));
       }
@@ -2691,7 +2741,7 @@ ${testBlocks.join('\n\n')}
     //    reference now selects locked_users instead of falling back to env.
     const category = this.classifyCaseDatasetCategory(tc, steps);
     if (category) {
-      for (const [dsName, recMap] of index) {
+      for (const [dsName, recMap] of candidateDatasets) {
         if (this.datasetMatchesCategory(dsName, category)) {
           return bind(dsName, recMap, pickRecord(recMap));
         }
