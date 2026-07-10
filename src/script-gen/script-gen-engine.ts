@@ -28,6 +28,13 @@ import {
   type NormalizationDiagnostics,
 } from './canonical-test-case';
 import { normalizeResolvedTestData } from './canonical-test-data';
+import {
+  type TokenUsage,
+  type GenerationMetrics,
+  deterministicMetrics,
+  newGenerationMetrics,
+  recordLlmCall,
+} from '../ai/generation-metrics';
 import type { AuthConfig, AuthResult } from './auth-engine';
 import { WorkflowMapper, type WorkflowMap, type WorkflowFlow, type WorkflowStep, type WorkflowAction } from './workflow-mapper';
 import { SelectorQualityEngine, type ScoredSelector } from './selector-quality-engine';
@@ -95,6 +102,11 @@ export interface TestPlan {
     selectorQuality: number;
     model: string;
     tokensUsed: number;
+    /** Provider's prompt/completion breakdown; `null` when it reported no usage. */
+    promptTokens?: number | null;
+    completionTokens?: number | null;
+    /** Provider that produced the plan ("openai" | "anthropic"). */
+    provider?: string;
   };
 }
 
@@ -305,6 +317,15 @@ export interface GenerationResult {
     tokensUsed: number;
     model: string;
   };
+  /**
+   * Generation Cost metrics — the aggregated, provider-reported token usage for
+   * this generation (never estimated). Persist THIS (not a bare token count) so
+   * History can show `1.7K tokens` with a prompt/completion/calls breakdown and
+   * derive cost from current pricing. `totalTokens === null` means "unknown"
+   * (a provider returned no usage); a deterministic no-LLM run reports `0` with
+   * `cacheHit: true`. See generation-metrics.ts.
+   */
+  generationMetrics: GenerationMetrics;
   errors: string[];
   /** Present when authentication was attempted */
   authResult?: AuthResult;
@@ -790,7 +811,7 @@ export class ScriptGenEngine {
   private async generateTestPlanCompletion(
     systemPrompt: string,
     userPrompt: string,
-  ): Promise<{ content: string; tokens: number; model: string }> {
+  ): Promise<{ content: string; tokens: number; model: string; usage: TokenUsage; provider: string }> {
     if (this._anthropic) {
       try {
         const r = await this._anthropic.createChatCompletion({
@@ -803,7 +824,15 @@ export class ScriptGenEngine {
           maxTokens: 4000,
           jsonMode: true,
         });
-        return { content: r.content || '{}', tokens: r.tokensUsed, model: r.model };
+        // Capture the provider's real usage — prompt/completion breakdown when
+        // the Anthropic client surfaced it, else null (unknown), never faked.
+        const usage: TokenUsage = {
+          promptTokens: r.promptTokens ?? null,
+          completionTokens: r.completionTokens ?? null,
+          totalTokens: r.tokensUsed ?? null,
+          model: r.model,
+        };
+        return { content: r.content || '{}', tokens: r.tokensUsed, model: r.model, usage, provider: 'anthropic' };
       } catch (err) {
         logger.warn(MOD, 'Anthropic test-plan generation failed; falling back to OpenAI', {
           error: (err as Error).message,
@@ -821,11 +850,45 @@ export class ScriptGenEngine {
       temperature: 0.3,
       max_tokens: 4000,
     });
+    // OpenAI returns `usage` with prompt/completion/total. If a model/route omits
+    // it, record null (unknown) rather than a misleading 0.
+    const u = response.usage;
+    const usage: TokenUsage = {
+      promptTokens: u?.prompt_tokens ?? null,
+      completionTokens: u?.completion_tokens ?? null,
+      totalTokens: u?.total_tokens ?? null,
+      model: this.model,
+    };
     return {
       content: response.choices[0]?.message?.content || '{}',
       tokens: response.usage?.total_tokens || 0,
       model: this.model,
+      usage,
+      provider: 'openai',
     };
+  }
+
+  /**
+   * Build the aggregated {@link GenerationMetrics} for an AI-backed generation
+   * from the test plan's captured provider usage. If the plan carries no
+   * provider (it came from the deterministic fallback because the LLM failed),
+   * report it as a deterministic, no-LLM run rather than inventing token counts.
+   */
+  private buildPlanMetrics(testPlan: TestPlan, startTime: number): GenerationMetrics {
+    const md = testPlan.metadata;
+    if (!md.provider) {
+      return deterministicMetrics({ model: md.model, durationMs: Date.now() - startTime });
+    }
+    const metrics = newGenerationMetrics({ provider: md.provider, model: md.model });
+    const usage: TokenUsage = {
+      promptTokens: md.promptTokens ?? null,
+      completionTokens: md.completionTokens ?? null,
+      totalTokens: md.tokensUsed ?? null,
+      model: md.model,
+    };
+    recordLlmCall(metrics, usage);
+    metrics.durationMs = Date.now() - startTime;
+    return metrics;
   }
 
   /**
@@ -1180,6 +1243,7 @@ export class ScriptGenEngine {
         tokensUsed,
         model: this.model,
       },
+      generationMetrics: this.buildPlanMetrics(testPlan, startTime),
       errors,
       ...(authResult ? { authResult } : {}),
       // Expose raw crawl data for Application Intelligence caching (only for fresh crawls)
@@ -1188,7 +1252,7 @@ export class ScriptGenEngine {
       ...(frameworkAnalysis ? { frameworkAnalysis } : {}),
     };
 
-    logger.info(MOD, 'Script generation complete', result.stats);
+    logger.info(MOD, 'Script generation complete', { ...result.stats, generationMetrics: result.generationMetrics });
     return result;
   }
 
@@ -1656,6 +1720,10 @@ ${combined.map(l => (l ? `    ${l}` : '')).join('\n')}
         tokensUsed: 0,
         model: 'deterministic-test-case',
       },
+      generationMetrics: deterministicMetrics({
+        model: 'deterministic-test-case',
+        durationMs: Date.now() - startTime,
+      }),
       errors: [],
       ...(locatorGrounding ? { locatorGrounding } : {}),
       ...(repositoryIntelligence ? { repositoryIntelligence } : {}),
@@ -1883,6 +1951,10 @@ ${combined.map(l => (l ? `    ${l}` : '')).join('\n')}
           tokensUsed: 0,
           model: 'deterministic-requirement-batch',
         },
+        generationMetrics: deterministicMetrics({
+          model: 'deterministic-requirement-batch',
+          durationMs: Date.now() - startTime,
+        }),
         errors,
         pipeline,
       };
@@ -1929,6 +2001,10 @@ ${combined.map(l => (l ? `    ${l}` : '')).join('\n')}
         tokensUsed: 0,
         model: 'deterministic-requirement-batch',
       },
+      generationMetrics: deterministicMetrics({
+        model: 'deterministic-requirement-batch',
+        durationMs: Date.now() - startTime,
+      }),
       errors,
       pipeline,
       ...(locatorGrounding.total > 0 ? { locatorGrounding } : {}),
@@ -5664,6 +5740,9 @@ ${config.testCase
           selectorQuality: avgSelectorScore,
           model: usedModel,
           tokensUsed: tokens,
+          promptTokens: completion.usage.promptTokens,
+          completionTokens: completion.usage.completionTokens,
+          provider: completion.provider,
         },
       };
     } catch (e) {
