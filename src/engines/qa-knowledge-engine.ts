@@ -137,6 +137,51 @@ export interface ScenarioSemantics {
 }
 
 /**
+ * The closed set of executable verbs a KB action template step may carry.
+ * Application- and framework-neutral (intent, not a Playwright/Selenium call).
+ * Redeclared here — identical to the graph's `ScenarioActionKind` — to keep the
+ * Knowledge Base decoupled from the graph module, exactly as `ScenarioSemantics`
+ * is redeclared rather than imported.
+ */
+export type ScenarioActionKind =
+  | 'navigate'
+  | 'fill'
+  | 'click'
+  | 'check'
+  | 'uncheck'
+  | 'select'
+  | 'upload';
+
+/**
+ * One authored step of a scenario's canonical action SEQUENCE. This is the KB's
+ * expression of "what does the browser do, in order?" — it owns the sequence and
+ * the abstract semantic targets; it does NOT own layout (id/order) or grounding.
+ *
+ * The builder turns each template step into a graph `ScenarioAction` by assigning
+ * a deterministic `id`/`order` from the array position — never reordering, never
+ * translating the target into the app's vocabulary. Targets stay CANONICAL; the
+ * Execution Resolver in Script Gen maps them to the app's element and locator at
+ * emit time. Deliberately carries NO id/order (structural, assigned by the
+ * builder) and NO locator/selector (grounding is the resolver's job).
+ */
+export interface ScenarioActionTemplate {
+  /** The verb (see {@link ScenarioActionKind}). */
+  action: ScenarioActionKind;
+  /**
+   * Abstract SEMANTIC target — an element/page identity (e.g. `login_page`,
+   * `username`, `password`, `login_button`, `error_message`). NEVER a locator.
+   */
+  target: string;
+  /**
+   * Optional literal (e.g. a dropdown option) or a `@dataset.*` reference (e.g.
+   * `@dataset.username`) resolved downstream from `execution.resolvedDataset`.
+   */
+  value?: string;
+  /** When true the step may be skipped if its target is absent in the app. */
+  optional?: boolean;
+}
+
+/**
  * A single baseline scenario the category implies. This is the deterministic
  * "obligation" — the LLM later expands it into concrete, grounded test cases.
  */
@@ -188,6 +233,18 @@ export interface PlannedScenario {
    * that function) so uncurated categories keep working unchanged.
    */
   semantics?: ScenarioSemantics;
+  /**
+   * The canonical, ORDERED action sequence for this scenario (Open → Fill →
+   * Click → Verify …). Authored here because the Knowledge Base — not a step
+   * parser — is the authority on what a login/checkout/search fundamentally
+   * DOES. When present the builder binds each abstract `target` to the app and
+   * attaches the result to the node's `actions[]`, and Script Gen executes it
+   * directly (no prose parsing). When omitted, `getScenarioActionTemplate`
+   * returns `null` and Script Gen falls back to its legacy step parser — so this
+   * is purely additive. The KB NEVER derives a sequence it was not authored with:
+   * a guessed action sequence is worse than none.
+   */
+  actionTemplate?: ScenarioActionTemplate[];
   /**
    * Recognition vocabulary: lowercase terms that let this Knowledge layer
    * RECOGNISE the scenario in the explicit evidence (Acceptance Criteria,
@@ -350,13 +407,40 @@ export function classifyQACategory(
 export const QA_KNOWLEDGE_BASE: Record<Exclude<QACategory, 'generic'>, PlannedScenario[]> = {
   authentication: [
     { id: 'auth-pos-valid', title: 'Valid credentials log in successfully', objective: 'A registered user with correct credentials is authenticated and lands in the authenticated area.', coverageType: 'positive', priority: 'P0', riskArea: 'Authentication / access', core: true,
-      semantics: { variableUnderTest: 'none', preconditions: 'a registered user with the correct username and correct password', variation: 'none — all credentials are valid', expectedBehavior: 'authentication succeeds and the user reaches the authenticated landing page', requiredDataRole: 'registered_user' } },
+      semantics: { variableUnderTest: 'none', preconditions: 'a registered user with the correct username and correct password', variation: 'none — all credentials are valid', expectedBehavior: 'authentication succeeds and the user reaches the authenticated landing page', requiredDataRole: 'registered_user' },
+      actionTemplate: [
+        { action: 'navigate', target: 'login_page' },
+        { action: 'fill', target: 'username', value: '@dataset.username' },
+        { action: 'fill', target: 'password', value: '@dataset.password' },
+        { action: 'click', target: 'login_button' },
+      ] },
     { id: 'auth-neg-wrong-password', title: 'Invalid password is rejected', objective: 'A wrong password does not authenticate and a clear, non-leaking error is shown.', coverageType: 'negative', priority: 'P0', riskArea: 'Unauthorized access', obligation: { level: 'required', condition: 'always' },
-      semantics: { variableUnderTest: 'password', preconditions: 'a registered user with the correct username and correct password', variation: 'the password is replaced with an incorrect value (the username stays valid)', expectedBehavior: 'authentication is rejected with a generic error and the user stays on the login page', requiredDataRole: 'registered_user' } },
+      semantics: { variableUnderTest: 'password', preconditions: 'a registered user with the correct username and correct password', variation: 'the password is replaced with an incorrect value (the username stays valid)', expectedBehavior: 'authentication is rejected with a generic error and the user stays on the login page', requiredDataRole: 'registered_user' },
+      actionTemplate: [
+        { action: 'navigate', target: 'login_page' },
+        { action: 'fill', target: 'username', value: '@dataset.username' },
+        { action: 'fill', target: 'password', value: 'wrong-password' },
+        { action: 'click', target: 'login_button' },
+      ] },
     { id: 'auth-neg-empty-fields', title: 'Empty required fields are rejected', objective: 'Submitting with blank username and/or password is blocked with field-level validation.', coverageType: 'negative', priority: 'P1', riskArea: 'Input validation', obligation: { level: 'required', condition: 'always' },
-      semantics: { variableUnderTest: 'a required field', preconditions: 'a registered user with the correct username and correct password', variation: 'exactly ONE required field is left blank while the other stays valid', expectedBehavior: 'field-level validation blocks submission before authentication is attempted', requiredDataRole: 'registered_user' } },
+      semantics: { variableUnderTest: 'a required field', preconditions: 'a registered user with the correct username and correct password', variation: 'exactly ONE required field is left blank while the other stays valid', expectedBehavior: 'field-level validation blocks submission before authentication is attempted', requiredDataRole: 'registered_user' },
+      actionTemplate: [
+        { action: 'navigate', target: 'login_page' },
+        { action: 'fill', target: 'username', value: '@dataset.username' },
+        { action: 'click', target: 'login_button' },
+      ] },
     { id: 'auth-neg-unknown-user', title: 'Unknown / non-existent user is rejected', objective: 'An unregistered identifier cannot authenticate and the error does not reveal whether the account exists.', coverageType: 'negative', priority: 'P1', riskArea: 'Account enumeration', conditionalOnKeywords: ['unknown', 'non-existent', 'nonexistent', 'not registered', 'unregistered', 'enumerat', 'no account', 'does not exist'],
-      semantics: { variableUnderTest: 'username', preconditions: 'a valid password paired with a registered username', variation: 'the username is replaced with an unregistered identifier (the password stays valid)', expectedBehavior: 'authentication is rejected with a non-enumerating error that does not reveal whether the account exists', requiredDataRole: 'unregistered_user' } },
+      semantics: { variableUnderTest: 'username', preconditions: 'a valid password paired with a registered username', variation: 'the username is replaced with an unregistered identifier (the password stays valid)', expectedBehavior: 'authentication is rejected with a non-enumerating error that does not reveal whether the account exists', requiredDataRole: 'unregistered_user' },
+      // The username is an unregistered SENTINEL the KB owns (never a real record),
+      // so the graph — not Script Gen's step inference — decides what "unknown
+      // user" means. The password stays valid (@dataset) so ONLY the identifier
+      // is the variable under test.
+      actionTemplate: [
+        { action: 'navigate', target: 'login_page' },
+        { action: 'fill', target: 'username', value: 'unregistered_user' },
+        { action: 'fill', target: 'password', value: '@dataset.password' },
+        { action: 'click', target: 'login_button' },
+      ] },
     { id: 'auth-neg-locked-user', title: 'Locked / disabled account cannot log in', objective: 'A locked or disabled account is refused even with correct credentials.', coverageType: 'negative', priority: 'P1', riskArea: 'Account state enforcement', conditionalOnKeywords: ['lock', 'disable', 'suspend', 'attempt'],
       semantics: { variableUnderTest: 'account state', preconditions: 'a registered user with the correct username and correct password', variation: 'the account is in a locked / disabled state while the credentials remain correct', expectedBehavior: 'authentication is refused with a locked/disabled-account message despite correct credentials', requiredDataRole: 'locked_account' } },
     { id: 'auth-edge-whitespace-case', title: 'Whitespace / case handling on identifier', objective: 'Leading/trailing whitespace is trimmed and identifier case is handled per the rule (case-insensitive email, etc.).', coverageType: 'edge_cases', priority: 'P2', riskArea: 'Input normalization', conditionalOnKeywords: ['whitespace', 'trim', 'case-insensitive', 'case sensitive', 'case-sensitive', 'lowercase', 'uppercase', 'normali'],
@@ -528,6 +612,63 @@ export function getScenarioSemantics(scenario: PlannedScenario): ScenarioSemanti
     requiredDataRole: 'valid_data',
   };
 }
+
+/**
+ * Resolve a scenario's canonical, ordered ACTION TEMPLATE — the KB's answer to
+ * "what does the browser do, step by step?" that Script Gen executes directly
+ * instead of parsing it back out of prose.
+ *
+ * This is a pure KB lookup — NOT inference, and CRUCIALLY NOT a fallible default.
+ * Unlike `getScenarioSemantics` (which can synthesise a safe generic default
+ * because a vague-but-correct meaning is harmless), an action sequence is only
+ * useful if it is RIGHT: a guessed sequence would make Script Gen emit wrong
+ * automation. So this returns the authored template when present and `null`
+ * otherwise — the KB never invents a sequence. On `null`, Script Gen keeps using
+ * its legacy step parser, so uncurated scenarios are unaffected.
+ *
+ * The returned steps carry CANONICAL targets (`username`, `login_button`, …) and
+ * symbolic `@dataset.*` values; grounding targets to the app and resolving
+ * dataset values happens downstream (Execution Resolver in Script Gen), never here.
+ */
+export function getScenarioActionTemplate(scenario: PlannedScenario): ScenarioActionTemplate[] | null {
+  if (scenario.actionTemplate && scenario.actionTemplate.length > 0) {
+    return scenario.actionTemplate;
+  }
+  return null;
+}
+
+/**
+ * Action-template coverage RATCHET — the guard against "semantics for 14, actions
+ * for 3" drift.
+ *
+ * The rule we hold: within a module, a scenario that has authored SEMANTICS should
+ * eventually also have an authored ACTION TEMPLATE. We are rolling that out module
+ * by module and `authentication` FIRST. The scenarios below are the ones in the
+ * authentication catalog that are KNOWINGLY not yet authored, each with the reason
+ * it cannot be expressed with the current, frozen action grammar
+ * (`{action, target, value?, optional?}`) — they need a richer value/flow
+ * vocabulary (value transforms, repetition, multi-phase flows) that is out of
+ * scope for 2D.3. This list is asserted EXACTLY by
+ * `tests/unit/qa-knowledge-actions-invariant.test.ts`, so:
+ *   • authoring a pending scenario fails the test until it is removed here
+ *     (the list can only SHRINK — coverage can never silently regress), and
+ *   • a new authentication scenario with no template must be added here with a
+ *     reason (no silent gaps).
+ *
+ * EXPANSION RULE: no OTHER module may begin authoring action templates until this
+ * list is empty (authentication at 100%). The invariant test enforces that too.
+ */
+export const AUTH_SCENARIOS_PENDING_ACTION_TEMPLATE: Readonly<Record<string, string>> = {
+  'auth-neg-locked-user': 'same interaction as auth-pos-valid; differentiated only by data role (locked_account) + the assertion — no distinct action sequence to author until 2D.4 assertions land',
+  'auth-edge-whitespace-case': 'requires a value TRANSFORM (pad/whitespace/case) on the dataset value — not expressible as a static literal or @dataset.* token',
+  'auth-neg-invalid-identifier-format': 'requires a malformed-identifier value derived from the valid one — needs a value-transform grammar',
+  'auth-sec-injection': 'requires an injection payload value keyed to the field under test — needs a payload/value-transform grammar',
+  'auth-edge-password-masking': 'a UI/security property OBSERVATION with no distinct action sequence — pure assertion (2D.4)',
+  'auth-sec-lockout-threshold': 'requires REPEATING the failed-login block N times — needs a repetition/flow construct the flat action list cannot express',
+  'auth-sec-session': 'requires a protected-resource request WITHOUT a session — not a login-form interaction',
+  'auth-pos-remember-me': 'requires check(remember-me) + a browser RESTART across contexts — restart is not expressible as an action',
+  'auth-pos-logout': 'a multi-phase flow (log in, then log out, then re-request a protected page) that the single flat action list cannot yet express',
+};
 
 /* ============================================================================
  *  Scenario recognition — the Knowledge layer owns the vocabulary + matching.

@@ -87,12 +87,18 @@ ScenarioNode {
     // resolvedBrowser / resolvedLocale / resolvedEnvironment — natural future members
   }
 
-  // ── 5. ACTIONS  (added in 2D.3) ─────────────  immutable, "the executable steps"
+  // ── 5. ACTIONS  (landed in 2D.3) ────────────  immutable, "the executable steps"
   actions[] {
-    stepId
-    action                    // navigate | fill | click | select | check | upload | wait | verify
-    target                    // stable element identity (semantic key), NOT a raw locator
-    value                     // literal, or @dataset.* reference resolved from execution
+    id                        // stable identity for this step within the node
+    order                     // 0-based execution order (array is authoritative)
+    action                    // navigate | fill | click | check | uncheck | select | upload
+                              //   (STATE-CHANGING verbs ONLY — no `verify`; assertions are §6)
+    target                    // CANONICAL element identity (app-neutral semantic key, e.g.
+                              //   `username` — NOT `email_input` and NOT a raw locator). The
+                              //   Builder copies this VERBATIM; the Execution Resolver in
+                              //   Script Gen grounds it to a locator at emit time.
+    value?                    // literal, or @dataset.* reference resolved from execution
+    optional?                 // step may be skipped when its target is absent
   }
 
   // ── 6. ASSERTIONS  (added in 2D.4) ──────────  immutable, "the executable expected outcomes"
@@ -170,8 +176,14 @@ If a field seems to fit two sections, it is probably two fields. Split it. (The 
   today, `resources.dataRoles` once `resources` lands) is an immutable NEED. The Dataset Resolver maps role
   → record; the resolved record lands in `execution.resolvedDataset`. A resolved record must **never** appear
   in `semantics` or `resources` — requirement and resolution are different abstractions.
-- **`target` is a semantic element identity, never a raw locator string.** Locator resolution is Script
-  Gen's job at emit time; the graph stays framework-neutral.
+- **`target` is a CANONICAL, application-neutral semantic identity — never app vocabulary and never a raw
+  locator.** The KB authors canonical targets (`username`), the Builder copies them VERBATIM (it does NOT
+  translate `username` → `email_input`), and the **Execution Resolver** in Script Gen grounds canonical →
+  app selector → Playwright locator at emit time. This keeps the graph framework- and app-neutral: if the
+  app renames a field, only the resolver changes — the graph never regenerates.
+- **Actions are STATE-CHANGING verbs ONLY** (`navigate`/`fill`/`click`/`check`/`uncheck`/`select`/`upload`).
+  There is deliberately no `verify` action — a scenario's expected outcomes are Assertions (§6), a separate
+  concern. Actions *do*; assertions *check*. Mixing them was explicitly rejected.
 - **`value` may be a `@dataset.*` reference.** Actions reference execution data symbolically so the same
   action list is reusable across datasets — the value is bound from `execution.resolvedDataset` at emit time.
 - **Every shared-node field serves ≥2 consumers.** Single-consumer data belongs in that consumer, not on
@@ -184,8 +196,8 @@ If a field seems to fit two sections, it is probably two fields. Split it. (The 
 
 ## 4. Schema-version governance
 
-`SCENARIO_GRAPH_SCHEMA_VERSION` (currently `'1.0.0'`) is the contract version. Bump it when the shape
-changes:
+`SCENARIO_GRAPH_SCHEMA_VERSION` (currently `'1.1.0'` — bumped from `1.0.0` when 2D.3 populated `actions`) is
+the contract version. Bump it when the shape changes:
 
 - **PATCH** — additive optional field within an existing section, backward-compatible.
 - **MINOR** — new section slot populated for the first time (`resources`, 2D.3 `actions`, 2D.4 `assertions`).
@@ -204,7 +216,7 @@ graphs (as they already do for `semantics` and `execution`).
 | semantics   | ✅ (optional) | builder ← KB (`getScenarioSemantics`) | Test Case Lab, Script Gen, Healing, Dataset Resolver |
 | **resources** | 🔲 reserved (role req. in `semantics.requiredDataRole` today) | builder ← KB | Dataset Resolver (+ future env/browser consumers) |
 | execution   | ✅ (optional; `resolvedDataset`) | builder ← Dataset Resolver | Test Case Lab, Script Gen (2D.2) |
-| **actions** | 🔲 reserved | builder (2D.3) | Script Gen (2D.3) |
+| **actions** | ✅ (optional) | builder ← KB (`getScenarioActionTemplate`) | Script Gen (`generateFromTestCase` + `generateFromTestCases`) |
 | **assertions** | 🔲 reserved | builder (2D.4) | Script Gen (2D.4) |
 | metadata    | ✅ (scattered) | builder / validator | RTM, telemetry |
 
@@ -237,5 +249,6 @@ forces it (which is then a reviewed MAJOR schema change, per §4).
 
 ---
 
-**Next step:** Sprint 2D.3 — graph owns executable **actions** (`actions[]`: `action` / `target` / `value`).
-(2D.2 — consume `execution.resolvedDataset` — is implemented and in review as PR #273.)
+**Next step:** Sprint 2D.4 — graph owns executable **assertions** (`assertions[]`: `type` / `target` /
+`expected`). (2D.3 — graph owns executable `actions[]`, consumed by Script Gen — is implemented and in
+review as PR #274; 2D.2 — consume `execution.resolvedDataset` — merged as PR #273.)

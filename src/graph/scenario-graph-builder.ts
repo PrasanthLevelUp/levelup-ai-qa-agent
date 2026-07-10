@@ -20,7 +20,11 @@ import {
   type DraftTestCase,
 } from '../engines/scenario-builder';
 import { validateCanonicalTestCases } from '../engines/canonical-validator';
-import { getScenarioSemantics } from '../engines/qa-knowledge-engine';
+import {
+  getScenarioSemantics,
+  getScenarioActionTemplate,
+  type ScenarioActionTemplate,
+} from '../engines/qa-knowledge-engine';
 import { datasetResolver, type Dataset } from '../engines/dataset-resolver';
 import {
   type ScenarioGraph,
@@ -30,6 +34,7 @@ import {
   type ScenarioSeverity,
   type ScenarioSource,
   type ScenarioSemantics,
+  type ScenarioAction,
   SCENARIO_GRAPH_SCHEMA_VERSION,
   computeFingerprint,
 } from './scenario-graph';
@@ -135,6 +140,48 @@ export function deriveEdges(nodes: ScenarioNode[]): ScenarioEdge[] {
 }
 
 /* ------------------------------------------------------------------ */
+/*  Action materialization (KB template → canonical node actions)      */
+/* ------------------------------------------------------------------ */
+
+/**
+ * MATERIALIZE a KB-authored action TEMPLATE into the graph's canonical
+ * `ScenarioAction[]`.
+ *
+ * This is the ONLY thing the builder does with actions, and it is deliberately
+ * minimal — it adds STRUCTURE (identity + order), nothing else:
+ *   • assigns a deterministic `id` (`<scenarioId>:<n>`) and `order` (the array
+ *     index — a faithful copy of the KB order, never a re-sort);
+ *   • copies `target`, `value` and `optional` VERBATIM.
+ *
+ * It does NOT invent, add, drop, or reorder steps (the sequence is the KB's —
+ * "the builder may materialize actions, but it must never invent them"), and it
+ * does NOT translate targets into the application's vocabulary. Targets stay
+ * CANONICAL (`username`, not `email_input`): the builder has no business knowing
+ * app vocabulary, and keeping it out means the graph never has to be rebuilt when
+ * the app renames a field or changes selectors. Mapping a canonical target to the
+ * app's element and then to a locator is the Execution Resolver's job inside
+ * Script Gen, at emit time — exactly as it already grounds the human steps.
+ *
+ * Pure and deterministic: identical inputs ⇒ identical output.
+ */
+export function materializeActionTemplate(
+  scenarioId: string,
+  template: readonly ScenarioActionTemplate[],
+): ScenarioAction[] {
+  return template.map((step, i) => {
+    const action: ScenarioAction = {
+      id: `${scenarioId}:${i}`,
+      order: i,
+      action: step.action,
+      target: step.target,
+    };
+    if (step.value !== undefined) action.value = step.value;
+    if (step.optional !== undefined) action.optional = step.optional;
+    return action;
+  });
+}
+
+/* ------------------------------------------------------------------ */
 /*  Builder                                                            */
 /* ------------------------------------------------------------------ */
 
@@ -170,6 +217,15 @@ export interface NodeMetaLike {
    * carried straight onto the node so consumers read one canonical answer.
    */
   semantics?: ScenarioSemantics;
+  /**
+   * The scenario's canonical executable actions, materialized from the KB
+   * action template (`getScenarioActionTemplate` → `materializeActionTemplate`)
+   * by the caller. Targets stay CANONICAL (app-neutral); the Execution Resolver
+   * in Script Gen grounds them to locators. Absent when the KB has no authored
+   * template — the node then carries no `actions` and Script Gen falls back to
+   * its legacy step parser.
+   */
+  actions?: ScenarioAction[];
 }
 
 export interface AssembleGraphArgs {
@@ -214,6 +270,7 @@ function nodesFromCases(
       title: tc.title,
       objective: tc.objective ?? m.objective ?? '',
       ...(m.semantics ? { semantics: m.semantics } : {}),
+      ...(m.actions && m.actions.length ? { actions: m.actions } : {}),
       coverageType: m.coverageType ?? 'positive',
       priority: tc.priority as ScenarioPriority,
       severity: tc.severity as ScenarioSeverity,
@@ -303,7 +360,19 @@ export function buildScenarioGraph(
   // Resolve each planned scenario's canonical semantics ONCE, keyed by its
   // stable scenarioId, so the node carries the same answer the KB authored.
   const semanticsById = new Map<string, ScenarioSemantics>();
-  for (const s of plan.scenarios) semanticsById.set(s.id, getScenarioSemantics(s));
+  // Materialize each planned scenario's KB action TEMPLATE ONCE, same keying.
+  // The KB owns the sequence (`getScenarioActionTemplate`, authored-or-null —
+  // never invented); the builder only materializes structure (`id`/`order`) via
+  // `materializeActionTemplate` and copies targets VERBATIM (canonical). It does
+  // NOT translate targets into app vocabulary — that grounding is the Execution
+  // Resolver's job in Script Gen. Scenarios with no authored template get no
+  // entry, so their nodes carry no `actions`.
+  const actionsById = new Map<string, ScenarioAction[]>();
+  for (const s of plan.scenarios) {
+    semanticsById.set(s.id, getScenarioSemantics(s));
+    const template = getScenarioActionTemplate(s);
+    if (template) actionsById.set(s.id, materializeActionTemplate(s.id, template));
+  }
 
   // The arrays are index-aligned (all derived from `drafts` in order):
   // det.scenarios[i] ↔ cases[i] ↔ drafts[i].
@@ -312,6 +381,7 @@ export function buildScenarioGraph(
     grounded: d.grounded,
     objective: d.objective,
     semantics: semanticsById.get(d.scenarioId),
+    actions: actionsById.get(d.scenarioId),
   }));
 
   return assembleScenarioGraph({
