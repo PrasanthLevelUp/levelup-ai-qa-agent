@@ -1,223 +1,330 @@
-# Sprint 2D Intelligence Removal Checklist
+# Sprint 2D: Scenario Graph Completion
 
-**Goal:** Transform Script Generation from "intelligent planner" → "deterministic adapter"
+> **Renamed from "Duplicate Intelligence Removal".**
+> The old name framed this work as *deleting code from Script Generation*. That framing is backwards
+> and dangerous — it invites us to delete inference before the graph can replace it, which just loses
+> functionality.
+>
+> The correct question is **NOT** "what code can we delete from Script Gen?"
+> The correct question is **"what information is still missing from the Scenario Graph?"**
+>
+> Every PR must be **additive**: the graph gains a concrete capability. Deletion of the old inference
+> code is the *outcome* of the graph becoming complete — never the objective, and never done first.
 
-**Definition of Done:** If I completely remove the original requirement text, Script Generation still produces the same Playwright script because everything it needs already exists in the Scenario Graph.
+---
+
+## 🎯 The Guiding Principle
+
+**Old (wrong) mental model:**
+```
+Remove regex → Script Gen becomes dumber → hope the graph covers it
+```
+
+**New (correct) mental model:**
+```
+Make regex UNNECESSARY → Script Gen has nothing left to infer → deletion is trivial & safe
+```
+
+Each PR answers one question:
+
+> **"What capability does the Scenario Graph gain?"**
+
+Not:
+
+> ~~"What code did we delete?"~~
+
+---
+
+## 🧭 Why This Matters Beyond Script Generation
+
+Once the Scenario Graph owns the full canonical **execution model** —
+
+```
+Scenario
+  ↓
+Execution Dataset   (2D.2)
+  ↓
+Executable Actions  (2D.3)   ← step · action · target · value
+  ↓
+Executable Assertions (2D.4) ← type · target · value
+```
+
+— then **every** downstream consumer reads the exact same model:
+
+```
+Script Generation
+Healing
+Replay
+Self-Healing
+Coverage Gap Analysis
+Impact Analysis
+```
+
+That shared canonical execution model is a far bigger win than Script Generation itself.
+This is the highest-ROI change remaining in LevelUp.
+
+---
+
+## 🚦 The Migration Rule (read before every PR)
+
+> **Never delete an inference path until the graph field that replaces it is populated,
+> consumed, and proven by a test.**
+
+Additive PRs (2D.2 → 2D.4) come FIRST. They leave the old inference code untouched and simply
+prefer graph data when present. Only once the graph is complete do the deletion PRs (2D.5 → 2D.6)
+run — and by then they remove genuinely dead code.
 
 ---
 
 ## 🎯 Current State (Post-2D.1)
 
 ✅ **Sprint 2D.1 Complete**
-- Script Gen now consumes `ScenarioSemantics` when available
-- Stable `scenarioId`-based matching (no more title fragility)
-- Credentials derived from `variableUnderTest` + `variation` (bypassing ScenarioIntelligence for graph-backed cases)
+- Script Gen consumes `ScenarioSemantics` when available (`variableUnderTest` + `variation` + `expectedBehavior`)
+- Stable `scenarioId`-based matching (no more fragile title matching)
+- Credentials derived from semantics for graph-backed cases (bypasses ScenarioIntelligence)
 - 4/4 unit tests passing
 
-**BUT:** ScenarioIntelligence still exists, and Script Gen still has ~1000+ lines of embedded business logic for non-graph cases.
+**Reality check:** the graph still describes steps as prose (`"Enter username"`), not executable
+actions. Script Gen still has to decide `fill()` vs `click()`, resolve the locator, resolve the value,
+and order the steps. So the inference code **cannot** be deleted yet — the graph doesn't carry enough
+information to replace it. That is exactly what 2D.3 and 2D.4 fix.
 
 ---
 
-## 📋 Remaining Duplicate Intelligence (by Sprint)
+## 📋 Implementation Order (revised — implement EXACTLY in this order)
 
-### **Sprint 2D.2: Consume `execution.resolvedDataset` ⭐⭐⭐⭐⭐**
+```
+2D.2  Execution data          (graph owns resolved dataset values)
+  ↓
+2D.3  Executable actions       (graph owns step · action · target · value)
+  ↓
+2D.4  Executable assertions    (graph owns assertion · type · target · value)
+  ↓
+2D.5  Delete duplicated inference   (regex/title/bucket detection — now dead)
+  ↓
+2D.6  Delete ScenarioIntelligence   (module gone; architecture contract enforces it)
+```
 
-**Current Problem:** Script Gen still extracts credential values from step text and dataset names.
+---
 
-**What to Remove:**
-- [ ] `extractCredentialsFromSteps()` in `script-gen-engine.ts` (~L2055-2085)
-- [ ] Dataset name parsing: `'users'.split('.')[0]` logic
-- [ ] Regex-based credential extraction from step descriptions
-- [ ] `looksLikeCredential()` heuristic (L2065-2072)
-- [ ] Special character literal extraction from steps (used in `scenario-intelligence/detection.ts:32`)
+### **PR 2D.2 — Graph owns Execution Data ⭐⭐⭐⭐⭐**
 
-**What to Add:**
-- [ ] Read username/password directly from `execution.resolvedDataset` on ScenarioNode
-- [ ] Fallback: if no resolvedDataset, use empty strings or skip credential steps entirely (don't infer)
+**Capability the graph gains:** every scenario node carries the concrete, resolved dataset values it
+will execute with — no downstream consumer ever re-derives them from step text.
+
+**Additive work:**
+- [ ] Script Gen reads username/password (and other fields) from `execution.resolvedDataset` on the ScenarioNode
+- [ ] When `resolvedDataset` is present, it is the single source of truth for values
+- [ ] Leave `extractCredentialsFromSteps()` / `looksLikeCredential()` in place as fallback for legacy cases — do NOT delete yet
 
 **Target Files:**
-- `src/script-gen/script-gen-engine.ts` (credential derivation)
-- `src/script-gen/scenario-intelligence/detection.ts` (`extractSpecialCharLiteral`)
+- `src/script-gen/script-gen-engine.ts` (credential derivation reads execution first)
 
 **Test Coverage:**
 - [ ] Unit test: Script Gen reads `resolvedDataset.username` + `resolvedDataset.password` from graph
-- [ ] Unit test: No dataset → no credential fills (graceful degradation)
+- [ ] Unit test: `resolvedDataset` present → step-text extraction is NOT invoked
+- [ ] Unit test: no `resolvedDataset` → legacy fallback still works (no regression)
+
+**Definition of Done:** Values in generated scripts come from the graph, not from parsing prose.
 
 ---
 
-### **Sprint 2D.3: Deterministic Action Mapping ⭐⭐⭐⭐**
+### **PR 2D.3 — Graph owns Executable Actions ⭐⭐⭐⭐⭐**
 
-**Current Problem:** Script Gen uses regex to detect "login triad", "checkout flow", etc. and rewrites them.
+**Capability the graph gains:** each scenario step becomes a structured, executable instruction instead
+of prose. This is the pivotal PR — it's what makes the login/checkout regex *unnecessary*.
 
-**What to Remove:**
-- [ ] **Login triad detection** (L3395-3577 in `script-gen-engine.ts`)
-  - Regex: `/user-?name|username|login.*input/i`, `/password|\bpwd\b|\bpass\b/i`
-  - Conditional: `if (loginMethod && userFillLine && passFillLine && hasLoginClick)`
-  - Entire login PO replacement logic
-- [ ] **Checkout detection** (L3610 in `script-gen-engine.ts`)
-  - Regex: `/(checkout|#finish|#continue|place.?order|finish)/i`
-  - Same pattern in `page-object-rewriter.ts:304`
-- [ ] **Flow bucketing** (`inferFlowBucket()` L1880-1910)
-  - Auth regex: `/\blog ?in\b|\bsign ?in\b|\blogin\b|credential|username|password/`
-  - Returns `{key: 'login', label: 'Login'}` based on text matching
-- [ ] **Action grounding by semantic regex** (L4094-4138)
-  - Username field: `/user( ?name)?|email|login id/.test(t)`
-  - Password field detection
-  - Click login button: `/click.*(login|log in|sign in|submit)/`
+**The shape the graph must now carry:**
+```json
+{
+  "stepId": "S3",
+  "action": "fill",
+  "target": "username",
+  "value": "@dataset.username"
+}
+```
 
-**What to Replace With:**
-- [ ] Read `step.action` from Scenario Graph (e.g., `{type: 'fill', target: 'username', value: '@dataset.username'}`)
-- [ ] Map action → Playwright code deterministically (no regex, no detection)
-- [ ] Structure: Graph has ordered steps → Script Gen emits them in order, 1:1
+`action ∈ { navigate, fill, click, select, check, upload, wait, verify }`
+`target` = a stable element identity (semantic key), NOT a raw locator string.
+`value` = literal or a `@dataset.*` reference resolved from 2D.2.
+
+**Additive work:**
+- [ ] Extend ScenarioNode step schema with `action` / `target` / `value` (populated upstream in the graph builder)
+- [ ] Script Gen gains a deterministic mapper:
+      ```ts
+      switch (step.action) {
+        case 'fill':   return `await ${loc(step.target)}.fill(${val(step.value)});`;
+        case 'click':  return `await ${loc(step.target)}.click();`;
+        case 'select': ...
+        case 'verify': ...
+      }
+      ```
+- [ ] When a step carries a structured `action`, the mapper is used and **all inference is skipped for that step**
+- [ ] Steps WITHOUT structured actions still flow through the existing regex path (legacy fallback — untouched)
+
+**Explicitly NOT in this PR:**
+- 🚫 Do NOT delete login-triad regex, checkout regex, `inferFlowBucket()`, or field-detection regex.
+  They remain as the fallback for un-migrated steps. They become dead only in 2D.5.
 
 **Target Files:**
-- `src/script-gen/script-gen-engine.ts` (L1880-1910, L3395-3577, L3610, L4094-4138)
-- `src/script-gen/page-object-rewriter.ts` (L304)
+- Scenario Graph builder (adds action/target/value to steps) — upstream
+- `src/script-gen/script-gen-engine.ts` (deterministic action mapper)
 
 **Test Coverage:**
-- [ ] Unit test: Graph contains `{action: 'fill', field: 'username'}` → Script emits `await page.fill('#username', user.username)`
-- [ ] Unit test: No regex matching, no PO detection — pure mapping
+- [ ] Unit test: step `{action:'fill', target:'username', value:'@dataset.username'}` → `await …username.fill(user.username)` with zero regex
+- [ ] Unit test: step `{action:'click', target:'login_button'}` → `await …click()`
+- [ ] Unit test: legacy prose step (no `action`) → still handled by fallback (no regression)
+
+**Definition of Done:** A fully-migrated scenario produces its script by pure `switch(action)` mapping,
+with the regex path never entered.
 
 ---
 
-### **Sprint 2D.4: Assertions from `expectedBehavior` ⭐⭐⭐⭐**
+### **PR 2D.4 — Graph owns Executable Assertions ⭐⭐⭐⭐**
 
-**Current Problem:** Script Gen infers assertions from title, expected result text, URL patterns, etc.
+**Capability the graph gains:** expected outcomes become structured, executable assertions instead of
+abstract prose like `"Login succeeds"`. Script Gen never invents an assertion again.
 
-**What to Remove:**
-- [ ] **Assertion inference from title/steps** (L4299-4305)
-  - `if (/login/.test(t)) await expect(page).toHaveURL(...)`
-- [ ] **Coverage category inference** (L2259-2290 in `buildCoverageMetadata()`)
-  - Regex: `/\bpositive\b|smoke|happy\s*path|\bsuccess\b/` → add 'Functional'
-  - Currently has Sprint 2D.1 bypass for graph cases, but legacy path still exists
-- [ ] **Error fragment inference** (L4427-4500 in `buildAssertion()`)
-  - Calls `this.scenario.classify()` → transformer → `errorFragment()`
-  - Has Sprint 2D.1 bypass when `semantics` available, but ScenarioIntelligence still active for legacy cases
-- [ ] **Post-login assertion generation** (L5366-5369)
-  - `if (step.description.toLowerCase().includes('login'))`
-- [ ] **Hardcoded success indicators** (L4395-4401)
-  - `if (!page.url().includes('/login'))` → assume success
+`expectedBehavior: "Login succeeds"` is still too abstract. The graph must carry:
+```json
+{
+  "assertions": [
+    { "type": "url",     "value": "/inventory" },
+    { "type": "visible", "target": "logout_button" }
+  ]
+}
+```
 
-**What to Replace With:**
-- [ ] Read `expectedBehavior` from ScenarioNode
-- [ ] Map each expected behavior → assertion (e.g., `{type: 'url', pattern: '/dashboard'}` → `await expect(page).toHaveURL(...)`)
-- [ ] Read `expectedResults` array from ScenarioNode → generate multi-assertion chain
+`type ∈ { url, visible, hidden, text, value, enabled, disabled, count, error }`
+
+**Additive work:**
+- [ ] Extend ScenarioNode with a structured `assertions[]` array (populated upstream)
+- [ ] Script Gen gains a deterministic assertion mapper:
+      ```ts
+      switch (a.type) {
+        case 'url':     return `await expect(page).toHaveURL(${re(a.value)});`;
+        case 'visible': return `await expect(${loc(a.target)}).toBeVisible();`;
+        case 'text':    return `await expect(${loc(a.target)}).toContainText(${str(a.value)});`;
+        ...
+      }
+      ```
+- [ ] When structured `assertions[]` exists, use them exclusively
+- [ ] Leave title/URL/error-fragment inference in place as fallback for un-migrated nodes
+
+**Explicitly NOT in this PR:**
+- 🚫 Do NOT delete `buildAssertion()` inference, coverage-category regex, or the `/login/` URL heuristics.
+  Deletion happens in 2D.5.
 
 **Target Files:**
-- `src/script-gen/script-gen-engine.ts` (L2259-2290, L4299-4305, L4427-4500, L5366-5369)
+- Scenario Graph builder (adds structured assertions) — upstream
+- `src/script-gen/script-gen-engine.ts` (deterministic assertion mapper)
 
 **Test Coverage:**
-- [ ] Unit test: `expectedBehavior: {url: '/dashboard'}` → generates `toHaveURL` assertion
-- [ ] Unit test: `expectedResults: [{type: 'error', text: 'Invalid credentials'}]` → generates `toContainText` assertion
+- [ ] Unit test: `{type:'url', value:'/inventory'}` → `toHaveURL(/inventory/)`
+- [ ] Unit test: `{type:'visible', target:'logout_button'}` → `toBeVisible()`
+- [ ] Unit test: `{type:'error', value:'Invalid credentials'}` → `toContainText('Invalid credentials')`
+- [ ] Unit test: node without `assertions[]` → legacy inference still runs (no regression)
+
+**Definition of Done:** A migrated scenario's assertions come entirely from the graph; Script Gen
+guesses nothing.
 
 ---
 
-### **Sprint 2D.5: Deterministic Script Structure ⭐⭐⭐**
+### **PR 2D.5 — Delete Duplicated Inference ⭐⭐⭐⭐**
 
-**Current Problem:** Script structure varies based on inferred scenario type (login vs checkout vs normal).
+**Now — and only now — deletion is safe**, because 2D.2–2D.4 made every one of these paths unreachable
+for graph-backed scenarios. This PR removes what is, by this point, dead code.
 
-**What to Remove:**
-- [ ] **PO matching by scenario type** (L3167, L3395, L3756)
-  - `if (usePO) importLine += loginPO.importPath`
-  - `if (loginPO) { ... }` conditional logic
-- [ ] **Flow-based PO selection** (happens in `applyPageObjectActions()`)
-- [ ] **Scenario-aware step grouping** (login triad collapse, checkout grouping)
+**What to delete (verify each is dead via coverage first):**
+- [ ] Login-triad detection (L3395–3577 in `script-gen-engine.ts`)
+- [ ] Checkout detection (L3610 in `script-gen-engine.ts`; L304 in `page-object-rewriter.ts`)
+- [ ] `inferFlowBucket()` auth/checkout bucketing (L1880–1910)
+- [ ] Field-grounding regex (username/password/click detection, L4094–4138)
+- [ ] Assertion inference from title/URL (`buildAssertion()` heuristics, L4299–4305, L4395–4401)
+- [ ] Coverage-category regex (L2259–2290)
+- [ ] `extractCredentialsFromSteps()` / `looksLikeCredential()` (L2055–2085) — replaced by 2D.2
+- [ ] Post-login assertion trigger (L5366–5369)
 
-**What to Replace With:**
-- [ ] Uniform script structure regardless of scenario type
-- [ ] Steps from graph → code lines (1:1, no grouping, no collapsing)
-- [ ] PO imports based on ACTUAL elements used, not inferred scenario type
-
-**Target Files:**
-- `src/script-gen/script-gen-engine.ts` (L3167, L3395, L3756, entire `applyPageObjectActions()`)
+**Precondition (must hold before merging):**
+- [ ] Prove via test/telemetry that graph-backed scenarios never enter these paths
+- [ ] Any remaining callers are legacy-only and explicitly scoped for removal
 
 **Test Coverage:**
-- [ ] Unit test: Two scenarios with same graph structure → identical script structure
-- [ ] Unit test: Login scenario vs checkout scenario → both use same deterministic template
+- [ ] Regression suite: all migrated scenarios produce identical (or better) scripts with the code removed
+- [ ] No test relies on the deleted inference for a graph-backed case
 
 ---
 
-### **Sprint 2D.6: Remove Duplicate Intelligence ⭐⭐⭐⭐⭐**
+### **PR 2D.6 — Delete ScenarioIntelligence ⭐⭐⭐⭐⭐**
 
-**Current Problem:** ScenarioIntelligence module still exists with 7+ transformers that re-classify scenarios.
+**The final step:** the classification module is now entirely obsolete.
 
-**What to DELETE ENTIRELY:**
-- [ ] `src/script-gen/scenario-intelligence/` directory (entire module)
-  - `index.ts` — `ScenarioIntelligence` class
-  - `detection.ts` — `classifyScenario()`, `extractSpecialCharLiteral()`
-  - `transformers/boundary-length.transformer.ts`
-  - `transformers/empty-fields.transformer.ts`
-  - `transformers/invalid-credentials.transformer.ts`
-  - `transformers/normal.transformer.ts`
-  - `transformers/special-characters.transformer.ts`
-  - `transformers/whitespace.transformer.ts`
-  - `types.ts`
-- [ ] Remove `this.scenario = new ScenarioIntelligence()` from `script-gen-engine.ts:595`
-- [ ] Remove import `ScenarioIntelligence` from `script-gen-engine.ts:44`
-- [ ] Remove all calls to `this.scenario.classify()`
-- [ ] Remove all transformer references
+**What to DELETE:**
+- [ ] `src/script-gen/scenario-intelligence/` (entire directory: `index.ts`, `detection.ts`, `types.ts`, all 6 transformers)
+- [ ] `this.scenario = new ScenarioIntelligence()` (script-gen-engine.ts:595)
+- [ ] `import { ScenarioIntelligence } …` (script-gen-engine.ts:44)
+- [ ] All `this.scenario.classify()` calls and transformer references
 
-**Verification:**
-- [ ] `grep -r "ScenarioIntelligence" src/` → 0 results
-- [ ] `grep -r "scenario.classify" src/` → 0 results
-- [ ] `grep -r "transformer" src/script-gen/` → 0 results (except type imports)
-- [ ] ALL Script Gen logic reads ONLY from ScenarioNode fields (no inference, no classification)
+**Architecture contract (enforced by test):**
+- [ ] `grep -r "ScenarioIntelligence" src/` → **0**
+- [ ] `grep -r "scenario.classify" src/` → **0**
+- [ ] `grep -r "transformer" src/script-gen/` → **0** (except unrelated type imports)
+- [ ] Script Gen reads ONLY from ScenarioNode fields — zero classification, zero inference
 
 **Test Coverage:**
-- [ ] Architecture contract test: `script-gen-engine.ts` imports NO scenario-intelligence modules
-- [ ] Architecture contract test: No regex-based scenario detection anywhere in `src/script-gen/`
+- [ ] Architecture contract test: `script-gen-engine.ts` imports no scenario-intelligence module
+- [ ] Architecture contract test: no regex-based scenario detection remains in `src/script-gen/`
 
 ---
 
-## 🧹 Supporting Cleanup (Not Blockers, But Nice-to-Have)
+## 🧹 Supporting Cleanup (opportunistic, after 2D.6)
 
-- [ ] Remove auth-specific regex from `page-crawler.ts` (L309, L363) — page classification shouldn't be login-aware
-- [ ] Remove login-specific logic from `auth-engine.ts` (if Script Gen no longer needs it)
-- [ ] Remove `workflow-mapper.ts` login page detection (L94-95)
+- [ ] Remove auth-specific regex from `page-crawler.ts` (L309, L363)
 - [ ] Remove login-specific stopwords from credential validator (L2070)
+- [ ] Review `workflow-mapper.ts` login page detection (L94–95)
 
 ---
 
 ## 📊 Progress Tracking
 
-| Sprint | Status | Files Changed | Tests Added | Intelligence Removed |
-|--------|--------|---------------|-------------|---------------------|
-| 2D.1   | ✅ DONE | 4 | 4 | Semantics-based credentials (partial) |
-| 2D.2   | 🔲 TODO | TBD | TBD | Dataset value extraction |
-| 2D.3   | 🔲 TODO | TBD | TBD | Action detection regex |
-| 2D.4   | 🔲 TODO | TBD | TBD | Assertion inference |
-| 2D.5   | 🔲 TODO | TBD | TBD | Flow-based structure |
-| 2D.6   | 🔲 TODO | TBD | TBD | ScenarioIntelligence module |
+| PR    | Capability the Graph Gains          | Additive? | Status | Tests |
+|-------|-------------------------------------|-----------|--------|-------|
+| 2D.1  | Semantics (variable/variation/behavior) | ✅ | ✅ DONE | 4 |
+| 2D.2  | **Execution data** (resolvedDataset)     | ✅ additive | 🔲 TODO | TBD |
+| 2D.3  | **Executable actions** (step·action·target·value) | ✅ additive | 🔲 TODO | TBD |
+| 2D.4  | **Executable assertions** (type·target·value) | ✅ additive | 🔲 TODO | TBD |
+| 2D.5  | — (deletion of now-dead inference)  | 🗑️ removal | 🔲 TODO | TBD |
+| 2D.6  | — (deletion of ScenarioIntelligence) | 🗑️ removal | 🔲 TODO | TBD |
 
 ---
 
 ## ✅ Success Criteria (End of Sprint 2D)
 
-**The Litmus Test:**
+**The Litmus Test — remove the requirement text entirely:**
 ```typescript
-// Remove this line from the entire codebase:
-const requirement = tc.requirement; // ❌ NEVER READ
+const requirement = undefined; // ❌ NEVER READ
 
-// Script Gen should work using ONLY:
+// Script Gen works using ONLY the canonical graph node:
 const node = scenarioGraph.get(tc.scenarioId);
 const script = generateScript({
-  title: node.title,
-  objective: node.objective,
-  semantics: node.semantics,          // ← variableUnderTest + variation + expectedBehavior
-  execution: node.execution,          // ← resolvedDataset
-  expectedResults: node.expectedResults,
-  steps: node.steps,                  // ← ordered action list with targets + values
+  title:           node.title,
+  objective:       node.objective,
+  execution:       node.execution,        // 2D.2 — resolved dataset values
+  steps:           node.steps,            // 2D.3 — each: action · target · value
+  assertions:      node.assertions,       // 2D.4 — each: type · target · value
 });
 ```
 
-**Verification:**
-1. Remove `requirement` field from all test case projections
-2. Run Script Generation
-3. Generated scripts are IDENTICAL (or better)
-4. Zero fallback to ScenarioIntelligence
-5. Zero regex-based classification
-6. `src/script-gen/scenario-intelligence/` directory deleted
+**Verified when:**
+1. The graph carries execution data, executable actions, and executable assertions
+2. Script Gen is a pure `switch(action)` / `switch(assertion.type)` adapter
+3. Removing the requirement text changes nothing in the output
+4. Zero fallback to ScenarioIntelligence; zero regex classification
+5. `src/script-gen/scenario-intelligence/` is deleted and the architecture contract test enforces it
+
+And the same canonical execution model is now consumable by Healing, Replay, Self-Healing,
+Coverage Gap, and Impact Analysis.
 
 ---
 
-**Next Step:** Start Sprint 2D.2 (consume `execution.resolvedDataset`)
+**Next Step:** Start **PR 2D.2 — Graph owns Execution Data** (additive; `execution.resolvedDataset`).
