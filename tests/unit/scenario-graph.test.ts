@@ -367,10 +367,10 @@ describe('buildScenarioGraph — resolved dataset on nodes (Sprint 2C)', () => {
       requirementId: 42,
       availableDatasets: [VALID_USERS],
     });
-    // Every registered_user node gets the resolved record; at least one exists.
-    const resolvedNodes = g.nodes.filter(n => n.resolvedDataset);
+    // Every registered_user node gets the resolved record under `execution`.
+    const resolvedNodes = g.nodes.filter(n => n.execution?.resolvedDataset);
     expect(resolvedNodes.length).toBeGreaterThan(0);
-    const rec = resolvedNodes[0]!.resolvedDataset!;
+    const rec = resolvedNodes[0]!.execution!.resolvedDataset!;
     expect(rec.datasetId).toBe('valid_users');
     expect(rec.recordId).toBe('standard_user');
     // The node holds the REAL, UNMASKED values (masking happens at projection).
@@ -380,13 +380,13 @@ describe('buildScenarioGraph — resolved dataset on nodes (Sprint 2C)', () => {
     expect((rec as any).confidence).toBeUndefined();
   });
 
-  it('leaves resolvedDataset undefined when no dataset declares the role', () => {
+  it('leaves execution undefined when no dataset declares the role', () => {
     const g = buildScenarioGraph(LOGIN_REQ, COVERAGE, LOGIN_KNOWLEDGE, {
       now: FIXED_NOW,
       requirementId: 42,
       availableDatasets: [], // nothing to match against
     });
-    expect(g.nodes.every(n => n.resolvedDataset === undefined)).toBe(true);
+    expect(g.nodes.every(n => n.execution === undefined)).toBe(true);
   });
 
   it('is additive — omitting availableDatasets changes nothing else on the node', () => {
@@ -396,14 +396,15 @@ describe('buildScenarioGraph — resolved dataset on nodes (Sprint 2C)', () => {
     const without = buildScenarioGraph(LOGIN_REQ, COVERAGE, LOGIN_KNOWLEDGE, {
       now: FIXED_NOW, requirementId: 42,
     });
-    // Same node ids + semantics; only resolvedDataset differs.
+    // Same node ids + semantics; only execution differs.
     expect(withData.nodes.map(n => n.id)).toEqual(without.nodes.map(n => n.id));
     expect(withData.nodes.map(n => n.semantics)).toEqual(without.nodes.map(n => n.semantics));
+    expect(without.nodes.every(n => n.execution === undefined)).toBe(true);
     // Resolution is deterministic across builds.
     const again = buildScenarioGraph(LOGIN_REQ, COVERAGE, LOGIN_KNOWLEDGE, {
       now: FIXED_NOW, requirementId: 42, availableDatasets: [VALID_USERS],
     });
-    expect(withData.nodes.map(n => n.resolvedDataset)).toEqual(again.nodes.map(n => n.resolvedDataset));
+    expect(withData.nodes.map(n => n.execution)).toEqual(again.nodes.map(n => n.execution));
   });
 
   it('never mutates the Dataset[] it is given', () => {

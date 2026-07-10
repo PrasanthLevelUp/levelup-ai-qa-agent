@@ -114,11 +114,13 @@ describe('toTestCaseLab', () => {
           ? {
               ...n,
               semantics: { ...n.semantics!, requiredDataRole: 'registered_user' },
-              resolvedDataset: {
-                datasetId: 'valid_users',
-                recordId: 'standard_user',
-                values: { username: 'standard_user', password: 'secret_sauce' },
-                reason: 'role registered_user → dataset valid_users',
+              execution: {
+                resolvedDataset: {
+                  datasetId: 'valid_users',
+                  recordId: 'standard_user',
+                  values: { username: 'standard_user', password: 'secret_sauce' },
+                  reason: 'role registered_user → dataset valid_users',
+                },
               },
             }
           : n,
@@ -143,8 +145,8 @@ describe('toTestCaseLab', () => {
     expect(c0.resolvedDataset!.values.password).toBe('*****');
     expect((c0.resolvedDataset as any).confidence).toBeUndefined();
 
-    // The node still holds the REAL values — masking is projection-only.
-    expect(withResolved.nodes[0]!.resolvedDataset!.values.password).toBe('secret_sauce');
+    // The node still holds the REAL values under execution — masking is projection-only.
+    expect(withResolved.nodes[0]!.execution!.resolvedDataset!.values.password).toBe('secret_sauce');
   });
 
   it('leaves testData untouched and omits resolvedDataset when unresolved', () => {

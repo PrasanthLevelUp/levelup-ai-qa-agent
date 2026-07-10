@@ -120,6 +120,28 @@ export interface ScenarioNode {
   /** True when the scenario is grounded in the requirement/app profile/test data. */
   grounded: boolean;
   /**
+   * Per-EXECUTION facts for this node — everything that can change from run to run
+   * without changing the scenario's identity. A single scenario (e.g. "Login")
+   * may execute against `standard_user`, `problem_user` or `premium_user`, in
+   * different environments/browsers/locales; none of that alters what the
+   * scenario *is*. Keeping it under `execution` (rather than flattened onto the
+   * node) means future consumers — Script Gen, Healing, Replay, Scheduler —
+   * extend one clearly-scoped object instead of accreting sibling fields, and it
+   * keeps execution data out of the scenario identity / fingerprint.
+   *
+   * Optional so older persisted graphs and unresolved nodes remain valid.
+   */
+  execution?: ScenarioExecution;
+}
+
+/**
+ * Execution-scoped facts attached to a {@link ScenarioNode}. Distinct from
+ * `semantics` (what the scenario means) — this is *how a particular run is
+ * parameterised*. Today it carries the resolved dataset record; environment,
+ * browser and locale are the natural next members (added by future sprints).
+ */
+export interface ScenarioExecution {
+  /**
    * The concrete dataset record resolved for this node's `semantics.requiredDataRole`,
    * or absent when the role is empty or no available dataset declares it. Resolved
    * EXACTLY ONCE, deterministically, at graph-build time (see scenario-graph-builder),

@@ -38,7 +38,7 @@ const norm = (s?: string) => (s || '').trim().toLowerCase();
  * `testData` (if any) is preserved on its own line so nothing is lost.
  */
 function composeResolvedTestData(node: ScenarioNode): string {
-  const r = node.resolvedDataset;
+  const r = node.execution?.resolvedDataset;
   if (!r) return node.testData;
   const role = node.semantics?.requiredDataRole || 'n/a';
   const fields = Object.keys(r.values);
@@ -127,8 +127,11 @@ export function toTestCaseLab(graph: ScenarioGraph): TestCaseLabProjection {
     source: n.source,
     sourceEvidence: n.sourceEvidence,
     scenarioIndex: i,
-    // Mask at the projection boundary — the node keeps the real values.
-    ...(n.resolvedDataset ? { resolvedDataset: maskResolvedDataset(n.resolvedDataset) } : {}),
+    // Mask at the projection boundary — the node keeps the real values under
+    // `execution`. The projection flattens it onto the case for the Lab view.
+    ...(n.execution?.resolvedDataset
+      ? { resolvedDataset: maskResolvedDataset(n.execution.resolvedDataset) }
+      : {}),
   }));
   return { scenarios, testCases };
 }

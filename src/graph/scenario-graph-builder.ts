@@ -185,9 +185,9 @@ export interface AssembleGraphArgs {
   /**
    * Datasets available to resolve each node's `semantics.requiredDataRole`
    * against. When provided, resolution runs ONCE here at graph-build time and
-   * the winning record is carried on the node (`resolvedDataset`). Omitted (or
-   * empty) means no resolution — nodes simply carry no `resolvedDataset`, which
-   * is the pre-Sprint-2C behaviour, so this is fully backwards compatible.
+   * the winning record is carried on the node under `execution.resolvedDataset`.
+   * Omitted (or empty) means no resolution — nodes simply carry no `execution`,
+   * which is the pre-Sprint-2C behaviour, so this is fully backwards compatible.
    */
   availableDatasets?: readonly Dataset[];
 }
@@ -230,9 +230,11 @@ function nodesFromCases(
       source: tc.source as ScenarioSource,
       sourceEvidence: tc.sourceEvidence,
       grounded: m.grounded ?? false,
-      // Carry the REAL (unmasked) resolved record — the node is the internal
-      // source of truth. Masking is applied only at projection boundaries.
-      ...(resolved ? { resolvedDataset: resolved } : {}),
+      // Carry the REAL (unmasked) resolved record under `execution` — the node is
+      // the internal source of truth. `execution` groups all per-run facts
+      // (dataset today; environment/browser/locale later) apart from scenario
+      // identity. Masking is applied only at projection boundaries.
+      ...(resolved ? { execution: { resolvedDataset: resolved } } : {}),
     };
   });
 }
