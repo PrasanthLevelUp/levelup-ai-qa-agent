@@ -4651,6 +4651,21 @@ ${gotoB}${sessionLogin('pageB')}
     if (/\b(valid|invalid|successful|success|failure|failed|redirect|redirected|dashboard|logged\s?in|log\s?in|login|logout|credential|credentials|message|displayed|visible|shown|should|scenario|verify|verified|ensure|confirm|expected|able\s+to|correctly|properly|standard\s+user)\b/.test(p)) {
       return false;
     }
+    // Scenario INPUT-MUTATION qualifiers ("whitespace", "special characters",
+    // "leading/trailing", "uppercase", "maximum length", "256 characters")
+    // describe HOW a value is mutated in a boundary/negative case — they do NOT
+    // name a UI control. Grounding one as a locator finds no element, falls back
+    // to the curated field selector, and (because the phrase never matched) marks
+    // it ungrounded — which used to emit a bogus `// TODO: Review locator` above
+    // a perfectly good credential fill. When stripping these qualifier tokens
+    // leaves no real field noun behind, the phrase is a pure qualifier: reject it
+    // so the caller grounds the canonical field ('username email' / 'password')
+    // instead, which resolves cleanly with no false review flag.
+    const withoutQualifiers = p
+      .replace(/\b(leading|trailing|whitespace|spaces?|special|characters?|chars?|symbols?|uppercase|lowercase|upper|lower|mixed|case|maximum|minimum|max|min|length|long|short|blank|empty|[0-9]+)\b/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+    if (!withoutQualifiers) return false;
     return true;
   }
 
