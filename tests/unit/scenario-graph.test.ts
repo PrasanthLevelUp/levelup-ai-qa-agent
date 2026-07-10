@@ -24,6 +24,7 @@ import {
   computeFingerprint,
   type ScenarioNode,
 } from '../../src/graph/scenario-graph';
+import type { Dataset } from '../../src/engines/dataset-resolver';
 
 /* ------------------------------------------------------------------ */
 /*  Fixtures — a realistic login requirement + grounded App Profile.   */
@@ -338,5 +339,78 @@ describe('buildScenarioGraph — scenario semantics on nodes', () => {
     const a = build();
     const b = build();
     expect(a.nodes.map(n => n.semantics)).toEqual(b.nodes.map(n => n.semantics));
+  });
+});
+
+/* ================================================================== */
+/*  Sprint 2C — the resolved dataset record rides ON the graph node    */
+/* ================================================================== */
+
+describe('buildScenarioGraph — resolved dataset on nodes (Sprint 2C)', () => {
+  // A rich dataset object (values + role tags), NOT a token-safe summary.
+  const VALID_USERS: Dataset = {
+    datasetId: 'valid_users',
+    name: 'valid_users',
+    roles: ['registered_user'],
+    records: [
+      {
+        recordId: 'standard_user',
+        values: { username: 'standard_user', password: 'secret_sauce' },
+        tags: ['registered_user'],
+      },
+    ],
+  };
+
+  it('resolves ONCE at build time and attaches the record to matching nodes', () => {
+    const g = buildScenarioGraph(LOGIN_REQ, COVERAGE, LOGIN_KNOWLEDGE, {
+      now: FIXED_NOW,
+      requirementId: 42,
+      availableDatasets: [VALID_USERS],
+    });
+    // Every registered_user node gets the resolved record; at least one exists.
+    const resolvedNodes = g.nodes.filter(n => n.resolvedDataset);
+    expect(resolvedNodes.length).toBeGreaterThan(0);
+    const rec = resolvedNodes[0]!.resolvedDataset!;
+    expect(rec.datasetId).toBe('valid_users');
+    expect(rec.recordId).toBe('standard_user');
+    // The node holds the REAL, UNMASKED values (masking happens at projection).
+    expect(rec.values.username).toBe('standard_user');
+    expect(rec.values.password).toBe('secret_sauce');
+    // Deterministic resolver — no confidence rides along.
+    expect((rec as any).confidence).toBeUndefined();
+  });
+
+  it('leaves resolvedDataset undefined when no dataset declares the role', () => {
+    const g = buildScenarioGraph(LOGIN_REQ, COVERAGE, LOGIN_KNOWLEDGE, {
+      now: FIXED_NOW,
+      requirementId: 42,
+      availableDatasets: [], // nothing to match against
+    });
+    expect(g.nodes.every(n => n.resolvedDataset === undefined)).toBe(true);
+  });
+
+  it('is additive — omitting availableDatasets changes nothing else on the node', () => {
+    const withData = buildScenarioGraph(LOGIN_REQ, COVERAGE, LOGIN_KNOWLEDGE, {
+      now: FIXED_NOW, requirementId: 42, availableDatasets: [VALID_USERS],
+    });
+    const without = buildScenarioGraph(LOGIN_REQ, COVERAGE, LOGIN_KNOWLEDGE, {
+      now: FIXED_NOW, requirementId: 42,
+    });
+    // Same node ids + semantics; only resolvedDataset differs.
+    expect(withData.nodes.map(n => n.id)).toEqual(without.nodes.map(n => n.id));
+    expect(withData.nodes.map(n => n.semantics)).toEqual(without.nodes.map(n => n.semantics));
+    // Resolution is deterministic across builds.
+    const again = buildScenarioGraph(LOGIN_REQ, COVERAGE, LOGIN_KNOWLEDGE, {
+      now: FIXED_NOW, requirementId: 42, availableDatasets: [VALID_USERS],
+    });
+    expect(withData.nodes.map(n => n.resolvedDataset)).toEqual(again.nodes.map(n => n.resolvedDataset));
+  });
+
+  it('never mutates the Dataset[] it is given', () => {
+    const snapshot = JSON.stringify([VALID_USERS]);
+    buildScenarioGraph(LOGIN_REQ, COVERAGE, LOGIN_KNOWLEDGE, {
+      now: FIXED_NOW, requirementId: 42, availableDatasets: [VALID_USERS],
+    });
+    expect(JSON.stringify([VALID_USERS])).toBe(snapshot);
   });
 });

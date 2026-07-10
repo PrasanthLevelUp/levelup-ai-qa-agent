@@ -81,16 +81,36 @@ export interface Dataset {
 /**
  * The ONLY thing a consumer ever receives. No scenario, no planner, no graph,
  * no scores/ranking — just the resolved truth: which dataset, which record, and
- * its values, plus a confidence and a human-readable reason for traceability.
+ * its values, plus a human-readable reason for traceability.
+ *
+ * NO `confidence`: resolution is deterministic and binary — either a dataset
+ * declares the role (a record is returned) or none does (`null`). There is no
+ * uncertainty to express, so a confidence number would be noise. The internal
+ * score only breaks ties between equally-valid candidates; it is never exposed.
  */
 export interface ResolvedDatasetRecord {
   readonly datasetId: string;
   readonly recordId: string;
   readonly values: Readonly<Record<string, string>>;
-  /** 0..1 — how confident the deterministic match is. */
-  readonly confidence: number;
   /** Human-readable explanation (traceability), e.g. why this record won. */
   readonly reason: string;
+}
+
+/** The mask shown in place of a resolved value at any display/prompt boundary. */
+export const MASKED_VALUE = '*****';
+
+/**
+ * Project a resolved record with every value replaced by {@link MASKED_VALUE},
+ * preserving the field NAMES, datasetId, recordId and reason. Pure — returns a
+ * fresh frozen record, never mutates the input. This is the single masking
+ * primitive reused at every boundary that leaves the internal graph (the Test
+ * Case Lab projection and the LLM formatter prompt) so literal credential values
+ * never leak while the role/field structure stays visible.
+ */
+export function maskResolvedDataset(record: ResolvedDatasetRecord): ResolvedDatasetRecord {
+  const masked: Record<string, string> = {};
+  for (const key of Object.keys(record.values)) masked[key] = MASKED_VALUE;
+  return Object.freeze({ ...record, values: Object.freeze(masked) });
 }
 
 /* ------------------------------------------------------------------ */
@@ -208,7 +228,6 @@ export class DatasetResolver {
       recordId: winner.record.recordId,
       // Copy values so the returned record can be frozen without touching input.
       values: Object.freeze({ ...winner.record.values }),
-      confidence: Math.round(winner.score * 100) / 100,
       reason:
         `role '${role}' matched dataset '${winner.dataset.datasetId}'` +
         `${winner.dataset.roles?.includes(role) ? ' (dataset role)' : ' (record tag)'}` +

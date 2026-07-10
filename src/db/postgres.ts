@@ -9220,6 +9220,60 @@ export async function getTestDataSetSummaries(
   return out;
 }
 
+/**
+ * Rich dataset loader for the Dataset Resolver (Sprint 2C).
+ * ----------------------------------------------------------------------------
+ * Unlike {@link getTestDataSetSummaries} (which strips values and, crucially,
+ * the per-record `tags` the resolver keys off), this returns the REAL dataset
+ * objects: each set with its full records, values and role `tags`. This is the
+ * source of truth the resolver matches a required data role against.
+ *
+ * Deliberately returns a DB-NATIVE shape (no engine/resolver types) so the DB
+ * layer stays free of engine imports — the API route maps this into the
+ * resolver's `Dataset[]` contract. Values ARE included here (the resolver needs
+ * real records); masking is applied later, at every display/prompt boundary.
+ *
+ * @param datasetIds - optional filter for deterministic linkage to a run.
+ */
+export async function getTestDataSetsWithRecords(
+  companyId: number,
+  projectId?: number,
+  environment?: string,
+  datasetIds?: number[],
+): Promise<Array<{
+  id: number;
+  name: string;
+  environment: string;
+  records: Array<{ key: string; value: any; tags: string[]; isSecret: boolean }>;
+}>> {
+  let sets = await listTestDataSets(companyId, projectId, environment);
+  if (datasetIds && datasetIds.length > 0) {
+    sets = sets.filter(ds => datasetIds.includes(ds.id));
+  }
+  if (sets.length === 0) return [];
+  const out: Array<{
+    id: number;
+    name: string;
+    environment: string;
+    records: Array<{ key: string; value: any; tags: string[]; isSecret: boolean }>;
+  }> = [];
+  for (const ds of sets) {
+    const records = await getTestDataRecords(ds.id);
+    out.push({
+      id: ds.id,
+      name: ds.name,
+      environment: ds.environment,
+      records: records.map(r => ({
+        key: r.key,
+        value: r.value_jsonb,
+        tags: r.tags ?? [],
+        isSecret: r.is_secret,
+      })),
+    });
+  }
+  return out;
+}
+
 export async function updateTestDataRecord(
   id: number,
   updates: Partial<Pick<TestDataRecord, 'value_jsonb' | 'data_type' | 'is_secret' | 'secret_ref' | 'tags'>>,

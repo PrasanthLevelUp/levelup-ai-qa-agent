@@ -42,8 +42,13 @@
  */
 
 import type { QACategory, ScenarioSemantics } from './qa-knowledge-engine';
-import { datasetResolver } from './dataset-resolver';
-import type { Dataset, ResolvedDatasetRecord } from './dataset-resolver';
+// Resolution no longer happens here — it runs ONCE at Scenario Graph build time
+// and the record is carried down onto the case. We only need the record TYPE and
+// the shared masking primitive (single source of truth) for the prompt boundary.
+import {
+  maskResolvedDataset as maskResolvedRecord,
+  type ResolvedDatasetRecord,
+} from './dataset-resolver';
 import type {
   PlannedScenarioWithProvenance,
   ProvenanceSource,
@@ -272,6 +277,15 @@ export interface FormatterTestCase {
   /** Planner provenance carried through for explainability (optional: absent on
    * cases reconstructed from older DB rows). */
   provenance?: ScenarioProvenance;
+  /**
+   * The dataset record resolved for this case's required data role, carried down
+   * FROM the Scenario Graph (resolved once at graph-build time, never here). The
+   * Test Case Lab projection sets it; `buildFormatterInputs` reads it straight
+   * onto the FormatterInput so the LLM prompt can reference the data by role.
+   * Absent when the graph did not resolve a record. Holds real values; masking
+   * happens at the prompt boundary.
+   */
+  resolvedDataset?: ResolvedDatasetRecord;
 }
 
 /* ------------------------------------------------------------------ */
@@ -768,19 +782,15 @@ export interface FormatterInput {
 export function buildFormatterInputs(
   cases: FormatterTestCase[],
   semanticsById?: Map<string, ScenarioSemantics>,
-  availableDatasets?: readonly Dataset[],
 ): FormatterInput[] {
   return cases.map(tc => {
     const sem = semanticsById?.get(tc.scenarioId);
     const dataRole = sem?.requiredDataRole ?? 'valid_data';
-    // Turn the abstract data ROLE into a concrete dataset record — the ONLY
-    // place resolution happens. Best-effort: `resolve` returns null when no
-    // available dataset declares the role, and the contract stays valid without
-    // it. The resolver is a PURE function of (role, datasets) — it reads no
-    // scenario/semantics and never mutates either input.
-    const resolved = availableDatasets?.length
-      ? datasetResolver.resolve(dataRole, availableDatasets)
-      : null;
+    // Resolution already happened ONCE, at Scenario Graph build time, and the
+    // winning record was carried down onto this case (via the Test Case Lab
+    // projection). We simply READ it here — no dataset lookup, no resolver call,
+    // no second resolution. Absent when the graph resolved nothing.
+    const resolved = tc.resolvedDataset ?? null;
     // Deep-freeze: the seed steps array AND the whole object, so the immutable
     // contract is enforced at runtime (a stray mutation throws in strict mode /
     // is silently ignored otherwise — never a hidden semantic edit).
@@ -824,7 +834,7 @@ export function buildFormatterPrompt(inputs: FormatterInput[]): string {
   // dataset id, record id, role and the field NAMES (so it can write "Enter the
   // registered username") but NEVER the literal secret values — those never
   // belong in a manual test case and must not leak into the prompt/output.
-  const projected = inputs.map(maskResolvedDataset);
+  const projected = inputs.map(maskFormatterInput);
   const payload = JSON.stringify(projected);
   return `You are a senior QA engineer writing manual test cases. Each item below is an ALREADY-DECIDED test case: its objective, preconditions, the single variable under test, the expected behavior, the required data role, priority and coverage are FIXED. Do NOT change, restate or second-guess them.
 
@@ -846,29 +856,17 @@ TEST CASES:
 ${payload}`;
 }
 
-/** Mask token for resolved dataset field values shown in the formatter prompt. */
-const MASKED_VALUE = '*****';
-
 /**
  * Project a FormatterInput for the prompt, replacing every resolved-dataset
- * value with a mask while preserving the field NAMES, dataset id, record id,
- * confidence and reason. Pure — never mutates the input (values are copied into
- * a fresh object). Inputs without a resolved dataset pass through untouched.
+ * value with {@link MASKED_VALUE} while preserving the field NAMES, dataset id,
+ * record id and reason. The masking of the record itself reuses the SINGLE
+ * shared primitive (`maskResolvedRecord` from the Dataset Resolver) so the mask
+ * behaviour is defined in exactly one place. Pure — never mutates the input.
+ * Inputs without a resolved dataset pass through untouched.
  */
-function maskResolvedDataset(
-  input: FormatterInput,
-): FormatterInput | (Omit<FormatterInput, 'resolvedDataset'> & {
-  resolvedDataset: Omit<ResolvedDatasetRecord, 'values'> & { values: Record<string, string> };
-}) {
+function maskFormatterInput(input: FormatterInput): FormatterInput {
   if (!input.resolvedDataset) return input;
-  const maskedValues: Record<string, string> = {};
-  for (const key of Object.keys(input.resolvedDataset.values)) {
-    maskedValues[key] = MASKED_VALUE;
-  }
-  return {
-    ...input,
-    resolvedDataset: { ...input.resolvedDataset, values: maskedValues },
-  };
+  return { ...input, resolvedDataset: maskResolvedRecord(input.resolvedDataset) };
 }
 
 /**

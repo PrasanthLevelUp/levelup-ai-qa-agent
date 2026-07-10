@@ -21,6 +21,7 @@ import {
 } from '../engines/scenario-builder';
 import { validateCanonicalTestCases } from '../engines/canonical-validator';
 import { getScenarioSemantics } from '../engines/qa-knowledge-engine';
+import { datasetResolver, type Dataset } from '../engines/dataset-resolver';
 import {
   type ScenarioGraph,
   type ScenarioNode,
@@ -51,6 +52,11 @@ export interface BuildScenarioGraphOptions {
   featureTypeHint?: string;
   /** Fixed timestamp for deterministic tests; defaults to now(). */
   now?: string;
+  /**
+   * Datasets available for role resolution (see `AssembleGraphArgs`). Passed
+   * straight through to `assembleScenarioGraph`. Omitted means no resolution.
+   */
+  availableDatasets?: readonly Dataset[];
 }
 
 /* ------------------------------------------------------------------ */
@@ -176,12 +182,33 @@ export interface AssembleGraphArgs {
   category: string;
   requirementId?: number;
   now?: string;
+  /**
+   * Datasets available to resolve each node's `semantics.requiredDataRole`
+   * against. When provided, resolution runs ONCE here at graph-build time and
+   * the winning record is carried on the node (`resolvedDataset`). Omitted (or
+   * empty) means no resolution — nodes simply carry no `resolvedDataset`, which
+   * is the pre-Sprint-2C behaviour, so this is fully backwards compatible.
+   */
+  availableDatasets?: readonly Dataset[];
 }
 
 /** Turn index-aligned canonical cases + meta into typed scenario nodes. */
-function nodesFromCases(cases: CanonicalCaseLike[], meta: NodeMetaLike[]): ScenarioNode[] {
+function nodesFromCases(
+  cases: CanonicalCaseLike[],
+  meta: NodeMetaLike[],
+  availableDatasets?: readonly Dataset[],
+): ScenarioNode[] {
   return cases.map((tc, i) => {
     const m = meta[i] || {};
+    // Resolve the required data role EXACTLY ONCE, here, deterministically. The
+    // resolver is pure and returns `null` when the role is empty or no available
+    // dataset declares it — in which case the node simply carries no resolved
+    // record. We never fall back, guess, or pick datasets[0].
+    const role = m.semantics?.requiredDataRole;
+    const resolved =
+      role && availableDatasets?.length
+        ? datasetResolver.resolve(role, availableDatasets)
+        : null;
     return {
       id: tc.scenarioId,
       title: tc.title,
@@ -203,6 +230,9 @@ function nodesFromCases(cases: CanonicalCaseLike[], meta: NodeMetaLike[]): Scena
       source: tc.source as ScenarioSource,
       sourceEvidence: tc.sourceEvidence,
       grounded: m.grounded ?? false,
+      // Carry the REAL (unmasked) resolved record — the node is the internal
+      // source of truth. Masking is applied only at projection boundaries.
+      ...(resolved ? { resolvedDataset: resolved } : {}),
     };
   });
 }
@@ -215,7 +245,7 @@ function nodesFromCases(cases: CanonicalCaseLike[], meta: NodeMetaLike[]): Scena
  * paying to run the pipeline twice.
  */
 export function assembleScenarioGraph(args: AssembleGraphArgs): ScenarioGraph {
-  const nodes = nodesFromCases(args.cases, args.meta);
+  const nodes = nodesFromCases(args.cases, args.meta, args.availableDatasets);
   const edges = deriveEdges(nodes);
 
   const requirementText = [
@@ -291,5 +321,6 @@ export function buildScenarioGraph(
     category: plan.classification.category,
     requirementId: options?.requirementId,
     now: options?.now,
+    availableDatasets: options?.availableDatasets,
   });
 }

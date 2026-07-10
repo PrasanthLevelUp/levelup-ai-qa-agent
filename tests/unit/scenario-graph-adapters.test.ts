@@ -101,6 +101,58 @@ describe('toTestCaseLab', () => {
     expect(p.testCases[0]!.priority).toBe('P0');
     expect(p.scenarios[0]!.coverageType).toBe('positive');
   });
+
+  /* -- Sprint 2C: the resolved dataset becomes VISIBLE in the Lab -- */
+
+  it('surfaces the resolved role/dataset/record and MASKS literal values', () => {
+    // Attach a resolved record (REAL, unmasked values) to the first node, the
+    // way buildScenarioGraph does at graph-build time.
+    const withResolved: ScenarioGraph = {
+      ...graph,
+      nodes: graph.nodes.map((n, i) =>
+        i === 0
+          ? {
+              ...n,
+              semantics: { ...n.semantics!, requiredDataRole: 'registered_user' },
+              resolvedDataset: {
+                datasetId: 'valid_users',
+                recordId: 'standard_user',
+                values: { username: 'standard_user', password: 'secret_sauce' },
+                reason: 'role registered_user → dataset valid_users',
+              },
+            }
+          : n,
+      ),
+    };
+
+    const p = toTestCaseLab(withResolved);
+    const c0 = p.testCases[0]!;
+
+    // The Lab now shows role, dataset and record names (Sprint 2C visibility).
+    expect(c0.testData).toContain('registered_user');
+    expect(c0.testData).toContain('valid_users');
+    expect(c0.testData).toContain('standard_user');
+    // …but never the secret literal value.
+    expect(c0.testData).not.toContain('secret_sauce');
+
+    // The structured record is surfaced too — and MASKED at this boundary.
+    expect(c0.resolvedDataset).toBeDefined();
+    expect(c0.resolvedDataset!.datasetId).toBe('valid_users');
+    expect(c0.resolvedDataset!.recordId).toBe('standard_user');
+    expect(c0.resolvedDataset!.values.username).toBe('*****');
+    expect(c0.resolvedDataset!.values.password).toBe('*****');
+    expect((c0.resolvedDataset as any).confidence).toBeUndefined();
+
+    // The node still holds the REAL values — masking is projection-only.
+    expect(withResolved.nodes[0]!.resolvedDataset!.values.password).toBe('secret_sauce');
+  });
+
+  it('leaves testData untouched and omits resolvedDataset when unresolved', () => {
+    const p = toTestCaseLab(graph); // no dataset was resolved
+    expect(p.testCases[1]!.resolvedDataset).toBeUndefined();
+    // The original grounded testData string is preserved verbatim.
+    expect(p.testCases[1]!.testData).toBe('standard_user');
+  });
 });
 
 /* ================================================================== */

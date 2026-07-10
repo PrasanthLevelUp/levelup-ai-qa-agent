@@ -393,7 +393,7 @@ describe('Formatter mode — minimal prompt (FormatterInput contract)', () => {
     expect(input.steps.length).toBe(originalLen);
   });
 
-  it('attaches resolvedDataset when a role-declaring dataset is available (never mutates semantics)', () => {
+  it('carries the resolvedDataset already on a case (resolved upstream at graph build) onto the FormatterInput', () => {
     const plan = planScenarios(LOGIN_REQ, COVERAGE, 'authentication');
     const { drafts } = buildDraftTestCases(plan, LOGIN_KNOWLEDGE, LOGIN_REQ);
     const out = buildDeterministicOutput(drafts);
@@ -404,17 +404,22 @@ describe('Formatter mode — minimal prompt (FormatterInput contract)', () => {
         requiredDataRole: 'registered_user',
       } as any],
     ]);
-    const datasets = [{
+    // Resolution no longer happens in buildFormatterInputs — it runs ONCE at
+    // Scenario Graph build time and the winning record is carried down onto the
+    // case (via the Test Case Lab projection). Simulate that here.
+    out.testCases[0].resolvedDataset = {
       datasetId: 'valid_users',
-      name: 'valid_users',
-      roles: ['registered_user'],
-      records: [{ recordId: 'standard_user', values: { username: 'standard_user', password: 'secret_sauce' }, tags: ['registered_user'] }],
-    }];
-    const inputs = buildFormatterInputs(out.testCases, semantics, datasets);
+      recordId: 'standard_user',
+      values: { username: 'standard_user', password: 'secret_sauce' },
+      reason: "role 'registered_user' matched dataset 'valid_users' → record 'standard_user'",
+    };
+    const inputs = buildFormatterInputs(out.testCases, semantics);
     const resolved = inputs[0].resolvedDataset;
     expect(resolved).toBeDefined();
     expect(resolved!.datasetId).toBe('valid_users');
     expect(resolved!.recordId).toBe('standard_user');
+    // A resolved record has NO confidence — deterministic, binary (see Sprint 2C).
+    expect((resolved as any).confidence).toBeUndefined();
     // Additive: dataRole is untouched and the semantics map is not mutated.
     expect(inputs[0].dataRole).toBe('registered_user');
     expect(semantics.get(out.testCases[0].scenarioId)!.requiredDataRole).toBe('registered_user');
@@ -431,13 +436,15 @@ describe('Formatter mode — minimal prompt (FormatterInput contract)', () => {
         requiredDataRole: 'registered_user',
       } as any],
     ]);
-    const datasets = [{
+    // Feed an UNMASKED resolved record (as the graph node holds internally) to
+    // prove the prompt boundary masks the values.
+    out.testCases[0].resolvedDataset = {
       datasetId: 'valid_users',
-      name: 'valid_users',
-      roles: ['registered_user'],
-      records: [{ recordId: 'standard_user', values: { username: 'standard_user', password: 'secret_sauce' }, tags: ['registered_user'] }],
-    }];
-    const inputs = buildFormatterInputs(out.testCases, semantics, datasets);
+      recordId: 'standard_user',
+      values: { username: 'standard_user', password: 'secret_sauce' },
+      reason: "role 'registered_user' matched dataset 'valid_users' → record 'standard_user'",
+    };
+    const inputs = buildFormatterInputs(out.testCases, semantics);
     const prompt = buildFormatterPrompt(inputs);
     // The dataset id, record id and role are surfaced for role-based wording...
     expect(prompt).toContain('valid_users');

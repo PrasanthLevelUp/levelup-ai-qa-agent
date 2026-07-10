@@ -20,7 +20,10 @@
 import {
   DatasetResolver,
   datasetResolver,
+  maskResolvedDataset,
+  MASKED_VALUE,
   type Dataset,
+  type ResolvedDatasetRecord,
 } from '../../src/engines/dataset-resolver';
 import {
   buildDraftTestCases,
@@ -75,7 +78,8 @@ describe('DatasetResolver — deterministic role → record resolution', () => {
     expect(record!.datasetId).toBe('valid_users');
     expect(record!.recordId).toBe('standard_user');
     expect(record!.values).toEqual({ username: 'standard_user', password: 'secret_sauce' });
-    expect(record!.confidence).toBeGreaterThan(0);
+    // No `confidence` — resolution is deterministic and binary (Sprint 2C rework).
+    expect((record as any).confidence).toBeUndefined();
     expect(record!.reason).toContain('registered_user');
     expect(record!.reason).toContain('valid_users');
   });
@@ -102,8 +106,9 @@ describe('DatasetResolver — deterministic role → record resolution', () => {
     const plan = planScenarios(LOGIN_REQ, ['positive'], 'authentication');
     const { drafts } = buildDraftTestCases(plan, LOGIN_KNOWLEDGE, LOGIN_REQ);
     const out = buildDeterministicOutput(drafts);
-    // Pass datasets that declare NONE of the requested roles → resolve() = null.
-    const inputs = buildFormatterInputs(out.testCases, undefined, [ADMIN_USERS]);
+    // Cases carry NO resolvedDataset (the graph resolved nothing) → the formatter
+    // contract is still total and valid, with resolvedDataset simply absent.
+    const inputs = buildFormatterInputs(out.testCases, undefined);
     expect(inputs.length).toBe(out.testCases.length);
     for (const input of inputs) {
       expect(input.resolvedDataset).toBeUndefined();
@@ -132,9 +137,10 @@ describe('DatasetResolver — deterministic role → record resolution', () => {
     const winnerB = resolver.resolve('registered_user', [RICH, SPARSE]);
     expect(winnerA!.datasetId).toBe('rich_users');
     expect(winnerB!.datasetId).toBe('rich_users'); // order-independent
-    expect(winnerA!.confidence).toBeGreaterThan(
-      resolver.resolve('registered_user', [SPARSE])!.confidence,
-    );
+    // The winning record is the fully-populated one — the score (internal only,
+    // never exposed) rewards key completeness. Sparse alone still resolves.
+    expect(winnerA!.recordId).toBe('full');
+    expect(resolver.resolve('registered_user', [SPARSE])!.datasetId).toBe('sparse_users');
   });
 
   it('5) same inputs → same record, every time (pure & deterministic)', () => {
@@ -171,8 +177,34 @@ describe('DatasetResolver — deterministic role → record resolution', () => {
       } as any],
     ]);
     const semanticsSnapshot = JSON.stringify(Array.from(semantics.entries()));
-    buildFormatterInputs(out.testCases, semantics, ALL_DATASETS);
+    buildFormatterInputs(out.testCases, semantics);
     expect(JSON.stringify(Array.from(semantics.entries()))).toBe(semanticsSnapshot);
+  });
+
+  it('8) maskResolvedDataset replaces every value with MASKED_VALUE, preserving shape', () => {
+    const record: ResolvedDatasetRecord = {
+      datasetId: 'valid_users',
+      recordId: 'standard_user',
+      values: { username: 'standard_user', password: 'secret_sauce' },
+      reason: 'role registered_user → dataset valid_users',
+    };
+    const snapshot = JSON.stringify(record);
+    const masked = maskResolvedDataset(record);
+
+    // Identity fields + reason are preserved verbatim.
+    expect(masked.datasetId).toBe('valid_users');
+    expect(masked.recordId).toBe('standard_user');
+    expect(masked.reason).toBe(record.reason);
+    // Field NAMES survive; every VALUE is masked (no literal leaks).
+    expect(Object.keys(masked.values)).toEqual(['username', 'password']);
+    expect(masked.values.username).toBe(MASKED_VALUE);
+    expect(masked.values.password).toBe(MASKED_VALUE);
+    // Result is frozen and the source record is untouched (pure).
+    expect(Object.isFrozen(masked)).toBe(true);
+    expect(Object.isFrozen(masked.values)).toBe(true);
+    expect(JSON.stringify(record)).toBe(snapshot);
+    // No `confidence` ever rides along.
+    expect((masked as any).confidence).toBeUndefined();
   });
 });
 

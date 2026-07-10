@@ -779,6 +779,16 @@ export interface KnowledgeContext {
    */
   testData?: Array<{ name: string; environment: string; recordCount: number; sampleKeys: string[] }>;
   /**
+   * The REAL, rich project datasets (dataset + records + role tags + values)
+   * used by the Dataset Resolver to turn a scenario's required data role into a
+   * concrete record at Scenario Graph build time. Unlike `testData` (token-safe
+   * summaries that dropped the role tags and values), these are the actual
+   * dataset objects from the Test Data Store, so Sprint 2C resolves against the
+   * source of truth. Values are used internally only and are always masked before
+   * any prompt/display boundary. Absent when the project has no datasets.
+   */
+  datasets?: Dataset[];
+  /**
    * Optional scope for intent-scoped retrieval via the shared
    * IntelligenceOrchestrator (Phase 2). When present AND the orchestrator flag
    * is on, generation uses a single orchestrated intelligence block in place of
@@ -988,37 +998,6 @@ Because these datasets exist, you MUST:
 2. Use the actual keys as the data behind positive AND negative cases (e.g. a locked/invalid user from the data above for negative login).
 3. Keep credentials and other secret values abstract — refer to the dataset/key, never embed a real password.
 Do NOT invent placeholder data (john@test.com, password123, ABC Product) when a matching dataset above can supply it.`;
-  }
-
-  /**
-   * Adapt the token-safe Test Data summaries into the Dataset[] shape the
-   * Dataset Resolver matches against. This is a pure structural projection — it
-   * declares NO roles and reads NO scenario/semantics, so it never smuggles
-   * business logic into the resolver.
-   *
-   * HONEST LIMITATION (Sprint 2C): the generation-time knowledge only carries a
-   * summary (name / environment / recordCount / sampleKeys) — NOT the per-record
-   * values or the role tags the resolver keys off. So today these adapted
-   * datasets declare no roles and the resolver correctly returns `null` for
-   * every case (the formatter still works, unchanged). The wiring is in place
-   * end-to-end; it "lights up" with zero formatter changes the moment the Test
-   * Data Store surfaces role-tagged records here.
-   */
-  private buildResolverDatasets(knowledge?: KnowledgeContext): Dataset[] {
-    const sets = knowledge?.testData;
-    if (!sets?.length) return [];
-    return sets.map(ds => {
-      const values: Record<string, string> = {};
-      for (const key of ds.sampleKeys ?? []) values[key] = '';
-      return {
-        datasetId: ds.name,
-        name: ds.name,
-        // No role tags available from a summary — declares nothing (see note).
-        roles: [],
-        records: [{ recordId: ds.name, values, tags: [] }],
-        metadata: ds.environment ? [ds.environment] : [],
-      };
-    });
   }
 
   /* ---- Phase 2: Requirement Understanding ---- */
@@ -1572,6 +1551,10 @@ Return ONLY valid JSON, no markdown fences.`;
           })),
           knowledgeVersion: scenarioPlan?.knowledgeVersion ?? '',
           category: scenarioPlan?.classification.category ?? 'generic',
+          // The REAL project datasets — role resolution runs ONCE here, at graph
+          // build, and the winning record is carried on each node (then masked by
+          // the Test Case Lab projection). Absent → nodes carry no resolved record.
+          availableDatasets: genKnowledge?.datasets,
         });
         const projection = toTestCaseLab(scenarioGraph);
         logger.info(MOD, 'Scenario graph assembled (Test Case Lab consuming)', {
@@ -1741,11 +1724,10 @@ Return ONLY valid JSON. Address EVERY selected coverage type, organise scenarios
     // reuse the exact same inputs for the cases it needs to re-ask.
     const formatterInputs: FormatterInput[] | undefined =
       formatterMode && deterministicOutput
-        ? buildFormatterInputs(
-            deterministicOutput.testCases,
-            semanticsById,
-            this.buildResolverDatasets(genKnowledge),
-          )
+        ? // Resolution already ran at graph build; the resolved record rides on
+          // deterministicOutput.testCases (from the Test Case Lab projection), so
+          // buildFormatterInputs just reads it — no datasets passed here.
+          buildFormatterInputs(deterministicOutput.testCases, semanticsById)
         : undefined;
     const formatterPrompt = formatterInputs ? buildFormatterPrompt(formatterInputs) : '';
     const prompt = formatterMode ? formatterPrompt : fullPrompt;
@@ -1869,11 +1851,9 @@ Return ONLY valid JSON. Address EVERY selected coverage type, organise scenarios
         );
         if (QA_STANDARD_REPAIR_ENABLED && errorIds.size > 0 && formatterInputs) {
           const failing = polishedCases.filter(c => errorIds.has(c.scenarioId));
-          const repairInputs = buildFormatterInputs(
-            failing,
-            semanticsById,
-            this.buildResolverDatasets(genKnowledge),
-          );
+          // Same as above — the resolved record already rides on each case; no
+          // datasets passed, no re-resolution.
+          const repairInputs = buildFormatterInputs(failing, semanticsById);
           const fixesById: Record<string, string[]> = {};
           for (const c of failing) {
             fixesById[c.scenarioId] = violationsToInstructions(report.byId.get(c.scenarioId) ?? []);
