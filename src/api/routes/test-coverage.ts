@@ -673,6 +673,11 @@ export function createTestCoverageRouter(): Router {
               // these in ai_metadata is the "separate DATA, not pipelines" model:
               // one scenario persisted once, rendered differently per surface.
               aiMetadata: buildAiMetadata({
+                // Sprint 2D — stable scenario identity (never title, always KB id).
+                // Persisted here so downstream consumers (Script Gen, Healing, Coverage
+                // Gap Analysis) match test cases to their canonical ScenarioNode by
+                // immutable id instead of fragile title matching.
+                scenarioId: (tc as any).scenarioId,
                 objective: (tc as any).objective,
                 riskArea: (tc as any).riskArea,
                 grounding: (tc as any).grounding,

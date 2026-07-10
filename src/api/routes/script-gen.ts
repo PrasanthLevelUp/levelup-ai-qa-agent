@@ -615,7 +615,7 @@ export function createScriptGenRouter(): Router {
       // ── Sprint 2D: load the Scenario Graph for requirement-based generation ──
       // When generating from a requirement that has a persisted/buildable Scenario
       // Graph, load it once and match each test case to its canonical node (by
-      // title) so Script Gen can consume the graph's semantics + resolvedDataset
+      // scenarioId) so Script Gen can consume the graph's semantics + resolvedDataset
       // instead of re-inferring them. Best-effort — if graph load fails or a case
       // has no matching node, generation falls back to legacy inference for that case.
       let scenarioGraphNodes: Map<string, any> | undefined;
@@ -632,9 +632,10 @@ export function createScriptGenRouter(): Router {
           if (graphResult.graph && graphResult.graph.nodes.length > 0) {
             // Project nodes to {semantics, execution} only — Script Gen reads ONLY
             // these two fields from the node, never the full graph structure.
+            // Keyed by node.id (scenarioId) for stable identity-based resolution.
             scenarioGraphNodes = new Map(
               graphResult.graph.nodes.map((n: any) => [
-                n.title,
+                n.id,
                 {
                   ...(n.semantics ? { semantics: n.semantics } : {}),
                   ...(n.execution ? { execution: n.execution } : {}),

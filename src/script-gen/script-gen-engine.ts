@@ -1182,13 +1182,17 @@ export class ScriptGenEngine {
     const steps = this.parseTestCaseSteps(tc);
     if (!steps.length) return null;
 
-    // Sprint 2D.1: resolve the Scenario Graph node for this test case (by title).
+    // Sprint 2D.1: resolve the Scenario Graph node for this test case (by scenarioId).
     // When available, Script Gen consumes its semantics (variableUnderTest +
     // variation + expectedBehavior) instead of re-inferring them via
     // ScenarioIntelligence. Attach it to the test case context so downstream
     // methods (applyPageObjectActions, buildCoverageMetadata, buildAssertion)
-    // can check for it.
-    const scenarioNode = config.scenarioGraphNodes?.get(tc.title || '');
+    // can check for it. Match by stable scenarioId (from ai_metadata or top-level),
+    // with title fallback for legacy test cases that predate Sprint 2D.
+    const scenarioId = tc.ai_metadata?.scenarioId || tc.scenarioId || null;
+    const scenarioNode = scenarioId
+      ? config.scenarioGraphNodes?.get(scenarioId)
+      : config.scenarioGraphNodes?.get(tc.title || ''); // Legacy title fallback
     (tc as any).__scenarioNode = scenarioNode;
 
     // Real base URL — prefer the navigate step's URL, else config.url. NEVER prose.
