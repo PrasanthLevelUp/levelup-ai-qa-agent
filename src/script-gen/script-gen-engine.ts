@@ -501,10 +501,12 @@ export interface GenerationConfig {
   /**
    * Sprint 2D — the canonical Scenario Graph nodes, keyed by test case title.
    * When present, Script Generation reads the scenario semantics
-   * (variableUnderTest, variation, preconditions, expectedBehavior,
-   * requiredDataRole) and execution context (resolvedDataset) directly from the
-   * graph instead of re-inferring them, making Script Gen a pure adapter from
-   * Scenario Graph → Playwright code.
+   * (variableUnderTest, variation, preconditions, expectedBehavior) and, above
+   * all, the execution context (resolvedDataset) directly from the graph instead
+   * of re-inferring them, making Script Gen a pure adapter from Scenario Graph →
+   * Playwright code. Dataset selection is owned entirely by the graph: Script Gen
+   * consumes `execution.resolvedDataset` and never translates business roles
+   * (e.g. `requiredDataRole`, which is deprecated) into datasets itself.
    *
    * Optional and fully backward-compatible: when absent or when a test case has
    * no matching node, generation uses legacy inference. Threaded by the route
@@ -2542,32 +2544,6 @@ ${testBlocks.join('\n\n')}
   }
 
   /**
-   * Map a Scenario Graph requiredDataRole (a business role) to a dataset category.
-   * Example: "locked_user" → "locked", "registered_user" → "valid".
-   * Returns null when the role doesn't cleanly map to a known category (e.g.
-   * "guest" or "admin" roles that aren't standard auth fixtures).
-   */
-  private mapRoleToCategory(role: string): AuthDatasetCategory | null {
-    const r = role.toLowerCase();
-    // Locked / blocked / suspended accounts
-    if (/lock|blocked|suspended|disabled/.test(r)) return 'locked';
-    // Invalid password scenarios
-    if (/invalid.*pass|wrong.*pass|incorrect.*pass/.test(r)) return 'invalid_password';
-    // Unknown / unregistered user scenarios
-    if (/unknown|unregistered|nonexistent|ghost/.test(r)) return 'unknown_user';
-    // Empty username scenarios
-    if (/empty.*user|blank.*user|missing.*user/.test(r) && !/pass/.test(r)) return 'empty_username';
-    // Empty password scenarios
-    if (/empty.*pass|blank.*pass|missing.*pass/.test(r)) return 'empty_password';
-    // Generic invalid (not password-specific)
-    if (/invalid|wrong|incorrect/.test(r) && !/pass/.test(r)) return 'invalid';
-    // Valid / registered / standard user (positive path)
-    if (/valid|registered|standard|correct|active|happy|default|primary/.test(r)) return 'valid';
-    // No clean mapping
-    return null;
-  }
-
-  /**
    * True when a DATASET NAME belongs to the given scenario category. Matching is
    * TOKEN-based (de-pluralized words), never substring — so "valid_users" and
    * "invalid_password_users" are told apart cleanly (the latter tokenizes to
@@ -2635,27 +2611,20 @@ ${testBlocks.join('\n\n')}
       }
     }
 
-    // ── Semantic guidance: use requiredDataRole to filter datasets ───────────
-    // Even when the graph didn't resolve a specific record (thin fixtures, etc.),
-    // its `semantics.requiredDataRole` tells us the INTENT (locked_user vs
-    // valid_user). Use that to constrain which datasets we consider, preventing
-    // "locked user" from silently falling back to `invalid_users`.
-    const requiredRole = scenarioNode?.semantics?.requiredDataRole;
-    let candidateDatasets = [...index.entries()];
-    if (requiredRole) {
-      // Map requiredDataRole to the dataset category it implies.
-      const roleCategory = this.mapRoleToCategory(requiredRole);
-      if (roleCategory) {
-        // Filter to datasets matching this category.
-        const filtered = candidateDatasets.filter(([name]) =>
-          this.datasetMatchesCategory(name, roleCategory),
-        );
-        // Only apply the filter if it yields results; otherwise fall back to all
-        // datasets (backward-compatible for edge cases where the role doesn't
-        // cleanly map or the dataset naming doesn't follow conventions).
-        if (filtered.length > 0) candidateDatasets = filtered;
-      }
-    }
+    // ── Future: consume the graph's resolved dataset CATEGORY when present ───
+    // The graph is the single source of dataset knowledge (Sprint 2 removed all
+    // business-role inference from Script Gen). When the Dataset Resolver later
+    // exposes `execution.datasetCategory` (the resolved bucket — e.g.
+    // "locked_users" — for thin fixtures where a specific record wasn't pinned),
+    // Script Gen should bind to that category directly, WITHOUT re-deriving it.
+    //
+    // We deliberately do NOT map `semantics.requiredDataRole` here: that field is
+    // deprecated in the graph contract, and translating a business role
+    // ("locked_user") into a dataset category is Dataset-Resolver knowledge, not
+    // Script-Gen knowledge. Keeping it out prevents business rules from creeping
+    // back into the emitter. Until the graph carries `datasetCategory`, we fall
+    // through to the pre-existing, text-based legacy heuristic below (unchanged).
+    const candidateDatasets = [...index.entries()];
 
     // ── Legacy text-matching heuristic (backward-compatible fallback) ────────
     const haystack = `${tc.test_data || ''}\n${steps.join('\n')}`.toLowerCase();
