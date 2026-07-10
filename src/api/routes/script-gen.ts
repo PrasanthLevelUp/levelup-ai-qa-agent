@@ -995,7 +995,7 @@ export function createScriptGenRouter(): Router {
 
       console.log(`[ScriptGen] 📊 Intelligence summary: repoIntel=${intelligenceMetadata.repoIntelligenceUsed} (${intelligenceMetadata.repoFramework ?? 'n/a'}), knowledge=${intelligenceMetadata.knowledgeItemsUsed} items, cache=${intelligenceMetadata.profileCacheUsed}, adaptive=${intelligenceMetadata.adaptiveCodegenUsed} (${intelligenceMetadata.adaptiveMode ?? 'n/a'})`);
 
-      // Persist to DB (now includes intelligence_metadata + generation_metrics)
+      // Persist to DB (now includes intelligence_metadata + ai_metrics)
       const scriptId = await logGeneratedScript({
         url: config.url,
         test_case_id: testCaseId != null ? Number(testCaseId) : null,
@@ -1020,10 +1020,10 @@ export function createScriptGenRouter(): Router {
         tokens_used: effectiveTokens,
         model: result.stats.model,
         generation_time_ms: generationTimeMs,
-        // Structured token/usage telemetry: captured from the provider's own
+        // Structured AI generation telemetry: captured from the provider's own
         // `usage` object (never estimated). null = not yet captured; 0 tokens +
         // cacheHit = genuine deterministic run → UI shows "Deterministic" badge.
-        generation_metrics: result.generationMetrics,
+        ai_metrics: result.generationMetrics,
         files_generated: result.generatedFiles.map((f: GeneratedFile) => ({ path: f.path, size: f.content.length, type: f.type })),
         negative_tests_included: config.includeNegativeTests,
         intelligence_metadata: intelligenceMetadata,
