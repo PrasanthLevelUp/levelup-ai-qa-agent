@@ -4,6 +4,7 @@
  */
 
 import { Pool, type PoolClient } from 'pg';
+import { backfillDatasetRoleTags, deriveRoleFromContent, CANONICAL_ROLES } from './migrations/dataset-role-backfill';
 import { logger } from '../utils/logger';
 import { normalizeBaseUrl } from '../utils/url-normalize';
 import { normalizeSteps } from '../script-gen/canonical-test-case';
@@ -2705,6 +2706,25 @@ async function migrateDefaultCompany(client: PoolClient): Promise<void> {
   await safeExec(client, 'idx_tdr_dataset', `CREATE INDEX IF NOT EXISTS idx_tdr_dataset ON test_data_records(dataset_id)`);
   await safeExec(client, 'idx_tdr_key', `CREATE INDEX IF NOT EXISTS idx_tdr_key ON test_data_records(key)`);
   await safeExec(client, 'idx_tdr_tags', `CREATE INDEX IF NOT EXISTS idx_tdr_tags ON test_data_records USING GIN(tags)`);
+
+  // ── Sprint 2C: seed data ROLES onto pre-existing records ──
+  // The Dataset Resolver matches `requiredDataRole` against record role tags.
+  // Datasets created before Sprint 2C carry none, so without this the resolver
+  // would return null for every legacy dataset and users would never see the
+  // feature work. This is a deterministic, idempotent, content-first seed (see
+  // dataset-role-backfill.ts) — after the first run it tags nothing.
+  try {
+    const roleBackfill = await backfillDatasetRoleTags(client);
+    if (roleBackfill.tagged > 0) {
+      console.log(
+        `✅ [DB] Dataset role backfill: tagged ${roleBackfill.tagged}/${roleBackfill.scanned} record(s) ` +
+          `(${roleBackfill.skipped} left as-is)`,
+      );
+    }
+  } catch (err) {
+    // Non-fatal — a seeding hiccup must never block boot.
+    console.warn('⚠️ [DB] Dataset role backfill skipped:', (err as Error).message);
+  }
 
   // ── Test Case → Dataset Linkage ──
   // Many-to-many relationship enabling deterministic dataset selection during
@@ -9159,11 +9179,23 @@ export async function createTestDataRecord(data: {
   tags?: string[];
 }): Promise<TestDataRecord> {
   const pool = getPool();
+  // Creation-time role tagging (Sprint 2C): so NEW datasets are resolvable
+  // immediately and never depend on the legacy backfill running again. We use
+  // CONTENT-ONLY derivation here (business truth, no dataset-name lookup); the
+  // name-map fallback stays a migration-only concern for sparse legacy data.
+  // Skipped when the caller already supplied a canonical role.
+  const suppliedTags = data.tags ?? [];
+  const alreadyRoleTagged = suppliedTags.some(t => (CANONICAL_ROLES as readonly string[]).includes(String(t).trim().toLowerCase()));
+  let tags = suppliedTags;
+  if (!alreadyRoleTagged) {
+    const role = deriveRoleFromContent({ key: data.key, values: data.value });
+    if (role) tags = [...suppliedTags, role];
+  }
   const { rows } = await pool.query(
     `INSERT INTO test_data_records (dataset_id, key, value_jsonb, data_type, is_secret, secret_ref, tags)
      VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`,
     [data.datasetId, data.key, JSON.stringify(data.value), data.dataType ?? 'object',
-     data.isSecret ?? false, data.secretRef ?? null, data.tags ?? []],
+     data.isSecret ?? false, data.secretRef ?? null, tags],
   );
   return rows[0];
 }
