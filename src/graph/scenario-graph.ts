@@ -70,6 +70,12 @@ export interface ScenarioSemantics {
   preconditions: string;
   variation: string;
   expectedBehavior: string;
+  /**
+   * @deprecated A data ROLE requirement (e.g. "registered_user"), never a resolved
+   * dataset. It lives here only until the `resources` section lands, at which point it
+   * migrates to `resources.dataRoles` (Graph Schema 2.0). Kept during migration so the
+   * move stays additive. See docs/EXECUTION_GRAPH_CONTRACT.md §3.
+   */
   requiredDataRole: string;
 }
 

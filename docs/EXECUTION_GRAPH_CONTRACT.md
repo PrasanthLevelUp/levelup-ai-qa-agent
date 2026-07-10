@@ -1,7 +1,8 @@
 # The Execution Graph Contract (frozen)
 
-> **Status:** FROZEN as of Sprint 2D (pre-2D.2). Changes to the section model below require
-> a design review and a schema-version bump — not an ad-hoc field added to a node.
+> **Status:** FROZEN as of Sprint 2D. Architecture review complete — the section model is final.
+> Remaining work is *populating* the graph, not reshaping it. Changes to the section model below
+> require a design review and a schema-version bump — not an ad-hoc field added to a node.
 >
 > **Scope:** This document freezes the canonical shape of `ScenarioNode` / `ScenarioGraph`
 > (`src/graph/scenario-graph.ts`) *before* Sprint 2D adds executable Actions (2D.3) and
@@ -56,20 +57,31 @@ ScenarioNode {
     preconditions
     variation
     expectedBehavior
-    requiredDataRole          // a data ROLE ("a registered user") — never a resolved dataset
+    requiredDataRole          // DEPRECATED — a data ROLE ("a registered user"), never a resolved
+                              //   dataset. Migrates to resources.dataRoles in Graph Schema 2.0.
+                              //   Kept here only until `resources` lands so migration stays additive.
   }
 
   // ── 3. RESOURCES  (reserved) ────────────────  immutable, "what the scenario NEEDS"
+  // REQUIREMENTS ONLY. Resources holds abstract capability requirements, never a
+  // resolved/selected value. Right:  registered_user, chromium, staging, inventory_api.
+  // Wrong: standard_user, "Chrome 139", "staging-03" — those are resolved values and
+  // belong in `execution`. Execution owns the resolved values, forever.
   resources {
-    dataRoles                 // e.g. ["registered_user"]  (the role requirement)
+    dataRoles                 // e.g. ["registered_user"]  (the role requirement, NOT "standard_user")
     services                  // e.g. ["inventory_api"]     (required backing services / mocks)
-    environment               // required env class (e.g. "staging-capable")
-    browser                   // required browser capability (e.g. "chromium")
+    environment               // required env CLASS (e.g. "staging"), NOT a host like "staging-03"
+    browser                   // required browser CAPABILITY (e.g. "chromium"), NOT "Chrome 139"
     locale                    // required locale (e.g. "en-US")
     // featureFlags / device / tenant / oauthClient — natural future members
   }
 
   // ── 4. EXECUTION ────────────────────────────  runtime, "what THIS run actually USED"
+  // RUNTIME RESOLVED VALUES ONLY. Execution answers exactly one question:
+  // "what did this run actually use?" — nothing more.
+  // Allowed:     resolvedDataset, resolvedBrowser, resolvedLocale, resolvedEnvironment.
+  // NOT allowed: executionOrder, retryPolicy, priority, coverage — those are not
+  //              "what this run used"; they belong in metadata or elsewhere.
   execution {
     resolvedDataset           // 2D.2 — concrete record resolved from resources.dataRoles
     // resolvedBrowser / resolvedLocale / resolvedEnvironment — natural future members
@@ -87,7 +99,9 @@ ScenarioNode {
   assertions[] {
     type                      // url | visible | hidden | text | value | enabled | disabled | count | error
     target                    // stable element identity (when the assertion is element-scoped)
-    value                     // expected literal / pattern
+    expected                  // the EXPECTED literal / pattern. Named `expected` (not `value`)
+                              //   because assertions compare actual-vs-expected; actions consume
+                              //   `value`, assertions verify `expected`.
   }
 
   // ── 7. QA METADATA + PROVENANCE ─────────────  diagnostic / classification
@@ -119,7 +133,7 @@ ScenarioNode {
 | **resources**  | ✅ immutable    | *What does it NEED to run?*        | `dataRoles: ["registered_user"]` | resolved/selected values (those are execution) |
 | **execution**  | ❌ runtime      | *What did THIS run actually use?* | `resolvedDataset: {username,…}` | anything that changes identity |
 | **actions**    | ✅ immutable    | *What steps execute, in order?*   | `{action:"fill", target:"username"}` | resolved values inline (use `@dataset.*`) |
-| **assertions** | ✅ immutable    | *What outcomes are verified?*     | `{type:"url", value:"/inventory"}` | prose like "login succeeds" |
+| **assertions** | ✅ immutable    | *What outcomes are verified?*     | `{type:"url", expected:"/inventory"}` | prose like "login succeeds" |
 | **metadata**   | ❌ diagnostic   | *How confident / how measured?*   | `confidence: 0.82`              | anything behaviour-bearing |
 
 **The three-question separation** — the reason `resources` and `execution` are distinct sections:
@@ -213,6 +227,15 @@ The contract is frozen means:
 This is what lets every subsequent sprint be *additive*: the destination for each new capability is already
 decided. **No more structural discussions — only fill the reserved sections.**
 
+**The one question every PR from here must answer:**
+
+> **What capability moved into the Execution Graph?**
+
+— *not* — *"what new architecture should we invent?"* The model is complete enough that the remaining work is
+**populating** the graph, not reshaping it. Do not redesign the model again unless a real product problem
+forces it (which is then a reviewed MAJOR schema change, per §4).
+
 ---
 
-**Next step:** Sprint 2D.2 — populate & consume `execution.resolvedDataset` (additive; no inference removed).
+**Next step:** Sprint 2D.3 — graph owns executable **actions** (`actions[]`: `action` / `target` / `value`).
+(2D.2 — consume `execution.resolvedDataset` — is implemented and in review as PR #273.)
