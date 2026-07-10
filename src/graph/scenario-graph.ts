@@ -162,16 +162,19 @@ export interface ScenarioNode {
    * `execution.resolvedDataset`).
    *
    * OWNERSHIP — the Knowledge Base owns the action SEQUENCE (it knows a login is
-   * Open → Fill Username → Fill Password → Click → Verify); the builder only
-   * BINDS each abstract target to the app's semantic key and resolves `@dataset.*`.
-   * Neither invents actions from the prose steps. When the KB has no authored
+   * Open → Fill Username → Fill Password → Click). The builder only MATERIALIZES
+   * that template into the graph (assigns a stable `id` + `order`); it does NOT
+   * translate targets into the application's vocabulary. Neither the KB nor the
+   * builder invents actions from the prose steps. When the KB has no authored
    * template for a scenario this stays undefined and Script Gen falls back to its
    * legacy step parser — so the field is purely additive and back-compatible.
    *
-   * INVARIANT — actions carry NO locator/selector/CSS/XPath. Grounding a target
-   * to a concrete locator is Script Gen's job at emit time (from crawl data),
-   * exactly as with the human `steps`. Keeping locators out preserves the node's
-   * portability across runs and app versions.
+   * INVARIANT — targets stay CANONICAL and application-neutral (`username`, not
+   * `email_input`). Mapping a canonical target to the app's element and then to a
+   * concrete locator is the Execution Resolver's job inside Script Gen, at emit
+   * time, from crawl data. Because the graph never encodes app vocabulary or
+   * locators, it does NOT need to be rebuilt when the application renames a field
+   * or changes its selectors — only the resolver's grounding changes.
    */
   actions?: ScenarioAction[];
 }
@@ -184,9 +187,13 @@ export interface ScenarioNode {
  * The closed set of executable verbs an action may carry. Application-neutral
  * and framework-neutral — these describe INTENT ("fill this field"), not a
  * Playwright/Selenium call. Script Gen maps each verb to concrete framework
- * code at emit time. `verify` is the read-only "assert something is true" verb;
- * richer, typed assertions arrive as their own `assertions[]` section in 2D.4,
- * so `verify` here is intentionally coarse until then.
+ * code at emit time.
+ *
+ * DELIBERATELY DOES NOT INCLUDE A `verify`/assert VERB. Actions describe what the
+ * browser DOES; asserting what must be TRUE is a separate concern that gets its
+ * own typed `assertions[]` section in 2D.4 (emitted as `expect(...)`). Keeping
+ * assertions out of the action vocabulary preserves a clean Actions vs Assertions
+ * separation — an action list can never smuggle in a coarse, un-typed check.
  */
 export type ScenarioActionKind =
   | 'navigate'
@@ -195,8 +202,7 @@ export type ScenarioActionKind =
   | 'check'
   | 'uncheck'
   | 'select'
-  | 'upload'
-  | 'verify';
+  | 'upload';
 
 /**
  * A single canonical executable step. This is the exact, minimal contract the
@@ -216,7 +222,7 @@ export type ScenarioActionKind =
  *   • `value`    — optional. A literal (e.g. a URL, a dropdown option) OR a
  *                  `@dataset.*` reference (e.g. `@dataset.username`) that Script
  *                  Gen resolves from `execution.resolvedDataset`. Absent for
- *                  valueless verbs (`click`, `check`, `verify`, …).
+ *                  valueless verbs (`click`, `check`, `uncheck`, …).
  *   • `optional` — when true the step may be skipped if its target is absent
  *                  (e.g. a "Remember me" checkbox that some apps omit). Defaults
  *                  to false / required.

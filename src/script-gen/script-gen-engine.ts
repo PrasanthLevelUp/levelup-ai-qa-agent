@@ -3931,15 +3931,20 @@ ${gotoB}${sessionLogin('pageB')}
    * When a Scenario Graph node carries a canonical `actions[]` list, Script Gen
    * EXECUTES it directly instead of parsing the natural-language steps. This is
    * the "graph owns actions" path: the KB authored the ordered sequence and the
-   * Builder bound each `target` to the App Profile, so there is NOTHING to infer
-   * here — no verb parsing, no title matching, no regex over prose. We simply
-   * walk the ordered list and emit one statement group per action.
+   * Builder materialized it (id/order) WITHOUT translating targets — every
+   * `target` is still CANONICAL and application-neutral (e.g. `username`, not
+   * `email_input`). So there is NOTHING to infer here — no verb parsing, no
+   * title matching, no regex over prose. We simply walk the ordered list and
+   * emit one statement group per action.
    *
-   * Locator resolution is a pure dictionary lookup: each canonical `target`
-   * (e.g. `username`, `login_button`, `error_message`) maps to one of the
-   * pre-grounded semantic selectors already resolved against the crawl DOM in
-   * `ctx.sel` (so it is ALSO already reflected in the Locator Grounding Report —
-   * no double counting). Unknown targets degrade to a stable label locator.
+   * This method IS the Execution Resolver — the single place canonical targets
+   * become concrete Playwright locators. Resolution is a pure dictionary lookup:
+   * each canonical `target` (e.g. `username`, `login_button`, `error_message`)
+   * maps to one of the pre-grounded semantic selectors already resolved against
+   * the crawl DOM in `ctx.sel` (so it is ALSO already reflected in the Locator
+   * Grounding Report — no double counting). Unknown targets degrade to a stable
+   * label locator. Because grounding lives here (not in the graph), an app that
+   * renames a field only re-runs this resolver — the graph never regenerates.
    *
    * Values obey the same dataset precedence Script Gen uses elsewhere: a
    * `@dataset.<field>` token binds to the live resolved record (`user.<field>`)
@@ -4050,13 +4055,11 @@ ${gotoB}${sessionLogin('pageB')}
         case 'upload':
           stmts = [`await ${locatorFor(a.target)}.setInputFiles(${valueExpr(a.value)});`];
           break;
-        case 'verify':
-          // Provisional presence assertion. Richer expected-result assertions are
-          // still contributed by the assertion pipeline until Sprint 2D.4 moves
-          // executable assertions into the graph.
-          stmts = [`await expect(${locatorFor(a.target)}).toBeVisible();`];
-          break;
         default:
+          // Actions are STATE-CHANGING verbs only (navigate/fill/click/check/
+          // uncheck/select/upload). Assertions are a separate concern owned by
+          // the assertion pipeline (and, from Sprint 2D.4, graph-owned
+          // `expect(...)`), so there is deliberately no `verify` verb here.
           continue;
       }
       // An `optional` action must not fail the run when its control is absent —

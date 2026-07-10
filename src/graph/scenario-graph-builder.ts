@@ -62,13 +62,6 @@ export interface BuildScenarioGraphOptions {
    * straight through to `assembleScenarioGraph`. Omitted means no resolution.
    */
   availableDatasets?: readonly Dataset[];
-  /**
-   * Optional App-Profile-sourced map from abstract KB action targets to the
-   * app's own semantic keys (e.g. `{ username: 'email_input' }`). Used only to
-   * BIND targets on the KB action templates — never to add/reorder steps. When
-   * omitted, abstract targets pass through and Script Gen grounds them itself.
-   */
-  targetBindings?: TargetBindings;
 }
 
 /* ------------------------------------------------------------------ */
@@ -147,46 +140,40 @@ export function deriveEdges(nodes: ScenarioNode[]): ScenarioEdge[] {
 }
 
 /* ------------------------------------------------------------------ */
-/*  Action binding (KB template → canonical node actions)              */
+/*  Action materialization (KB template → canonical node actions)      */
 /* ------------------------------------------------------------------ */
 
 /**
- * A pure map from an abstract KB target (e.g. `username`) to the app's own
- * semantic key (e.g. `email_input`). Sourced from the App Profile when one is
- * available. Absent/empty means passthrough — the abstract target is kept and
- * Script Gen grounds it to a concrete locator at emit time, exactly as it does
- * for the human steps.
- */
-export type TargetBindings = Readonly<Record<string, string>>;
-
-/**
- * Bind a KB-authored action TEMPLATE into the graph's canonical `ScenarioAction[]`.
+ * MATERIALIZE a KB-authored action TEMPLATE into the graph's canonical
+ * `ScenarioAction[]`.
  *
  * This is the ONLY thing the builder does with actions, and it is deliberately
- * minimal: it does NOT invent, add, drop, or reorder steps (the sequence is the
- * KB's; that is the architectural rule "the builder may bind actions, but it
- * must never invent them"). For each authored step it:
+ * minimal — it adds STRUCTURE (identity + order), nothing else:
  *   • assigns a deterministic `id` (`<scenarioId>:<n>`) and `order` (the array
  *     index — a faithful copy of the KB order, never a re-sort);
- *   • BINDS the abstract `target` to the app's semantic key via `bindings` when
- *     one is supplied, otherwise passes the abstract target through unchanged;
- *   • copies `value` and `optional` verbatim (dataset refs are resolved later,
- *     by Script Gen, from `execution.resolvedDataset`).
+ *   • copies `target`, `value` and `optional` VERBATIM.
+ *
+ * It does NOT invent, add, drop, or reorder steps (the sequence is the KB's —
+ * "the builder may materialize actions, but it must never invent them"), and it
+ * does NOT translate targets into the application's vocabulary. Targets stay
+ * CANONICAL (`username`, not `email_input`): the builder has no business knowing
+ * app vocabulary, and keeping it out means the graph never has to be rebuilt when
+ * the app renames a field or changes selectors. Mapping a canonical target to the
+ * app's element and then to a locator is the Execution Resolver's job inside
+ * Script Gen, at emit time — exactly as it already grounds the human steps.
  *
  * Pure and deterministic: identical inputs ⇒ identical output.
  */
-export function bindActionTemplate(
+export function materializeActionTemplate(
   scenarioId: string,
   template: readonly ScenarioActionTemplate[],
-  bindings?: TargetBindings,
 ): ScenarioAction[] {
   return template.map((step, i) => {
-    const bound = bindings && bindings[step.target] ? bindings[step.target]! : step.target;
     const action: ScenarioAction = {
       id: `${scenarioId}:${i}`,
       order: i,
       action: step.action,
-      target: bound,
+      target: step.target,
     };
     if (step.value !== undefined) action.value = step.value;
     if (step.optional !== undefined) action.optional = step.optional;
@@ -231,10 +218,12 @@ export interface NodeMetaLike {
    */
   semantics?: ScenarioSemantics;
   /**
-   * The scenario's canonical executable actions, bound from the KB action
-   * template (`getScenarioActionTemplate` → `bindActionTemplate`) by the caller.
-   * Absent when the KB has no authored template — the node then carries no
-   * `actions` and Script Gen falls back to its legacy step parser.
+   * The scenario's canonical executable actions, materialized from the KB
+   * action template (`getScenarioActionTemplate` → `materializeActionTemplate`)
+   * by the caller. Targets stay CANONICAL (app-neutral); the Execution Resolver
+   * in Script Gen grounds them to locators. Absent when the KB has no authored
+   * template — the node then carries no `actions` and Script Gen falls back to
+   * its legacy step parser.
    */
   actions?: ScenarioAction[];
 }
@@ -371,15 +360,18 @@ export function buildScenarioGraph(
   // Resolve each planned scenario's canonical semantics ONCE, keyed by its
   // stable scenarioId, so the node carries the same answer the KB authored.
   const semanticsById = new Map<string, ScenarioSemantics>();
-  // Bind each planned scenario's KB action TEMPLATE ONCE, same keying. The KB
-  // owns the sequence (`getScenarioActionTemplate`, authored-or-null — never
-  // invented); the builder only binds targets (`bindActionTemplate`). Scenarios
-  // with no authored template get no entry, so their nodes carry no `actions`.
+  // Materialize each planned scenario's KB action TEMPLATE ONCE, same keying.
+  // The KB owns the sequence (`getScenarioActionTemplate`, authored-or-null —
+  // never invented); the builder only materializes structure (`id`/`order`) via
+  // `materializeActionTemplate` and copies targets VERBATIM (canonical). It does
+  // NOT translate targets into app vocabulary — that grounding is the Execution
+  // Resolver's job in Script Gen. Scenarios with no authored template get no
+  // entry, so their nodes carry no `actions`.
   const actionsById = new Map<string, ScenarioAction[]>();
   for (const s of plan.scenarios) {
     semanticsById.set(s.id, getScenarioSemantics(s));
     const template = getScenarioActionTemplate(s);
-    if (template) actionsById.set(s.id, bindActionTemplate(s.id, template, options?.targetBindings));
+    if (template) actionsById.set(s.id, materializeActionTemplate(s.id, template));
   }
 
   // The arrays are index-aligned (all derived from `drafts` in order):

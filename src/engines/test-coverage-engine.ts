@@ -42,7 +42,7 @@ import type { Dataset } from './dataset-resolver';
 import { validateCanonicalTestCases } from './canonical-validator';
 import { validateQaStandard, violationsToInstructions } from './qa-standard-validator';
 import type { ScenarioSemantics } from './qa-knowledge-engine';
-import { assembleScenarioGraph, bindActionTemplate } from '../graph/scenario-graph-builder';
+import { assembleScenarioGraph, materializeActionTemplate } from '../graph/scenario-graph-builder';
 import { toTestCaseLab } from '../graph/scenario-graph-adapters';
 import type { ScenarioGraph } from '../graph/scenario-graph';
 import { classifyQACategory, getScenarioSemantics, getScenarioActionTemplate } from './qa-knowledge-engine';
@@ -1538,14 +1538,16 @@ Return ONLY valid JSON, no markdown fences.`;
       // Impact Analysis read the same structure via the graph service). Output
       // is identical — assembled from the same cases — so it is zero-risk.
       if (SCENARIO_GRAPH_ENABLED) {
-        // Bind each scenario's KB action TEMPLATE ONCE, keyed by scenarioId, so
-        // the graph nodes carry the canonical executable actions Script Gen will
-        // consume. KB owns the sequence (authored-or-null); the builder only
-        // binds targets. Scenarios with no authored template get no actions.
+        // Materialize each scenario's KB action TEMPLATE ONCE, keyed by
+        // scenarioId, so the graph nodes carry the canonical executable actions
+        // Script Gen will consume. KB owns the sequence (authored-or-null); the
+        // builder only materializes structure (`id`/`order`) and copies targets
+        // VERBATIM (canonical) — it does NOT translate them into app vocabulary.
+        // Scenarios with no authored template get no actions.
         const actionsById = new Map(
           (scenarioPlan?.scenarios ?? []).flatMap(s => {
             const template = getScenarioActionTemplate(s);
-            return template ? [[s.id, bindActionTemplate(s.id, template)] as const] : [];
+            return template ? [[s.id, materializeActionTemplate(s.id, template)] as const] : [];
           }),
         );
         // Graph nodes carry the SAME KB-authored semantics resolved above.
