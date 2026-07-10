@@ -4270,8 +4270,30 @@ ${gotoB}${sessionLogin('pageB')}
     };
 
     const out: string[] = [];
-    // Defensive: honor the canonical `order` even if the array arrived unsorted.
-    const ordered = [...assertions].sort((a, b) => a.order - b.order);
+    // ── Sprint 3.4 (Assertion Quality) — business-first, URL last ────────────
+    // The graph authors assertions in EXECUTION order (`order`). For some
+    // POSITIVE scenarios the KB happens to list the page-level `url` check FIRST
+    // (e.g. auth-pos-valid: url → visible). A Senior SDET proves BUSINESS success
+    // by verifying a real element / message / state is present, and treats the
+    // URL as corroboration, not the proof. So at EMIT time ONLY — never in the
+    // graph — we present business assertions first and demote page-level `url`
+    // checks to the end.
+    //
+    // This is a STABLE PARTITION, not a re-sort: within each tier the canonical
+    // `order` is preserved verbatim (we NEVER reorder business meaning against
+    // each other), and no assertion is added, dropped, reordered across meaning,
+    // or invented. It is a purely presentational concern owned by Script Gen —
+    // the graph's `order`/`id` contract is untouched. `url` is the only frozen
+    // AssertionType that is a page-level fallback; every other type asserts a
+    // concrete business element/state and stays in the leading tier.
+    const assertionTier = (t: string): number => (t === 'url' ? 1 : 0);
+    const ordered = assertions
+      .map((a, i) => ({ a, i }))
+      .sort((x, y) =>
+        (assertionTier(x.a.type) - assertionTier(y.a.type)) ||
+        (x.a.order - y.a.order) ||
+        (x.i - y.i))
+      .map((e) => e.a);
     for (const a of ordered) {
       let stmts: string[] = [];
       const loc = a.target ? locatorFor(a.target) : '';
