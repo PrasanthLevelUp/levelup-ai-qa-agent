@@ -152,6 +152,82 @@ export interface ScenarioNode {
    * Optional so older persisted graphs and unresolved nodes remain valid.
    */
   execution?: ScenarioExecution;
+  /**
+   * The canonical, ORDERED executable steps for this scenario — the graph's
+   * answer to "what does the browser actually DO?" so Script Gen never has to
+   * parse it back out of the natural-language `steps`. Each entry is an
+   * application-neutral {@link ScenarioAction}: a verb (`fill`/`click`/…), a
+   * semantic `target` (an element identity, NEVER a locator/CSS/page-object),
+   * and an optional `value` (a literal or a `@dataset.*` reference resolved from
+   * `execution.resolvedDataset`).
+   *
+   * OWNERSHIP — the Knowledge Base owns the action SEQUENCE (it knows a login is
+   * Open → Fill Username → Fill Password → Click → Verify); the builder only
+   * BINDS each abstract target to the app's semantic key and resolves `@dataset.*`.
+   * Neither invents actions from the prose steps. When the KB has no authored
+   * template for a scenario this stays undefined and Script Gen falls back to its
+   * legacy step parser — so the field is purely additive and back-compatible.
+   *
+   * INVARIANT — actions carry NO locator/selector/CSS/XPath. Grounding a target
+   * to a concrete locator is Script Gen's job at emit time (from crawl data),
+   * exactly as with the human `steps`. Keeping locators out preserves the node's
+   * portability across runs and app versions.
+   */
+  actions?: ScenarioAction[];
+}
+
+/* ------------------------------------------------------------------ */
+/*  Actions                                                            */
+/* ------------------------------------------------------------------ */
+
+/**
+ * The closed set of executable verbs an action may carry. Application-neutral
+ * and framework-neutral — these describe INTENT ("fill this field"), not a
+ * Playwright/Selenium call. Script Gen maps each verb to concrete framework
+ * code at emit time. `verify` is the read-only "assert something is true" verb;
+ * richer, typed assertions arrive as their own `assertions[]` section in 2D.4,
+ * so `verify` here is intentionally coarse until then.
+ */
+export type ScenarioActionKind =
+  | 'navigate'
+  | 'fill'
+  | 'click'
+  | 'check'
+  | 'uncheck'
+  | 'select'
+  | 'upload'
+  | 'verify';
+
+/**
+ * A single canonical executable step. This is the exact, minimal contract the
+ * graph exposes to Script Gen — nothing more. It is deliberately tiny: an
+ * ordered verb + semantic target + optional value.
+ *
+ *   • `id`       — stable identity for the action within its node (diffs, healing,
+ *                  impact analysis can reference a specific step).
+ *   • `order`    — 0-based execution order. The array is authoritative, but the
+ *                  explicit ordinal makes the contract self-describing and lets
+ *                  consumers sort defensively without relying on array order.
+ *   • `action`   — the verb (see {@link ScenarioActionKind}).
+ *   • `target`   — a SEMANTIC element identity (e.g. `username`, `login_button`,
+ *                  `error_message`). NEVER a CSS selector, XPath, page-object
+ *                  path, or raw locator — grounding to a locator is Script Gen's
+ *                  job. `navigate` uses the page/route identity as its target.
+ *   • `value`    — optional. A literal (e.g. a URL, a dropdown option) OR a
+ *                  `@dataset.*` reference (e.g. `@dataset.username`) that Script
+ *                  Gen resolves from `execution.resolvedDataset`. Absent for
+ *                  valueless verbs (`click`, `check`, `verify`, …).
+ *   • `optional` — when true the step may be skipped if its target is absent
+ *                  (e.g. a "Remember me" checkbox that some apps omit). Defaults
+ *                  to false / required.
+ */
+export interface ScenarioAction {
+  id: string;
+  order: number;
+  action: ScenarioActionKind;
+  target: string;
+  value?: string;
+  optional?: boolean;
 }
 
 /**
@@ -234,7 +310,10 @@ export interface ScenarioGraph {
   builtAt: string; // ISO timestamp
 }
 
-export const SCENARIO_GRAPH_SCHEMA_VERSION = '1.0.0';
+// 1.1.0 — Sprint 2D.3 populated the reserved `actions[]` section for the first
+// time (MINOR bump per the contract's versioning rule: a new section slot
+// populated for the first time is backward-compatible/additive).
+export const SCENARIO_GRAPH_SCHEMA_VERSION = '1.1.0';
 
 /* ------------------------------------------------------------------ */
 /*  Pure helpers                                                       */

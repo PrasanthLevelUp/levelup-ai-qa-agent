@@ -513,6 +513,10 @@ export interface GenerationConfig {
   scenarioGraphNodes?: Map<string, {
     semantics?: import('../graph/scenario-graph').ScenarioSemantics;
     execution?: import('../graph/scenario-graph').ScenarioExecution;
+    // Sprint 2D.3: the canonical, ordered executable action list the graph owns
+    // (KB authors the sequence, the Builder binds targets). When present, Script
+    // Gen EXECUTES these directly — it never parses the NL steps to derive them.
+    actions?: import('../graph/scenario-graph').ScenarioAction[];
   }>;
   /**
    * How to treat a test-case STEP that the deterministic engine cannot map to a
@@ -1356,7 +1360,17 @@ export class ScriptGenEngine {
     const preLines = preResult.lines;
     preResult.used.forEach((v) => usedPOVars.add(v));
 
-    const { lines } = this.tcStepsToCode(steps, { ...ctx, testCaseId: tc.id });
+    // ── Sprint 2D.3: graph owns the executable actions ──────────────────────
+    // When the resolved Scenario Graph node carries a canonical `actions[]`
+    // list, EXECUTE it directly (deterministic adapter) instead of parsing the
+    // NL steps. This is the "graph owns actions" path — no verb parsing, no
+    // regex over prose. When absent (legacy test cases / no graph), fall back to
+    // the historical step parser so behaviour is 100% backward compatible.
+    const graphActions = scenarioNode?.actions;
+    const resolvedDatasetValues = scenarioNode?.execution?.resolvedDataset?.values ?? null;
+    const { lines } = (graphActions && graphActions.length)
+      ? this.emitGraphActionLines(graphActions, { ...ctx, testCaseId: tc.id }, resolvedDatasetValues)
+      : this.tcStepsToCode(steps, { ...ctx, testCaseId: tc.id });
 
     // ── Rewrite raw locator steps to reuse high-level Page Object methods ──
     // Only collapses when the method GENUINELY exists in scanned metadata; other
@@ -3909,6 +3923,152 @@ ${gotoB}${sessionLogin('pageB')}
     }
     const key = (phrase || 'value').split(/\s+/).slice(0, 2).join(' ') || 'value';
     return `'Test ${escapeStr(key)}'`;
+  }
+
+  /**
+   * Sprint 2D.3 — Graph-owned actions → Playwright (the deterministic adapter).
+   *
+   * When a Scenario Graph node carries a canonical `actions[]` list, Script Gen
+   * EXECUTES it directly instead of parsing the natural-language steps. This is
+   * the "graph owns actions" path: the KB authored the ordered sequence and the
+   * Builder bound each `target` to the App Profile, so there is NOTHING to infer
+   * here — no verb parsing, no title matching, no regex over prose. We simply
+   * walk the ordered list and emit one statement group per action.
+   *
+   * Locator resolution is a pure dictionary lookup: each canonical `target`
+   * (e.g. `username`, `login_button`, `error_message`) maps to one of the
+   * pre-grounded semantic selectors already resolved against the crawl DOM in
+   * `ctx.sel` (so it is ALSO already reflected in the Locator Grounding Report —
+   * no double counting). Unknown targets degrade to a stable label locator.
+   *
+   * Values obey the same dataset precedence Script Gen uses elsewhere: a
+   * `@dataset.<field>` token binds to the live resolved record (`user.<field>`)
+   * when present, else to the node's `execution.resolvedDataset` value (2D.2),
+   * else to a literal/env fallback. A concrete literal value is escaped as-is.
+   *
+   * Returns the SAME `{ lines }` shape as `tcStepsToCode` so the downstream
+   * pipeline (Page-Object reuse, assertions, nav-guarantee) is unchanged.
+   */
+  private emitGraphActionLines(
+    actions: import('../graph/scenario-graph').ScenarioAction[],
+    ctx: { url: string; creds: { username: string; password: string }; sel: Record<string, string>; data?: { varName: string; ref: string; hasUsername: boolean; hasPassword: boolean }; crawl?: CrawlResult; stepTracked?: LocatorGroundingEntry[]; testCaseId?: number },
+    resolvedValues: Record<string, string> | null,
+  ): { lines: string[] } {
+    // Canonical target → pre-grounded semantic selector key (ctx.sel). This is a
+    // fixed vocabulary lookup, NOT prose parsing — the graph's targets are drawn
+    // from the same controlled set the KB authors.
+    const SELECTOR_KEY: Record<string, string> = {
+      username: 'username', email: 'username', user: 'username',
+      password: 'password',
+      login_button: 'login', submit: 'login', sign_in: 'login', login: 'login',
+      error_message: 'error', error: 'error',
+      authenticated_landing: 'title', landing: 'title', title: 'title',
+      logout_button: 'logout', logout: 'logout', menu: 'menu',
+      cart: 'cart', product: 'product',
+    };
+
+    // Resolve a target to a full Playwright locator expression. Prefer the
+    // pre-grounded selector; degrade to a stable label locator for targets not
+    // in the grounded vocabulary (no regex — plain underscore→space).
+    const locatorFor = (target: string): string => {
+      const key = SELECTOR_KEY[target] ?? target;
+      return ctx.sel[key] ?? `page.getByLabel('${escapeStr(target.split('_').join(' '))}')`;
+    };
+
+    // Resolve the JS value expression for a fill/select/upload action.
+    //   • undefined          → '' (intentional empty field)
+    //   • @dataset.<field>   → live record (user.<field>) ?? resolvedDataset ?? literal/env
+    //   • concrete literal   → the escaped literal
+    // Fixed alias sets — a membership check, never a prose regex.
+    const USER_FIELDS = new Set(['username', 'user', 'email', 'login', 'user_name']);
+    const PWD_FIELDS = new Set(['password', 'pass', 'pwd']);
+    const DATASET_PREFIX = '@dataset.';
+    const valueExpr = (raw: string | undefined): string => {
+      if (raw == null) return `''`;
+      // A `@dataset.<field>` token is a structured reference, resolved by plain
+      // string ops (startsWith/slice) — NOT a regex over natural-language prose.
+      if (!raw.startsWith(DATASET_PREFIX)) return `'${escapeStr(raw)}'`;
+      const field = raw.slice(DATASET_PREFIX.length).trim();
+      const lower = field.toLowerCase();
+      const isPwd = PWD_FIELDS.has(lower);
+      const isUser = USER_FIELDS.has(lower);
+      // 1) Live resolved record binding (strongest — mirrors buildPreconditionLogin).
+      if (ctx.data) {
+        if (isUser && ctx.data.hasUsername) return `${ctx.data.varName}.username ?? ''`;
+        if (isPwd && ctx.data.hasPassword) return `${ctx.data.varName}.password ?? ''`;
+      }
+      // 2) Node execution.resolvedDataset value (Sprint 2D.2). Try the credential
+      //    resolver first (handles username/password aliases), then the raw field.
+      if (resolvedValues) {
+        const viaCred = isPwd
+          ? this.resolveDatasetCredential(resolvedValues, 'password')
+          : isUser
+            ? this.resolveDatasetCredential(resolvedValues, 'username')
+            : null;
+        const direct = viaCred ?? resolvedValues[field];
+        if (typeof direct === 'string' && direct.length > 0) return `'${escapeStr(direct)}'`;
+      }
+      // 3) Literal/env fallback (never a silent empty string for a bound field).
+      if (isUser) return this.credFillExpr('username', ctx.creds.username);
+      if (isPwd) return this.credFillExpr('password', ctx.creds.password);
+      return `''`;
+    };
+
+    const out: string[] = [];
+    // Emit one statement group per action, blank-separated (mirrors tcStepsToCode).
+    const emit = (stmts: string[]): void => {
+      for (const s of stmts) out.push(s);
+      out.push('');
+    };
+
+    // Defensive: honor the canonical `order` even if the array arrived unsorted.
+    const ordered = [...actions].sort((a, b) => a.order - b.order);
+    for (const a of ordered) {
+      let stmts: string[] = [];
+      switch (a.action) {
+        case 'navigate':
+          stmts = [
+            `await page.goto('${escapeStr(ctx.url)}');`,
+            `await page.waitForLoadState('domcontentloaded');`,
+          ];
+          break;
+        case 'fill':
+          stmts = [`await ${locatorFor(a.target)}.fill(${valueExpr(a.value)});`];
+          break;
+        case 'click':
+          stmts = [`await ${locatorFor(a.target)}.click();`];
+          break;
+        case 'check':
+          stmts = [`await ${locatorFor(a.target)}.check();`];
+          break;
+        case 'uncheck':
+          stmts = [`await ${locatorFor(a.target)}.uncheck();`];
+          break;
+        case 'select':
+          stmts = [`await ${locatorFor(a.target)}.selectOption(${valueExpr(a.value)});`];
+          break;
+        case 'upload':
+          stmts = [`await ${locatorFor(a.target)}.setInputFiles(${valueExpr(a.value)});`];
+          break;
+        case 'verify':
+          // Provisional presence assertion. Richer expected-result assertions are
+          // still contributed by the assertion pipeline until Sprint 2D.4 moves
+          // executable assertions into the graph.
+          stmts = [`await expect(${locatorFor(a.target)}).toBeVisible();`];
+          break;
+        default:
+          continue;
+      }
+      // An `optional` action must not fail the run when its control is absent —
+      // guard it behind a count check (navigate is never optional-guarded).
+      if (a.optional && a.action !== 'navigate') {
+        const loc = locatorFor(a.target);
+        emit([`if (await ${loc}.count() > 0) {`, ...stmts.map((s) => `  ${s}`), `}`]);
+      } else {
+        emit(stmts);
+      }
+    }
+    return { lines: out };
   }
 
   /**

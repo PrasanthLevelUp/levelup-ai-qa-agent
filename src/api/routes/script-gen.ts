@@ -630,15 +630,18 @@ export function createScriptGenRouter(): Router {
             { requirementId: reqIdNum, companyId, projectId },
           );
           if (graphResult.graph && graphResult.graph.nodes.length > 0) {
-            // Project nodes to {semantics, execution} only — Script Gen reads ONLY
-            // these two fields from the node, never the full graph structure.
-            // Keyed by node.id (scenarioId) for stable identity-based resolution.
+            // Project nodes to {semantics, execution, actions} only — Script Gen
+            // reads ONLY these fields from the node, never the full graph
+            // structure. Keyed by node.id (scenarioId) for stable identity-based
+            // resolution. `actions` (Sprint 2D.3) lets Script Gen execute the
+            // graph's canonical steps directly instead of parsing prose.
             scenarioGraphNodes = new Map(
               graphResult.graph.nodes.map((n: any) => [
                 n.id,
                 {
                   ...(n.semantics ? { semantics: n.semantics } : {}),
                   ...(n.execution ? { execution: n.execution } : {}),
+                  ...(n.actions ? { actions: n.actions } : {}),
                 },
               ]),
             );

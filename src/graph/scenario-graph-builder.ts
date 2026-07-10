@@ -20,7 +20,11 @@ import {
   type DraftTestCase,
 } from '../engines/scenario-builder';
 import { validateCanonicalTestCases } from '../engines/canonical-validator';
-import { getScenarioSemantics } from '../engines/qa-knowledge-engine';
+import {
+  getScenarioSemantics,
+  getScenarioActionTemplate,
+  type ScenarioActionTemplate,
+} from '../engines/qa-knowledge-engine';
 import { datasetResolver, type Dataset } from '../engines/dataset-resolver';
 import {
   type ScenarioGraph,
@@ -30,6 +34,7 @@ import {
   type ScenarioSeverity,
   type ScenarioSource,
   type ScenarioSemantics,
+  type ScenarioAction,
   SCENARIO_GRAPH_SCHEMA_VERSION,
   computeFingerprint,
 } from './scenario-graph';
@@ -57,6 +62,13 @@ export interface BuildScenarioGraphOptions {
    * straight through to `assembleScenarioGraph`. Omitted means no resolution.
    */
   availableDatasets?: readonly Dataset[];
+  /**
+   * Optional App-Profile-sourced map from abstract KB action targets to the
+   * app's own semantic keys (e.g. `{ username: 'email_input' }`). Used only to
+   * BIND targets on the KB action templates — never to add/reorder steps. When
+   * omitted, abstract targets pass through and Script Gen grounds them itself.
+   */
+  targetBindings?: TargetBindings;
 }
 
 /* ------------------------------------------------------------------ */
@@ -135,6 +147,54 @@ export function deriveEdges(nodes: ScenarioNode[]): ScenarioEdge[] {
 }
 
 /* ------------------------------------------------------------------ */
+/*  Action binding (KB template → canonical node actions)              */
+/* ------------------------------------------------------------------ */
+
+/**
+ * A pure map from an abstract KB target (e.g. `username`) to the app's own
+ * semantic key (e.g. `email_input`). Sourced from the App Profile when one is
+ * available. Absent/empty means passthrough — the abstract target is kept and
+ * Script Gen grounds it to a concrete locator at emit time, exactly as it does
+ * for the human steps.
+ */
+export type TargetBindings = Readonly<Record<string, string>>;
+
+/**
+ * Bind a KB-authored action TEMPLATE into the graph's canonical `ScenarioAction[]`.
+ *
+ * This is the ONLY thing the builder does with actions, and it is deliberately
+ * minimal: it does NOT invent, add, drop, or reorder steps (the sequence is the
+ * KB's; that is the architectural rule "the builder may bind actions, but it
+ * must never invent them"). For each authored step it:
+ *   • assigns a deterministic `id` (`<scenarioId>:<n>`) and `order` (the array
+ *     index — a faithful copy of the KB order, never a re-sort);
+ *   • BINDS the abstract `target` to the app's semantic key via `bindings` when
+ *     one is supplied, otherwise passes the abstract target through unchanged;
+ *   • copies `value` and `optional` verbatim (dataset refs are resolved later,
+ *     by Script Gen, from `execution.resolvedDataset`).
+ *
+ * Pure and deterministic: identical inputs ⇒ identical output.
+ */
+export function bindActionTemplate(
+  scenarioId: string,
+  template: readonly ScenarioActionTemplate[],
+  bindings?: TargetBindings,
+): ScenarioAction[] {
+  return template.map((step, i) => {
+    const bound = bindings && bindings[step.target] ? bindings[step.target]! : step.target;
+    const action: ScenarioAction = {
+      id: `${scenarioId}:${i}`,
+      order: i,
+      action: step.action,
+      target: bound,
+    };
+    if (step.value !== undefined) action.value = step.value;
+    if (step.optional !== undefined) action.optional = step.optional;
+    return action;
+  });
+}
+
+/* ------------------------------------------------------------------ */
 /*  Builder                                                            */
 /* ------------------------------------------------------------------ */
 
@@ -170,6 +230,13 @@ export interface NodeMetaLike {
    * carried straight onto the node so consumers read one canonical answer.
    */
   semantics?: ScenarioSemantics;
+  /**
+   * The scenario's canonical executable actions, bound from the KB action
+   * template (`getScenarioActionTemplate` → `bindActionTemplate`) by the caller.
+   * Absent when the KB has no authored template — the node then carries no
+   * `actions` and Script Gen falls back to its legacy step parser.
+   */
+  actions?: ScenarioAction[];
 }
 
 export interface AssembleGraphArgs {
@@ -214,6 +281,7 @@ function nodesFromCases(
       title: tc.title,
       objective: tc.objective ?? m.objective ?? '',
       ...(m.semantics ? { semantics: m.semantics } : {}),
+      ...(m.actions && m.actions.length ? { actions: m.actions } : {}),
       coverageType: m.coverageType ?? 'positive',
       priority: tc.priority as ScenarioPriority,
       severity: tc.severity as ScenarioSeverity,
@@ -303,7 +371,16 @@ export function buildScenarioGraph(
   // Resolve each planned scenario's canonical semantics ONCE, keyed by its
   // stable scenarioId, so the node carries the same answer the KB authored.
   const semanticsById = new Map<string, ScenarioSemantics>();
-  for (const s of plan.scenarios) semanticsById.set(s.id, getScenarioSemantics(s));
+  // Bind each planned scenario's KB action TEMPLATE ONCE, same keying. The KB
+  // owns the sequence (`getScenarioActionTemplate`, authored-or-null — never
+  // invented); the builder only binds targets (`bindActionTemplate`). Scenarios
+  // with no authored template get no entry, so their nodes carry no `actions`.
+  const actionsById = new Map<string, ScenarioAction[]>();
+  for (const s of plan.scenarios) {
+    semanticsById.set(s.id, getScenarioSemantics(s));
+    const template = getScenarioActionTemplate(s);
+    if (template) actionsById.set(s.id, bindActionTemplate(s.id, template, options?.targetBindings));
+  }
 
   // The arrays are index-aligned (all derived from `drafts` in order):
   // det.scenarios[i] ↔ cases[i] ↔ drafts[i].
@@ -312,6 +389,7 @@ export function buildScenarioGraph(
     grounded: d.grounded,
     objective: d.objective,
     semantics: semanticsById.get(d.scenarioId),
+    actions: actionsById.get(d.scenarioId),
   }));
 
   return assembleScenarioGraph({
