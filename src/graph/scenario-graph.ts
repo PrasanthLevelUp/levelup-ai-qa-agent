@@ -87,6 +87,15 @@ export interface ScenarioSemantics {
  * graph from slowly accreting single-purpose properties as the platform grows.
  * (`semantics` qualifies: Test Case Lab, Script Gen, Healing and the Dataset
  * Resolver all read it.)
+ *
+ * CONTRACT — this node's shape is FROZEN. It is organised into ownership
+ * sections (identity / semantics / execution / actions / assertions / metadata)
+ * with strict placement rules. Before adding, moving, or repurposing any field,
+ * read docs/EXECUTION_GRAPH_CONTRACT.md and bump SCENARIO_GRAPH_SCHEMA_VERSION.
+ * In particular: `requiredDataRole` is a ROLE (belongs in `semantics`); a
+ * RESOLVED dataset record belongs in `execution`, never in `semantics`. The
+ * reserved `actions[]` (Sprint 2D.3) and `assertions[]` (Sprint 2D.4) slots are
+ * documented there and are added alongside their first consumers.
  */
 export interface ScenarioNode {
   /** Stable canonical id (the KB scenarioId). Unique within a graph. */
