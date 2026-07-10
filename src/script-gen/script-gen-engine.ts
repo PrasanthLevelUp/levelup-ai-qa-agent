@@ -499,6 +499,22 @@ export interface GenerationConfig {
     records: Array<{ key: string; value: any }>;
   }>;
   /**
+   * Sprint 2D — the canonical Scenario Graph nodes, keyed by test case title.
+   * When present, Script Generation reads the scenario semantics
+   * (variableUnderTest, variation, preconditions, expectedBehavior,
+   * requiredDataRole) and execution context (resolvedDataset) directly from the
+   * graph instead of re-inferring them, making Script Gen a pure adapter from
+   * Scenario Graph → Playwright code.
+   *
+   * Optional and fully backward-compatible: when absent or when a test case has
+   * no matching node, generation uses legacy inference. Threaded by the route
+   * when a persisted/buildable graph exists for the requirement.
+   */
+  scenarioGraphNodes?: Map<string, {
+    semantics?: import('../graph/scenario-graph').ScenarioSemantics;
+    execution?: import('../graph/scenario-graph').ScenarioExecution;
+  }>;
+  /**
    * How to treat a test-case STEP that the deterministic engine cannot map to a
    * grounded action (review issue #3). Historically these emitted a silent
    * `// NOTE: step not auto-mapped — review manually.` comment that was easy to
@@ -577,6 +593,106 @@ export class ScriptGenEngine {
   // Owns all scenario-specific credential mutation, assertion hints and coverage
   // categories; keeps the generator free of embedded per-scenario branching.
   private readonly scenario = new ScenarioIntelligence();
+
+  /**
+   * Sprint 2D.1 — derive credentials + expected behavior from Scenario Semantics.
+   * When the Scenario Graph node is available, this REPLACES the
+   * ScenarioIntelligence inference (which re-classifies the scenario from its
+   * title/steps). Returns the same shape as `transformer.transformCredentials()` +
+   * `transformer.errorFragment()` so the call sites remain unchanged.
+   *
+   * Maps the KB's application-neutral semantics (variableUnderTest + variation +
+   * expectedBehavior) to the concrete Playwright actions:
+   *   - "wrong password" → valid username + invalid password
+   *   - "empty username" → empty username + valid password
+   *   - "valid credentials" → valid username + valid password
+   *
+   * This is the core 2D.1 goal: Script Gen becomes a pure adapter FROM the graph,
+   * not a re-inferencer.
+   */
+  private deriveFromSemantics(
+    semantics: import('../graph/scenario-graph').ScenarioSemantics,
+    credentialResolver: ScenarioCredentialResolver,
+  ): {
+    credentials: { username: string; password: string };
+    errorFragment: string;
+    coverageCategories: string[];
+  } {
+    const vut = semantics.variableUnderTest.toLowerCase();
+    const variation = semantics.variation.toLowerCase();
+    const expected = semantics.expectedBehavior.toLowerCase();
+
+    let username: string;
+    let password: string;
+    let errorFrag = '';
+    const categories: string[] = [];
+
+    // Derive credentials based on (variableUnderTest, variation).
+    // The "variable under test" is what changes; everything else stays at the
+    // valid baseline (from preconditions).
+    if (vut.includes('password') || vut.includes('pwd')) {
+      // Password is varied → username stays valid.
+      username = credentialResolver.base().username;
+      if (variation.includes('wrong') || variation.includes('invalid') || variation.includes('incorrect')) {
+        password = credentialResolver.envPassword() || `'InvalidPass123!'`;
+        errorFrag = 'do not match';
+        categories.push('Negative');
+      } else if (variation.includes('empty') || variation.includes('blank') || variation === 'none') {
+        password = `''`;
+        errorFrag = 'is required';
+        categories.push('Validation');
+      } else {
+        // Valid or unrecognized variation → use valid password.
+        password = credentialResolver.base().password;
+      }
+    } else if (vut.includes('username') || vut.includes('user')) {
+      // Username is varied → password stays valid.
+      password = credentialResolver.base().password;
+      if (variation.includes('wrong') || variation.includes('invalid') || variation.includes('unregistered')) {
+        username = credentialResolver.envUsername() || `'invalid_user'`;
+        errorFrag = 'do not match';
+        categories.push('Negative');
+      } else if (variation.includes('empty') || variation.includes('blank') || variation === 'none') {
+        username = `''`;
+        errorFrag = 'is required';
+        categories.push('Validation');
+      } else if (variation.includes('locked')) {
+        username = `'locked_out_user'`;
+        errorFrag = 'locked out';
+        categories.push('Negative');
+      } else {
+        username = credentialResolver.base().username;
+      }
+    } else if (vut === 'none' || variation === 'none') {
+      // Positive/observation scenario — no variation, all valid.
+      username = credentialResolver.base().username;
+      password = credentialResolver.base().password;
+      categories.push('Functional');
+    } else {
+      // Fallback for unrecognized variable: assume both valid.
+      username = credentialResolver.base().username;
+      password = credentialResolver.base().password;
+    }
+
+    // Override errorFrag if expectedBehavior is explicit about rejection.
+    if (expected.includes('reject') || expected.includes('error') || expected.includes('fail')) {
+      if (!errorFrag && !expected.includes('success')) {
+        errorFrag = ''; // Generic error surface, no specific message
+      }
+      if (!categories.includes('Negative')) categories.push('Negative');
+    } else if (expected.includes('success') || expected.includes('authenticated') || expected.includes('redirect')) {
+      errorFrag = ''; // No error expected
+      if (!categories.length) categories.push('Functional');
+    }
+
+    if (!categories.length) categories.push('Functional');
+
+    return {
+      credentials: { username, password },
+      errorFragment: errorFrag,
+      coverageCategories: categories,
+    };
+  }
   /**
    * Non-fatal Test Data warnings collected during a generation (e.g. a dataset
    * that was stored field-per-record and had to be reshaped into entities at
@@ -1065,6 +1181,19 @@ export class ScriptGenEngine {
     const tc = config.testCase!;
     const steps = this.parseTestCaseSteps(tc);
     if (!steps.length) return null;
+
+    // Sprint 2D.1: resolve the Scenario Graph node for this test case (by scenarioId).
+    // When available, Script Gen consumes its semantics (variableUnderTest +
+    // variation + expectedBehavior) instead of re-inferring them via
+    // ScenarioIntelligence. Attach it to the test case context so downstream
+    // methods (applyPageObjectActions, buildCoverageMetadata, buildAssertion)
+    // can check for it. Match by stable scenarioId (from ai_metadata or top-level),
+    // with title fallback for legacy test cases that predate Sprint 2D.
+    const scenarioId = tc.ai_metadata?.scenarioId || tc.scenarioId || null;
+    const scenarioNode = scenarioId
+      ? config.scenarioGraphNodes?.get(scenarioId)
+      : config.scenarioGraphNodes?.get(tc.title || ''); // Legacy title fallback
+    (tc as any).__scenarioNode = scenarioNode;
 
     // Real base URL — prefer the navigate step's URL, else config.url. NEVER prose.
     let baseUrl = config.url;
@@ -2128,13 +2257,30 @@ ${testBlocks.join('\n\n')}
     if (/edge|boundary|\bmax(?:imum)?\b|\bmin(?:imum)?\b|length|whitespace|special\s*char|limit|overflow/.test(hay)) add('Boundary');
     if (/empty|required|blank|validation|format|missing|mandatory/.test(hay)) add('Validation');
     if (/\bpositive\b|smoke|happy\s*path|\bsuccess\b/.test(hay)) add('Functional');
-    // Fold in the categories declared by the classified scenario's transformer,
-    // so a new scenario type contributes its coverage category automatically
-    // (the 'normal' transformer contributes nothing and defers to the heuristics
-    // above). This keeps coverage metadata in lock-step with the transformer set.
+    
+    // Sprint 2D.1: derive coverage categories from Scenario Graph semantics when
+    // available, bypassing ScenarioIntelligence re-inference.
     if (tc) {
-      const { transformer } = this.scenario.resolve(tc, this.parseTestCaseSteps(tc));
-      for (const c of transformer.coverageCategories) add(c);
+      const semantics = (tc as any).__scenarioNode?.semantics;
+      if (semantics) {
+        // Derive coverage from the semantics variation/expectedBehavior.
+        const dummyResolver: ScenarioCredentialResolver = {
+          base: () => ({ username: '', password: '' }),
+          validCounterpart: () => ({ username: '', password: '' }),
+          envUsername: () => '',
+          envPassword: () => '',
+          authoredUsername: null,
+          authoredPassword: null,
+          authoredBothEmpty: false,
+          escape: (s: string) => s,
+        };
+        const derived = this.deriveFromSemantics(semantics, dummyResolver);
+        for (const c of derived.coverageCategories) add(c);
+      } else {
+        // Legacy path: classify and get transformer's coverage categories.
+        const { transformer } = this.scenario.resolve(tc, this.parseTestCaseSteps(tc));
+        for (const c of transformer.coverageCategories) add(c);
+      }
     }
     // Default: a case that is none of the above is a straightforward Functional
     // check. Always surface at least one category.
@@ -3361,10 +3507,24 @@ ${gotoB}${sessionLogin('pageB')}
           authoredBothEmpty: userFillVal === `''` && passFillVal === `''`,
           escape: escapeStr,
         };
-        const { classification, transformer } = this.scenario.resolve(tc, steps ?? []);
-        const creds = transformer.transformCredentials(classification, credentialResolver);
-        let u = creds.username;
-        let p = creds.password;
+
+        // Sprint 2D.1: consume Scenario Graph semantics when available, bypassing
+        // the ScenarioIntelligence re-inference. This makes Script Gen a pure
+        // adapter from graph → code.
+        const semantics = (tc as any).__scenarioNode?.semantics;
+        let u: string;
+        let p: string;
+        if (semantics) {
+          const derived = this.deriveFromSemantics(semantics, credentialResolver);
+          u = derived.credentials.username;
+          p = derived.credentials.password;
+        } else {
+          // Legacy path: classify the scenario from title/steps and transform.
+          const { classification, transformer } = this.scenario.resolve(tc, steps ?? []);
+          const creds = transformer.transformCredentials(classification, credentialResolver);
+          u = creds.username;
+          p = creds.password;
+        }
         // Priority #4 — Repository Reuse. When the LoginPage exposes an explicit
         // navigation method (open / goto / navigate / load), prefer it over a
         // raw `page.goto(baseUrl)` so the spec drives entry through the repo's
@@ -4266,11 +4426,28 @@ ${gotoB}${sessionLogin('pageB')}
       // renders); we assert the error surface + that we stayed on the login page,
       // unless the Expected Result itself quoted the message (messageFrag).
       if (!frag && this.isSauceLikeApp(ctx.url)) {
-        // The transformer for the classified scenario supplies the deterministic
-        // fragment: a string to assert, '' to assert the error surface only, or
-        // null when the scenario dictates nothing (defer to Expected-Result text).
-        const { transformer } = this.scenario.resolve(_tc, this.parseTestCaseSteps(_tc));
-        const scenarioFrag = transformer.errorFragment();
+        // Sprint 2D.1: derive the error fragment from Scenario Graph semantics
+        // when available, bypassing ScenarioIntelligence re-inference.
+        const semantics = (_tc as any).__scenarioNode?.semantics;
+        let scenarioFrag: string | null = null;
+        if (semantics) {
+          const dummyResolver: ScenarioCredentialResolver = {
+            base: () => ({ username: '', password: '' }),
+            validCounterpart: () => ({ username: '', password: '' }),
+            envUsername: () => '',
+            envPassword: () => '',
+            authoredUsername: null,
+            authoredPassword: null,
+            authoredBothEmpty: false,
+            escape: (s: string) => s,
+          };
+          const derived = this.deriveFromSemantics(semantics, dummyResolver);
+          scenarioFrag = derived.errorFragment;
+        } else {
+          // Legacy path: classify and get transformer's error fragment.
+          const { transformer } = this.scenario.resolve(_tc, this.parseTestCaseSteps(_tc));
+          scenarioFrag = transformer.errorFragment();
+        }
         // Intent signals from Expected Result + scenario/test-data (NOT title).
         const hay = `${lc} ${`${_tc.scenario ?? ''}`.toLowerCase()} ${`${_tc.test_data || ''}`.toLowerCase()}`;
         if (scenarioFrag === 'is required' || /empty|required|blank|cannot be (empty|blank)|no .*(username|password)/.test(lc)) {
