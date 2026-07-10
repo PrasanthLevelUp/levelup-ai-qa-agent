@@ -132,6 +132,15 @@ ScenarioNode {
                               //   `value`) because assertions compare actual-vs-expected; actions
                               //   consume `value`, assertions verify `expected`.
     optional?                 // check is skipped (count-guarded) when its target is absent
+    afterAction?              // The producing action's EXACT `id` (`<scenarioId>.<action>.
+                              //   <target>`, e.g. `auth-pos-valid.click.login_button`) — the
+                              //   SAME string stored in `actions[].id`, never an index, never a
+                              //   derived slug. Answers "which step produced this outcome?" so
+                              //   Replay / Healing / the execution timeline can say "after
+                              //   clicking Login, expected the inventory page". Resolve by plain
+                              //   equality: node.actions.find(a => a.id === afterAction) — no
+                              //   helper, no computation. Absent when the check is not tied to a
+                              //   materialized step.
   }
 
   // ── 7. QA METADATA + PROVENANCE ─────────────  diagnostic / classification
@@ -227,6 +236,15 @@ If a field seems to fit two sections, it is probably two fields. Split it. (The 
   check even after assertions are reordered, inserted, or removed. `order` carries sequence ONLY; identity
   lives in `id`. This is why `order` is free to change without breaking references, and why the builder must
   never fall back to `:a:<index>` ids.
+- **Every assertion knows which STEP produced it — by identity, not position.** An assertion may carry
+  `afterAction`, holding the producing action's EXACT `id` — the same `<scenarioId>.<action>.<target>` string
+  stored in `actions[].id` (e.g. `auth-pos-valid.click.login_button`), never an array index and never a
+  derived slug. Resolve it by plain equality (`node.actions.find(a => a.id === afterAction)`), so "the check
+  after the Login click" keeps resolving to the same step even when actions are reordered or a step is
+  inserted. Because both sides are the one identity, the join needs no helper and no computation. This is what lets Replay, Healing, the execution timeline, and root-cause explanations say
+  *"after clicking Login, expected the inventory page, but stayed on Login"* instead of a bare "assertion
+  failed" — a step → outcome link with zero runtime search. The KB (the authority on the sequence) authors it
+  and the builder copies it verbatim; it is omitted when a check is not tied to a materialized step.
 - **Assertions store CANONICAL business meaning, never Playwright.** The graph holds `{type:"visible",
   target:"login_error"}`, never `expect(...)`, `toBeVisible()`, or a CSS locator. Script Gen is a pure
   `switch(type)` renderer + resolver — it NEVER infers an assertion from prose. The KB authors the check;
@@ -241,10 +259,11 @@ If a field seems to fit two sections, it is probably two fields. Split it. (The 
 
 ## 4. Schema-version governance
 
-`SCENARIO_GRAPH_SCHEMA_VERSION` (currently `'1.2.0'` — `1.0.0` → `1.1.0` when 2D.3 populated `actions`,
-`1.1.0` → `1.2.0` when 2D.4 populated `assertions`) is the contract version. Bump it when the shape changes:
+`SCENARIO_GRAPH_SCHEMA_VERSION` (currently `'1.2.1'` — `1.0.0` → `1.1.0` when 2D.3 populated `actions`,
+`1.1.0` → `1.2.0` when 2D.4 populated `assertions`, `1.2.0` → `1.2.1` when the 2D.4 review added the
+optional `assertions[].afterAction` field) is the contract version. Bump it when the shape changes:
 
-- **PATCH** — additive optional field within an existing section, backward-compatible.
+- **PATCH** — additive optional field within an existing section, backward-compatible (`afterAction`, 2D.4 review).
 - **MINOR** — new section slot populated for the first time (`resources`, 2D.3 `actions`, 2D.4 `assertions`).
 - **MAJOR** — a field moves sections, is removed, or changes meaning (requires migration + review).
 

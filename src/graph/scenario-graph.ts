@@ -339,6 +339,19 @@ export type AssertionType =
  *                  `checked`/`unchecked`) need no `expected` — the type carries it.
  *   • `optional` — when true the check is skipped if its target is absent (e.g.
  *                  a control some apps omit). Defaults to false / required.
+ *   • `afterAction` — optional reference to the action this check is evaluated
+ *                  *after* — the producing step's EXACT {@link ScenarioAction} `id`
+ *                  (`<scenarioId>.<action>.<target>`, e.g.
+ *                  `auth-pos-valid.click.login_button`). It answers "which step
+ *                  produced this outcome?", so Replay, Healing, the execution
+ *                  timeline, and root-cause explanations can say "after clicking
+ *                  Login, expected the inventory page" instead of a bare "assertion
+ *                  failed". Because it IS the action's id, a consumer resolves it
+ *                  with a plain `node.actions.find(a => a.id === assertion.afterAction)`
+ *                  — no helper, no slug, no computation: one identity everywhere.
+ *                  Identity, not position — it survives action reordering exactly
+ *                  as `id` does. Absent when the check is not tied to a specific
+ *                  step (e.g. a scenario with no materialized actions).
  */
 export interface ScenarioAssertion {
   id: string;
@@ -347,6 +360,7 @@ export interface ScenarioAssertion {
   target?: string;
   expected?: string | number | boolean;
   optional?: boolean;
+  afterAction?: string;
 }
 
 /**
@@ -434,7 +448,11 @@ export interface ScenarioGraph {
 // 1.2.0 — Sprint 2D.4 populated the reserved `assertions[]` section for the
 //         first time (MINOR bump — a new section slot populated for the first
 //         time is backward-compatible/additive).
-export const SCENARIO_GRAPH_SCHEMA_VERSION = '1.2.0';
+// 1.2.1 — Sprint 2D.4 review: added the optional `assertions[].afterAction`
+//         semantic action reference. PATCH (not MINOR) per the contract's own
+//         versioning rule: an ADDITIVE OPTIONAL FIELD within an already-populated
+//         section is backward-compatible — a reader that omits it is unaffected.
+export const SCENARIO_GRAPH_SCHEMA_VERSION = '1.2.1';
 
 /* ------------------------------------------------------------------ */
 /*  Pure helpers                                                       */

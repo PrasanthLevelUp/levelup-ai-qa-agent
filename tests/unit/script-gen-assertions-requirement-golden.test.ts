@@ -145,6 +145,19 @@ describe('Sprint 2D.4 — golden: Requirement → graph → Script Gen → Playw
       'auth-neg-wrong-password.url.login',
     ]);
 
+    // Every assertion is linked to the step that produced it (2D.4 review),
+    // and the link resolves — by action.id (identity, NOT array position) — to the
+    // real click action in the same node. afterAction IS that action's id, so the
+    // join is a plain `act.id === a.afterAction`, no slug/derivation. This is what
+    // powers "after clicking Login, expected …" in Replay / Healing / the timeline.
+    for (const a of node.assertions) {
+      expect(a.afterAction).toBe('auth-neg-wrong-password.click.login_button');
+      const producer = node.actions.find((act: any) => act.id === a.afterAction);
+      expect(producer).toBeDefined();
+      expect(producer.action).toBe('click');
+      expect(producer.target).toBe('login_button');
+    }
+
     // 2. Project nodes EXACTLY as api/routes/script-gen.ts does: keyed by node.id
     //    with only {semantics, execution, actions, assertions}.
     const scenarioGraphNodes = new Map<string, any>(

@@ -35,8 +35,12 @@ import {
   getBaselineScenarios,
   QA_KNOWLEDGE_BASE,
   getScenarioAssertionTemplate,
+  getScenarioActionTemplate,
 } from '../../src/engines/qa-knowledge-engine';
-import { materializeAssertionTemplate } from '../../src/graph/scenario-graph-builder';
+import {
+  materializeAssertionTemplate,
+  materializeActionTemplate,
+} from '../../src/graph/scenario-graph-builder';
 
 // The FROZEN assertion grammar (Sprint 2D.4). Adding a type here is a deliberate
 // contract change — mirror it in `AssertionType` (graph + KB) and the renderer.
@@ -135,6 +139,51 @@ describe('Sprint 2D.4 — assertion-template coverage ratchet', () => {
       for (const id of ids) {
         expect(id.startsWith(`${s.id}.`)).toBe(true);
         expect(id).not.toMatch(/:a:\d+$/); // the old position-based scheme is gone
+      }
+    }
+  });
+
+  // (F) afterAction INTEGRITY — every authored reference is the EXACT id of a
+  //     REAL action in the SAME scenario (never a dangling ref, never a position).
+  //     afterAction IS an action.id, so the join is a plain `a.id === afterAction`
+  //     with no slug/derivation. This is the guarantee Replay / Healing / the
+  //     timeline rely on: "which step produced this assertion?" always resolves.
+  it('(F) every authored assertion.afterAction equals exactly one action id in its scenario', () => {
+    const dangling: string[] = [];
+    for (const s of auth) {
+      const assertions = s.assertionTemplate ?? [];
+      const actionTmpl = getScenarioActionTemplate(s);
+      const actionIds = actionTmpl
+        ? materializeActionTemplate(s.id, actionTmpl).map((act) => act.id)
+        : [];
+      for (const a of assertions) {
+        if (a.afterAction === undefined) continue;
+        const hits = actionIds.filter((id) => id === a.afterAction);
+        // A reference MUST match exactly one action id. If the scenario has no
+        // action template at all, any afterAction is dangling by definition.
+        if (hits.length !== 1) dangling.push(`${s.id}: '${a.afterAction}' matched ${hits.length} action(s)`);
+      }
+    }
+    expect(dangling).toEqual([]);
+  });
+
+  it('(F2) afterAction is only authored where an actionTemplate exists to reference', () => {
+    const orphaned = auth
+      .filter((s) => (s.assertionTemplate ?? []).some((a) => a.afterAction !== undefined))
+      .filter((s) => !getScenarioActionTemplate(s))
+      .map((s) => s.id);
+    expect(orphaned).toEqual([]);
+  });
+
+  it('(F3) every scenario that authors BOTH actions and assertions links each assertion to a step', () => {
+    // Where the KB owns the full flow (actions + assertions), each check should
+    // declare the step it follows — otherwise the execution-timeline story has a
+    // gap. This ratchets the four fully-authored login scenarios to 100% linkage.
+    for (const s of auth) {
+      const assertions = s.assertionTemplate ?? [];
+      if (assertions.length === 0 || !getScenarioActionTemplate(s)) continue;
+      for (const a of assertions) {
+        expect(typeof a.afterAction).toBe('string');
       }
     }
   });

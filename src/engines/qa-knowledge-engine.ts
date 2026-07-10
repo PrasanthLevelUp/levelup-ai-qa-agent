@@ -236,6 +236,20 @@ export interface ScenarioAssertionTemplate {
   expected?: string | number | boolean;
   /** When true the check is skipped if its target is absent in the app. */
   optional?: boolean;
+  /**
+   * Optional reference to the action this check runs *after* — the EXACT
+   * `ScenarioAction.id` of a step in THIS scenario's `actionTemplate`
+   * (`<scenarioId>.<action>.<target>`, e.g. `auth-pos-valid.click.login_button`).
+   * The KB — the authority on the sequence — declares it; the builder copies it
+   * VERBATIM onto the graph `ScenarioAssertion.afterAction`. It is identity, not
+   * position: it is the step's ONE canonical id, never an array index and never a
+   * separate slug — so a consumer resolves it with a plain
+   * `node.actions.find(a => a.id === afterAction)`, no computation. Author it only
+   * when the scenario HAS an `actionTemplate` to reference; omit it otherwise. The
+   * qa-knowledge assertions invariant test rejects any afterAction that does not
+   * match a real action id in the same scenario (no dangling references).
+   */
+  afterAction?: string;
 }
 
 /**
@@ -485,8 +499,8 @@ export const QA_KNOWLEDGE_BASE: Record<Exclude<QACategory, 'generic'>, PlannedSc
         { action: 'click', target: 'login_button' },
       ],
       assertionTemplate: [
-        { type: 'url', expected: '@page.inventory' },
-        { type: 'visible', target: 'authenticated_landing' },
+        { type: 'url', expected: '@page.inventory', afterAction: 'auth-pos-valid.click.login_button' },
+        { type: 'visible', target: 'authenticated_landing', afterAction: 'auth-pos-valid.click.login_button' },
       ] },
     { id: 'auth-neg-wrong-password', title: 'Invalid password is rejected', objective: 'A wrong password does not authenticate and a clear, non-leaking error is shown.', coverageType: 'negative', priority: 'P0', riskArea: 'Unauthorized access', obligation: { level: 'required', condition: 'always' },
       semantics: { variableUnderTest: 'password', preconditions: 'a registered user with the correct username and correct password', variation: 'the password is replaced with an incorrect value (the username stays valid)', expectedBehavior: 'authentication is rejected with a generic error and the user stays on the login page', requiredDataRole: 'registered_user' },
@@ -497,9 +511,9 @@ export const QA_KNOWLEDGE_BASE: Record<Exclude<QACategory, 'generic'>, PlannedSc
         { action: 'click', target: 'login_button' },
       ],
       assertionTemplate: [
-        { type: 'visible', target: 'login_error' },
-        { type: 'text', target: 'login_error', expected: '@messages.invalid_credentials' },
-        { type: 'url', expected: '@page.login' },
+        { type: 'visible', target: 'login_error', afterAction: 'auth-neg-wrong-password.click.login_button' },
+        { type: 'text', target: 'login_error', expected: '@messages.invalid_credentials', afterAction: 'auth-neg-wrong-password.click.login_button' },
+        { type: 'url', expected: '@page.login', afterAction: 'auth-neg-wrong-password.click.login_button' },
       ] },
     { id: 'auth-neg-empty-fields', title: 'Empty required fields are rejected', objective: 'Submitting with blank username and/or password is blocked with field-level validation.', coverageType: 'negative', priority: 'P1', riskArea: 'Input validation', obligation: { level: 'required', condition: 'always' },
       semantics: { variableUnderTest: 'a required field', preconditions: 'a registered user with the correct username and correct password', variation: 'exactly ONE required field is left blank while the other stays valid', expectedBehavior: 'field-level validation blocks submission before authentication is attempted', requiredDataRole: 'registered_user' },
@@ -509,9 +523,9 @@ export const QA_KNOWLEDGE_BASE: Record<Exclude<QACategory, 'generic'>, PlannedSc
         { action: 'click', target: 'login_button' },
       ],
       assertionTemplate: [
-        { type: 'visible', target: 'login_error' },
-        { type: 'text', target: 'login_error', expected: '@messages.password_required' },
-        { type: 'url', expected: '@page.login' },
+        { type: 'visible', target: 'login_error', afterAction: 'auth-neg-empty-fields.click.login_button' },
+        { type: 'text', target: 'login_error', expected: '@messages.password_required', afterAction: 'auth-neg-empty-fields.click.login_button' },
+        { type: 'url', expected: '@page.login', afterAction: 'auth-neg-empty-fields.click.login_button' },
       ] },
     { id: 'auth-neg-unknown-user', title: 'Unknown / non-existent user is rejected', objective: 'An unregistered identifier cannot authenticate and the error does not reveal whether the account exists.', coverageType: 'negative', priority: 'P1', riskArea: 'Account enumeration', conditionalOnKeywords: ['unknown', 'non-existent', 'nonexistent', 'not registered', 'unregistered', 'enumerat', 'no account', 'does not exist'],
       semantics: { variableUnderTest: 'username', preconditions: 'a valid password paired with a registered username', variation: 'the username is replaced with an unregistered identifier (the password stays valid)', expectedBehavior: 'authentication is rejected with a non-enumerating error that does not reveal whether the account exists', requiredDataRole: 'unregistered_user' },
@@ -526,9 +540,9 @@ export const QA_KNOWLEDGE_BASE: Record<Exclude<QACategory, 'generic'>, PlannedSc
         { action: 'click', target: 'login_button' },
       ],
       assertionTemplate: [
-        { type: 'visible', target: 'login_error' },
-        { type: 'text', target: 'login_error', expected: '@messages.invalid_credentials' },
-        { type: 'url', expected: '@page.login' },
+        { type: 'visible', target: 'login_error', afterAction: 'auth-neg-unknown-user.click.login_button' },
+        { type: 'text', target: 'login_error', expected: '@messages.invalid_credentials', afterAction: 'auth-neg-unknown-user.click.login_button' },
+        { type: 'url', expected: '@page.login', afterAction: 'auth-neg-unknown-user.click.login_button' },
       ] },
     { id: 'auth-neg-locked-user', title: 'Locked / disabled account cannot log in', objective: 'A locked or disabled account is refused even with correct credentials.', coverageType: 'negative', priority: 'P1', riskArea: 'Account state enforcement', conditionalOnKeywords: ['lock', 'disable', 'suspend', 'attempt'],
       semantics: { variableUnderTest: 'account state', preconditions: 'a registered user with the correct username and correct password', variation: 'the account is in a locked / disabled state while the credentials remain correct', expectedBehavior: 'authentication is refused with a locked/disabled-account message despite correct credentials', requiredDataRole: 'locked_account' },

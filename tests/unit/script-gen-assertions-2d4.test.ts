@@ -26,9 +26,13 @@
  */
 
 import { ScriptGenEngine } from '../../src/script-gen/script-gen-engine';
-import { materializeAssertionTemplate } from '../../src/graph/scenario-graph-builder';
+import {
+  materializeAssertionTemplate,
+  materializeActionTemplate,
+} from '../../src/graph/scenario-graph-builder';
 import {
   getScenarioAssertionTemplate,
+  getScenarioActionTemplate,
   getBaselineScenarios,
   type ScenarioAssertionTemplate,
 } from '../../src/engines/qa-knowledge-engine';
@@ -136,6 +140,59 @@ describe('Sprint 2D.4 — builder.materializeAssertionTemplate', () => {
     const a = materializeAssertionTemplate('s', template);
     const b = materializeAssertionTemplate('s', template);
     expect(JSON.stringify(a)).toBe(JSON.stringify(b));
+  });
+
+  it('copies afterAction VERBATIM and omits it when the KB does not author one', () => {
+    const withRef: ScenarioAssertionTemplate[] = [
+      { type: 'visible', target: 'login_error', afterAction: 's.click.login_button' },
+      { type: 'url', expected: '@page.login' }, // no afterAction authored
+    ];
+    const mat = materializeAssertionTemplate('s', withRef);
+    // afterAction is an action.id — copied byte-for-byte, never re-derived.
+    expect(mat[0].afterAction).toBe('s.click.login_button');
+    // Absent stays absent — never invented, never defaulted.
+    expect('afterAction' in mat[1]).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// afterAction — the link from an assertion to the action it follows. It IS the
+// producing action's `id` (`<scenarioId>.<action>.<target>`), so the join is a
+// plain `action.id === afterAction` — one identity, no slug, no computation.
+// ---------------------------------------------------------------------------
+describe('Sprint 2D.4 review — assertion.afterAction ↔ action.id (direct join)', () => {
+  it('action ids are UNIQUE per scenario and include the semantic <scenarioId>.click.login_button', () => {
+    for (const id of ['auth-pos-valid', 'auth-neg-wrong-password', 'auth-neg-empty-fields', 'auth-neg-unknown-user']) {
+      const scenario = getBaselineScenarios('authentication').find((s) => s.id === id)!;
+      const actions = materializeActionTemplate(id, getScenarioActionTemplate(scenario)!);
+      const ids = actions.map((a) => a.id);
+      expect(ids).toContain(`${id}.click.login_button`);
+      expect(new Set(ids).size).toBe(ids.length); // unique within the scenario
+    }
+  });
+
+  it('every authored afterAction equals EXACTLY ONE action id in the same scenario', () => {
+    const scenario = getBaselineScenarios('authentication').find((s) => s.id === 'auth-neg-wrong-password')!;
+    const actions = materializeActionTemplate('auth-neg-wrong-password', getScenarioActionTemplate(scenario)!);
+    const assertions = materializeAssertionTemplate('auth-neg-wrong-password', getScenarioAssertionTemplate(scenario)!);
+
+    for (const a of assertions) {
+      expect(a.afterAction).toBe('auth-neg-wrong-password.click.login_button');
+      const matches = actions.filter((act) => act.id === a.afterAction);
+      expect(matches).toHaveLength(1); // durable, unambiguous join — by id
+      expect(matches[0].action).toBe('click');
+      expect(matches[0].target).toBe('login_button');
+    }
+  });
+
+  it('is IDENTITY not position — the ref survives an action reordering', () => {
+    const scenario = getBaselineScenarios('authentication').find((s) => s.id === 'auth-neg-wrong-password')!;
+    const actions = materializeActionTemplate('auth-neg-wrong-password', getScenarioActionTemplate(scenario)!);
+    const reordered = [...actions].reverse();
+    const ref = 'auth-neg-wrong-password.click.login_button';
+    // The click moved from last to first, but its id still points to it.
+    expect(actions.find((a) => a.id === ref)!.action).toBe('click');
+    expect(reordered.find((a) => a.id === ref)!.action).toBe('click');
   });
 });
 

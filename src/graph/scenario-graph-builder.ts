@@ -243,7 +243,12 @@ function assertionSlug(check: ScenarioAssertionTemplate): string {
  *     disambiguated with a deterministic `#n` suffix (encounter order);
  *   • sets `order` to the array index (a faithful copy of the KB order, the
  *     authoritative EXECUTION order — never a re-sort);
- *   • copies `type`, `target`, `expected` and `optional` VERBATIM.
+ *   • copies `type`, `target`, `expected`, `optional` and `afterAction` VERBATIM
+ *     (`afterAction` is the KB's reference to the producing action — the EXACT
+ *     `ScenarioAction.id` (`<scenarioId>.<action>.<target>`) that
+ *     {@link materializeActionTemplate} assigns; the builder copies it, never
+ *     re-derives it, and a consumer resolves it with a plain
+ *     `node.actions.find(a => a.id === assertion.afterAction)` — no helper).
  *
  * It does NOT invent, add, drop, or reorder checks (the set is the KB's — "the
  * builder may materialize assertions, but it must never invent them"), and it
@@ -277,6 +282,12 @@ export function materializeAssertionTemplate(
     if (check.target !== undefined) assertion.target = check.target;
     if (check.expected !== undefined) assertion.expected = check.expected;
     if (check.optional !== undefined) assertion.optional = check.optional;
+    // The action reference is COPIED VERBATIM (like target/expected) — the
+    // builder never invents or re-derives it. It is the producing step's EXACT
+    // `ScenarioAction.id`; integrity (it matches a real action id in this
+    // scenario) is the KB's responsibility, enforced by the qa-knowledge
+    // assertions invariant test.
+    if (check.afterAction !== undefined) assertion.afterAction = check.afterAction;
     return assertion;
   });
 }
