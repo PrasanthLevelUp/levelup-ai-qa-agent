@@ -111,12 +111,18 @@ export interface HealingAction {
   }>;
   /**
    * Sprint 4.4 — the explainable {@link HealingResult} the orchestrator produced
-   * (reason, risk, evidence, chosen + ranked candidates, alternatives). We do NOT
-   * add a column for this: it is co-persisted into the existing `decision_trail`
-   * JSONB alongside the waterfall trail as `{ trail, healingResult }` (mirrors how
-   * `generated_scripts.ai_metrics` holds script-gen provenance). Read paths accept
-   * both the legacy array shape and the composite object. Optional — legacy/CLI
-   * heals simply omit it.
+   * (reason, risk, evidence, chosen + ranked candidates, alternatives).
+   *
+   * DESIGN NOTE: We do NOT add a column for this. It is co-persisted into the
+   * existing `decision_trail` JSONB alongside the waterfall trail as a composite
+   * `{ trail, healingResult }`. This mirrors how `generated_scripts.ai_metrics`
+   * holds script-gen provenance. Conceptually, `decision_trail` (the execution
+   * waterfall) and `HealingResult` (the final decision) are distinct layers; if
+   * healing grows significantly and we need to query/index HealingResult fields
+   * (risk, reasonCode, confidence) outside the explainability flow, consider
+   * migrating to a dedicated column. For Sprint 4.4, co-location keeps the PR
+   * minimal (no schema change). Read paths accept both the legacy array shape and
+   * the composite object. Optional — legacy/CLI heals simply omit it.
    */
   healing_result?: unknown;
   /**
@@ -3275,9 +3281,20 @@ export async function updateExecution(id: number, fields: Partial<TestExecution>
 /**
  * Sprint 4.4 — serialize the value stored in `healing_actions.decision_trail`.
  *
+ * DESIGN NOTE — TWO CONCEPTS, ONE COLUMN (pragmatic reuse):
+ * `decision_trail` and `HealingResult` are CONCEPTUALLY DISTINCT:
+ *   • decision_trail  = "how did the engine reach the decision?" (execution waterfall)
+ *   • HealingResult   = "what was the final decision?" (reason, risk, evidence, candidates)
+ *
+ * Ideally, HealingResult would have its own JSONB column. We're co-persisting it
+ * here to avoid another migration (Sprint 4.4 already ships without schema changes).
+ * If healing grows significantly — e.g., we need to query/index/filter on risk,
+ * reasonCode, or confidence outside the explainability flow — consider migrating
+ * HealingResult to its own column. For now, this works and keeps the PR minimal.
+ *
  * The column historically held just the waterfall trail (an array). We now
- * co-persist the explainable HealingResult beside it, without adding a column,
- * as a composite `{ trail, healingResult }`. Chosen behaviour:
+ * co-persist the explainable HealingResult beside it as a composite
+ * `{ trail, healingResult }`. Chosen behaviour:
  *   - both present  → `{ trail, healingResult }`
  *   - trail only    → the legacy array (unchanged wire shape for old readers)
  *   - result only   → `{ trail: null, healingResult }`
