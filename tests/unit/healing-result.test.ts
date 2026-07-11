@@ -17,7 +17,9 @@
  * 4. (4.2) rankedCandidates is a PURE VIEW of the engine's already-ranked
  *    ScoredCandidate output — engine order preserved (never re-sorted), 1-based
  *    rank, exactly one `chosen`, existing breakdown relabelled as evidence.
- * 5. Risk is a thin, deterministic first cut (formalised in 4.3).
+ * 5. Risk is derived by the deterministic HealingRiskClassifier (Sprint 4.3);
+ *    its own rules are unit-tested in healing-risk-classifier.test.ts. Here we
+ *    only assert the builder wires the classifier through end-to-end.
  * 6. A null suggestion yields a well-formed "no heal" result (never throws).
  */
 
@@ -27,7 +29,6 @@ import {
   buildRankedCandidates,
   inferHealingReason,
   reasonText,
-  deriveHealingRisk,
   type BuildHealingResultInput,
   type HealingReasonCode,
 } from '../../src/core/healing-result';
@@ -113,34 +114,7 @@ describe('Sprint 4.1 — HealingResult explainability contract', () => {
     });
   });
 
-  /* ---------------------------------------------------------------------- */
-  /*  deriveHealingRisk — thin first cut (4.3 formalises)                    */
-  /* ---------------------------------------------------------------------- */
-  describe('deriveHealingRisk', () => {
-    it('flags NO_HEAL and ELEMENT_MOVED as high', () => {
-      expect(deriveHealingRisk('NO_HEAL', 0.9, true)).toBe('high');
-      expect(deriveHealingRisk('ELEMENT_MOVED', 0.9, true)).toBe('high');
-    });
-
-    it('flags low confidence as high regardless of reason', () => {
-      expect(deriveHealingRisk('ID_CHANGED', 0.5, true)).toBe('high');
-    });
-
-    it('flags text/role changes as medium', () => {
-      expect(deriveHealingRisk('TEXT_CHANGED', 0.95, true)).toBe('medium');
-      expect(deriveHealingRisk('ROLE_CHANGED', 0.95, true)).toBe('medium');
-    });
-
-    it('flags mid confidence and un-validated heals as medium', () => {
-      expect(deriveHealingRisk('ID_CHANGED', 0.7, true)).toBe('medium');
-      expect(deriveHealingRisk('ID_CHANGED', 0.95, false)).toBe('medium');
-    });
-
-    it('treats a high-confidence, DOM-validated attribute swap as low', () => {
-      expect(deriveHealingRisk('DATA_TESTID_REMOVED', 0.95, true)).toBe('low');
-      expect(deriveHealingRisk('ID_CHANGED', 0.9, true)).toBe('low');
-    });
-  });
+  /* Risk classification moved to healing-risk-classifier.test.ts (Sprint 4.3). */
 
   /* ---------------------------------------------------------------------- */
   /*  buildEvidence — honest reflection of present signals                   */
@@ -337,9 +311,9 @@ describe('Sprint 4.1 — HealingResult explainability contract', () => {
     it('assembles a full explainable result for a data-testid removal, including the ranked set', () => {
       const result = buildHealingResult({
         originalSelector: '[data-testid="submit-btn"]',
-        suggestion: { newLocator: 'button.submit', strategy: 'rule_based', confidence: 0.9 },
+        suggestion: { newLocator: 'button.submit', strategy: 'rule_based', confidence: 0.96 },
         confidenceResult: {
-          finalScore: 0.9,
+          finalScore: 0.96,
           grade: 'A',
           autoApply: true,
           breakdown: { selectorQuality: 0.8, similarityScore: 0.9, validationBonus: 1 },

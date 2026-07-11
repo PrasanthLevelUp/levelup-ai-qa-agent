@@ -39,9 +39,10 @@
  * 3. Reasons come from a fixed vocabulary (`HealingReasonCode`) derived by
  *    comparing the original vs. healed selector plus the deterministic failure
  *    diagnosis — never generated text.
- * 4. Risk here is a thin, deterministic first cut. Sprint 4.3 will formalise the
- *    risk rules; the field exists now so the contract is stable for consumers and
- *    analytics. We deliberately keep it minimal (no over-engineering).
+ * 4. Risk (Sprint 4.3) is a deterministic *interpretation* of the fields above,
+ *    produced by the single `HealingRiskClassifier` in `healing-risk-classifier.ts`.
+ *    It adds no new inputs and never recomputes confidence — same result in,
+ *    same band out. See that module for the ordered rules.
  */
 
 /* -------------------------------------------------------------------------- */
@@ -64,8 +65,15 @@ export type HealingReasonCode =
   | 'SELECTOR_UPDATED' // healed, but no more specific difference could be attributed
   | 'NO_HEAL'; // nothing was healed (no suggestion produced)
 
-/** Coarse risk band. Sprint 4.3 formalises the classification rules. */
-export type HealingRisk = 'low' | 'medium' | 'high';
+/**
+ * Coarse risk band. Sprint 4.3 — the enum and its deterministic rules now live
+ * in `healing-risk-classifier.ts`; imported for use by the builder and
+ * re-exported so existing importers of `HealingRisk` from this module keep
+ * working. The enum's string values are `'low' | 'medium' | 'high'`, so the
+ * serialized contract is unchanged.
+ */
+import { HealingRisk, healingRiskClassifier } from './healing-risk-classifier';
+export { HealingRisk };
 
 /**
  * A single explainability signal that fed the confidence score. Score is 0..1.
@@ -328,36 +336,6 @@ export function reasonText(code: HealingReasonCode): string {
 }
 
 /* -------------------------------------------------------------------------- */
-/*  Risk (thin, deterministic first cut — formalised in Sprint 4.3)           */
-/* -------------------------------------------------------------------------- */
-
-/**
- * Coarse risk band from the reason and confidence. Sprint 4.3 will replace this
- * with a fuller rule set; kept intentionally small here so the field is present
- * and stable without pre-empting that work.
- *
- * Principle: attribute-only swaps on the same element are low risk; a text
- * change is medium (copy can be reworded on purpose); a moved element or a
- * low-confidence heal is high.
- */
-export function deriveHealingRisk(
-  reasonCode: HealingReasonCode,
-  confidence: number,
-  domValidated?: boolean,
-): HealingRisk {
-  if (reasonCode === 'NO_HEAL') return 'high';
-  if (reasonCode === 'ELEMENT_MOVED') return 'high';
-  if (confidence < 0.6) return 'high';
-
-  if (reasonCode === 'TEXT_CHANGED' || reasonCode === 'ROLE_CHANGED') return 'medium';
-  if (confidence < 0.85) return 'medium';
-  if (!domValidated) return 'medium';
-
-  // Attribute/id-only swap, high confidence, DOM-validated.
-  return 'low';
-}
-
-/* -------------------------------------------------------------------------- */
 /*  Evidence mapping (pure)                                                   */
 /* -------------------------------------------------------------------------- */
 
@@ -530,9 +508,7 @@ export function buildHealingResult(input: BuildHealingResultInput): HealingResul
   // Auto-apply: prefer the engine's own flag; else derive from its threshold.
   const autoApply = input.confidenceResult?.autoApply ?? confidence >= 0.85;
 
-  const risk = deriveHealingRisk(reasonCode, confidence, input.domValidated);
-
-  return {
+  const result: HealingResult = {
     originalSelector,
     healedSelector,
     healed,
@@ -546,6 +522,14 @@ export function buildHealingResult(input: BuildHealingResultInput): HealingResul
     chosenCandidate: healedSelector,
     rankedCandidates,
     alternatives: buildAlternatives(rankedCandidates),
-    risk,
+    // Placeholder — set below by the deterministic classifier, which reads the
+    // already-computed reasonCode / confidence / chosenCandidate off the result.
+    risk: HealingRisk.MEDIUM,
   };
+
+  // Sprint 4.3 — derive the risk band deterministically from the assembled
+  // result. No re-scoring, no new inputs; a pure interpretation of what we have.
+  result.risk = healingRiskClassifier.classify(result);
+
+  return result;
 }
