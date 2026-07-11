@@ -110,6 +110,16 @@ export interface HealingAction {
     reasoning?: string;
   }>;
   /**
+   * Sprint 4.4 — the explainable {@link HealingResult} the orchestrator produced
+   * (reason, risk, evidence, chosen + ranked candidates, alternatives). We do NOT
+   * add a column for this: it is co-persisted into the existing `decision_trail`
+   * JSONB alongside the waterfall trail as `{ trail, healingResult }` (mirrors how
+   * `generated_scripts.ai_metrics` holds script-gen provenance). Read paths accept
+   * both the legacy array shape and the composite object. Optional — legacy/CLI
+   * heals simply omit it.
+   */
+  healing_result?: unknown;
+  /**
    * Repo Intelligence "Patch the Page Object" targeting (Phase 4 / PR #160).
    * When the broken selector lived in a shared Page Object / helper, these
    * capture WHERE the patch was written (the shared file + line) and how many
@@ -3262,6 +3272,54 @@ export async function updateExecution(id: number, fields: Partial<TestExecution>
 /*  Healing Actions                                                           */
 /* -------------------------------------------------------------------------- */
 
+/**
+ * Sprint 4.4 — serialize the value stored in `healing_actions.decision_trail`.
+ *
+ * The column historically held just the waterfall trail (an array). We now
+ * co-persist the explainable HealingResult beside it, without adding a column,
+ * as a composite `{ trail, healingResult }`. Chosen behaviour:
+ *   - both present  → `{ trail, healingResult }`
+ *   - trail only    → the legacy array (unchanged wire shape for old readers)
+ *   - result only   → `{ trail: null, healingResult }`
+ *   - neither       → NULL
+ */
+export function serializeDecisionTrail(
+  trail: HealingAction['decision_trail'],
+  healingResult?: unknown,
+): string | null {
+  if (healingResult === undefined || healingResult === null) {
+    return trail ? JSON.stringify(trail) : null;
+  }
+  return JSON.stringify({ trail: trail ?? null, healingResult });
+}
+
+/**
+ * Inverse of {@link serializeDecisionTrail}. Accepts a raw `decision_trail`
+ * value (already-parsed JSONB from `pg`, or a JSON string) in EITHER shape and
+ * returns the two concepts separately. Legacy array rows yield `healingResult:
+ * null`. Never throws — malformed values degrade to empty.
+ */
+export function parseDecisionTrail(raw: unknown): {
+  trail: unknown[] | null;
+  healingResult: unknown | null;
+} {
+  let v = raw;
+  if (typeof v === 'string') {
+    try { v = JSON.parse(v); } catch { return { trail: null, healingResult: null }; }
+  }
+  if (Array.isArray(v)) return { trail: v, healingResult: null };
+  if (v && typeof v === 'object') {
+    const obj = v as Record<string, unknown>;
+    if ('healingResult' in obj || 'trail' in obj) {
+      return {
+        trail: Array.isArray(obj.trail) ? (obj.trail as unknown[]) : null,
+        healingResult: obj.healingResult ?? null,
+      };
+    }
+  }
+  return { trail: null, healingResult: null };
+}
+
 export async function logHealing(data: HealingAction, companyId?: number): Promise<number> {
   const result = await getPool().query(
     `INSERT INTO healing_actions
@@ -3284,7 +3342,7 @@ export async function logHealing(data: HealingAction, companyId?: number): Promi
       data.validation_status ?? null,
       data.validation_reason ?? null,
       data.patch_path ?? null,
-      data.decision_trail ? JSON.stringify(data.decision_trail) : null,
+      serializeDecisionTrail(data.decision_trail, data.healing_result),
       data.target_file_path ?? null,
       data.target_line ?? null,
       data.is_page_object_patch ?? false,
