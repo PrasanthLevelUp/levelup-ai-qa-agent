@@ -1,12 +1,12 @@
 /**
- * Sprint 4.1 · Healing Explainability — HealingResult contract
+ * Sprint 4.1 + 4.2 · Healing Explainability & Candidate Ranking — HealingResult
  * ============================================================================
  *
  * WHAT THIS COVERS:
  * `HealingResult` is the canonical, explainable output of a healing operation.
  * These tests pin the DETERMINISTIC behaviour of its pure builder so future
- * sprints (4.2 ranking, 4.3 risk, 4.4 history) can extend it without silently
- * changing the contract downstream UI/analytics depend on.
+ * sprints (4.3 risk, 4.4 history) can extend it without silently changing the
+ * contract downstream UI/analytics depend on.
  *
  * DESIGN INVARIANTS UNDER TEST:
  * 1. Reason codes are derived by comparing original vs. healed selectors — never
@@ -14,8 +14,9 @@
  * 2. Confidence is PASSED THROUGH from the engine (finalScore preferred), never
  *    recomputed.
  * 3. Evidence only reflects dimensions that were actually present.
- * 4. Alternatives exclude the chosen selector, dedupe, sort best-first, respect
- *    the limit.
+ * 4. (4.2) rankedCandidates is a PURE VIEW of the engine's already-ranked
+ *    ScoredCandidate output — engine order preserved (never re-sorted), 1-based
+ *    rank, exactly one `chosen`, existing breakdown relabelled as evidence.
  * 5. Risk is a thin, deterministic first cut (formalised in 4.3).
  * 6. A null suggestion yields a well-formed "no heal" result (never throws).
  */
@@ -23,7 +24,7 @@
 import {
   buildHealingResult,
   buildEvidence,
-  buildAlternatives,
+  buildRankedCandidates,
   inferHealingReason,
   reasonText,
   deriveHealingRisk,
@@ -199,55 +200,94 @@ describe('Sprint 4.1 — HealingResult explainability contract', () => {
   });
 
   /* ---------------------------------------------------------------------- */
-  /*  buildAlternatives — dedupe, exclude chosen, sort, limit                */
+  /*  buildRankedCandidates — Sprint 4.2 pure view of the ranked decision    */
   /* ---------------------------------------------------------------------- */
-  describe('buildAlternatives', () => {
-    it('excludes the chosen selector, dedupes, and sorts best-first', () => {
+  describe('buildRankedCandidates (Sprint 4.2)', () => {
+    it('preserves the engine order, assigns 1-based rank, and marks the chosen', () => {
       const input: BuildHealingResultInput = {
-        originalSelector: '#a',
-        domMemoryInsight: {
-          alternatives: [
-            { selector: '#chosen', compositeScore: 0.99, source: 'dom_memory' },
-            { selector: '#b', compositeScore: 0.6, source: 'dom_memory' },
-            { selector: '#c', compositeScore: 0.8, source: 'app_profile' },
-            { selector: '#b', compositeScore: 0.6, source: 'dom_memory' }, // dup
-          ],
-        },
+        originalSelector: 'button.old',
+        scoredCandidates: [
+          { newLocator: 'button[type=submit]', score: 0.98, source: 'app_profile' },
+          { newLocator: 'button.primary', score: 0.94, source: 'dom_memory' },
+          { newLocator: 'text=Login', score: 0.89, source: 'ai' },
+        ],
       };
-      const alts = buildAlternatives(input, '#chosen');
-      expect(alts.map((a) => a.selector)).toEqual(['#c', '#b']);
-      expect(alts[0].confidence).toBeGreaterThan(alts[1].confidence);
+      const ranked = buildRankedCandidates(input, 'button[type=submit]');
+      // Order is NOT re-sorted — it mirrors the engine's already-ranked output.
+      expect(ranked.map((c) => c.selector)).toEqual([
+        'button[type=submit]',
+        'button.primary',
+        'text=Login',
+      ]);
+      expect(ranked.map((c) => c.rank)).toEqual([1, 2, 3]);
+      expect(ranked.map((c) => c.chosen)).toEqual([true, false, false]);
+      // Scores are passed through verbatim (never recomputed).
+      expect(ranked[0].score).toBe(0.98);
     });
 
-    it('respects the limit', () => {
+    it('preserves the engine ordering on tied scores (does not re-sort)', () => {
       const input: BuildHealingResultInput = {
         originalSelector: '#a',
-        domMemoryInsight: {
-          alternatives: Array.from({ length: 10 }, (_, i) => ({
-            selector: `#alt${i}`,
-            compositeScore: i / 10,
-            source: 'dom_memory',
-          })),
-        },
+        scoredCandidates: [
+          { newLocator: '#first', score: 0.95, source: 'rule' },
+          { newLocator: '#second', score: 0.95, source: 'dom_memory' },
+          { newLocator: '#third', score: 0.9, source: 'ai' },
+        ],
       };
-      expect(buildAlternatives(input, null, 3)).toHaveLength(3);
+      const ranked = buildRankedCandidates(input, '#first');
+      expect(ranked.map((c) => c.selector)).toEqual(['#first', '#second', '#third']);
+      expect(ranked.map((c) => c.rank)).toEqual([1, 2, 3]);
     });
 
-    it('prefers composite > stability > raw score for confidence', () => {
+    it('handles a single candidate → rank 1, chosen true', () => {
       const input: BuildHealingResultInput = {
         originalSelector: '#a',
-        domMemoryInsight: {
-          alternatives: [
-            { selector: '#x', stabilityScore: 0.5, score: 0.1, source: 'dom_memory' },
-          ],
-        },
+        scoredCandidates: [{ newLocator: '#only', score: 0.9, source: 'rule' }],
       };
-      const [alt] = buildAlternatives(input, null);
-      expect(alt.confidence).toBeCloseTo(0.5);
+      const ranked = buildRankedCandidates(input, '#only');
+      expect(ranked).toHaveLength(1);
+      expect(ranked[0].rank).toBe(1);
+      expect(ranked[0].chosen).toBe(true);
     });
 
-    it('returns an empty list when there are no alternatives', () => {
-      expect(buildAlternatives({ originalSelector: '#a' }, '#b')).toEqual([]);
+    it('returns an empty list when there are zero candidates', () => {
+      expect(buildRankedCandidates({ originalSelector: '#a' }, '#b')).toEqual([]);
+      expect(
+        buildRankedCandidates({ originalSelector: '#a', scoredCandidates: [] }, '#b'),
+      ).toEqual([]);
+    });
+
+    it('falls back to marking rank 1 chosen when no selector matches the healed selector', () => {
+      const input: BuildHealingResultInput = {
+        originalSelector: '#a',
+        scoredCandidates: [
+          { newLocator: '#top', score: 0.9, source: 'rule' },
+          { newLocator: '#next', score: 0.8, source: 'ai' },
+        ],
+      };
+      // Healed selector was rewritten post-ranking and matches neither candidate.
+      const ranked = buildRankedCandidates(input, '#rewritten');
+      expect(ranked.filter((c) => c.chosen).map((c) => c.selector)).toEqual(['#top']);
+    });
+
+    it('relabels the ranker’s existing scoreBreakdown as per-candidate evidence (no recompute)', () => {
+      const input: BuildHealingResultInput = {
+        originalSelector: '#a',
+        scoredCandidates: [
+          {
+            newLocator: '#x',
+            score: 0.9,
+            source: 'app_profile',
+            scoreBreakdown: { confidence: 0.4, source: 0.3, rejected_syntax: 1 },
+          },
+        ],
+      };
+      const [cand] = buildRankedCandidates(input, '#x');
+      const dims = cand.evidence.map((e) => e.dimension);
+      expect(dims).toContain('confidence');
+      expect(dims).toContain('source');
+      // Hard-reject markers are not surfaced as evidence.
+      expect(dims).not.toContain('rejected_syntax');
     });
   });
 
@@ -289,10 +329,12 @@ describe('Sprint 4.1 — HealingResult explainability contract', () => {
       expect(result.confidence).toBe(0);
       expect(result.risk).toBe('high');
       expect(result.evidence).toEqual([]);
+      expect(result.chosenCandidate).toBeNull();
+      expect(result.rankedCandidates).toEqual([]);
       expect(result.alternatives).toEqual([]);
     });
 
-    it('assembles a full explainable result for a data-testid removal', () => {
+    it('assembles a full explainable result for a data-testid removal, including the ranked set', () => {
       const result = buildHealingResult({
         originalSelector: '[data-testid="submit-btn"]',
         suggestion: { newLocator: 'button.submit', strategy: 'rule_based', confidence: 0.9 },
@@ -304,8 +346,11 @@ describe('Sprint 4.1 — HealingResult explainability contract', () => {
         },
         domMemoryInsight: {
           selectorHistory: { stabilityScore: 0.7, assessment: 'stable' },
-          alternatives: [{ selector: '#submit', compositeScore: 0.6, source: 'dom_memory' }],
         },
+        scoredCandidates: [
+          { newLocator: 'button.submit', score: 0.9, source: 'rule' },
+          { newLocator: '#submit', score: 0.6, source: 'dom_memory' },
+        ],
         domValidated: true,
       });
       expect(result.healed).toBe(true);
@@ -313,7 +358,13 @@ describe('Sprint 4.1 — HealingResult explainability contract', () => {
       expect(result.reasonCode).toBe('DATA_TESTID_REMOVED');
       expect(result.reason).toBe(reasonText('DATA_TESTID_REMOVED'));
       expect(result.evidence.length).toBeGreaterThan(0);
-      expect(result.alternatives.map((a) => a.selector)).toEqual(['#submit']);
+      // Sprint 4.2 — the chosen selector and the full ranked set are exposed.
+      expect(result.chosenCandidate).toBe('button.submit');
+      expect(result.rankedCandidates.map((c) => c.selector)).toEqual(['button.submit', '#submit']);
+      expect(result.rankedCandidates.find((c) => c.chosen)!.selector).toBe('button.submit');
+      // alternatives is populated from rankedCandidates (1:1 today; can diverge later).
+      expect(result.alternatives.map((a) => a.selector)).toEqual(['button.submit', '#submit']);
+      expect(result.alternatives[0].confidence).toBeCloseTo(0.9);
       expect(result.risk).toBe('low');
     });
 
