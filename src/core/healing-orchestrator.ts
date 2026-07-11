@@ -23,6 +23,7 @@ import { ValidationEngine, type ValidationResult } from '../engines/validation-e
 import { PatchEngine, type PatchResult } from '../engines/patch-engine';
 import { RerunEngine, type RerunResult } from '../engines/rerun-engine';
 import { DOMMemoryQuery, type DOMMemoryInsight, type AlternativeSelector } from '../services/dom-memory-query';
+import { buildHealingResult, type HealingResult } from './healing-result';
 import {
   HealingIntelligenceContext,
   emptyHealingContext,
@@ -253,6 +254,14 @@ export interface HealingOutcome {
    * one file and repairs every dependent test. Absent for ordinary spec heals.
    */
   pageObjectPatch?: PageObjectPatchTarget;
+  /**
+   * Sprint 4.1 — the canonical, explainable healing result. Additive: it
+   * consolidates the already-computed suggestion / confidence / DOM-memory /
+   * diagnosis into one strongly-typed shape (original + healed selector, a
+   * deterministic reason, per-signal evidence, alternatives, and risk) for UI
+   * and analytics. Existing consumers keep reading `suggestion` etc. unchanged.
+   */
+  healingResult?: HealingResult;
 }
 
 /**
@@ -384,6 +393,25 @@ export class HealingOrchestrator {
       }
     } catch (err: any) {
       logger.debug(MOD, 'Repo Intelligence targeting failed (non-fatal)', { error: err?.message });
+    }
+
+    // Sprint 4.1 — attach the canonical, explainable HealingResult. Pure
+    // re-shaping of what the waterfall already produced (suggestion + confidence
+    // + DOM-memory + diagnosis); it never re-runs healing. Non-fatal: any error
+    // leaves the rest of the outcome intact for existing consumers.
+    try {
+      outcome.healingResult = buildHealingResult({
+        originalSelector: failure.failedLocator || failure.diagnosis?.locator || '',
+        suggestion: outcome.suggestion,
+        confidenceResult: outcome.confidenceResult,
+        domMemoryInsight: outcome.domMemoryInsight,
+        diagnosisCategory: failure.diagnosis?.category ?? null,
+        domValidated:
+          outcome.validationResult?.isValid ??
+          (outcome.confidenceResult?.breakdown?.validationBonus === 1),
+      });
+    } catch (err: any) {
+      logger.debug(MOD, 'HealingResult assembly failed (non-fatal)', { error: err?.message });
     }
 
     return outcome;
