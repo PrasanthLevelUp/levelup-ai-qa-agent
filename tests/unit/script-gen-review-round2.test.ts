@@ -164,8 +164,10 @@ const loginCase = {
       testCases: [unmappableCase],
     });
     const spec = (result.generatedFiles || []).find((f: any) => /\.spec\./.test(f.path))?.content as string ?? '';
-    check('warn policy: @warning marker emitted', /@warning: step not auto-mapped/.test(spec));
-    check('warn policy: soft runtime annotation emitted', /test\.info\(\)\.annotations\.push/.test(spec));
+    // Sprint 3.6 — the default no longer ships a soft marker; it FAILS FAST with
+    // a bare `throw` so CI breaks immediately on an unsupported step.
+    check('warn policy: fail-fast throw emitted', /throw new Error\([^\n]*Unsupported step/.test(spec));
+    check('warn policy: no silent TODO left behind', !/TODO: Map step/.test(spec));
     check('warn policy: unmapped step reported on result', 
       Array.isArray(result.unmappedSteps) && result.unmappedSteps.some((u: any) => /Frobnicate/.test(u.step)));
   }
@@ -176,8 +178,8 @@ const loginCase = {
       testCases: [unmappableCase], unmappedStepPolicy: 'comment',
     });
     const spec = (result.generatedFiles || []).find((f: any) => /\.spec\./.test(f.path))?.content as string ?? '';
-    check('comment policy: legacy NOTE emitted', /NOTE: step not auto-mapped — review manually\./.test(spec));
-    check('comment policy: no @warning marker', !/@warning/.test(spec));
+    check('comment policy: legacy TODO note emitted', /TODO: Map step — "/.test(spec));
+    check('comment policy: no fail-fast throw', !/throw new Error\([^\n]*Unsupported step/.test(spec));
   }
   {
     // error policy — generation should throw (never ship an unmapped spec)
