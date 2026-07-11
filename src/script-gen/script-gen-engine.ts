@@ -673,6 +673,50 @@ export class ScriptGenEngine {
     return null;
   }
 
+  /**
+   * Sprint 3.6 — Business Correctness. Select the credential COMBINATION for an
+   * authentication scenario deterministically from its stable KB `scenarioId`,
+   * NEVER from fuzzy title/keyword matching. Keyword matching was producing the
+   * WRONG business intent (an "unknown user" case emitting a valid-user + wrong-
+   * password login, a "locked account" case emitting `invalid_user`). The
+   * scenarioId already encodes the exact intent, so we map it directly.
+   *
+   * This adds NO new inference, regex, AI, or resolver: it only consumes
+   * knowledge that already exists — the id, and the KB-resolved dataset the
+   * resolver's `base()` binds (the Dataset Resolver already picks the correct
+   * actor for unknown/locked scenarios; this method stops the emitter from
+   * layering a wrong mutation on top of it).
+   *
+   *   auth-neg-wrong-password → registered user + a deliberately wrong password
+   *   auth-neg-unknown-user   → the unregistered user (KB-resolved dataset), verbatim
+   *   auth-sec-locked-account → the locked user (KB-resolved dataset), verbatim
+   *
+   * Returns null for any other id so the caller keeps its existing
+   * semantics / classification path completely unchanged.
+   */
+  private credentialsForScenarioId(
+    scenarioId: string | null | undefined,
+    resolver: ScenarioCredentialResolver,
+  ): { username: string; password: string } | null {
+    const id = String(scenarioId ?? '').trim().toLowerCase();
+    if (!id) return null;
+    switch (id) {
+      case 'auth-neg-wrong-password': {
+        // Registered user stays valid; ONLY the password is deliberately wrong.
+        return { username: resolver.base().username, password: `'wrong_password'` };
+      }
+      case 'auth-neg-unknown-user':
+      case 'auth-sec-locked-account': {
+        // The KB already resolved the correct actor (unregistered / locked) into
+        // the dataset base() binds — use those credentials verbatim. No mutation.
+        const base = resolver.base();
+        return { username: base.username, password: base.password };
+      }
+      default:
+        return null;
+    }
+  }
+
   private deriveFromSemantics(
     semantics: import('../graph/scenario-graph').ScenarioSemantics,
     credentialResolver: ScenarioCredentialResolver,
@@ -1300,6 +1344,10 @@ export class ScriptGenEngine {
       ? config.scenarioGraphNodes?.get(scenarioId)
       : config.scenarioGraphNodes?.get(tc.title || ''); // Legacy title fallback
     (tc as any).__scenarioNode = scenarioNode;
+    // Sprint 3.6: keep the stable KB scenarioId reachable from the emitter so
+    // credential selection can key off the id (never titles/keywords). Prefer an
+    // explicit id, else the node's own canonical id (title-fallback path).
+    (tc as any).__scenarioId = scenarioId ?? (scenarioNode as any)?.id ?? null;
 
     // Real base URL — prefer the navigate step's URL, else config.url. NEVER prose.
     let baseUrl = config.url;
@@ -3846,9 +3894,18 @@ ${gotoB}${sessionLogin('pageB')}
         // the ScenarioIntelligence re-inference. This makes Script Gen a pure
         // adapter from graph → code.
         const semantics = (tc as any).__scenarioNode?.semantics;
+        // Sprint 3.6 — Business Correctness. If the case carries a stable KB
+        // scenarioId we recognise, select the credential combination directly
+        // from that id (deterministic, no keyword guessing). Only then fall back
+        // to the graph semantics, then the legacy title/steps classification.
+        const scenarioId = (tc as any)?.__scenarioId ?? (tc as any)?.__scenarioNode?.id ?? null;
         let u: string;
         let p: string;
-        if (semantics) {
+        const byScenarioId = this.credentialsForScenarioId(scenarioId, credentialResolver);
+        if (byScenarioId) {
+          u = byScenarioId.username;
+          p = byScenarioId.password;
+        } else if (semantics) {
           const derived = this.deriveFromSemantics(semantics, credentialResolver);
           u = derived.credentials.username;
           p = derived.credentials.password;
@@ -3907,7 +3964,20 @@ ${gotoB}${sessionLogin('pageB')}
         // If no fill/click triad was found (idx stays -1), append login() at end.
         if (loginInsertIdx === -1) loginInsertIdx = filtered.length;
         filtered.splice(loginInsertIdx, 0, loginCall);
-        work = [...localDecls, ...filtered];
+        // Sprint 3.6 — Dead-variable cleanup. `ensureBase()` / `validCounterpart()`
+        // push a declaration (`const user = …`, `const validUser = …`) merely by
+        // being *considered* while building the scenario credentials, but a given
+        // scenario may reference only one of them (or neither). Emit a declaration
+        // ONLY when its variable is actually read by an emitted action/assertion.
+        // Pure string check against the already-generated lines — no AST, no extra
+        // pass, no parser.
+        const liveDecls = localDecls.filter((decl) => {
+          const name = decl.match(/^const\s+([A-Za-z_$][\w$]*)\s*=/)?.[1];
+          if (!name) return true; // not a simple `const x = …` — keep verbatim
+          const ref = new RegExp(`\\b${name}\\b`);
+          return filtered.some((line) => ref.test(line));
+        });
+        work = [...liveDecls, ...filtered];
         used.add(loginPO.varName);
       }
     }
@@ -4934,24 +5004,31 @@ ${gotoB}${sessionLogin('pageB')}
    * Emit an unmapped step under the active policy (review issue #3). Always
    * records the step to `this.unmappedSteps` so the API can surface an honest
    * count; the inline marker severity follows `unmappedStepPolicy`:
-   *   - 'error'  → throw in the generated code (fail fast, forces a fix)
-   *   - 'comment'→ legacy silent "review manually" note
-   *   - 'warn'   → greppable @warning marker + a soft runtime annotation (default)
+   *   - 'error'   → generation ABORTS (never even ships a spec — see
+   *                 enforceUnmappedStepPolicy); the in-code throw is a backstop.
+   *   - 'warn'    → FAIL FAST. The generated spec throws at runtime so CI fails
+   *                 immediately and the missing capability is obvious (default).
+   *   - 'comment' → legacy soft `// TODO` note (opt-in only).
+   *
+   * Sprint 3.6 — the default no longer emits a `// TODO` that makes the spec look
+   * finished while silently skipping the step. An unsupported action now fails
+   * loudly. We never invent code or guess an action.
    */
   private emitUnmappedStep(out: string[], raw: string, testCaseId?: number): void {
     this.unmappedSteps.push({ testCaseId, step: raw });
-    // Generation Quality: the marker embeds the exact step text so the one line
-    // is self-contained (no separate narration comment above it).
+    // Generation Quality: the message embeds the exact step text so the failure
+    // is self-contained and greppable.
     const oneLine = raw.replace(/\s+/g, ' ').trim();
-    if (this.unmappedStepPolicy === 'error') {
-      out.push(`throw new Error(${JSON.stringify(`Unmapped test step (fix the test case): ${raw}`)});`);
-    } else if (this.unmappedStepPolicy === 'comment') {
+    if (this.unmappedStepPolicy === 'comment') {
+      // Legacy opt-in: a soft note. Explicitly requested by the caller.
       out.push(`// TODO: Map step — "${oneLine}"`);
     } else {
-      // 'warn' (default): a single greppable TODO marker + a soft runtime
-      // annotation so the gap is visible in reports and test output.
-      out.push(`// TODO: Map step — "${oneLine}"`);
-      out.push(`test.info().annotations.push({ type: 'warning', description: ${JSON.stringify(`Unmapped step: ${raw}`)} });`);
+      // 'warn' (default) and 'error' both fail fast in the emitted code: a bare
+      // `throw` so the missing capability surfaces immediately at run time rather
+      // than shipping a half-generated spec. ('error' additionally aborts the
+      // whole generation via enforceUnmappedStepPolicy — this throw is a backstop
+      // for the edge case where a spec is somehow produced.)
+      out.push(`throw new Error(${JSON.stringify(`Unsupported step — Script Gen could not emit a grounded action for: "${oneLine}". Fix the test case or add support; never ship a half-generated spec.`)});`);
     }
     out.push('');
   }

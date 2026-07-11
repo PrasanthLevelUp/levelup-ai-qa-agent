@@ -95,10 +95,13 @@ async function main() {
   // 2) Generalised: no action locator is ever named from business prose.
   assertBusinessProseNeverAction(all);
 
-  // 3) The leaked title + expected-result steps are flagged, not executed.
+  // 3) The leaked title + expected-result steps FAIL FAST (Sprint 3.6), not
+  //    silently skipped behind a TODO, and are never executed as an action.
   const titleSpec = byTitle('Valid login - standard user');
-  ok('leaked scenario-title step is flagged as unmapped, not executed',
-    /TODO: Map step — "Valid login - standard user"/.test(titleSpec));
+  ok('leaked scenario-title step fails fast via throw, not executed',
+    /throw new Error\([^\n]*Valid login - standard user/.test(titleSpec));
+  ok('leaked scenario-title step is no longer a silent TODO',
+    !/TODO: Map step — "Valid login - standard user"/.test(titleSpec));
   ok('expected-result "redirected to the dashboard" is NOT a fill/click',
     !/redirected|dashboard/i.test(
       (titleSpec.match(/await [^\n]*\.(fill|click)\([^\n]*\)/g) || []).join('\n')));
@@ -108,8 +111,9 @@ async function main() {
   const credActions = (credSpec.match(/await [^\n]*\.(fill|click)\([^\n]*\)/g) || []);
   ok('precondition "User is on the login page" produces no action',
     !credActions.some(a => /is on the login page/i.test(a)));
-  ok('precondition is not even emitted as an unmapped TODO (recognised as context)',
-    !/TODO: Map step — "User is on the login page"/.test(credSpec));
+  ok('precondition is not even emitted as an unmapped step (recognised as context)',
+    !/TODO: Map step — "User is on the login page"/.test(credSpec) &&
+    !/throw new Error\([^\n]*User is on the login page/.test(credSpec));
 
   // 5) No over-correction: the genuine, verb-led field steps still map.
   ok('genuine "Enter username …" still fills the username field',
