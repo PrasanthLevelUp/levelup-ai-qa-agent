@@ -48,6 +48,7 @@ import { HealingOrchestrator, pageObjectPatchLogFields, type HealingOutcome } fr
 // Profile-only: it consumes the App Profile we already built; it never crawls.
 import { resolveDeterministicLocator, type DeterministicResolution } from '../core/deterministic-locator-healing';
 import type { ScoredCandidate } from '../core/candidate-ranker';
+import { buildHealingResult } from '../core/healing-result';
 import { HealingStrategySelector, type StrategyConfig } from '../core/healing-strategy-selector';
 import { routeHealingStrategy } from '../core/healing-strategy-router';
 import { assessRunTrust, type RunTrustAssessment } from '../core/execution-trust';
@@ -1694,6 +1695,23 @@ function createHealingWorker(
               pageObjectPatch: ranked.pageObjectPatch,
               domMemoryInsight: ranked.domMemoryInsight,
             };
+
+            // Sprint 4.2 — attach the explainable HealingResult carrying the
+            // engine's FULL ranked candidate set (this locator's `ranked.candidates`),
+            // with the candidate we're applying marked `chosen`. Pure re-shaping of
+            // the ranker's existing output — no re-scoring, re-ranking, or new work.
+            // Non-fatal: the heal proceeds unchanged if assembly ever throws.
+            try {
+              outcome.healingResult = buildHealingResult({
+                originalSelector: failure.failedLocator,
+                suggestion: outcome.suggestion,
+                domMemoryInsight: ranked.domMemoryInsight,
+                scoredCandidates: ranked.candidates,
+                diagnosisCategory: failure.diagnosis?.category ?? null,
+              });
+            } catch (err: any) {
+              logger.debug(MOD, 'HealingResult assembly failed (non-fatal)', { error: err?.message });
+            }
 
             logger.info(MOD, 'Trying ranked candidate', {
               testName: failure.testName, failedLocator: failure.failedLocator,

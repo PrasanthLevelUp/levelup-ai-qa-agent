@@ -24,7 +24,8 @@
  *     reasonCode         a deterministic category (never AI prose)
  *     reason             a short human sentence rendered from the code
  *     evidence[]         the per-signal breakdown that produced the confidence
- *     alternatives[]     the other candidates that were considered
+ *     chosenCandidate    the selector the engine chose
+ *     rankedCandidates[] every candidate the engine evaluated, in ranked order
  *     risk               low | medium | high
  *
  * DESIGN RULES (Sprint 4.1)
@@ -80,14 +81,41 @@ export interface HealingEvidence {
   detail: string;
 }
 
-/** An alternative candidate that was considered but not chosen. */
+/**
+ * One candidate the healing engine evaluated, exposed in the engine's own ranked
+ * order. Sprint 4.2 — this is a pure *view* of the existing `ScoredCandidate`
+ * the ranker already produced; nothing here is re-scored, re-ranked, or invented.
+ */
+export interface RankedHealingCandidate {
+  /** The candidate selector. */
+  selector: string;
+  /** The engine's own composite score (higher is better). Passed through as-is. */
+  score: number;
+  /** 1-based position in the engine's ranked order (1 = best). */
+  rank: number;
+  /** True for the candidate the engine actually chose (the healed selector). */
+  chosen: boolean;
+  /** Where the candidate came from (learned_pattern, app_profile, dom_memory, …). */
+  source: string;
+  /** Per-signal contributions the ranker already computed for this candidate. */
+  evidence: HealingEvidence[];
+}
+
+/**
+ * A recovery option surfaced to the user/UI. Sprint 4.2 — today this is
+ * populated from `rankedCandidates`, but it is **conceptually distinct** from
+ * the full ranked set. Tomorrow this may be a curated subset (e.g., only >0.90
+ * confidence, or only same-role candidates) while `rankedCandidates` remains the
+ * complete engine evaluation. Kept as a separate field for backward compatibility
+ * and future flexibility.
+ */
 export interface HealingAlternative {
   selector: string;
-  /** 0..1 — the candidate's own confidence/composite score. */
+  /** The candidate's confidence/composite score (0..1 for UI consistency). */
   confidence: number;
   /** Where the candidate came from (dom_memory, app_profile, rule, ai, …). */
   source: string;
-  /** Why it was considered / why it lost, when known. */
+  /** Why it was considered / reasoning, when known. */
   reasoning?: string;
 }
 
@@ -117,7 +145,23 @@ export interface HealingResult {
   reason: string;
   /** Per-signal evidence that produced the confidence score. */
   evidence: HealingEvidence[];
-  /** Other candidates that were considered, best-first. */
+  /** The selector the engine chose (mirrors `healedSelector`); null when nothing healed. */
+  chosenCandidate: string | null;
+  /**
+   * Every candidate the engine evaluated, in the engine's own ranked order
+   * (best-first). Sprint 4.2 — a pure view of the existing ranked decision, so a
+   * consumer can see the engine weighed multiple options rather than "magically"
+   * picking one. Empty when the ranked set was not available (e.g. legacy path).
+   */
+  rankedCandidates: RankedHealingCandidate[];
+  /**
+   * Recovery options surfaced to the user/UI. Sprint 4.2 — today this is
+   * populated from `rankedCandidates` (the full set), but it is **conceptually
+   * distinct**. Tomorrow this may be a curated/filtered subset (e.g., only >0.90
+   * confidence, or only same-role candidates) while `rankedCandidates` remains
+   * the complete engine evaluation. Kept as a separate field for backward
+   * compatibility and future flexibility (not redundant).
+   */
   alternatives: HealingAlternative[];
   /** Coarse risk band (thin first cut in 4.1; formalised in 4.3). */
   risk: HealingRisk;
@@ -156,17 +200,24 @@ export interface HealingResultConfidenceView {
   reasons?: string[];
 }
 
-export interface HealingResultAlternativeView {
-  selector: string;
+/**
+ * Structural view of the ranker's `ScoredCandidate`. We deliberately mirror only
+ * the fields we expose so this module never imports the ranker and stays pure.
+ */
+export interface HealingResultScoredCandidateView {
+  /** The candidate selector (ScoredCandidate.newLocator). */
+  newLocator: string;
+  /** The engine's composite score (higher is better). Passed through as-is. */
+  score: number;
+  /** Candidate source (learned_pattern, app_profile, dom_memory, rule, ai, …). */
   source?: string;
-  compositeScore?: number;
-  stabilityScore?: number;
-  score?: number;
-  reasoning?: string;
+  /** The producing engine's own confidence (0..1). */
+  confidence?: number;
+  /** Per-signal score contributions the ranker already computed. */
+  scoreBreakdown?: Record<string, number>;
 }
 
 export interface HealingResultDomMemoryView {
-  alternatives?: HealingResultAlternativeView[];
   selectorHistory?: { stabilityScore?: number; assessment?: string };
 }
 
@@ -177,8 +228,14 @@ export interface BuildHealingResultInput {
   suggestion?: HealingResultSuggestionView | null;
   /** The engine's explainable confidence result, when present. */
   confidenceResult?: HealingResultConfidenceView | null;
-  /** DOM Memory insight (alternatives + stability), when present. */
+  /** DOM Memory insight (stability), when present. */
   domMemoryInsight?: HealingResultDomMemoryView | null;
+  /**
+   * The engine's already-ranked candidates (from the ranker's `ScoredCandidate`
+   * output), best-first. When present, they populate `rankedCandidates`. Sprint
+   * 4.2 — passed through verbatim; never re-scored or re-sorted here.
+   */
+  scoredCandidates?: HealingResultScoredCandidateView[] | null;
   /** Deterministic failure diagnosis category, when present. */
   diagnosisCategory?: string | null;
   /** True when the healed selector was DOM/browser validated. */
@@ -346,40 +403,94 @@ export function buildEvidence(input: BuildHealingResultInput): HealingEvidence[]
 }
 
 /* -------------------------------------------------------------------------- */
-/*  Alternatives mapping (pure)                                               */
+/*  Ranked candidates mapping (pure)                                          */
 /* -------------------------------------------------------------------------- */
 
+/** Human labels for the ranker's existing score-breakdown dimensions. */
+const SCORE_DIMENSION_DETAIL: Record<string, string> = {
+  confidence: 'Producing engine’s own confidence in the candidate.',
+  source: 'Trust in the candidate’s source (grounded evidence outranks an AI guess).',
+  appProfile: 'The candidate exists in the crawled Application Profile.',
+  domMemory: 'DOM Memory historical stability of the candidate.',
+  pageObject: 'The candidate is tied to a shared repo Page Object.',
+  similarity: 'Semantic similarity to the failed locator’s intent.',
+};
+
 /**
- * Re-shape DOM-memory alternatives into `HealingAlternative[]`, best-first,
- * excluding the chosen healed selector. Confidence prefers the composite score,
- * then stability, then raw score.
+ * Re-shape the ranker's per-candidate `scoreBreakdown` into evidence. These are
+ * the contributions the ranker ALREADY computed — we only relabel them, never
+ * recompute. Hard-reject markers (e.g. `rejected_syntax`) are skipped.
  */
-export function buildAlternatives(
+function candidateEvidence(breakdown?: Record<string, number>): HealingEvidence[] {
+  if (!breakdown) return [];
+  const out: HealingEvidence[] = [];
+  for (const [dimension, value] of Object.entries(breakdown)) {
+    if (dimension.startsWith('rejected')) continue;
+    out.push({
+      dimension,
+      score: clamp01(value),
+      detail: SCORE_DIMENSION_DETAIL[dimension] ?? `Score contribution from ${dimension}.`,
+    });
+  }
+  return out;
+}
+
+/**
+ * Map the engine's already-ranked `ScoredCandidate[]` into `RankedHealingCandidate[]`.
+ *
+ * PURE VIEW — Sprint 4.2 rule: the ranker already scored, filtered, and sorted
+ * these best-first. We do NOT re-score, re-sort, or recompute confidence here;
+ * we preserve the engine's order verbatim and simply attach a 1-based `rank`,
+ * mark the `chosen` one, and relabel the existing per-candidate breakdown as
+ * evidence. Returns an empty list when no ranked set was provided.
+ */
+export function buildRankedCandidates(
   input: BuildHealingResultInput,
   healedSelector: string | null,
-  limit = 5,
-): HealingAlternative[] {
-  const alts = input.domMemoryInsight?.alternatives ?? [];
-  const chosen = (healedSelector || '').trim();
-  const out: HealingAlternative[] = [];
-  const seen = new Set<string>();
+): RankedHealingCandidate[] {
+  const scored = input.scoredCandidates ?? [];
+  if (scored.length === 0) return [];
 
-  for (const a of alts) {
-    const selector = (a.selector || '').trim();
-    if (!selector || selector === chosen) continue;
-    if (seen.has(selector)) continue;
-    seen.add(selector);
-    const confidence = clamp01(a.compositeScore ?? a.stabilityScore ?? a.score ?? 0);
-    out.push({
+  const chosen = (healedSelector || '').trim();
+  let chosenMarked = false;
+
+  const out: RankedHealingCandidate[] = scored.map((c, i) => {
+    const selector = (c.newLocator || '').trim();
+    const isChosen = !!chosen && selector === chosen;
+    if (isChosen) chosenMarked = true;
+    return {
       selector,
-      confidence,
-      source: a.source || 'dom_memory',
-      reasoning: a.reasoning,
-    });
-    if (out.length >= limit) break;
+      score: Number.isFinite(c.score) ? c.score : 0,
+      rank: i + 1, // preserve the engine's order; never re-sort
+      chosen: isChosen,
+      source: c.source || 'unknown',
+      evidence: candidateEvidence(c.scoreBreakdown),
+    };
+  });
+
+  // When we healed but no candidate selector matched the healed selector exactly
+  // (e.g. a post-ranking deterministic rewrite), fall back to marking the
+  // top-ranked candidate as chosen so exactly one `chosen` is always present.
+  if (!chosenMarked && chosen && out.length > 0) {
+    out[0].chosen = true;
   }
 
-  return out.sort((x, y) => y.confidence - x.confidence);
+  return out;
+}
+
+/**
+ * Map `rankedCandidates` to `alternatives` (recovery options). Sprint 4.2 —
+ * today this is a 1:1 transform; tomorrow this can apply filtering policy
+ * (e.g., only >0.90 confidence, or only same-role candidates) while
+ * `rankedCandidates` remains the complete engine evaluation.
+ */
+function buildAlternatives(rankedCandidates: RankedHealingCandidate[]): HealingAlternative[] {
+  return rankedCandidates.map((c) => ({
+    selector: c.selector,
+    confidence: clamp01(c.score), // normalize to 0..1 for UI consistency
+    source: c.source,
+    reasoning: undefined, // per-candidate reasoning not yet exposed; future extension point
+  }));
 }
 
 /* -------------------------------------------------------------------------- */
@@ -414,7 +525,7 @@ export function buildHealingResult(input: BuildHealingResultInput): HealingResul
   });
 
   const evidence = buildEvidence(input);
-  const alternatives = buildAlternatives(input, healedSelector);
+  const rankedCandidates = buildRankedCandidates(input, healedSelector);
 
   // Auto-apply: prefer the engine's own flag; else derive from its threshold.
   const autoApply = input.confidenceResult?.autoApply ?? confidence >= 0.85;
@@ -432,7 +543,9 @@ export function buildHealingResult(input: BuildHealingResultInput): HealingResul
     reasonCode,
     reason: reasonText(reasonCode),
     evidence,
-    alternatives,
+    chosenCandidate: healedSelector,
+    rankedCandidates,
+    alternatives: buildAlternatives(rankedCandidates),
     risk,
   };
 }
