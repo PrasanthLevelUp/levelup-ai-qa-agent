@@ -1813,6 +1813,7 @@ function createHealingWorker(
                 validation_reason: `[Iter ${iteration + 1} R${retry + 1}] ${outcome.suggestion.reasoning}`,
                 patch_path: validation.patchPath,
                 decision_trail: outcome.decisionTrail,
+                healing_result: outcome.healingResult, // Sprint 4.4 — co-persist explainable result
                 ...pageObjectPatchLogFields(outcome),
                 project_id: resolvedProjectId ?? null,
               }, job.companyId);
@@ -1922,6 +1923,7 @@ function createHealingWorker(
                   validation_reason: `[Iter ${iteration + 1} R${retry + 1}] Confirmed healed via confirmation rerun.`,
                   patch_path: validation.patchPath,
                   decision_trail: outcome.decisionTrail,
+                  healing_result: outcome.healingResult, // Sprint 4.4 — co-persist explainable result
                   ...pageObjectPatchLogFields(outcome),
                   project_id: resolvedProjectId ?? null,
                 }, job.companyId);
@@ -2059,6 +2061,7 @@ function createHealingWorker(
                 validation_reason: `[Iter ${iteration + 1} R${retry + 1}] ${outcome.suggestion.reasoning}`,
                 patch_path: validation.patchPath,
                 decision_trail: outcome.decisionTrail,
+                healing_result: outcome.healingResult, // Sprint 4.4 — co-persist explainable result
                 ...pageObjectPatchLogFields(outcome),
                 project_id: resolvedProjectId ?? null,
               }, job.companyId);
@@ -2146,6 +2149,7 @@ function createHealingWorker(
               validation_reason: `[Iter ${iteration + 1} R${retry + 1}] Reverted — same locator still failing.`,
               patch_path: validation.patchPath,
               decision_trail: outcome.decisionTrail,
+              healing_result: outcome.healingResult, // Sprint 4.4 — co-persist explainable result
               ...pageObjectPatchLogFields(outcome),
               project_id: resolvedProjectId ?? null,
             }, job.companyId);

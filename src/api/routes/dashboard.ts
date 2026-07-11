@@ -14,6 +14,7 @@ import {
   getHealingIntelligenceMetrics,
   listExecutionRecords,
   getExecutionRecord,
+  parseDecisionTrail,
 } from '../../db/postgres';
 import {
   buildExecutionTimeline,
@@ -115,7 +116,12 @@ export function createDashboardRouter(): Router {
         [cid, limit],
       );
 
-      const result = rows.map((a: any) => ({
+      const result = rows.map((a: any) => {
+        // Sprint 4.4 — pull the real reason/risk from the co-persisted
+        // HealingResult (if present) so the list can show honest summary
+        // chips without a second round-trip. Legacy rows → null (UI omits).
+        const hr = parseDecisionTrail(a.decision_trail).healingResult as any;
+        return {
         id: a.id,
         executionId: a.test_execution_id,
         projectId: a.project_id ?? null,
@@ -126,6 +132,9 @@ export function createDashboardRouter(): Router {
         healedLocator: a.healed_locator || '',
         status: a.success ? 'healed' : 'failed',
         strategy: a.healing_strategy || 'unknown',
+        reason: hr?.reason ?? null,
+        reasonCode: hr?.reasonCode ?? null,
+        risk: hr?.risk ?? null,
         confidence: a.confidence || 0,
         tokensUsed: a.ai_tokens_used || 0,
         cost: Math.round((a.ai_tokens_used || 0) * 0.000003 * 10000) / 10000,
@@ -134,7 +143,8 @@ export function createDashboardRouter(): Router {
         prUrl: a.pr_url || null,
         prNumber: a.pr_number || null,
         prStatus: a.pr_status || null,
-      }));
+        };
+      });
 
       res.json(result);
     } catch (err) {
@@ -168,19 +178,19 @@ export function createDashboardRouter(): Router {
       const failedLoc = a.failed_locator || '#unknown';
       const healedLoc = a.healed_locator || 'unknown';
 
-      const validationChecks = {
-        syntax: { passed: isSuccess, score: isSuccess ? 100 : 40 },
-        semantic: { passed: isSuccess, score: isSuccess ? Math.round(confidence * 100) : 30 },
-        exists: { passed: isSuccess, score: isSuccess ? 100 : 0 },
-        unique: { passed: true, score: 95 },
-        visible: { passed: isSuccess, score: isSuccess ? 90 : 20 },
-        interactable: { passed: isSuccess, score: isSuccess ? 85 : 10 },
-        security: { passed: true, score: 100 },
-      };
+      // Sprint 4.4 — surface the REAL explainable HealingResult that the
+      // orchestrator produced (reason, risk, evidence, chosen + ranked
+      // candidates, alternatives), co-persisted into `decision_trail`. We return
+      // it verbatim; the previous fabricated `validationChecks` (hard-coded
+      // unique=95 / security=100 etc.) and template `codeChanges` are gone.
+      // Legacy rows without a persisted result yield `healingResult: null`.
+      const { healingResult } = parseDecisionTrail(a.decision_trail);
 
+      // The only "code change" we can honestly show is the selector replacement
+      // the heal actually made: broken locator → healed locator.
       const codeChanges = {
-        before: `await page.click('${failedLoc}');`,
-        after: isSuccess ? `await ${healedLoc}.click();` : null,
+        before: failedLoc,
+        after: isSuccess ? healedLoc : null,
       };
 
       res.json({
@@ -194,7 +204,7 @@ export function createDashboardRouter(): Router {
         failedLocator: failedLoc,
         healedLocator: healedLoc,
         confidence,
-        validationChecks,
+        healingResult,
         codeChanges,
         validationStatus: a.validation_status || 'unknown',
         validationReason: a.validation_reason || '',
