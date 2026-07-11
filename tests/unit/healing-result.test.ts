@@ -1,0 +1,329 @@
+/**
+ * Sprint 4.1 · Healing Explainability — HealingResult contract
+ * ============================================================================
+ *
+ * WHAT THIS COVERS:
+ * `HealingResult` is the canonical, explainable output of a healing operation.
+ * These tests pin the DETERMINISTIC behaviour of its pure builder so future
+ * sprints (4.2 ranking, 4.3 risk, 4.4 history) can extend it without silently
+ * changing the contract downstream UI/analytics depend on.
+ *
+ * DESIGN INVARIANTS UNDER TEST:
+ * 1. Reason codes are derived by comparing original vs. healed selectors — never
+ *    generated text. Every code has a stable trigger.
+ * 2. Confidence is PASSED THROUGH from the engine (finalScore preferred), never
+ *    recomputed.
+ * 3. Evidence only reflects dimensions that were actually present.
+ * 4. Alternatives exclude the chosen selector, dedupe, sort best-first, respect
+ *    the limit.
+ * 5. Risk is a thin, deterministic first cut (formalised in 4.3).
+ * 6. A null suggestion yields a well-formed "no heal" result (never throws).
+ */
+
+import {
+  buildHealingResult,
+  buildEvidence,
+  buildAlternatives,
+  inferHealingReason,
+  reasonText,
+  deriveHealingRisk,
+  type BuildHealingResultInput,
+  type HealingReasonCode,
+} from '../../src/core/healing-result';
+
+describe('Sprint 4.1 — HealingResult explainability contract', () => {
+  /* ---------------------------------------------------------------------- */
+  /*  inferHealingReason — deterministic reason vocabulary                  */
+  /* ---------------------------------------------------------------------- */
+  describe('inferHealingReason', () => {
+    it('returns NO_HEAL when nothing was healed', () => {
+      expect(inferHealingReason('#login', null)).toBe('NO_HEAL');
+      expect(inferHealingReason('#login', '')).toBe('NO_HEAL');
+    });
+
+    it('returns LOCATOR_UNSTABLE when DOM Memory flagged the original as unstable', () => {
+      // stabilityScore <= 0.3 is the strongest, most specific attributable reason.
+      const code = inferHealingReason('#login', '#login-v2', { stabilityScore: 0.2 });
+      expect(code).toBe('LOCATOR_UNSTABLE');
+    });
+
+    it('returns DATA_TESTID_REMOVED when a data-test attribute the selector relied on is gone', () => {
+      const code = inferHealingReason(
+        '[data-testid="submit-btn"]',
+        'button.submit',
+      );
+      expect(code).toBe('DATA_TESTID_REMOVED');
+    });
+
+    it('returns ID_CHANGED when an #id the selector relied on disappears', () => {
+      const code = inferHealingReason('#submit-btn', 'button.submit');
+      expect(code).toBe('ID_CHANGED');
+    });
+
+    it('returns TEXT_CHANGED when a text-based match changes', () => {
+      const dropped = inferHealingReason('getByText("Sign In")', 'button.login');
+      expect(dropped).toBe('TEXT_CHANGED');
+      const reworded = inferHealingReason('getByText("Sign In")', 'getByText("Log In")');
+      expect(reworded).toBe('TEXT_CHANGED');
+    });
+
+    it('returns ROLE_CHANGED when a role/aria match is dropped', () => {
+      const code = inferHealingReason('getByRole("button")', 'button.primary');
+      expect(code).toBe('ROLE_CHANGED');
+    });
+
+    it('returns ELEMENT_MOVED when the structural path signal differs', () => {
+      const code = inferHealingReason('div > form input.email', 'input.email');
+      expect(code).toBe('ELEMENT_MOVED');
+    });
+
+    it('returns ATTRIBUTE_CHANGED when both are attribute selectors but the payload differs', () => {
+      const code = inferHealingReason('[name="user"]', '[name="username"]');
+      expect(code).toBe('ATTRIBUTE_CHANGED');
+    });
+
+    it('falls back to SELECTOR_UPDATED when no more specific difference is attributable', () => {
+      const code = inferHealingReason('button.login', 'button.signin');
+      expect(code).toBe('SELECTOR_UPDATED');
+    });
+  });
+
+  /* ---------------------------------------------------------------------- */
+  /*  reasonText — deterministic lookup                                      */
+  /* ---------------------------------------------------------------------- */
+  describe('reasonText', () => {
+    it('renders a stable human sentence for every reason code', () => {
+      const codes: HealingReasonCode[] = [
+        'DATA_TESTID_REMOVED',
+        'ID_CHANGED',
+        'ATTRIBUTE_CHANGED',
+        'TEXT_CHANGED',
+        'ROLE_CHANGED',
+        'ELEMENT_MOVED',
+        'LOCATOR_UNSTABLE',
+        'SELECTOR_UPDATED',
+        'NO_HEAL',
+      ];
+      for (const code of codes) {
+        const text = reasonText(code);
+        expect(typeof text).toBe('string');
+        expect(text.length).toBeGreaterThan(0);
+      }
+    });
+  });
+
+  /* ---------------------------------------------------------------------- */
+  /*  deriveHealingRisk — thin first cut (4.3 formalises)                    */
+  /* ---------------------------------------------------------------------- */
+  describe('deriveHealingRisk', () => {
+    it('flags NO_HEAL and ELEMENT_MOVED as high', () => {
+      expect(deriveHealingRisk('NO_HEAL', 0.9, true)).toBe('high');
+      expect(deriveHealingRisk('ELEMENT_MOVED', 0.9, true)).toBe('high');
+    });
+
+    it('flags low confidence as high regardless of reason', () => {
+      expect(deriveHealingRisk('ID_CHANGED', 0.5, true)).toBe('high');
+    });
+
+    it('flags text/role changes as medium', () => {
+      expect(deriveHealingRisk('TEXT_CHANGED', 0.95, true)).toBe('medium');
+      expect(deriveHealingRisk('ROLE_CHANGED', 0.95, true)).toBe('medium');
+    });
+
+    it('flags mid confidence and un-validated heals as medium', () => {
+      expect(deriveHealingRisk('ID_CHANGED', 0.7, true)).toBe('medium');
+      expect(deriveHealingRisk('ID_CHANGED', 0.95, false)).toBe('medium');
+    });
+
+    it('treats a high-confidence, DOM-validated attribute swap as low', () => {
+      expect(deriveHealingRisk('DATA_TESTID_REMOVED', 0.95, true)).toBe('low');
+      expect(deriveHealingRisk('ID_CHANGED', 0.9, true)).toBe('low');
+    });
+  });
+
+  /* ---------------------------------------------------------------------- */
+  /*  buildEvidence — honest reflection of present signals                   */
+  /* ---------------------------------------------------------------------- */
+  describe('buildEvidence', () => {
+    it('emits only the breakdown dimensions that are present', () => {
+      const input: BuildHealingResultInput = {
+        originalSelector: '#a',
+        confidenceResult: {
+          finalScore: 0.9,
+          breakdown: {
+            selectorQuality: 0.8,
+            similarityScore: 0.7,
+            // strategyReliability intentionally omitted
+            validationBonus: 1,
+          },
+        },
+      };
+      const ev = buildEvidence(input);
+      const dims = ev.map((e) => e.dimension);
+      expect(dims).toContain('selector_quality');
+      expect(dims).toContain('similarity');
+      expect(dims).toContain('validation');
+      expect(dims).not.toContain('strategy_reliability');
+      expect(dims).not.toContain('historical');
+    });
+
+    it('includes dom_stability when DOM Memory provided a stability score', () => {
+      const input: BuildHealingResultInput = {
+        originalSelector: '#a',
+        domMemoryInsight: {
+          selectorHistory: { stabilityScore: 0.42, assessment: 'flaky historically' },
+        },
+      };
+      const ev = buildEvidence(input);
+      const stability = ev.find((e) => e.dimension === 'dom_stability');
+      expect(stability).toBeDefined();
+      expect(stability!.score).toBeCloseTo(0.42);
+      expect(stability!.detail).toBe('flaky historically');
+    });
+
+    it('clamps scores into 0..1', () => {
+      const input: BuildHealingResultInput = {
+        originalSelector: '#a',
+        confidenceResult: { finalScore: 1, breakdown: { selectorQuality: 1.5, similarityScore: -0.2 } },
+      };
+      const ev = buildEvidence(input);
+      const q = ev.find((e) => e.dimension === 'selector_quality')!;
+      const s = ev.find((e) => e.dimension === 'similarity')!;
+      expect(q.score).toBe(1);
+      expect(s.score).toBe(0);
+    });
+
+    it('returns an empty list when no signals are present', () => {
+      expect(buildEvidence({ originalSelector: '#a' })).toEqual([]);
+    });
+  });
+
+  /* ---------------------------------------------------------------------- */
+  /*  buildAlternatives — dedupe, exclude chosen, sort, limit                */
+  /* ---------------------------------------------------------------------- */
+  describe('buildAlternatives', () => {
+    it('excludes the chosen selector, dedupes, and sorts best-first', () => {
+      const input: BuildHealingResultInput = {
+        originalSelector: '#a',
+        domMemoryInsight: {
+          alternatives: [
+            { selector: '#chosen', compositeScore: 0.99, source: 'dom_memory' },
+            { selector: '#b', compositeScore: 0.6, source: 'dom_memory' },
+            { selector: '#c', compositeScore: 0.8, source: 'app_profile' },
+            { selector: '#b', compositeScore: 0.6, source: 'dom_memory' }, // dup
+          ],
+        },
+      };
+      const alts = buildAlternatives(input, '#chosen');
+      expect(alts.map((a) => a.selector)).toEqual(['#c', '#b']);
+      expect(alts[0].confidence).toBeGreaterThan(alts[1].confidence);
+    });
+
+    it('respects the limit', () => {
+      const input: BuildHealingResultInput = {
+        originalSelector: '#a',
+        domMemoryInsight: {
+          alternatives: Array.from({ length: 10 }, (_, i) => ({
+            selector: `#alt${i}`,
+            compositeScore: i / 10,
+            source: 'dom_memory',
+          })),
+        },
+      };
+      expect(buildAlternatives(input, null, 3)).toHaveLength(3);
+    });
+
+    it('prefers composite > stability > raw score for confidence', () => {
+      const input: BuildHealingResultInput = {
+        originalSelector: '#a',
+        domMemoryInsight: {
+          alternatives: [
+            { selector: '#x', stabilityScore: 0.5, score: 0.1, source: 'dom_memory' },
+          ],
+        },
+      };
+      const [alt] = buildAlternatives(input, null);
+      expect(alt.confidence).toBeCloseTo(0.5);
+    });
+
+    it('returns an empty list when there are no alternatives', () => {
+      expect(buildAlternatives({ originalSelector: '#a' }, '#b')).toEqual([]);
+    });
+  });
+
+  /* ---------------------------------------------------------------------- */
+  /*  buildHealingResult — end-to-end assembly                               */
+  /* ---------------------------------------------------------------------- */
+  describe('buildHealingResult', () => {
+    it('passes confidence through from the engine (finalScore preferred, never recomputed)', () => {
+      const result = buildHealingResult({
+        originalSelector: '[data-testid="x"]',
+        suggestion: { newLocator: 'button.x', confidence: 0.42, strategy: 'rule_based' },
+        confidenceResult: { finalScore: 0.91, grade: 'A', autoApply: true },
+      });
+      // Engine's finalScore wins over the suggestion's own confidence.
+      expect(result.confidence).toBeCloseTo(0.91);
+      expect(result.grade).toBe('A');
+      expect(result.autoApply).toBe(true);
+    });
+
+    it('falls back to the suggestion confidence when no confidenceResult is present', () => {
+      const result = buildHealingResult({
+        originalSelector: '#a',
+        suggestion: { newLocator: '#b', confidence: 0.55 },
+      });
+      expect(result.confidence).toBeCloseTo(0.55);
+      // Auto-apply derived from the 0.85 threshold when the engine gave no flag.
+      expect(result.autoApply).toBe(false);
+    });
+
+    it('produces a well-formed NO_HEAL result when there is no suggestion', () => {
+      const result = buildHealingResult({
+        originalSelector: '#a',
+        suggestion: null,
+      });
+      expect(result.healed).toBe(false);
+      expect(result.healedSelector).toBeNull();
+      expect(result.strategy).toBeNull();
+      expect(result.reasonCode).toBe('NO_HEAL');
+      expect(result.confidence).toBe(0);
+      expect(result.risk).toBe('high');
+      expect(result.evidence).toEqual([]);
+      expect(result.alternatives).toEqual([]);
+    });
+
+    it('assembles a full explainable result for a data-testid removal', () => {
+      const result = buildHealingResult({
+        originalSelector: '[data-testid="submit-btn"]',
+        suggestion: { newLocator: 'button.submit', strategy: 'rule_based', confidence: 0.9 },
+        confidenceResult: {
+          finalScore: 0.9,
+          grade: 'A',
+          autoApply: true,
+          breakdown: { selectorQuality: 0.8, similarityScore: 0.9, validationBonus: 1 },
+        },
+        domMemoryInsight: {
+          selectorHistory: { stabilityScore: 0.7, assessment: 'stable' },
+          alternatives: [{ selector: '#submit', compositeScore: 0.6, source: 'dom_memory' }],
+        },
+        domValidated: true,
+      });
+      expect(result.healed).toBe(true);
+      expect(result.healedSelector).toBe('button.submit');
+      expect(result.reasonCode).toBe('DATA_TESTID_REMOVED');
+      expect(result.reason).toBe(reasonText('DATA_TESTID_REMOVED'));
+      expect(result.evidence.length).toBeGreaterThan(0);
+      expect(result.alternatives.map((a) => a.selector)).toEqual(['#submit']);
+      expect(result.risk).toBe('low');
+    });
+
+    it('trims whitespace from selectors', () => {
+      const result = buildHealingResult({
+        originalSelector: '  #a  ',
+        suggestion: { newLocator: '  #b  ' },
+      });
+      expect(result.originalSelector).toBe('#a');
+      expect(result.healedSelector).toBe('#b');
+    });
+  });
+});
