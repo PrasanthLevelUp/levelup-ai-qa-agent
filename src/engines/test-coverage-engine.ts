@@ -22,6 +22,7 @@ import {
   type ScenarioPlan,
   type ScenarioEvidence,
   type EvidenceSource,
+  type RequirementCoverage,
 } from './scenario-planner';
 import {
   buildDraftTestCases,
@@ -657,6 +658,12 @@ export interface GenerationResult {
   coverageGaps: CoverageGap[];
   /** Per-selected-type evaluation — proves every Coverage Type was processed. */
   coverageTypeEvaluations: CoverageTypeEvaluation[];
+  /**
+   * Sprint 5.1 — Requirement Coverage KPI. The headline trust metric: every
+   * explicit requirement step (X/Y, guaranteed 100%) with a per-step checklist
+   * of which scenarios cover it. Undefined only when the planner is disabled.
+   */
+  requirementCoverage?: RequirementCoverage;
   /** Which mode produced this result. */
   mode: GenerationMode;
   /**
@@ -672,6 +679,10 @@ export interface GenerationResult {
     coverageTypes: string[];
     automationReadyCount: number;
     gapsFound: number;
+    /** Sprint 5.1 — Requirement Coverage KPI counts (headline trust metric). */
+    requirementStepsTotal?: number;
+    requirementStepsCovered?: number;
+    requirementCoveragePercent?: number;
     tokensUsed: number;
     /** Prompt (input) tokens summed across every LLM call this run. */
     promptTokens?: number;
@@ -1320,13 +1331,19 @@ Return ONLY valid JSON, no markdown fences.`;
     // Priority 1 ("A"): only broaden the committed coverage beyond the user's
     // selection when this explicit opt-in is set. Default FALSE → generate
     // EXACTLY the selected types.
-    aiCoverageExpansion = false
+    aiCoverageExpansion = false,
+    // Sprint 5.2 — Deep Coverage. When true, the planner emits additional
+    // domain best-practice scenarios (negative/boundary/edge/security/…) as
+    // honest, clearly-tagged committed test cases. OFF = Standard Coverage.
+    deep = false
   ): Promise<{
     scenarios: TestScenario[];
     testCases: TestCase[];
     suggestedTestCases: TestCase[];
     missingRequirements: MissingRequirement[];
     coverageTypeEvaluations: CoverageTypeEvaluation[];
+    /** Sprint 5.1 — per-step Requirement Coverage KPI (guaranteed 100%). */
+    requirementCoverage?: RequirementCoverage;
     tokensUsed: number;
     /** Prompt (input) tokens for the generation call. */
     promptTokens: number;
@@ -1375,7 +1392,7 @@ Return ONLY valid JSON, no markdown fences.`;
     let scenarioPlanBlock = '';
     let scenarioPlan: ScenarioPlan | undefined;
     if (SCENARIO_PLANNER_ENABLED) {
-      scenarioPlan = planScenarios(input, coverageTypes, analysis.featureType, knowledge);
+      scenarioPlan = planScenarios(input, coverageTypes, analysis.featureType, knowledge, deep);
       scenarioPlanBlock = buildScenarioPlanBlock(scenarioPlan);
       // The orchestrator (not the Planner) scores the evidence. Average evidence
       // confidence is a cheap, honest signal of how well-grounded the plan is.
@@ -1962,6 +1979,7 @@ Return ONLY valid JSON. Address EVERY selected coverage type, organise scenarios
 
     return {
       scenarios, testCases, suggestedTestCases, missingRequirements, coverageTypeEvaluations,
+      requirementCoverage: scenarioPlan?.requirementCoverage,
       tokensUsed: resp.tokensUsed,
       promptTokens: resp.promptTokens,
       completionTokens: resp.completionTokens,
@@ -2082,6 +2100,16 @@ Return ONLY valid JSON array.`;
     coverageTypes: CoverageType[],
     knowledge?: KnowledgeContext,
     options?: {
+      /**
+       * Sprint 5.2 — Deep Coverage toggle (the user-facing control).
+       *   • OFF (default) → Standard Coverage: happy path + required negative +
+       *     core validation, all grounded in the requirement.
+       *   • ON → Deep Coverage: the planner ALSO emits domain best-practice
+       *     scenarios (negative/boundary/edge/security/…) as real committed test
+       *     cases, and the internal gap engine mines more real coverage.
+       */
+      deepCoverage?: boolean;
+      /** @deprecated Legacy alias for {@link deepCoverage}. Kept for back-compat. */
       includeCoverageGaps?: boolean;
       deduplicate?: boolean;
       mode?: GenerationMode;
@@ -2105,7 +2133,13 @@ Return ONLY valid JSON array.`;
     //   • Gap Analysis ON  → EXPANDED mode: same grounded coverage + a separate
     //           assumption-based "suggested additional coverage" bucket +
     //           missing-requirement questions + the non-automatable gap pass.
-    const includeCoverageGaps = options?.includeCoverageGaps !== false;
+    // Sprint 5.2 — Deep Coverage is the single user-facing control. It defaults
+    // to the legacy includeCoverageGaps semantics for back-compat, but when the
+    // caller passes `deepCoverage` that wins. Deep Coverage ON drives BOTH the
+    // planner's best-practice scenarios AND the internal gap engine (repurposed
+    // to mine more real coverage — the user never sees "Coverage Gap").
+    const deepCoverage = options?.deepCoverage ?? (options?.includeCoverageGaps === true);
+    const includeCoverageGaps = deepCoverage;
     const aiCoverageExpansion = options?.aiCoverageExpansion === true;
 
     // Pipeline wall-clock start — used for the end-to-end totalMs telemetry.
@@ -2181,7 +2215,7 @@ Return ONLY valid JSON array.`;
     // drop scenarios/cases to fit a fixed budget (user directive). Zero-token:
     // planScenarios is pure/deterministic.
     const plannedForBudget = SCENARIO_PLANNER_ENABLED
-      ? planScenarios(input, coverageTypes, analysis.featureType, knowledge).scenarios.length
+      ? planScenarios(input, coverageTypes, analysis.featureType, knowledge, deepCoverage).scenarios.length
       : 0;
     const outputBudget = coverageDrivenOutputBudget(
       plannedForBudget, coverageTypes.length, tierCfg.maxOutputTokens,
@@ -2195,7 +2229,7 @@ Return ONLY valid JSON array.`;
     const generationStart = Date.now();
     const gen = await this.generateTestCoverage(
       input, analysis, coverageTypes, knowledge, mode,
-      outputBudget, tierCfg.maxPromptChars, aiCoverageExpansion,
+      outputBudget, tierCfg.maxPromptChars, aiCoverageExpansion, deepCoverage,
     );
     const generationMs = Date.now() - generationStart;
     const { scenarios, testCases: rawTestCases, missingRequirements, coverageTypeEvaluations, tokensUsed: t2, promptChars, intelligenceScore } = gen;
@@ -2278,6 +2312,7 @@ Return ONLY valid JSON array.`;
       missingRequirements,
       coverageGaps: gaps,
       coverageTypeEvaluations,
+      requirementCoverage: gen.requirementCoverage,
       mode,
       intelligenceScore,
       stats: {
@@ -2286,6 +2321,9 @@ Return ONLY valid JSON array.`;
         coverageTypes,
         automationReadyCount: testCases.filter(tc => tc.automationReady).length,
         gapsFound: gaps.length,
+        requirementStepsTotal: gen.requirementCoverage?.total,
+        requirementStepsCovered: gen.requirementCoverage?.covered,
+        requirementCoveragePercent: gen.requirementCoverage?.percent,
         tokensUsed: totalTokens,
         promptTokens: promptTokensTotal,
         completionTokens: completionTokensTotal,

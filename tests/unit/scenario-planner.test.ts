@@ -22,6 +22,7 @@ import {
 import {
   planScenarios,
   buildScenarioPlanBlock,
+  extractRequirementSteps,
 } from '../../src/engines/scenario-planner';
 import type { CoverageType } from '../../src/engines/test-coverage-engine';
 
@@ -249,16 +250,20 @@ describe('Scenario Planner — planScenarios (single source of truth for existen
       { title: 'User Login', description: 'User can log in successfully.' },
       ['positive', 'negative', 'edge_cases', 'security'],
     );
-    // core + the two mandatory obligations.
-    expect(plan.scenarios.map(s => s.id).sort()).toEqual(
-      ['auth-neg-empty-fields', 'auth-neg-wrong-password', 'auth-pos-valid'],
-    );
-    // Every emitted scenario is an 'always' obligation (no evidence-conditional).
-    for (const s of plan.scenarios) {
+    const ids = new Set(plan.scenarios.map(s => s.id));
+    // The three mandatory KB obligations ARE emitted (core + invalid creds + required fields).
+    for (const kb of ['auth-pos-valid', 'auth-neg-wrong-password', 'auth-neg-empty-fields']) {
+      expect(ids.has(kb)).toBe(true);
+    }
+    // Every emitted KB obligation is an 'always' obligation (no evidence-conditional).
+    for (const s of plan.scenarios.filter(s => s.id.startsWith('auth-'))) {
       expect(getScenarioObligation(s).condition).toBe('always');
     }
-    // The conditional scenarios were NOT invented from the coverage type alone.
-    const ids = new Set(plan.scenarios.map(s => s.id));
+    // Sprint 5.1: the explicit requirement text is ALSO covered (never dropped).
+    expect(plan.requirementCoverage.percent).toBe(100);
+    expect(plan.requirementCoverage.total).toBeGreaterThan(0);
+    // The conditional scenarios were NOT invented from the coverage type alone —
+    // no lockout / injection / session / logout PHANTOMS without explicit evidence.
     for (const cond of ['auth-neg-locked-user', 'auth-sec-injection', 'auth-sec-session', 'auth-pos-logout']) {
       expect(ids.has(cond)).toBe(false);
     }
@@ -354,14 +359,34 @@ describe('Scenario Planner — planScenarios (single source of truth for existen
     expect(plan.scenarios.some(s => s.coverageType === 'negative')).toBe(false);
   });
 
-  it('returns an empty plan for a generic (unrecognised) requirement', () => {
+  it('Sprint 5.1: a generic (unrecognised) requirement still covers its explicit text', () => {
+    // Previously a generic requirement produced ZERO scenarios (silently
+    // dropped). Requirement Completeness now guarantees the author's own text is
+    // always covered, even when the KB has no baseline library for the category.
     const plan = planScenarios(
       { title: 'Homepage banner colour', description: 'Use the brand teal on the hero.' },
       ['positive', 'negative'],
     );
     expect(plan.classification.category).toBe('generic');
+    expect(plan.isEmpty).toBe(false);
+    expect(plan.scenarios.length).toBeGreaterThan(0);
+    // The scenario is requirement-grounded (not invented from a KB category).
+    expect(plan.scenarios[0].provenance.source).toBe('Requirement');
+    expect(plan.scenarios[0].provenance.assumption).toBe(false);
+    expect(plan.requirementCoverage.percent).toBe(100);
+  });
+
+  it('returns a truly empty plan only when there is no baseline AND no explicit text', () => {
+    // No recognised category and no description/AC/business-flow text to extract
+    // steps from → nothing to ground a scenario in → empty plan (legacy fallback).
+    const plan = planScenarios(
+      { title: 'Homepage banner colour', description: '' },
+      ['positive', 'negative'],
+    );
+    expect(plan.classification.category).toBe('generic');
     expect(plan.isEmpty).toBe(true);
     expect(plan.scenarios).toEqual([]);
+    expect(plan.requirementCoverage.total).toBe(0);
   });
 
   it('is pure/deterministic — same inputs yield an identical plan', () => {
@@ -374,11 +399,27 @@ describe('Scenario Planner — planScenarios (single source of truth for existen
 
 describe('Scenario Planner — buildScenarioPlanBlock', () => {
   it('returns empty string for an empty plan (legacy fallback)', () => {
+    // Empty only when there is no baseline AND no explicit requirement text.
     const plan = planScenarios(
-      { title: 'Homepage banner colour', description: 'Use the brand teal.' },
+      { title: 'Homepage banner colour', description: '' },
       ['positive'],
     );
+    expect(plan.isEmpty).toBe(true);
     expect(buildScenarioPlanBlock(plan)).toBe('');
+  });
+
+  it('Sprint 5.1: renders the Requirement Coverage KPI + per-step checklist', () => {
+    const plan = planScenarios(
+      {
+        title: 'Password reset',
+        description: 'User requests a reset link. User sets a new password. Old password no longer works.',
+      },
+      ['positive', 'negative'],
+    );
+    const block = buildScenarioPlanBlock(plan);
+    expect(block).toContain('REQUIREMENT COVERAGE:');
+    expect(block).toMatch(/\d+\/\d+ \(100%\)/);
+    expect(block).toContain('✓ Step 1:');
   });
 
   it('renders a plan block that forbids invention, forbids dropping, and cites provenance', () => {
@@ -491,5 +532,115 @@ describe('QA Knowledge Engine — getScenarioSemantics', () => {
     expect(derived.variableUnderTest.length).toBeGreaterThan(0);
     expect(derived.variation.toLowerCase()).toContain('everything else stays valid');
     expect(derived.expectedBehavior).toBe(neg.objective);
+  });
+});
+
+/* ================================================================== */
+/*  Sprint 5.1 — Requirement Completeness + 5.2 Deep Coverage         */
+/* ================================================================== */
+
+describe('Sprint 5.1 — extractRequirementSteps', () => {
+  it('splits numbered instructions, bullets, and multi-sentence descriptions into discrete steps', () => {
+    const steps = extractRequirementSteps({
+      description: '1. User enters email. 2. User enters password. 3. User clicks submit.',
+    });
+    expect(steps.length).toBe(3);
+    expect(steps.every(s => s.source === 'description')).toBe(true);
+    expect(steps[0].text.toLowerCase()).toContain('email');
+  });
+
+  it('prefers acceptance criteria and de-duplicates near-identical cross-field steps', () => {
+    const steps = extractRequirementSteps({
+      acceptanceCriteria: '- Valid users can log in\n- Invalid password is rejected',
+      description: 'Valid users can log in.', // restatement of AC line 1
+    });
+    // The AC lines win; the duplicate description line is dropped.
+    const acSteps = steps.filter(s => s.source === 'acceptanceCriteria');
+    expect(acSteps.length).toBe(2);
+    // No description step that merely restates an AC line.
+    expect(steps.some(s => s.source === 'description' && /valid users can log in/i.test(s.text))).toBe(false);
+  });
+
+  it('infers coverage type from step wording (negative / boundary / security)', () => {
+    const steps = extractRequirementSteps({
+      description: 'Reject invalid credentials. Password must be at most 20 characters. Block SQL injection attempts.',
+    });
+    const byType = steps.map(s => s.coverageType);
+    expect(byType).toContain('negative');
+    expect(byType).toContain('boundary');
+    expect(byType).toContain('security');
+  });
+
+  it('strips BDD prefixes so Given/When/Then phrasings do not leak into titles', () => {
+    const steps = extractRequirementSteps({
+      acceptanceCriteria: 'Given a registered user\nWhen they submit valid credentials\nThen they reach the dashboard',
+    });
+    expect(steps.every(s => !/^\s*(given|when|then)\b/i.test(s.text))).toBe(true);
+  });
+});
+
+describe('Sprint 5.1 — Requirement Coverage guarantee (no step left uncovered)', () => {
+  it('every explicit step is covered by at least one scenario (100%)', () => {
+    const plan = planScenarios(
+      {
+        title: 'Profile update',
+        description: 'User can change their display name. User can change their avatar. User can change their timezone. Changes are saved on submit.',
+      },
+      ['positive'],
+    );
+    expect(plan.requirementCoverage.total).toBeGreaterThanOrEqual(4);
+    expect(plan.requirementCoverage.covered).toBe(plan.requirementCoverage.total);
+    expect(plan.requirementCoverage.percent).toBe(100);
+    // Every step maps to at least one scenario id.
+    for (const step of plan.requirementCoverage.steps) {
+      expect(step.covered).toBe(true);
+      expect(step.scenarioIds.length).toBeGreaterThan(0);
+    }
+  });
+
+  it('requirement-derived scenarios are grounded (assumption:false), never invented', () => {
+    const plan = planScenarios(
+      { title: 'Widget', description: 'The widget must render a chart. The widget must export to CSV.' },
+      ['positive'],
+    );
+    const reqScenarios = plan.scenarios.filter(s => s.id.startsWith('req-step-'));
+    expect(reqScenarios.length).toBeGreaterThan(0);
+    for (const s of reqScenarios) {
+      expect(s.provenance.assumption).toBe(false);
+      expect(['Requirement', 'Acceptance Criteria']).toContain(s.provenance.source);
+      expect(s.provenance.evidence.length).toBeGreaterThan(0);
+    }
+  });
+});
+
+describe('Sprint 5.2 — Deep Coverage', () => {
+  it('Deep Coverage ON yields at least as many scenarios as Standard, adding honest best-practice cases', () => {
+    const req = { title: 'User Login', description: 'User can log in with email and password.' };
+    const standard = planScenarios(req, ['positive', 'negative'], 'authentication', undefined, false);
+    const deep = planScenarios(req, ['positive', 'negative'], 'authentication', undefined, true);
+    expect(deep.scenarios.length).toBeGreaterThanOrEqual(standard.scenarios.length);
+    // Any extra deep scenarios are clearly tagged and marked as assumptions.
+    const deepOnly = deep.scenarios.filter(s => s.provenance.source === 'Deep Coverage');
+    for (const s of deepOnly) {
+      expect(s.provenance.assumption).toBe(true);
+      expect(s.provenance.evidence).toEqual([]);
+    }
+  });
+
+  it('Standard Coverage never emits Deep Coverage scenarios', () => {
+    const req = { title: 'User Login', description: 'User can log in with email and password.' };
+    const standard = planScenarios(req, ['positive', 'negative'], 'authentication', undefined, false);
+    expect(standard.scenarios.some(s => s.provenance.source === 'Deep Coverage')).toBe(false);
+  });
+
+  it('Deep Coverage still guarantees 100% requirement coverage', () => {
+    const plan = planScenarios(
+      { title: 'Checkout', description: 'User reviews cart. User enters shipping. User pays. Order confirmation is shown.' },
+      ['positive'],
+      'checkout',
+      undefined,
+      true,
+    );
+    expect(plan.requirementCoverage.percent).toBe(100);
   });
 });
