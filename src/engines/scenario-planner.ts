@@ -85,7 +85,15 @@ export type ProvenanceSource =
   | 'Requirement'
   | 'Acceptance Criteria'
   | 'App Knowledge'
-  | 'Test Data';
+  | 'Test Data'
+  /**
+   * Deep Coverage (Sprint 5.2) — a domain best-practice scenario emitted ONLY
+   * when the user opts into Deep Coverage. It is grounded in the QA Knowledge
+   * Base's obligations for the detected category (NOT hallucinated), but is not
+   * gated on explicit evidence in THIS requirement. Always carries assumption:true
+   * so it is never mistaken for requirement-grounded coverage.
+   */
+  | 'Deep Coverage';
 
 /** Map the machine evidence source to the human-readable provenance bucket. */
 const SOURCE_LABEL: Record<EvidenceSource, ProvenanceSource> = {
@@ -130,6 +138,47 @@ export interface PlannedScenarioWithProvenance extends PlannedScenario {
   provenance: ScenarioProvenance;
 }
 
+/**
+ * A single EXPLICIT requirement step — a numbered instruction, bullet, acceptance
+ * criterion, or business-flow line the author actually wrote. Sprint 5.1 makes
+ * these the PRIMARY source of scenarios: every step must be represented by at
+ * least one generated test case before any baseline/deep coverage is added.
+ */
+export interface RequirementStep {
+  /** Stable id: req-step-<n>. */
+  id: string;
+  /** The exact author text of the step (readable citation, capped). */
+  text: string;
+  /** Which requirement field this step was extracted from. */
+  source: 'acceptanceCriteria' | 'description' | 'businessFlow';
+  /** Coverage type inferred from the step's wording (positive default). */
+  coverageType: CoverageType;
+}
+
+/** Per-step coverage record — powers the "Requirement Coverage X/Y" KPI. */
+export interface RequirementStepCoverage {
+  id: string;
+  text: string;
+  source: RequirementStep['source'];
+  /** True when at least one planned scenario represents this step. */
+  covered: boolean;
+  /** Ids of the planned scenarios that cover this step. */
+  scenarioIds: string[];
+}
+
+/**
+ * The Requirement Coverage summary — the headline trust metric. The product
+ * guarantee (Sprint 5.1) is that this is ALWAYS 100%: no explicit requirement
+ * step is left without a test case.
+ */
+export interface RequirementCoverage {
+  steps: RequirementStepCoverage[];
+  total: number;
+  covered: number;
+  /** Integer percent 0-100. */
+  percent: number;
+}
+
 export interface ScenarioPlan {
   /** Detected QA category + confidence + the signals that drove it. */
   classification: QACategoryClassification;
@@ -137,6 +186,12 @@ export interface ScenarioPlan {
   scenarios: PlannedScenarioWithProvenance[];
   /** Count of justified scenarios (== scenarios.length; all are evidence-backed). */
   justifiedCount: number;
+  /**
+   * Requirement Coverage — the mandatory per-step coverage map (Sprint 5.1).
+   * Guaranteed 100% because unmatched steps synthesize a requirement-derived
+   * scenario. Undefined only on the legacy zero-requirement edge.
+   */
+  requirementCoverage: RequirementCoverage;
   /** KB version for telemetry correlation. */
   knowledgeVersion: string;
   /** Whether the plan is empty (generic category or nothing justified). */
@@ -296,46 +351,265 @@ function deriveProvenance(
   };
 }
 
+/* ---------------------------------------------------------------------------
+ * Sprint 5.1 — Requirement Completeness
+ * The requirement is the PRIMARY source of scenarios. We extract every explicit
+ * step (numbered instruction / bullet / acceptance criterion / business-flow
+ * line) and GUARANTEE each is represented by at least one scenario. The baseline
+ * library is ADDITIVE (adds quality) — it never replaces requirement coverage.
+ * ------------------------------------------------------------------------- */
+
+/** Splitter for explicit step markers: newlines, bullets, numbered markers,
+ *  flow arrows, and sentence terminators. Deterministic — no NLP. */
+const STEP_SPLIT_RE = /\r?\n|(?:^|\s)[-*]\s+|[•\u2022\u2023\u25E6]|\d+[.)]\s+|→|=>|(?<=[.!?])\s+(?=[A-Z0-9"'(])/;
+
+/** Leading BDD / ordinal noise we strip so two phrasings of the same step match. */
+const STEP_PREFIX_RE = /^\s*(?:given|when|then|and|but|step\s*\d+|scenario)\b[:.)\-]?\s*/i;
+
+/** Words that add no meaning to token-overlap similarity. */
+const STOPWORDS = new Set([
+  'the', 'a', 'an', 'to', 'of', 'and', 'or', 'is', 'are', 'be', 'in', 'on', 'for',
+  'with', 'that', 'this', 'it', 'as', 'at', 'by', 'from', 'should', 'must', 'will',
+  'shall', 'can', 'user', 'users', 'system', 'when', 'then', 'given', 'if',
+]);
+
+/** Cues that flip an extracted step's inferred coverage type away from positive. */
+const NEGATIVE_CUES = ['invalid', 'incorrect', 'reject', 'error', 'fail', 'must not', 'cannot', "can't", 'denied', 'deny', 'unauthorized', 'unauthorised', 'blocked', 'forbidden', 'not allowed', 'wrong', 'missing', 'empty', 'without', 'prevent'];
+const BOUNDARY_CUES = ['maximum', 'minimum', ' max ', ' min ', 'at least', 'at most', 'up to', 'no more than', 'no less than', 'limit', 'characters', 'length', 'between', 'exceed'];
+const SECURITY_CUES = ['injection', 'xss', 'csrf', 'sql', 'sanitiz', 'sanitis', 'malicious', 'session token', 'brute', 'permission', 'role', 'authorization', 'authorisation', 'access control'];
+
+function inferStepCoverageType(text: string): CoverageType {
+  const t = lc(` ${text} `);
+  if (SECURITY_CUES.some(c => t.includes(c))) return 'security';
+  if (BOUNDARY_CUES.some(c => t.includes(c))) return 'boundary';
+  if (NEGATIVE_CUES.some(c => t.includes(c))) return 'negative';
+  return 'positive';
+}
+
+/** Normalize step text to a comparable token set (lowercase, stopwords removed). */
+function tokenize(text: string): Set<string> {
+  return new Set(
+    lc(text)
+      .replace(/[^a-z0-9\s]/g, ' ')
+      .split(/\s+/)
+      .filter(w => w.length > 2 && !STOPWORDS.has(w)),
+  );
+}
+
+/** Jaccard token overlap of two texts (0-1). */
+function jaccard(a: Set<string>, b: Set<string>): number {
+  if (!a.size || !b.size) return 0;
+  let inter = 0;
+  for (const t of a) if (b.has(t)) inter += 1;
+  return inter / (a.size + b.size - inter);
+}
+
+/** A short, readable scenario title from a longer step sentence. */
+function stepTitle(text: string): string {
+  const words = text.replace(/[.;:]+$/, '').split(/\s+/);
+  const short = words.slice(0, 9).join(' ');
+  const titled = short.charAt(0).toUpperCase() + short.slice(1);
+  return words.length > 9 ? `${titled}…` : titled;
+}
+
+/**
+ * Extract explicit requirement steps from the acceptance criteria, description
+ * and business flow. Steps are de-duplicated (lexically) across fields, in
+ * priority order AC → description → businessFlow, so the strongest spec wins.
+ */
+export function extractRequirementSteps(
+  input: Partial<Pick<RequirementInput, 'description' | 'businessFlow' | 'acceptanceCriteria'>>,
+): RequirementStep[] {
+  const fields: Array<{ source: RequirementStep['source']; raw?: string }> = [
+    { source: 'acceptanceCriteria', raw: input.acceptanceCriteria },
+    { source: 'description', raw: input.description },
+    { source: 'businessFlow', raw: input.businessFlow },
+  ];
+
+  const steps: RequirementStep[] = [];
+  const seen: Set<string>[] = []; // token sets already accepted (for cross-field dedup)
+  let n = 0;
+
+  for (const { source, raw } of fields) {
+    if (!raw || !raw.trim()) continue;
+    const fragments = raw
+      .split(STEP_SPLIT_RE)
+      .map(f => (f || '').replace(STEP_PREFIX_RE, '').trim())
+      .filter(f => f.length >= 4 && /[a-z0-9]/i.test(f));
+
+    for (const frag of fragments) {
+      const toks = tokenize(frag);
+      if (toks.size === 0) continue;
+      // Skip if a near-identical step was already captured (>= 0.8 overlap).
+      if (seen.some(prev => jaccard(prev, toks) >= 0.8)) continue;
+      seen.push(toks);
+      n += 1;
+      steps.push({
+        id: `req-step-${n}`,
+        text: cap(frag, 200),
+        source,
+        coverageType: inferStepCoverageType(frag),
+      });
+      if (steps.length >= MAX_REQUIREMENT_STEPS) return steps; // runaway guard
+    }
+  }
+  return steps;
+}
+
+/** Upper bound on extracted steps so a pathological paste never explodes the plan. */
+const MAX_REQUIREMENT_STEPS = 60;
+
+/** How close a scenario must be to a step (token overlap) to "cover" it. */
+const STEP_COVER_THRESHOLD = 0.34;
+
+/** Build a requirement-derived scenario for a step the baseline did not cover. */
+function requirementScenario(step: RequirementStep): PlannedScenarioWithProvenance {
+  const isAC = step.source === 'acceptanceCriteria';
+  const sourceLabel: ProvenanceSource = isAC ? 'Acceptance Criteria' : 'Requirement';
+  const evSource: EvidenceSource = isAC ? 'acceptanceCriteria' : 'requirement';
+  const fieldName = step.source === 'acceptanceCriteria' ? 'Acceptance Criteria'
+    : step.source === 'businessFlow' ? 'Business Flow' : 'Requirement description';
+  return {
+    id: step.id,
+    title: stepTitle(step.text),
+    objective: `Verify the requirement: "${step.text}"`,
+    coverageType: step.coverageType,
+    priority: 'P1',
+    riskArea: 'Requirement coverage',
+    provenance: {
+      whyExists: `Explicit requirement step (${fieldName})`,
+      source: sourceLabel,
+      derivedFrom: step.text,
+      assumption: false,
+      evidence: [{
+        id: `${step.id}:${evSource}`,
+        source: evSource,
+        reference: isAC ? 'AC' : 'REQ',
+        excerpt: step.text,
+      }],
+    },
+  };
+}
+
 /**
  * Build a deterministic scenario plan for a requirement.
  *
+ * Pipeline (Sprint 5.1 + 5.2):
+ *   1. Requirement Coverage (MANDATORY) — every explicit step gets a scenario.
+ *   2. Baseline Library (additive) — evidence-justified category obligations,
+ *      filtered to the user's selected coverage types.
+ *   3. Deep Coverage (optional) — when `deep`, also emit the category's known
+ *      obligations that lack explicit evidence, as honest best-practice cases.
+ *   4. Deduplicate (lexical) — merge near-identical scenarios; requirement
+ *      coverage is preserved (a step matched to a baseline scenario stays covered).
+ *
  * @param input          The requirement.
- * @param coverageTypes  The user's SELECTED coverage types (a FILTER — we only
- *                       keep justified scenarios whose type the user picked).
+ * @param coverageTypes  The user's SELECTED coverage types (a FILTER for the
+ *                       baseline/deep library only — requirement steps are ALWAYS
+ *                       covered regardless).
  * @param featureTypeHint Optional upstream analysis featureType hint.
- * @param knowledge      Optional App Knowledge / Test Data — additional evidence
- *                       the planner may derive scenarios from.
+ * @param knowledge      Optional App Knowledge / Test Data — additional evidence.
+ * @param deep           Deep Coverage toggle (Sprint 5.2). When true, broadens
+ *                       the baseline library with best-practice obligations.
  */
 export function planScenarios(
   input: Pick<RequirementInput, 'title' | 'description' | 'module' | 'businessFlow' | 'acceptanceCriteria'>,
   coverageTypes: CoverageType[],
   featureTypeHint?: string,
   knowledge?: PlannerKnowledge,
+  deep = false,
 ): ScenarioPlan {
   const classification = classifyQACategory(input, featureTypeHint);
   const baseline = getBaselineScenarios(classification.category);
 
-  // Respect the user's coverage selection: never keep a scenario for a type the
-  // user did not select. If nothing is selected, fall back to positive so a plan
-  // can still form (matches the engine's own default).
-  const selected = new Set<CoverageType>(coverageTypes.length ? coverageTypes : ['positive']);
+  // Respect the user's coverage selection for the LIBRARY only. If nothing is
+  // selected, fall back to positive. In Deep mode the selection is broadened to
+  // the full deep set so the library contributes more real cases.
+  const DEEP_TYPES: CoverageType[] = ['positive', 'negative', 'edge_cases', 'boundary', 'security', 'integration', 'role_based'];
+  const base: CoverageType[] = coverageTypes.length ? coverageTypes : ['positive'];
+  const selected = new Set<CoverageType>(deep ? [...base, ...DEEP_TYPES] : base);
 
   const evidence = buildEvidence(input, knowledge);
 
-  // Derive ONLY the scenarios explicit evidence justifies. Coverage type filters;
-  // provenance decides existence.
   const scenarios: PlannedScenarioWithProvenance[] = [];
+
+  // ── Phase 2: Baseline library (evidence-justified) ──
+  // Existing behaviour — a scenario earns its place from explicit evidence /
+  // 'always' obligation. Coverage type filters; provenance decides existence.
+  const emittedIds = new Set<string>();
   for (const s of baseline) {
     if (!selected.has(s.coverageType)) continue;
     const provenance = deriveProvenance(s, evidence, classification.category);
     if (!provenance) continue; // unjustified → not planned (no invention)
     scenarios.push({ ...s, provenance });
+    emittedIds.add(s.id);
   }
+
+  // ── Phase 3: Deep Coverage (optional, honest best-practice) ──
+  // Emit the category's KNOWN obligations that lacked explicit evidence, marked
+  // as assumption-based Deep Coverage so they are never mistaken for grounded
+  // requirement coverage. This is what makes the toggle produce MORE real cases.
+  if (deep) {
+    for (const s of baseline) {
+      if (emittedIds.has(s.id)) continue;
+      if (!selected.has(s.coverageType)) continue;
+      const obligation = getScenarioObligation(s);
+      if (obligation.condition === 'always') continue; // already covered above
+      scenarios.push({
+        ...s,
+        provenance: {
+          whyExists: `Deep Coverage: standard ${classification.category} ${s.coverageType} check — domain best-practice, not explicitly stated in this requirement`,
+          source: 'Deep Coverage',
+          derivedFrom: `${classification.category} best-practice`,
+          assumption: true,
+          evidence: [],
+        },
+      });
+      emittedIds.add(s.id);
+    }
+  }
+
+  // ── Phase 1 (guarantee): Requirement Coverage ──
+  // Extract explicit steps and ensure each maps to at least one scenario. A step
+  // already represented by an emitted scenario (lexical match) is marked covered
+  // by it; otherwise we synthesize a requirement-derived scenario. Requirement
+  // steps are NEVER dropped for coverage-type reasons — completeness first.
+  const steps = extractRequirementSteps(input);
+  const scenarioTokens = scenarios.map(s => tokenize(`${s.title} ${s.objective} ${(s.conditionalOnKeywords || []).join(' ')}`));
+  const coverage: RequirementStepCoverage[] = [];
+
+  for (const step of steps) {
+    const stepToks = tokenize(step.text);
+    const matchedIds: string[] = [];
+    let best = 0;
+    scenarios.forEach((s, i) => {
+      const sim = jaccard(stepToks, scenarioTokens[i]);
+      if (sim >= STEP_COVER_THRESHOLD) matchedIds.push(s.id);
+      if (sim > best) best = sim;
+    });
+
+    if (matchedIds.length === 0) {
+      // No existing scenario represents this step → synthesize one (mandatory).
+      const rs = requirementScenario(step);
+      scenarios.push(rs);
+      scenarioTokens.push(stepToks);
+      matchedIds.push(rs.id);
+    }
+    coverage.push({ id: step.id, text: step.text, source: step.source, covered: true, scenarioIds: matchedIds });
+  }
+
+  const requirementCoverage: RequirementCoverage = {
+    steps: coverage,
+    total: coverage.length,
+    covered: coverage.filter(c => c.covered).length,
+    percent: coverage.length === 0 ? 100 : Math.round((coverage.filter(c => c.covered).length / coverage.length) * 100),
+  };
 
   return {
     classification,
     scenarios,
     justifiedCount: scenarios.length,
+    requirementCoverage,
     knowledgeVersion: QA_KNOWLEDGE_VERSION,
     isEmpty: scenarios.length === 0,
   };
@@ -353,30 +627,53 @@ export function planScenarios(
 export function buildScenarioPlanBlock(plan: ScenarioPlan): string {
   if (plan.isEmpty) return '';
 
-  // Group by coverage type for a clean, senior-QA-style checklist.
+  // ── Phase 5: Ordering — Happy → Negative → Boundary → Edge → the rest. ──
+  const TYPE_ORDER: CoverageType[] = ['positive', 'negative', 'boundary', 'edge_cases', 'security', 'integration', 'role_based'];
+  const orderIdx = (t: CoverageType) => {
+    const i = TYPE_ORDER.indexOf(t);
+    return i === -1 ? TYPE_ORDER.length : i;
+  };
   const byType = new Map<CoverageType, PlannedScenarioWithProvenance[]>();
   for (const s of plan.scenarios) {
     const arr = byType.get(s.coverageType) || [];
     arr.push(s);
     byType.set(s.coverageType, arr);
   }
+  const orderedTypes = [...byType.keys()].sort((a, b) => orderIdx(a) - orderIdx(b));
 
   const lines: string[] = [];
-  for (const [type, items] of byType) {
+  for (const type of orderedTypes) {
     lines.push(`  [${type}]`);
+    // Within a type, list requirement-grounded scenarios first, then Deep Coverage.
+    const items = (byType.get(type) || []).slice().sort((a, b) => {
+      const aDeep = a.provenance.source === 'Deep Coverage' ? 1 : 0;
+      const bDeep = b.provenance.source === 'Deep Coverage' ? 1 : 0;
+      return aDeep - bDeep;
+    });
     for (const s of items) {
-      lines.push(`    • ${s.title} — ${s.objective}  (source: ${s.provenance.source})`);
+      const tag = s.provenance.source === 'Deep Coverage' ? 'deep-coverage' : 'requirement-grounded';
+      lines.push(`    • ${s.title} — ${s.objective}  (source: ${s.provenance.source}; ${tag})`);
     }
   }
 
+  const rc = plan.requirementCoverage;
+  const checklist = rc.steps
+    .map((s, i) => `  ${s.covered ? '✓' : '✗'} Step ${i + 1}: ${s.text}`)
+    .join('\n');
+  const coverageHeader = rc.total > 0
+    ? `REQUIREMENT COVERAGE: ${rc.covered}/${rc.total} (${rc.percent}%) — every explicit requirement step below MUST have at least one test case.\n${checklist}\n`
+    : '';
+
   return `
 --- DERIVED SCENARIO PLAN (QA Knowledge Engine — category: ${plan.classification.category}, confidence: ${plan.classification.confidence}) ---
-These are the ONLY business scenarios justified by the explicit Requirement, Acceptance Criteria, App Knowledge and Test Data. They were derived deterministically and each cites the evidence that justifies it.
+These are the business scenarios justified by the explicit Requirement, Acceptance Criteria, App Knowledge and Test Data, plus (when Deep Coverage is on) domain best-practice checks clearly tagged 'deep-coverage'. They were derived deterministically and each cites the evidence that justifies it.
 
+${coverageHeader}
 Your job is to write each scenario up as a concrete, grounded test case — NOT to change WHICH scenarios exist:
   • Produce exactly one (or more, if a scenario genuinely needs multiple data variations) test case per planned scenario below.
-  • DO NOT invent additional scenarios. If a failure mode / edge case is not listed here, the evidence did not justify it — leave it out.
-  • DO NOT drop a planned scenario. Every line below is justified and must be written up.
+  • DO NOT invent additional scenarios. If a failure mode / edge case is not listed here, it was not justified — leave it out.
+  • DO NOT drop a planned scenario. Every line below is justified and MUST be written up — most importantly, every requirement step above must be covered.
+  • Scenarios are already ordered Happy Path → Negative → Boundary → Edge; preserve that order.
 
 PLANNED SCENARIOS (${plan.justifiedCount} justified):
 ${lines.join('\n')}

@@ -1145,7 +1145,7 @@ async function initSchema(client: PoolClient): Promise<void> {
     company_id             INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
     plan_id                INTEGER NOT NULL REFERENCES plans(id),
     status                 VARCHAR(20) NOT NULL DEFAULT 'active'
-                           CHECK (status IN ('active','trialing','past_due','cancelled','expired')),
+                           CHECK (status IN ('active','trialing','past_due','cancelled','expired','suspended')),
     billing_cycle          VARCHAR(10) NOT NULL DEFAULT 'monthly'
                            CHECK (billing_cycle IN ('monthly','annually')),
     currency               VARCHAR(3) NOT NULL DEFAULT 'USD',
@@ -1158,6 +1158,13 @@ async function initSchema(client: PoolClient): Promise<void> {
     created_at             TIMESTAMPTZ DEFAULT NOW(),
     updated_at             TIMESTAMPTZ DEFAULT NOW()
   )`);
+
+  // Migration: allow 'suspended' status on existing subscriptions tables (kill-switch support)
+  await run('subscriptions_suspended_status', `DO $$ BEGIN
+    ALTER TABLE subscriptions DROP CONSTRAINT IF EXISTS subscriptions_status_check;
+    ALTER TABLE subscriptions ADD CONSTRAINT subscriptions_status_check
+      CHECK (status IN ('active','trialing','past_due','cancelled','expired','suspended'));
+  END $$`);
 
   await run('subscription_usage', `CREATE TABLE IF NOT EXISTS subscription_usage (
     id              SERIAL PRIMARY KEY,
@@ -2953,14 +2960,20 @@ export async function getSubscription(companyId: number): Promise<any | null> {
 export async function createSubscription(data: {
   companyId: number; planId: number; billingCycle?: string; currency?: string;
   gateway?: string; gatewaySubId?: string; gatewayCustomerId?: string;
+  status?: string; trialDays?: number;
 }): Promise<number> {
   const cycle = data.billingCycle || 'monthly';
-  const interval = cycle === 'annually' ? '365 days' : '30 days';
+  // Trial subscriptions expire after trialDays; paid subscriptions run one billing interval.
+  const trialing = data.status === 'trialing' && (data.trialDays ?? 0) > 0;
+  const interval = trialing
+    ? `${data.trialDays} days`
+    : cycle === 'annually' ? '365 days' : '30 days';
+  const status = data.status || 'active';
   const { rows } = await getPool().query(
-    `INSERT INTO subscriptions (company_id, plan_id, billing_cycle, currency, payment_gateway, gateway_subscription_id, gateway_customer_id, current_period_end)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, NOW() + $8::interval)
+    `INSERT INTO subscriptions (company_id, plan_id, status, billing_cycle, currency, payment_gateway, gateway_subscription_id, gateway_customer_id, current_period_end)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW() + $9::interval)
      RETURNING id`,
-    [data.companyId, data.planId, cycle, data.currency || 'USD', data.gateway || 'stripe',
+    [data.companyId, data.planId, status, cycle, data.currency || 'USD', data.gateway || 'manual',
      data.gatewaySubId || null, data.gatewayCustomerId || null, interval]
   );
   return rows[0].id;
@@ -3189,18 +3202,231 @@ export async function createCompany(name: string, slug: string): Promise<number>
   return rows[0].id;
 }
 
-export async function getCompanies(): Promise<Array<{ id: number; name: string; slug: string; is_active: boolean; created_at: string }>> {
+/**
+ * List all companies enriched with their current plan, subscription status,
+ * trial/expiry date and user count. Picks the most relevant subscription per
+ * company (active/trialing first, otherwise the latest). Read-only; safe for
+ * the founder-admin companies list.
+ */
+export async function getCompanies(): Promise<Array<Record<string, any>>> {
   const pool = getPool();
   const { rows } = await pool.query(
-    `SELECT id, name, slug, is_active, created_at FROM companies ORDER BY name`
+    `SELECT c.id, c.name, c.slug, c.is_active, c.created_at,
+            s.status         AS subscription_status,
+            s.current_period_end AS period_end,
+            p.name           AS plan_name,
+            p.slug           AS plan_slug,
+            p.credits_monthly,
+            p.max_users,
+            (SELECT COUNT(*)::int FROM users u WHERE u.company_id = c.id) AS user_count
+     FROM companies c
+     LEFT JOIN LATERAL (
+       SELECT * FROM subscriptions s2
+       WHERE s2.company_id = c.id
+       ORDER BY (s2.status IN ('active','trialing')) DESC, s2.created_at DESC
+       LIMIT 1
+     ) s ON TRUE
+     LEFT JOIN plans p ON p.id = s.plan_id
+     ORDER BY c.name`
   );
   return rows;
 }
 
-export async function getCompanyById(id: number): Promise<{ id: number; name: string; slug: string; is_active: boolean } | null> {
+export async function getCompanyById(id: number): Promise<Record<string, any> | null> {
   const pool = getPool();
-  const { rows } = await pool.query(`SELECT id, name, slug, is_active FROM companies WHERE id = $1`, [id]);
+  const { rows } = await pool.query(
+    `SELECT c.id, c.name, c.slug, c.is_active, c.created_at, c.updated_at,
+            s.id             AS subscription_id,
+            s.status         AS subscription_status,
+            s.billing_cycle,
+            s.currency,
+            s.current_period_start AS period_start,
+            s.current_period_end   AS period_end,
+            p.id             AS plan_id,
+            p.name           AS plan_name,
+            p.slug           AS plan_slug,
+            p.credits_monthly,
+            p.max_users,
+            p.max_repos,
+            p.features       AS plan_features,
+            (SELECT COUNT(*)::int FROM users u WHERE u.company_id = c.id) AS user_count
+     FROM companies c
+     LEFT JOIN LATERAL (
+       SELECT * FROM subscriptions s2
+       WHERE s2.company_id = c.id
+       ORDER BY (s2.status IN ('active','trialing')) DESC, s2.created_at DESC
+       LIMIT 1
+     ) s ON TRUE
+     LEFT JOIN plans p ON p.id = s.plan_id
+     WHERE c.id = $1`,
+    [id],
+  );
   return rows[0] || null;
+}
+
+/**
+ * Fast demo onboarding — create a company, its admin user, and a subscription
+ * to the chosen plan in a single transaction. Also writes an audit-log entry.
+ * The caller supplies an already-hashed password; the plaintext temp password
+ * is generated and returned by the route layer for display.
+ */
+export async function createCompanyWithAdmin(data: {
+  name: string;
+  slug: string;
+  adminUsername: string;
+  adminName?: string;
+  passwordHash: string;
+  planSlug: string;
+  trialDays?: number;
+  createdBy?: string | null;
+}): Promise<{ companyId: number; adminUserId: number; subscriptionId: number; planName: string; periodEnd: string }> {
+  const client = await getPool().connect();
+  try {
+    await client.query('BEGIN');
+
+    // 1. Company
+    const companyRes = await client.query(
+      `INSERT INTO companies (name, slug) VALUES ($1, $2) RETURNING id`,
+      [data.name, data.slug],
+    );
+    const companyId = companyRes.rows[0].id as number;
+
+    // 2. Admin user
+    const userRes = await client.query(
+      `INSERT INTO users (username, password_hash, role, company_name, company_id)
+       VALUES ($1, $2, 'admin', $3, $4) RETURNING id`,
+      [data.adminUsername, data.passwordHash, data.adminName || data.name, companyId],
+    );
+    const adminUserId = userRes.rows[0].id as number;
+
+    // 3. Plan → subscription
+    const planRes = await client.query(`SELECT id, name FROM plans WHERE slug = $1`, [data.planSlug]);
+    if (planRes.rows.length === 0) {
+      throw new Error(`Plan '${data.planSlug}' not found`);
+    }
+    const planId = planRes.rows[0].id as number;
+    const planName = planRes.rows[0].name as string;
+
+    const trialDays = data.trialDays ?? 0;
+    const status = trialDays > 0 ? 'trialing' : 'active';
+    const interval = trialDays > 0 ? `${trialDays} days` : '30 days';
+    const subRes = await client.query(
+      `INSERT INTO subscriptions (company_id, plan_id, status, billing_cycle, currency, payment_gateway, current_period_end)
+       VALUES ($1, $2, $3, 'monthly', 'USD', 'manual', NOW() + $4::interval)
+       RETURNING id, current_period_end`,
+      [companyId, planId, status, interval],
+    );
+    const subscriptionId = subRes.rows[0].id as number;
+    const periodEnd = subRes.rows[0].current_period_end as string;
+
+    // 4. Audit log
+    await client.query(
+      `INSERT INTO audit_logs (user_id, username, action, resource, resource_id, details)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [null, data.createdBy || 'founder-admin', 'company_created', 'companies', String(companyId),
+       JSON.stringify({ name: data.name, slug: data.slug, plan: data.planSlug, trialDays, admin: data.adminUsername })],
+    );
+
+    await client.query('COMMIT');
+    return { companyId, adminUserId, subscriptionId, planName, periodEnd };
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+/** Kill-switch: suspend a company. Blocks product APIs; preserves all data. */
+export async function suspendCompany(companyId: number): Promise<void> {
+  const pool = getPool();
+  await pool.query(`UPDATE companies SET is_active = FALSE, updated_at = NOW() WHERE id = $1`, [companyId]);
+  await pool.query(
+    `UPDATE subscriptions SET status = 'suspended', updated_at = NOW()
+     WHERE company_id = $1 AND status IN ('active','trialing','past_due')`,
+    [companyId],
+  );
+}
+
+/** Re-activate a suspended company. Restores product access. */
+export async function activateCompany(companyId: number): Promise<void> {
+  const pool = getPool();
+  await pool.query(`UPDATE companies SET is_active = TRUE, updated_at = NOW() WHERE id = $1`, [companyId]);
+  // Restore the most recent suspended subscription: 'trialing' if the period is
+  // still in the future, otherwise 'active'.
+  await pool.query(
+    `UPDATE subscriptions SET
+       status = CASE WHEN current_period_end > NOW() AND plan_id IN (SELECT id FROM plans WHERE slug = 'free')
+                     THEN 'trialing' ELSE 'active' END,
+       updated_at = NOW()
+     WHERE company_id = $1 AND status = 'suspended'`,
+    [companyId],
+  );
+}
+
+/** Extend the current subscription period (trial or paid) by N days. */
+export async function extendTrial(companyId: number, days: number): Promise<string | null> {
+  const pool = getPool();
+  const { rows } = await pool.query(
+    `UPDATE subscriptions SET
+       current_period_end = GREATEST(current_period_end, NOW()) + $2::int * INTERVAL '1 day',
+       status = CASE WHEN status = 'expired' THEN 'trialing' ELSE status END,
+       updated_at = NOW()
+     WHERE id = (
+       SELECT id FROM subscriptions WHERE company_id = $1
+       ORDER BY (status IN ('active','trialing','past_due','suspended')) DESC, created_at DESC LIMIT 1
+     )
+     RETURNING current_period_end`,
+    [companyId, days],
+  );
+  return rows[0]?.current_period_end || null;
+}
+
+/**
+ * Manual plan assignment (founder-driven upgrade/downgrade, no payment gateway).
+ * Updates the company's current subscription in place if one exists; otherwise
+ * creates a fresh active subscription. Returns the new plan name.
+ */
+export async function assignPlan(companyId: number, planSlug: string): Promise<{ planName: string; previousPlan: string | null }> {
+  const pool = getPool();
+  const planRes = await pool.query(`SELECT id, name FROM plans WHERE slug = $1`, [planSlug]);
+  if (planRes.rows.length === 0) throw new Error(`Plan '${planSlug}' not found`);
+  const planId = planRes.rows[0].id as number;
+  const planName = planRes.rows[0].name as string;
+
+  // Most relevant existing subscription (active/trialing/suspended first, else latest).
+  const subRes = await pool.query(
+    `SELECT s.id, p.name AS plan_name FROM subscriptions s
+     JOIN plans p ON p.id = s.plan_id
+     WHERE s.company_id = $1
+     ORDER BY (s.status IN ('active','trialing','suspended','past_due')) DESC, s.created_at DESC
+     LIMIT 1`,
+    [companyId],
+  );
+
+  if (subRes.rows.length > 0) {
+    const previousPlan = subRes.rows[0].plan_name as string;
+    await pool.query(
+      `UPDATE subscriptions SET plan_id = $2, updated_at = NOW() WHERE id = $1`,
+      [subRes.rows[0].id, planId],
+    );
+    return { planName, previousPlan };
+  }
+
+  await pool.query(
+    `INSERT INTO subscriptions (company_id, plan_id, status, billing_cycle, currency, payment_gateway, current_period_end)
+     VALUES ($1, $2, 'active', 'monthly', 'USD', 'manual', NOW() + INTERVAL '30 days')`,
+    [companyId, planId],
+  );
+  return { planName, previousPlan: null };
+}
+
+/** Lightweight kill-switch check — is this company allowed to use the product? */
+export async function isCompanyActive(companyId: number): Promise<boolean> {
+  const { rows } = await getPool().query(`SELECT is_active FROM companies WHERE id = $1`, [companyId]);
+  // Unknown company → treat as active (fail-open) so resolution fallbacks aren't broken.
+  if (rows.length === 0) return true;
+  return rows[0].is_active !== false;
 }
 
 export async function getCompanyBySlug(slug: string): Promise<{ id: number; name: string; slug: string; is_active: boolean } | null> {
