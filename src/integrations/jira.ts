@@ -54,6 +54,25 @@ export interface JiraIssueType {
   subtask: boolean;
 }
 
+/**
+ * A Jira issue mapped into a requirement-friendly shape for the Requirements
+ * Hub import flow. `description` is flattened from ADF into plain text so it can
+ * feed the scenario planner unchanged.
+ */
+export interface JiraImportedIssue {
+  key: string;            // AUTH-123
+  summary: string;        // issue title
+  description: string;    // plain-text description (ADF flattened)
+  issueType: string;      // Story, Epic, Task, Bug
+  status: string;         // To Do, In Progress, Done ...
+  priority?: string;      // Highest, High, Medium ...
+  assignee?: string;      // display name
+  sprint?: string;        // active/most-recent sprint name, if any
+  labels?: string[];
+  updated?: string;       // ISO timestamp of last update
+  url: string;            // browse URL
+}
+
 export interface CreateTicketResult {
   success: boolean;
   issueKey?: string;
@@ -250,6 +269,185 @@ export async function fetchIssueTypes(
   } catch {
     return [];
   }
+}
+
+/**
+ * Search issues in a project filtered by issue type(s), for the Requirements
+ * Hub import flow. Returns issues mapped into a requirement-friendly shape.
+ * Uses the Jira JQL search API and only pulls the fields we need.
+ */
+export async function searchIssues(
+  config: JiraConfig,
+  projectKey: string,
+  issueTypes: string[],
+  maxResults = 100,
+): Promise<JiraImportedIssue[]> {
+  try {
+    const jqlParts = [`project = "${projectKey}"`];
+    if (issueTypes && issueTypes.length > 0) {
+      const quoted = issueTypes.map((t) => `"${t.replace(/"/g, '')}"`).join(', ');
+      jqlParts.push(`issuetype IN (${quoted})`);
+    }
+    const jql = jqlParts.join(' AND ') + ' ORDER BY updated DESC';
+    const fields = [
+      'summary',
+      'description',
+      'issuetype',
+      'status',
+      'priority',
+      'assignee',
+      'labels',
+      'updated',
+    ].join(',');
+
+    const issues: JiraImportedIssue[] = [];
+    let nextPageToken: string | undefined;
+
+    // Jira Cloud's legacy /rest/api/3/search is removed (410); the current
+    // enhanced endpoint is /rest/api/3/search/jql with token-based pagination
+    // (no startAt / total). Loop until isLast or we hit the cap.
+    while (issues.length < maxResults) {
+      const body: Record<string, any> = {
+        jql,
+        maxResults: Math.min(100, maxResults - issues.length),
+        fields: fields.split(','),
+      };
+      if (nextPageToken) body.nextPageToken = nextPageToken;
+
+      const res = await jiraFetch(config, '/rest/api/3/search/jql', {
+        method: 'POST',
+        body: JSON.stringify(body),
+      });
+      if (!res.ok) {
+        const errText = await res.text();
+        logger.error(MOD, 'searchIssues failed', { status: res.status, body: errText.slice(0, 300) });
+        break;
+      }
+      const data = (await res.json()) as any;
+      const batch: any[] = data.issues || [];
+      for (const issue of batch) {
+        issues.push(mapIssue(config, issue));
+      }
+      nextPageToken = data.nextPageToken;
+      if (data.isLast || !nextPageToken || batch.length === 0) break;
+    }
+
+    return issues;
+  } catch (err) {
+    logger.error(MOD, 'searchIssues error', { error: (err as Error).message });
+    return [];
+  }
+}
+
+/** Map a raw Jira issue payload into our requirement-friendly shape. */
+function mapIssue(config: JiraConfig, issue: any): JiraImportedIssue {
+  const f = issue.fields || {};
+  // Sprint lives in a customfield whose id varies per instance; find the first
+  // array field holding objects that look like sprints (have a `name`).
+  let sprint: string | undefined;
+  for (const [k, v] of Object.entries(f)) {
+    if (k.startsWith('customfield_') && Array.isArray(v) && v.length > 0) {
+      const last = v[v.length - 1] as any;
+      if (last && typeof last === 'object' && typeof last.name === 'string' && 'state' in last) {
+        sprint = last.name;
+        break;
+      }
+    }
+  }
+  return {
+    key: issue.key,
+    summary: f.summary || issue.key,
+    description: adfToPlainText(f.description),
+    issueType: f.issuetype?.name || 'Task',
+    status: f.status?.name || 'To Do',
+    priority: f.priority?.name,
+    assignee: f.assignee?.displayName,
+    sprint,
+    labels: Array.isArray(f.labels) ? f.labels : [],
+    updated: f.updated,
+    url: `${config.instanceUrl.replace(/\/$/, '')}/browse/${issue.key}`,
+  };
+}
+
+/**
+ * Flatten an Atlassian Document Format (ADF) description into readable plain
+ * text. Handles headings, paragraphs, bullet/ordered lists and hard breaks so
+ * numbered acceptance criteria survive into the scenario planner. Falls back to
+ * the raw string if the value is already a string (older API / plain text).
+ */
+export function adfToPlainText(adf: any): string {
+  if (!adf) return '';
+  if (typeof adf === 'string') return adf;
+  const lines: string[] = [];
+
+  const walkInline = (nodes: any[]): string =>
+    (nodes || [])
+      .map((n) => {
+        if (n.type === 'text') return n.text || '';
+        if (n.type === 'hardBreak') return '\n';
+        if (n.type === 'inlineCard') return n.attrs?.url || '';
+        if (n.type === 'mention') return n.attrs?.text || '';
+        if (Array.isArray(n.content)) return walkInline(n.content);
+        return '';
+      })
+      .join('');
+
+  const walkBlock = (node: any, depth = 0): void => {
+    if (!node) return;
+    switch (node.type) {
+      case 'doc':
+        (node.content || []).forEach((c: any) => walkBlock(c, depth));
+        break;
+      case 'heading':
+      case 'paragraph': {
+        const text = walkInline(node.content || []).trim();
+        if (text) lines.push(text);
+        break;
+      }
+      case 'bulletList':
+      case 'orderedList': {
+        const ordered = node.type === 'orderedList';
+        (node.content || []).forEach((item: any, i: number) => {
+          const prefix = ordered ? `${i + 1}. ` : '- ';
+          const text = walkInline(collectItemInline(item)).trim();
+          if (text) lines.push(`${'  '.repeat(depth)}${prefix}${text}`);
+          // nested lists
+          (item.content || [])
+            .filter((c: any) => c.type === 'bulletList' || c.type === 'orderedList')
+            .forEach((c: any) => walkBlock(c, depth + 1));
+        });
+        break;
+      }
+      case 'codeBlock': {
+        const text = walkInline(node.content || []);
+        if (text) lines.push(text);
+        break;
+      }
+      default:
+        if (Array.isArray(node.content)) node.content.forEach((c: any) => walkBlock(c, depth));
+    }
+  };
+
+  // Gather inline content of a listItem's direct paragraphs (not nested lists).
+  const collectItemInline = (item: any): any[] => {
+    const out: any[] = [];
+    (item.content || [])
+      .filter((c: any) => c.type === 'paragraph' || c.type === 'heading')
+      .forEach((c: any) => out.push(...(c.content || [])));
+    return out;
+  };
+
+  walkBlock(adf);
+  return lines.join('\n').trim();
+}
+
+/**
+ * Load the stored, connected Jira config for the current company. Exposed for
+ * the Requirements Hub import routes so users never re-enter credentials.
+ * Returns null if Jira isn't configured/connected.
+ */
+export async function getStoredJiraConfig(): Promise<JiraConfig | null> {
+  return getJiraConfig();
 }
 
 /* -------------------------------------------------------------------------- */

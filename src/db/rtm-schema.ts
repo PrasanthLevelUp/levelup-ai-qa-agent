@@ -100,6 +100,35 @@ export const RTM_STATEMENTS: RtmStatement[] = [
       ON requirements(created_at DESC)`,
   },
 
+  /* ─── Sprint 6.1: Requirements Hub — requirement source tracking ──────
+   * Every requirement now records WHERE it came from so the Requirements Hub
+   * can show source badges, filter by source, and (later) sync. Additive +
+   * backward compatible: legacy rows default to source='manual', which is
+   * exactly what they are. `source_id` holds the external key (e.g. AUTH-123).
+   * `sync_status` tracks drift vs. the external source (synced / out_of_date /
+   * modified) for the later bidirectional-sync phase. */
+  {
+    label: 'requirements_source_columns',
+    sql: `ALTER TABLE requirements
+      ADD COLUMN IF NOT EXISTS source VARCHAR(30) NOT NULL DEFAULT 'manual',
+      ADD COLUMN IF NOT EXISTS source_id VARCHAR(150),
+      ADD COLUMN IF NOT EXISTS sync_status VARCHAR(20) NOT NULL DEFAULT 'synced'`,
+  },
+  {
+    label: 'idx_requirements_source',
+    sql: `CREATE INDEX IF NOT EXISTS idx_requirements_source
+      ON requirements(company_id, source) WHERE deleted_at IS NULL`,
+  },
+  // Dedup guard: a given external issue (source + source_id) maps to at most one
+  // live requirement per company/project, so re-importing updates instead of
+  // duplicating. NULL source_id (manual reqs) is exempt.
+  {
+    label: 'uq_requirements_source_id',
+    sql: `CREATE UNIQUE INDEX IF NOT EXISTS uq_requirements_source_id
+      ON requirements (company_id, (COALESCE(project_id, 0)), source, source_id)
+      WHERE deleted_at IS NULL AND source_id IS NOT NULL`,
+  },
+
   /* ─── 2. Traceability Links ───────────────────────────────────────── */
   {
     label: 'traceability_links',
