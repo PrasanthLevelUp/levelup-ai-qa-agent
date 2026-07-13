@@ -13272,6 +13272,10 @@ export interface RtmRequirement {
   deleted_at: string | null;
   metadata: Record<string, any>;
   coverage_percentage: number;
+  /** Sprint 6.1 — Requirements Hub source tracking. */
+  source: string;               // 'manual' | 'jira' | 'azure' | 'github' | ...
+  source_id: string | null;     // external key, e.g. AUTH-123
+  sync_status: string;          // 'synced' | 'out_of_date' | 'modified'
 }
 
 /**
@@ -13317,6 +13321,14 @@ export async function createRequirement(data: {
   createdBy?: number | null;
   metadata?: Record<string, any> | null;
   /**
+   * Sprint 6.1 — Requirements Hub source tracking. `source` defaults to
+   * 'manual'; imported requirements set 'jira' (and later 'azure', 'github', …)
+   * with `sourceId` holding the external key (e.g. AUTH-123).
+   */
+  source?: string | null;
+  sourceId?: string | null;
+  syncStatus?: string | null;
+  /**
    * Write-path attribution (Phase 2). Optional — NULL lets the DB triggers
    * stamp the project's current sprint / default environment when project_id is
    * known; explicit values are respected.
@@ -13330,10 +13342,11 @@ export async function createRequirement(data: {
     `INSERT INTO requirements
        (company_id, project_id, requirement_id, title, description, category,
         priority, acceptance_criteria, status, tags, created_by, metadata,
-        environment_id, sprint_id)
+        source, source_id, sync_status, environment_id, sprint_id)
      VALUES ($1, $2, $3, $4, $5, $6,
              COALESCE($7, 'Medium'), $8, COALESCE($9, 'Not Tested'), $10, $11,
-             COALESCE($12, '{}'::jsonb), $13, $14)
+             COALESCE($12, '{}'::jsonb), COALESCE($13, 'manual'), $14,
+             COALESCE($15, 'synced'), $16, $17)
      RETURNING *`,
     [
       data.companyId,
@@ -13348,11 +13361,85 @@ export async function createRequirement(data: {
       data.tags ?? null,
       data.createdBy ?? null,
       data.metadata ? JSON.stringify(data.metadata) : null,
+      data.source ?? null,
+      data.sourceId ?? null,
+      data.syncStatus ?? null,
       data.environmentId ?? null,
       data.sprintId ?? null,
     ],
   );
   return result.rows[0];
+}
+
+/**
+ * Sprint 6.1 — look up a requirement by its external source key so re-imports
+ * update the existing row instead of creating a duplicate. Scoped to
+ * company + project (NULL project matches NULL). Returns null if not found.
+ */
+export async function getRequirementBySourceId(params: {
+  companyId: number;
+  projectId?: number | null;
+  source: string;
+  sourceId: string;
+}): Promise<RtmRequirement | null> {
+  const pool = getPool();
+  const result = await pool.query(
+    `SELECT * FROM requirements
+     WHERE company_id = $1
+       AND COALESCE(project_id, 0) = COALESCE($2, 0)
+       AND source = $3
+       AND source_id = $4
+       AND deleted_at IS NULL
+     LIMIT 1`,
+    [params.companyId, params.projectId ?? null, params.source, params.sourceId],
+  );
+  return result.rows[0] ?? null;
+}
+
+/**
+ * Sprint 6.1 — update the mutable fields of an imported requirement on re-sync.
+ * Only touches content + sync metadata; preserves the existing requirement_id
+ * and any linked test cases.
+ */
+export async function updateRequirementFromSource(
+  id: string,
+  companyId: number,
+  data: {
+    title?: string;
+    description?: string | null;
+    acceptanceCriteria?: string | null;
+    priority?: string | null;
+    status?: string | null;
+    metadata?: Record<string, any> | null;
+    syncStatus?: string | null;
+  },
+): Promise<RtmRequirement | null> {
+  const pool = getPool();
+  const result = await pool.query(
+    `UPDATE requirements
+        SET title = COALESCE($3, title),
+            description = COALESCE($4, description),
+            acceptance_criteria = COALESCE($5, acceptance_criteria),
+            priority = COALESCE($6, priority),
+            status = COALESCE($7, status),
+            metadata = COALESCE($8, metadata),
+            sync_status = COALESCE($9, sync_status),
+            updated_at = NOW()
+      WHERE id = $1 AND company_id = $2 AND deleted_at IS NULL
+      RETURNING *`,
+    [
+      id,
+      companyId,
+      data.title ?? null,
+      data.description ?? null,
+      data.acceptanceCriteria ?? null,
+      data.priority ?? null,
+      data.status ?? null,
+      data.metadata ? JSON.stringify(data.metadata) : null,
+      data.syncStatus ?? null,
+    ],
+  );
+  return result.rows[0] ?? null;
 }
 
 /**
@@ -13365,6 +13452,7 @@ export async function getRequirements(params: {
   category?: string;
   priority?: string;
   status?: string;
+  source?: string;
   search?: string;
   limit?: number;
   offset?: number;
@@ -13394,8 +13482,13 @@ export async function getRequirements(params: {
     values.push(params.status);
     i++;
   }
+  if (params.source) {
+    where.push(`r.source = $${i}`);
+    values.push(params.source);
+    i++;
+  }
   if (params.search) {
-    where.push(`(r.title ILIKE $${i} OR r.description ILIKE $${i} OR r.requirement_id ILIKE $${i})`);
+    where.push(`(r.title ILIKE $${i} OR r.description ILIKE $${i} OR r.requirement_id ILIKE $${i} OR r.source_id ILIKE $${i})`);
     values.push(`%${params.search}%`);
     i++;
   }
