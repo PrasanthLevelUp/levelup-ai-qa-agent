@@ -26,7 +26,16 @@ import {
   getTestCasesForRequirement,
   getRequirementAutomationCoverage,
   recalculateAllRequirementCoverage,
+  getRequirementBySourceId,
+  updateRequirementFromSource,
 } from '../../db/postgres';
+import {
+  getStoredJiraConfig,
+  fetchProjects,
+  fetchIssueTypes,
+  searchIssues,
+  type JiraImportedIssue,
+} from '../../integrations/jira';
 
 const MOD = 'requirements-routes';
 
@@ -89,8 +98,201 @@ function projectToManual(dbRows: any[]): any[] {
   });
 }
 
+/** Map a Jira priority name onto our fixed priority vocabulary. */
+function mapJiraPriority(name?: string): string {
+  switch ((name || '').toLowerCase()) {
+    case 'highest':
+    case 'blocker':
+      return 'Critical';
+    case 'high':
+      return 'High';
+    case 'low':
+    case 'lowest':
+    case 'trivial':
+      return 'Low';
+    default:
+      return 'Medium';
+  }
+}
+
+/** Map a Jira status name onto our requirement status vocabulary. */
+function mapJiraStatus(name?: string): string {
+  const s = (name || '').toLowerCase();
+  if (s.includes('done') || s.includes('closed') || s.includes('resolved')) return 'Passed';
+  if (s.includes('progress') || s.includes('review') || s.includes('testing')) return 'In Progress';
+  return 'Not Tested';
+}
+
+/** Derive a coarse category from the Jira issue type. Kept intentionally simple. */
+function mapJiraCategory(issueType?: string): string | null {
+  const t = (issueType || '').toLowerCase();
+  if (t === 'bug') return 'Bug';
+  if (t === 'epic') return 'Epic';
+  return null; // Story / Task -> let it stay uncategorized (user can set it)
+}
+
 export function createRequirementsRouter(): Router {
   const router = Router();
+
+  /* ─── Jira: list projects (STATIC — must precede /:id) ─────────────
+   * Uses the STORED, already-connected Jira config so the user never re-enters
+   * credentials in the Requirements Hub. 400 if Jira isn't connected. */
+  router.get('/jira/projects', async (_req: Request, res: Response) => {
+    try {
+      const config = await getStoredJiraConfig();
+      if (!config) {
+        return res.status(400).json({
+          success: false,
+          error: 'Jira is not connected. Connect it under Tools → Jira first.',
+          code: 'JIRA_NOT_CONNECTED',
+        });
+      }
+      const projects = await fetchProjects(config);
+      res.json({ success: true, data: projects });
+    } catch (error: any) {
+      logger.error(MOD, 'GET /jira/projects failed', { error: error?.message });
+      res.status(500).json({ success: false, error: 'Failed to fetch Jira projects' });
+    }
+  });
+
+  /* ─── Jira: list issue types for a project (STATIC) ──────────────── */
+  router.get('/jira/issue-types', async (req: Request, res: Response) => {
+    try {
+      const projectKey = req.query.projectKey ? String(req.query.projectKey) : '';
+      if (!projectKey) {
+        return res.status(400).json({ success: false, error: 'projectKey is required' });
+      }
+      const config = await getStoredJiraConfig();
+      if (!config) {
+        return res.status(400).json({
+          success: false,
+          error: 'Jira is not connected. Connect it under Tools → Jira first.',
+          code: 'JIRA_NOT_CONNECTED',
+        });
+      }
+      const types = await fetchIssueTypes(config, projectKey);
+      // Requirements are authored from top-level work items, never sub-tasks.
+      res.json({ success: true, data: types.filter((t) => !t.subtask) });
+    } catch (error: any) {
+      logger.error(MOD, 'GET /jira/issue-types failed', { error: error?.message });
+      res.status(500).json({ success: false, error: 'Failed to fetch Jira issue types' });
+    }
+  });
+
+  /* ─── Jira: import issues as requirements (STATIC) ───────────────────
+   * Body: { projectKey, issueTypes: string[], maxResults? }
+   * Each imported issue becomes (or updates) a requirement scoped to the
+   * current company/project. Re-importing an already-imported issue UPDATES it
+   * in place (matched by source + source_id) instead of duplicating. Returns a
+   * summary { imported, updated, skipped, total, requirements }. */
+  router.post('/jira/import', async (req: Request, res: Response) => {
+    try {
+      const companyId = (req as any).companyId;
+      const projectId = (req as any).projectId ?? null;
+      const userId = (req as any).userId ?? null;
+      const { environmentId, sprintId } = getContextFromRequest(req);
+
+      const { projectKey, issueTypes, maxResults } = req.body || {};
+      if (!projectKey || typeof projectKey !== 'string') {
+        return res.status(400).json({ success: false, error: 'projectKey is required' });
+      }
+      const types: string[] = Array.isArray(issueTypes) ? issueTypes.filter((t) => typeof t === 'string') : [];
+
+      const config = await getStoredJiraConfig();
+      if (!config) {
+        return res.status(400).json({
+          success: false,
+          error: 'Jira is not connected. Connect it under Tools → Jira first.',
+          code: 'JIRA_NOT_CONNECTED',
+        });
+      }
+
+      const cap = Math.min(Math.max(Number(maxResults) || 100, 1), 200);
+      const issues: JiraImportedIssue[] = await searchIssues(config, projectKey, types, cap);
+
+      let imported = 0;
+      let updated = 0;
+      let skipped = 0;
+      const requirements: any[] = [];
+
+      for (const issue of issues) {
+        // Build the metadata envelope of live Jira facts shown in the Hub.
+        const jiraMeta = {
+          source: 'jira',
+          sourceId: issue.key,
+          jira: {
+            key: issue.key,
+            issueType: issue.issueType,
+            status: issue.status,
+            priority: issue.priority ?? null,
+            assignee: issue.assignee ?? null,
+            sprint: issue.sprint ?? null,
+            labels: issue.labels ?? [],
+            updated: issue.updated ?? null,
+            url: issue.url,
+            projectKey,
+          },
+        };
+
+        const existing = await getRequirementBySourceId({
+          companyId,
+          projectId,
+          source: 'jira',
+          sourceId: issue.key,
+        });
+
+        if (existing) {
+          const row = await updateRequirementFromSource(existing.id, companyId, {
+            title: issue.summary,
+            description: issue.description || null,
+            priority: mapJiraPriority(issue.priority),
+            metadata: { ...(existing.metadata || {}), ...jiraMeta },
+            syncStatus: 'synced',
+          });
+          if (row) {
+            updated++;
+            requirements.push(row);
+          } else {
+            skipped++;
+          }
+          continue;
+        }
+
+        const row = await createRequirement({
+          companyId,
+          projectId,
+          title: issue.summary,
+          description: issue.description || null,
+          category: mapJiraCategory(issue.issueType),
+          priority: mapJiraPriority(issue.priority),
+          acceptanceCriteria: null,
+          status: mapJiraStatus(issue.status),
+          tags: issue.labels && issue.labels.length ? issue.labels : null,
+          createdBy: userId,
+          metadata: jiraMeta,
+          source: 'jira',
+          sourceId: issue.key,
+          syncStatus: 'synced',
+          environmentId: environmentId ?? null,
+          sprintId: sprintId ?? null,
+        });
+        imported++;
+        requirements.push(row);
+      }
+
+      logger.info(MOD, 'Jira import complete', {
+        companyId, projectId, projectKey, types, imported, updated, skipped, total: issues.length,
+      });
+
+      res.json({
+        success: true,
+        data: { imported, updated, skipped, total: issues.length, requirements },
+      });
+    } catch (error: any) {
+      logger.error(MOD, 'POST /jira/import failed', { error: error?.message });
+      res.status(500).json({ success: false, error: 'Failed to import from Jira' });
+    }
+  });
 
   /* ─── Coverage summary (STATIC — must precede /:id) ──────────────── */
   router.get('/coverage-summary', async (req: Request, res: Response) => {
@@ -190,7 +392,7 @@ export function createRequirementsRouter(): Router {
     try {
       const companyId = (req as any).companyId;
       const projectId = (req as any).projectId ?? null;
-      const { category, priority, status, search } = req.query;
+      const { category, priority, status, source, search } = req.query;
 
       const limit = req.query.limit ? parseInt(String(req.query.limit), 10) : undefined;
       const offset = req.query.offset ? parseInt(String(req.query.offset), 10) : undefined;
@@ -201,6 +403,7 @@ export function createRequirementsRouter(): Router {
         category: category ? String(category) : undefined,
         priority: priority ? String(priority) : undefined,
         status: status ? String(status) : undefined,
+        source: source ? String(source) : undefined,
         search: search ? String(search) : undefined,
         limit: Number.isFinite(limit) ? limit : undefined,
         offset: Number.isFinite(offset) ? offset : undefined,
