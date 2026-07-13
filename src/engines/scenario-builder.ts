@@ -67,6 +67,9 @@ const PROVENANCE_SOURCE_SLUG: Record<ProvenanceSource, DraftTestCase['source']> 
   'Acceptance Criteria': 'acceptance_criteria',
   'App Knowledge': 'app_knowledge',
   'Test Data': 'test_data',
+  // Deep Coverage scenarios are domain best-practice, grounded in the QA
+  // knowledge base obligations (never hallucinated). They relay as 'knowledge'.
+  'Deep Coverage': 'knowledge',
 };
 
 /* ------------------------------------------------------------------ */

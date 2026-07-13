@@ -150,9 +150,22 @@ describe('buildDraftTestCases — pure transform (no existence decisions)', () =
       'authentication',
     );
     const { drafts } = buildDraftTestCases(plan, LOGIN_KNOWLEDGE, LOGIN_REQ);
-    expect(drafts.map(d => d.scenarioId).sort()).toEqual(
-      ['auth-neg-empty-fields', 'auth-neg-wrong-password', 'auth-pos-valid'],
-    );
+    const ids = new Set(drafts.map(d => d.scenarioId));
+    // The three mandatory KB obligations are present...
+    for (const kb of ['auth-neg-empty-fields', 'auth-neg-wrong-password', 'auth-pos-valid']) {
+      expect(ids.has(kb)).toBe(true);
+    }
+    // ...and no conditional PHANTOMS were invented from the coverage type alone.
+    for (const phantom of ['auth-neg-locked-user', 'auth-sec-injection', 'auth-sec-session', 'auth-pos-logout']) {
+      expect(ids.has(phantom)).toBe(false);
+    }
+    // The only non-KB draft (if any) is the requirement-grounded step scenario
+    // (Sprint 5.1 completeness) — never an invented phantom.
+    for (const d of drafts) {
+      const isKb = d.scenarioId.startsWith('auth-');
+      const isReqStep = d.scenarioId.startsWith('req-step-');
+      expect(isKb || isReqStep).toBe(true);
+    }
   });
 
   it('reflects the planner: explicit lockout evidence yields strictly more drafts than a bare login', () => {
@@ -204,9 +217,11 @@ describe('buildDraftTestCases — fail-open', () => {
     expect(groundedCount).toBe(0);
     for (const d of drafts) {
       // Even with no App Profile, `source` still relays the planner's evidence
-      // source (here the core scenario is derived from the Requirement) —
-      // grounding absence is reflected only in `grounded`.
-      expect(d.source).toBe('requirement');
+      // source — the core scenario is derived from the Requirement, and any
+      // Sprint 5.1 requirement-step scenario relays 'requirement' or (when the
+      // step came from acceptance criteria) 'acceptance_criteria'. Grounding
+      // absence is reflected only in `grounded`.
+      expect(['requirement', 'acceptance_criteria']).toContain(d.source);
       expect(d.grounded).toBe(false);
       expect(d.steps.length).toBeGreaterThan(0);
     }
@@ -561,17 +576,22 @@ describe('No invention — authentication (quality over quantity)', () => {
       'authentication',
     );
     const { drafts } = buildDraftTestCases(plan, LOGIN_KNOWLEDGE, LOGIN_REQ);
-    const ids = drafts.map(d => d.scenarioId);
+    const ids = new Set(drafts.map(d => d.scenarioId));
     // The KB obligations for a bare credential login: valid + invalid + required.
-    expect(ids.sort()).toEqual(
-      ['auth-neg-empty-fields', 'auth-neg-wrong-password', 'auth-pos-valid'],
-    );
+    for (const kb of ['auth-neg-empty-fields', 'auth-neg-wrong-password', 'auth-pos-valid']) {
+      expect(ids.has(kb)).toBe(true);
+    }
     // The conditional (mechanism-specific) scenarios are gone — nothing in the
     // bare requirement justifies them.
-    expect(ids).not.toContain('auth-sec-injection');
-    expect(ids).not.toContain('auth-neg-invalid-identifier-format');
-    expect(ids).not.toContain('auth-edge-password-masking');
-    expect(ids).not.toContain('auth-neg-locked-user');
+    expect(ids.has('auth-sec-injection')).toBe(false);
+    expect(ids.has('auth-neg-invalid-identifier-format')).toBe(false);
+    expect(ids.has('auth-edge-password-masking')).toBe(false);
+    expect(ids.has('auth-neg-locked-user')).toBe(false);
+    // Any additional draft is the requirement-grounded step (Sprint 5.1), never
+    // an invented mechanism phantom.
+    for (const d of drafts) {
+      expect(d.scenarioId.startsWith('auth-') || d.scenarioId.startsWith('req-step-')).toBe(true);
+    }
   });
 
   it('explicit evidence (acceptance criteria) DOES justify the corresponding scenarios', () => {
