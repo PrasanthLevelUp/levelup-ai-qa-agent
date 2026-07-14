@@ -1032,6 +1032,12 @@ export function createTestCoverageRouter(): Router {
           intelligence: scriptResult.intelligence,
           // Framework audit (Phase 1: Impact Analysis + Quality Report)
           ...(scriptResult.frameworkAnalysis ? { frameworkAnalysis: scriptResult.frameworkAnalysis } : {}),
+          // Step 1/2 — Repository Profile snapshot (developer debug panel).
+          ...(scriptResult.profileDebug ? { profileDebug: scriptResult.profileDebug } : {}),
+          // Repository Intelligence Audit — diagnostic Q1-Q4 (no score, no gate).
+          ...(scriptResult.repositoryIntelligenceAudit
+            ? { repositoryIntelligenceAudit: scriptResult.repositoryIntelligenceAudit }
+            : {}),
           github: {
             prUrl: prResult.prUrl,
             prNumber: prResult.prNumber,
