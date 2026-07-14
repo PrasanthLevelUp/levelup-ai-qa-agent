@@ -1034,8 +1034,10 @@ export function createTestCoverageRouter(): Router {
           ...(scriptResult.frameworkAnalysis ? { frameworkAnalysis: scriptResult.frameworkAnalysis } : {}),
           // Step 1/2 — Repository Profile snapshot (developer debug panel).
           ...(scriptResult.profileDebug ? { profileDebug: scriptResult.profileDebug } : {}),
-          // Step 3/4 — deterministic repository reuse audit + score.
-          ...(scriptResult.reuseVerification ? { reuseVerification: scriptResult.reuseVerification } : {}),
+          // Repository Intelligence Audit — diagnostic Q1-Q4 (no score, no gate).
+          ...(scriptResult.repositoryIntelligenceAudit
+            ? { repositoryIntelligenceAudit: scriptResult.repositoryIntelligenceAudit }
+            : {}),
           github: {
             prUrl: prResult.prUrl,
             prNumber: prResult.prNumber,

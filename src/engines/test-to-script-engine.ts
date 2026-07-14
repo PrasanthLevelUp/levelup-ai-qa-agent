@@ -46,10 +46,11 @@ import {
 import {
   summarizeProfileForDebug,
   formatProfileSummary,
-  verifyRepoReuse,
+  auditRepositoryIntelligence,
+  formatAudit,
   type RepositoryProfileDebugSummary,
-  type ReuseVerificationReport,
-} from '../script-gen/repo-reuse-verifier';
+  type RepositoryIntelligenceAudit,
+} from '../script-gen/repo-intelligence-auditor';
 import { auditFramework, type GenerationContext } from '../script-gen/framework-auditor';
 import { extractElementDescriptions } from '../utils/element-descriptions';
 import type { KnowledgeItem } from '../ai/knowledge-optimizer';
@@ -95,16 +96,6 @@ export interface TestToScriptInput {
   framework?: 'playwright';          // future: cypress, selenium
   baseUrl?: string;                   // the application URL for navigate()
   outputDir?: string;                 // e.g. "tests/generated"
-  /**
-   * When true, a repository reuse score below the threshold (or any CRITICAL
-   * violation) makes generation THROW instead of returning poor scripts
-   * (Step 4 gate). Defaults to false: the audit still runs and is attached to
-   * the result, but the pipeline only WARNs. Reversible / non-breaking.
-   * Overridable globally via SCRIPTGEN_ENFORCE_REPO_REUSE=true.
-   */
-  enforceRepoReuse?: boolean;
-  /** Custom reuse pass mark (0–100). Defaults to DEFAULT_REUSE_THRESHOLD (80). */
-  repoReuseThreshold?: number;
 }
 
 export interface GeneratedScriptFile {
@@ -147,17 +138,18 @@ export interface TestToScriptResult {
   /** Framework audit analysis (Phase 1: Impact Analysis + Quality Report) */
   frameworkAnalysis?: import('../script-gen/framework-auditor').FrameworkAuditResult;
   /**
-   * Step 1/2 snapshot of the Repository Profile that reached generation. Null
-   * when no repository profile was loaded (greenfield). Powers the developer
+   * Snapshot of the Repository Profile that reached generation (Q1). Null when
+   * no repository profile was loaded (greenfield). Powers the developer
    * Repository Intelligence debug panel and the "Profile Loaded" log.
    */
   profileDebug?: RepositoryProfileDebugSummary | null;
   /**
-   * Step 3/4 deterministic post-generation reuse audit: did the emitted scripts
-   * actually honour the repository's reusable assets, or fall back to generic,
-   * hardcoded code? Always attached when a repo profile was present.
+   * Repository Intelligence Audit (Q1–Q4): did the profile load, reach the
+   * prompt builder, get included in the LLM prompt, and did the generated
+   * scripts follow it (per-asset checklist)? Diagnostic only — no score, no
+   * gate. Always attached when a repo profile was present.
    */
-  reuseVerification?: ReuseVerificationReport;
+  repositoryIntelligenceAudit?: RepositoryIntelligenceAudit;
 }
 
 /**
@@ -552,57 +544,35 @@ export class TestToScriptEngine {
       }
     }
 
-    // ── Step 3/4: deterministic post-generation Repository Reuse audit.
-    //    Runs ONLY when a repository profile was actually loaded (otherwise the
-    //    run is greenfield and there is nothing to reuse). The score is always
-    //    attached; Step 4 only THROWS when enforcement is explicitly opted in.
-    let reuseVerification: ReuseVerificationReport | undefined;
+    // ── Repository Intelligence Audit (diagnostic, NEVER a gate).
+    //    Answers 4 questions on real data: (Q1) did the Repository Profile
+    //    load? (Q2) did it reach the Prompt Builder? (Q3) was it actually
+    //    included in the LLM prompt — showing the exact prompt section? (Q4)
+    //    did the generated script follow it — a per-asset PASS/FAIL checklist.
+    //    No score, no threshold, no enforcement. Runs only when a profile was
+    //    loaded (otherwise the run is greenfield and there is nothing to audit).
+    let repositoryIntelligenceAudit: RepositoryIntelligenceAudit | undefined;
     if (intel.repoProfile) {
       try {
-        const threshold =
-          input.repoReuseThreshold ??
-          (Number.isFinite(Number(process.env.SCRIPTGEN_REPO_REUSE_THRESHOLD))
-            ? Number(process.env.SCRIPTGEN_REPO_REUSE_THRESHOLD)
-            : undefined);
-        reuseVerification = verifyRepoReuse(
-          intel.repoProfile,
-          files.map((f) => ({ path: f.filePath, content: f.content })),
-          threshold != null ? { threshold } : {},
+        repositoryIntelligenceAudit = auditRepositoryIntelligence({
+          profile: intel.repoProfile,
+          files: files.map((f) => ({ path: f.filePath, content: f.content })),
+          promptSection: intel.repoGuide?.promptBlock ?? null,
+          reachedPromptBuilder: !!intel.repoGuide,
+        });
+        const anyFail = repositoryIntelligenceAudit.checklist.some(
+          (row) => row.status === 'FAIL',
         );
-        const logPayload = {
-          score: reuseVerification.score,
-          threshold: reuseVerification.threshold,
-          passed: reuseVerification.passed,
-          filesAudited: reuseVerification.filesAudited,
-          violations: reuseVerification.violations.map(
-            (v) => `[${v.severity}] ${v.ruleId} (${v.file ?? '-'}) x${v.occurrences}`,
-          ),
-        };
-        if (reuseVerification.passed) {
-          logger.info(MOD, `✅ ${reuseVerification.verdict}`, logPayload);
+        const rendered = formatAudit(repositoryIntelligenceAudit);
+        if (anyFail) {
+          logger.warn(MOD, `Repository Intelligence Audit — divergences found\n${rendered}`);
         } else {
-          logger.warn(MOD, `🚨 ${reuseVerification.verdict}`, logPayload);
+          logger.info(MOD, `Repository Intelligence Audit\n${rendered}`);
         }
-
-        const enforce =
-          input.enforceRepoReuse ?? process.env.SCRIPTGEN_ENFORCE_REPO_REUSE === 'true';
-        if (enforce && !reuseVerification.passed) {
-          const critical = reuseVerification.violations
-            .filter((v) => v.severity === 'critical' || v.severity === 'high')
-            .map((v) => `${v.ruleId}: ${v.message}`)
-            .join('; ');
-          throw new Error(
-            `${reuseVerification.verdict} — generation rejected (enforceRepoReuse). ` +
-              `Violations: ${critical || 'reuse score below threshold'}`,
-          );
-        }
-      } catch (verErr: any) {
-        // A thrown ENFORCE error must propagate; a verifier bug must not.
-        if (/generation rejected \(enforceRepoReuse\)/.test(verErr?.message ?? '')) {
-          throw verErr;
-        }
-        logger.warn(MOD, 'Repo reuse verification failed (non-blocking)', {
-          error: verErr?.message,
+      } catch (auditErr: any) {
+        // A diagnostic must never break generation.
+        logger.warn(MOD, 'Repository Intelligence Audit failed (non-blocking)', {
+          error: auditErr?.message,
         });
       }
     }
@@ -617,7 +587,7 @@ export class TestToScriptEngine {
       intelligence,
       ...(frameworkAnalysis ? { frameworkAnalysis } : {}),
       ...(intel.profileDebug ? { profileDebug: intel.profileDebug } : {}),
-      ...(reuseVerification ? { reuseVerification } : {}),
+      ...(repositoryIntelligenceAudit ? { repositoryIntelligenceAudit } : {}),
     };
   }
 
