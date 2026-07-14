@@ -15,6 +15,7 @@ import {
   ScenarioLike,
   ExistingTestCandidate,
 } from '../../src/coverage-intelligence/existing-test-discovery';
+import { CoverageDecision } from '../../src/coverage-intelligence/types';
 import type { RepositoryProfile } from '../../src/context/types';
 
 /* ------------------------------------------------------------------ */
@@ -144,7 +145,7 @@ describe('acceptance criteria', () => {
     };
     const [res] = discoverExistingTests([scenario], profile);
     expect(res.status).toBe('existing');
-    expect(res.recommendation).toBe('reuse');
+    expect(res.recommendation).toBe(CoverageDecision.REUSE);
     expect(res.existingTest).toContain('tests/login/locked-user.spec.ts');
     expect(res.confidence).toBeGreaterThanOrEqual(72);
     expect(res.matchedOn).toContain('locked');
@@ -160,7 +161,7 @@ describe('acceptance criteria', () => {
     };
     const [res] = discoverExistingTests([scenario], profile);
     expect(res.status).toBe('missing');
-    expect(res.recommendation).toBe('generate');
+    expect(res.recommendation).toBe(CoverageDecision.GENERATE);
     expect(res.existingTest).toBeNull();
     expect(res.confidence).toBeLessThan(40);
   });
@@ -212,7 +213,7 @@ describe('polarity guard', () => {
       cands.map((c) => tokenize(`${c.testName}`)),
       { existingThreshold: 0.72, partialThreshold: 0.4, maxAlternatives: 3, scorer: new TfidfCosineScorer() },
     );
-    expect(res.recommendation).not.toBe('reuse');
+    expect(res.recommendation).not.toBe(CoverageDecision.REUSE);
   });
 });
 
@@ -241,7 +242,7 @@ describe('discoverExistingTests (batch)', () => {
       testSuites: [],
       businessFlows: [],
     } as unknown as RepositoryProfile);
-    expect(results.every((r) => r.status === 'missing' && r.recommendation === 'generate')).toBe(true);
+    expect(results.every((r) => r.status === 'missing' && r.recommendation === CoverageDecision.GENERATE)).toBe(true);
     expect(results.every((r) => r.confidence === 0)).toBe(true);
   });
 

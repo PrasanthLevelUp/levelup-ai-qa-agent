@@ -44,6 +44,7 @@
  */
 
 import type { RepositoryProfile, TestSuiteInfo, BusinessFlow } from '../context/types';
+import { CoverageDecision } from './types';
 
 /* ------------------------------------------------------------------ */
 /*  Public types                                                       */
@@ -64,7 +65,6 @@ export interface ScenarioLike {
 }
 
 export type CoverageStatus = 'existing' | 'partial' | 'missing';
-export type CoverageRecommendation = 'reuse' | 'extend' | 'generate';
 
 /** One candidate existing test drawn from the RepositoryProfile. */
 export interface ExistingTestCandidate {
@@ -89,7 +89,7 @@ export interface ScenarioCoverage {
   confidence: number;
   /** Best matching existing test ("filePath :: testName"), or null when missing. */
   existingTest: string | null;
-  recommendation: CoverageRecommendation;
+  recommendation: CoverageDecision;
   /** The distinctive normalized terms that drove the match (explainability). */
   matchedOn: string[];
   /** Human one-liner explaining the decision. */
@@ -363,7 +363,7 @@ export function discoverForScenario(
       status: 'missing',
       confidence: 0,
       existingTest: null,
-      recommendation: 'generate',
+      recommendation: CoverageDecision.GENERATE,
       matchedOn: [],
       reason:
         candidates.length === 0
@@ -416,7 +416,7 @@ export function discoverForScenario(
       status: 'missing',
       confidence: 0,
       existingTest: null,
-      recommendation: 'generate',
+      recommendation: CoverageDecision.GENERATE,
       matchedOn: [],
       reason: 'No existing test shares meaningful terms with this scenario.',
       alternatives: [],
@@ -436,7 +436,7 @@ export function discoverForScenario(
       status: 'missing',
       confidence: 0,
       existingTest: null,
-      recommendation: 'generate',
+      recommendation: CoverageDecision.GENERATE,
       matchedOn: [],
       reason:
         'Only generic terms overlap with existing tests (no distinctive shared concept) — this is new coverage.',
@@ -447,7 +447,7 @@ export function discoverForScenario(
   const confidence = Math.round(best.score * 100);
 
   let status: CoverageStatus;
-  let recommendation: CoverageRecommendation;
+  let recommendation: CoverageDecision;
   let reason: string;
   const polarityCapped =
     rawScores[best.i] >= opts.existingThreshold &&
@@ -455,17 +455,17 @@ export function discoverForScenario(
 
   if (best.score >= opts.existingThreshold) {
     status = 'existing';
-    recommendation = 'reuse';
+    recommendation = CoverageDecision.REUSE;
     reason = `Strong match with an existing test — reuse it instead of generating a duplicate.`;
   } else if (best.score >= opts.partialThreshold) {
     status = 'partial';
-    recommendation = 'extend';
+    recommendation = CoverageDecision.EXTEND;
     reason = polarityCapped
       ? `Related test exists but its polarity differs (e.g. positive vs negative path) — extend it rather than duplicate.`
       : `A related test exists but does not fully cover this scenario — extend it.`;
   } else {
     status = 'missing';
-    recommendation = 'generate';
+    recommendation = CoverageDecision.GENERATE;
     reason = `No sufficiently similar test found — this is new coverage.`;
   }
 
