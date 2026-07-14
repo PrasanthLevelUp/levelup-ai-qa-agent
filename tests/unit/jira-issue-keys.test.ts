@@ -102,6 +102,21 @@ describe('parseIssueKeys', () => {
     ).toEqual({ valid: ['AUTH-123', 'PAY-44'], invalid: [] });
   });
 
+  it('mixes bare keys and browse URLs across newlines (common copy-paste workflow)', () => {
+    // Real-world: copy a mix of keys and URLs from a backlog, paste them all.
+    const input = `AUTH-123
+
+https://company.atlassian.net/browse/PAY-45
+
+WEB-101
+
+https://company.atlassian.net/browse/LOGIN-88`;
+    expect(parseIssueKeys(input)).toEqual({
+      valid: ['AUTH-123', 'PAY-45', 'WEB-101', 'LOGIN-88'],
+      invalid: [],
+    });
+  });
+
   it('accepts an array of tokens', () => {
     expect(parseIssueKeys(['AUTH-123', 'PAY-44'])).toEqual({
       valid: ['AUTH-123', 'PAY-44'],
