@@ -54,6 +54,7 @@ import {
   type PromptSectionBreakdown,
   type OptimizeStats,
 } from './prompt-optimizer';
+import { stageMetric, summarizeStages, type StageMetric, type StageShare } from '../ai/generation-metrics';
 
 const MOD = 'test-coverage-engine';
 
@@ -745,6 +746,10 @@ export interface GenerationResult {
       scenarioCount?: number;
       /** Number of committed test cases produced. */
       testCaseCount?: number;
+      /** Per-stage token + time telemetry (Sprint 6.x). Splits the opaque run
+       *  total into the stages that actually spend tokens/time, each with its
+       *  % share — so the real hot stage is visible before any optimization. */
+      stageBreakdown?: StageShare[];
     };
   };
 }
@@ -1349,6 +1354,14 @@ Return ONLY valid JSON, no markdown fences.`;
     promptTokens: number;
     /** Completion (output) tokens for the generation call. */
     completionTokens: number;
+    /** QA Standard repair call cost — reported SEPARATELY so the per-stage
+     *  breakdown can itemize it (previously these tokens were silently dropped,
+     *  under-counting the run). Zero when no repair pass ran. */
+    repairTokens: number;
+    repairPromptTokens: number;
+    repairCompletionTokens: number;
+    repairMs: number;
+    repairCalls: number;
     /** Size of the generation prompt actually sent — for measurability
      *  (prompt size → output volume → tokens/cost), per the "measure, don't
      *  just keep raising the budget" principle. */
@@ -1830,6 +1843,14 @@ Return ONLY valid JSON. Address EVERY selected coverage type, organise scenarios
     // full output budget and a generous prompt-char budget so neither the input
     // context nor the JSON schema at the end of the prompt is truncated.
     const resp = await this.callLLM(prompt, maxOutputTokens, { complexity: 'complex', maxPromptChars });
+    // QA Standard repair accumulators — tokens spent by the (optional) targeted
+    // repair pass. Tracked separately from the main generation call so the
+    // per-stage breakdown is honest. Previously these tokens were discarded.
+    let repairTokens = 0;
+    let repairPromptTokens = 0;
+    let repairCompletionTokens = 0;
+    let repairMs = 0;
+    let repairCalls = 0;
     let parsed: {
       scenarios?: TestScenario[];
       testCases?: TestCase[];
@@ -1901,10 +1922,18 @@ Return ONLY valid JSON. Address EVERY selected coverage type, organise scenarios
             fixesById[c.scenarioId] = violationsToInstructions(report.byId.get(c.scenarioId) ?? []);
           }
           try {
+            const repairStart = Date.now();
             const repairResp = await this.callLLM(
               buildRepairPrompt(repairInputs, fixesById), maxOutputTokens,
               { complexity: 'standard', maxPromptChars },
             );
+            // Attribute the repair call's cost regardless of whether the repair
+            // is ultimately accepted — the tokens were spent either way.
+            repairMs += Date.now() - repairStart;
+            repairCalls += 1;
+            repairTokens += repairResp.tokensUsed;
+            repairPromptTokens += repairResp.promptTokens;
+            repairCompletionTokens += repairResp.completionTokens;
             const repairParsed = JSON.parse(repairResp.content);
             // Overlay ONLY the failing subset (applyPolish enforces the subset
             // count contract); then splice the repaired cases back by id.
@@ -1983,6 +2012,11 @@ Return ONLY valid JSON. Address EVERY selected coverage type, organise scenarios
       tokensUsed: resp.tokensUsed,
       promptTokens: resp.promptTokens,
       completionTokens: resp.completionTokens,
+      repairTokens,
+      repairPromptTokens,
+      repairCompletionTokens,
+      repairMs,
+      repairCalls,
       promptChars: prompt.length,
       promptBreakdown,
       promptOptimization: optimizeStats,
@@ -2214,9 +2248,11 @@ Return ONLY valid JSON array.`;
     // the number of coverage types selected, so the model is never forced to
     // drop scenarios/cases to fit a fixed budget (user directive). Zero-token:
     // planScenarios is pure/deterministic.
+    const planningStart = Date.now();
     const plannedForBudget = SCENARIO_PLANNER_ENABLED
       ? planScenarios(input, coverageTypes, analysis.featureType, knowledge, deepCoverage).scenarios.length
       : 0;
+    const planningMs = Date.now() - planningStart;
     const outputBudget = coverageDrivenOutputBudget(
       plannedForBudget, coverageTypes.length, tierCfg.maxOutputTokens,
     );
@@ -2255,37 +2291,43 @@ Return ONLY valid JSON array.`;
     // open. Can be disabled via options.deduplicate=false. Applied to both buckets.
     const dedupWork = async (): Promise<{
       testCases: TestCase[]; suggestedTestCases: TestCase[]; removed: number;
+      tokensUsed: number; durationMs: number;
     }> => {
+      const dedupStageStart = Date.now();
       if (options?.deduplicate === false) {
-        return { testCases: rawTestCases, suggestedTestCases: rawSuggested, removed: 0 };
+        return { testCases: rawTestCases, suggestedTestCases: rawSuggested, removed: 0, tokensUsed: 0, durationMs: 0 };
       }
       let kept = rawTestCases;
       let keptSuggested = rawSuggested;
       let removed = 0;
+      let tokensUsed = 0; // embeddings tokens across both dedup passes (previously uncounted)
       if (rawTestCases.length > 1) {
         const dedup = await this.deduplicateTestCases(rawTestCases);
         kept = dedup.kept;
         removed += dedup.removed;
+        tokensUsed += dedup.tokensUsed;
       }
       if (rawSuggested.length > 1) {
         const dedupS = await this.deduplicateTestCases(rawSuggested);
         keptSuggested = dedupS.kept;
         removed += dedupS.removed;
+        tokensUsed += dedupS.tokensUsed;
       }
-      return { testCases: kept, suggestedTestCases: keptSuggested, removed };
+      return { testCases: kept, suggestedTestCases: keptSuggested, removed, tokensUsed, durationMs: Date.now() - dedupStageStart };
     };
 
     // Phase 6: Gap analysis — only when the caller asked for it AND the
     // requirement cleared the complexity gate (Priority 3). Saves a full LLM
     // call for simple requirements.
-    const gapWork = async (): Promise<{ gaps: CoverageGap[]; tokensUsed: number; promptTokens?: number; completionTokens?: number }> => {
+    const gapWork = async (): Promise<{ gaps: CoverageGap[]; tokensUsed: number; promptTokens?: number; completionTokens?: number; durationMs: number }> => {
+      const gapStageStart = Date.now();
       if (!runGapAnalysis) {
         logger.info(MOD, 'Gap analysis skipped — not requested or below complexity gate');
-        return { gaps: [], tokensUsed: 0 };
+        return { gaps: [], tokensUsed: 0, durationMs: 0 };
       }
       const gapResult = await this.analyzeCoverageGaps(input, analysis, scenarios, knowledge);
       logger.info(MOD, 'Gap analysis complete', { gaps: gapResult.gaps.length });
-      return gapResult;
+      return { ...gapResult, durationMs: Date.now() - gapStageStart };
     };
 
     const [dedupResult, gapResult] = await Promise.all([dedupWork(), gapWork()]);
@@ -2296,14 +2338,95 @@ Return ONLY valid JSON array.`;
     const t3 = gapResult.tokensUsed;
     const p3 = gapResult.promptTokens ?? 0;      // gap-analysis prompt tokens
     const c3 = gapResult.completionTokens ?? 0;  // gap-analysis completion tokens
+    const dedupTokens = dedupResult.tokensUsed;  // embeddings tokens (previously uncounted)
+    const dedupMs = dedupResult.durationMs;
+    const gapMs = gapResult.durationMs;
 
-    const totalTokens = t1 + t2 + t3;
+    // QA-repair tokens: a second generation-model round-trip that fixes format
+    // violations. Previously its usage was silently discarded, under-reporting
+    // the run. Now attributed to its own stage.
+    const repairTokens = gen.repairTokens;
+    const repairPromptTokens = gen.repairPromptTokens;
+    const repairCompletionTokens = gen.repairCompletionTokens;
+
+    // Honest totals: every LLM + embeddings call the run actually made. Dedup
+    // embeddings report only a prompt/input dimension (no completion), so they
+    // land on the prompt side.
+    const totalTokens = t1 + t2 + repairTokens + t3 + dedupTokens;
     // Prompt (input) vs completion (output) totals across every LLM call. This
     // is what makes token analytics honest: the UI can now show WHERE tokens go
     // (big input prompt vs small output) instead of one opaque total.
-    const promptTokensTotal = p1 + p2 + p3;
-    const completionTokensTotal = c1 + c2 + c3;
+    const promptTokensTotal = p1 + p2 + repairPromptTokens + p3 + dedupTokens;
+    const completionTokensTotal = c1 + c2 + repairCompletionTokens + c3;
     const estimatedCostUsd = estimateCostUsd(promptTokensTotal, completionTokensTotal);
+
+    // ── Per-stage token telemetry (Sprint 6.x) ──────────────────────────────
+    // Split the opaque run total into the stages that actually spend tokens/time
+    // so the real hot stage is visible BEFORE any optimization. Deterministic
+    // stages (planner) are reported at a truthful ZERO, never null/estimated.
+    const stages: StageMetric[] = [
+      stageMetric({
+        stage: 'Requirement Analysis',
+        deterministic: !tierCfg.runAnalysis,
+        llmCalls: tierCfg.runAnalysis ? 1 : 0,
+        promptTokens: tierCfg.runAnalysis ? p1 : 0,
+        completionTokens: tierCfg.runAnalysis ? c1 : 0,
+        totalTokens: tierCfg.runAnalysis ? t1 : 0,
+        durationMs: analysisMs,
+        note: tierCfg.runAnalysis ? undefined : 'heuristic (tier-skipped, zero-token)',
+      }),
+      stageMetric({
+        stage: 'Scenario Planning',
+        deterministic: true,
+        llmCalls: 0,
+        durationMs: planningMs,
+        note: 'deterministic planner (zero-token)',
+      }),
+      stageMetric({
+        stage: 'Scenario + Test Case Generation',
+        llmCalls: 1,
+        promptTokens: p2,
+        completionTokens: c2,
+        totalTokens: t2,
+        // Subtract repair time so the single generation call's wall-clock is not
+        // conflated with the separate repair round-trip below.
+        durationMs: Math.max(0, generationMs - gen.repairMs),
+        note: 'single batched call — all scenarios + cases',
+      }),
+    ];
+    if (gen.repairCalls > 0) {
+      stages.push(stageMetric({
+        stage: 'QA Repair',
+        llmCalls: gen.repairCalls,
+        promptTokens: repairPromptTokens,
+        completionTokens: repairCompletionTokens,
+        totalTokens: repairTokens,
+        durationMs: gen.repairMs,
+        note: 'format-violation fix round-trip',
+      }));
+    }
+    stages.push(stageMetric({
+      stage: 'Gap Analysis',
+      deterministic: !runGapAnalysis,
+      llmCalls: runGapAnalysis ? 1 : 0,
+      promptTokens: runGapAnalysis ? p3 : 0,
+      completionTokens: runGapAnalysis ? c3 : 0,
+      totalTokens: runGapAnalysis ? t3 : 0,
+      durationMs: gapMs,
+      note: runGapAnalysis ? undefined : 'skipped (not requested or below complexity gate)',
+    }));
+    stages.push(stageMetric({
+      stage: 'Deduplication',
+      // Embeddings-backed: not an LLM completion, but not free either.
+      llmCalls: 0,
+      promptTokens: dedupTokens,
+      completionTokens: 0,
+      totalTokens: dedupTokens,
+      durationMs: dedupMs,
+      note: 'semantic embeddings (text-embedding-3-small)',
+    }));
+    const stageSummary = summarizeStages(stages);
+    const stageBreakdown = stageSummary.stages;
     const result: GenerationResult = {
       requirementAnalysis: analysis,
       scenarios,
@@ -2359,9 +2482,27 @@ Return ONLY valid JSON array.`;
           promptOptimization,
           scenarioCount: scenarios.length,
           testCaseCount: testCases.length,
+          stageBreakdown,
         },
       },
     };
+    // Per-stage token table — printed so the hot stage is visible in logs
+    // without needing the DB/UI. Each row: stage · tokens · %share · ms.
+    logger.info(MOD, 'Per-stage token telemetry', {
+      totalTokens: stageSummary.totalTokens,
+      promptTokens: stageSummary.promptTokens,
+      completionTokens: stageSummary.completionTokens,
+      totalDurationMs: stageSummary.totalDurationMs,
+      llmCalls: stageSummary.llmCalls,
+      stages: stageBreakdown.map(s => ({
+        stage: s.stage,
+        tokens: s.totalTokens,
+        pct: s.pctOfTokens,
+        ms: s.durationMs,
+        deterministic: s.deterministic,
+        note: s.note,
+      })),
+    });
     logger.info(MOD, 'Generation complete', {
       promptVersion: PROMPT_VERSION,
       engineVersion: ENGINE_VERSION,
@@ -2394,9 +2535,13 @@ Return ONLY valid JSON array.`;
   async deduplicateTestCases(
     testCases: TestCase[],
     threshold = 0.9
-  ): Promise<{ kept: TestCase[]; removed: number }> {
-    if (testCases.length < 2) return { kept: testCases, removed: 0 };
+  ): Promise<{ kept: TestCase[]; removed: number; tokensUsed: number; durationMs: number }> {
+    const dedupStart = Date.now();
+    if (testCases.length < 2) return { kept: testCases, removed: 0, tokensUsed: 0, durationMs: 0 };
 
+    // Embeddings tokens spent by this pass. Cheap (text-embedding-3-small) but
+    // NOT free — previously uncounted, which under-reported the run's true cost.
+    let tokensUsed = 0;
     try {
       // Embed a compact signature for each case: title + expected result carry the
       // semantic intent; including them keeps "same behaviour, different wording"
@@ -2410,10 +2555,12 @@ Return ONLY valid JSON array.`;
         model: modelConfig.model,
         input: signatures,
       });
+      // Embeddings usage reports prompt/total tokens (no completion dimension).
+      tokensUsed = resp.usage?.total_tokens ?? resp.usage?.prompt_tokens ?? 0;
       const vectors = resp.data.map(d => d.embedding as number[]);
       if (vectors.length !== testCases.length) {
         // Defensive: provider returned an unexpected count — skip dedup.
-        return { kept: testCases, removed: 0 };
+        return { kept: testCases, removed: 0, tokensUsed, durationMs: Date.now() - dedupStart };
       }
 
       const priorityRank = (p?: string) => ({ P0: 0, P1: 1, P2: 2, P3: 3 }[p || 'P2'] ?? 2);
@@ -2468,15 +2615,15 @@ Return ONLY valid JSON array.`;
         }
       }
 
-      if (removedIdx.size === 0) return { kept: testCases, removed: 0 };
+      if (removedIdx.size === 0) return { kept: testCases, removed: 0, tokensUsed, durationMs: Date.now() - dedupStart };
       const kept = testCases.filter((_, idx) => !removedIdx.has(idx));
       logger.info(MOD, 'Semantic dedup removed near-duplicate test cases', {
         before: testCases.length, after: kept.length, removed: removedIdx.size, threshold,
       });
-      return { kept, removed: removedIdx.size };
+      return { kept, removed: removedIdx.size, tokensUsed, durationMs: Date.now() - dedupStart };
     } catch (err: any) {
       logger.warn(MOD, 'Dedup failed (continuing with full set)', { error: err.message });
-      return { kept: testCases, removed: 0 };
+      return { kept: testCases, removed: 0, tokensUsed, durationMs: Date.now() - dedupStart };
     }
   }
 
