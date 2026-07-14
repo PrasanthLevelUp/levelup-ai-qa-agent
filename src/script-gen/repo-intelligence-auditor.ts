@@ -11,7 +11,15 @@
  *   Q4  Did the generated script follow it?                    → a per-asset
  *       checklist (Framework / Environment / Logger / Wait Strategy /
  *       Test Data / Page Objects / Completeness), each PASS | FAIL | N/A with
- *       the concrete Expected vs Actual evidence.
+ *       the concrete Expected vs Actual evidence AND a deterministic Reason
+ *       (the Generation Decision Report): MISSING_FROM_PROMPT vs
+ *       IN_PROMPT_IGNORED vs NO_MATCHING_ASSET vs INCOMPLETE_GENERATION. That
+ *       reason points straight at the layer to fix — no AI, no guessing.
+ *
+ * Platform-wide, not Script-Gen-specific: the same four questions apply to
+ * Healing, the Migration Assistant, and any future repo-grounded feature. The
+ * `RepositoryIntelligenceAuditor` facade exposes auditPrompt / auditGeneration /
+ * audit / auditHealing / auditMigration over the SAME primitives.
  *
  * Deliberately NOT here (per product direction):
  *   • No reuse *score* / percentage. A "54%" hides which of the four questions
@@ -51,6 +59,35 @@ export type AuditAsset =
   | 'Page Objects'
   | 'Completeness';
 
+/**
+ * WHY a row landed where it did — the Generation Decision Report. Deterministic,
+ * no AI. It distinguishes the three failure mechanisms so debugging is instant:
+ *
+ *   FOLLOWED              — the generated code honoured the repository guidance.
+ *   NO_MATCHING_ASSET     — the repository has nothing of this kind to reuse.
+ *   MISSING_FROM_PROMPT   — the profile had it, but it never made it into the
+ *                           prompt the LLM saw → fix the Prompt Builder.
+ *   IN_PROMPT_IGNORED     — it WAS in the prompt, yet the output diverged → the
+ *                           LLM ignored guidance → fix the generation contract.
+ *   INCOMPLETE_GENERATION — the generator shipped a half-written test (not a
+ *                           repo-guidance issue).
+ */
+export type AuditReason =
+  | 'FOLLOWED'
+  | 'NO_MATCHING_ASSET'
+  | 'MISSING_FROM_PROMPT'
+  | 'IN_PROMPT_IGNORED'
+  | 'INCOMPLETE_GENERATION';
+
+/** Human-readable one-liner for each reason (mirrors the review wording). */
+export const REASON_TEXT: Record<AuditReason, string> = {
+  FOLLOWED: 'Repository guidance followed',
+  NO_MATCHING_ASSET: 'Repository has no matching asset',
+  MISSING_FROM_PROMPT: 'Missing from prompt',
+  IN_PROMPT_IGNORED: 'Present in prompt but absent in output',
+  INCOMPLETE_GENERATION: 'Generator emitted an incomplete test',
+};
+
 /** A single row of the "Did the generated script follow it?" checklist. */
 export interface AssetAudit {
   asset: AuditAsset;
@@ -59,6 +96,11 @@ export interface AssetAudit {
   expected: string;
   /** What the generated code actually did. */
   actual: string;
+  /**
+   * The deterministic reason for the status — the Generation Decision Report.
+   * Annotated once the prompt-inclusion evidence is known (see annotateReasons).
+   */
+  reason: AuditReason;
   /** Optional clarifying note (e.g. why a check was conservative). */
   detail?: string;
   /** Files (+ occurrence counts) that drove the status. */
@@ -75,8 +117,17 @@ export interface PromptInclusionAudit {
   promptSection: string | null;
 }
 
+/**
+ * Which AI flow produced the artifacts being audited. The auditor is NOT
+ * script-gen specific — the same four questions apply to healing, migration,
+ * and any future repo-grounded feature.
+ */
+export type AuditFlow = 'script-gen' | 'healing' | 'migration' | string;
+
 /** The full Repository Intelligence Audit (Q1–Q4). */
 export interface RepositoryIntelligenceAudit {
+  /** The flow that was audited (default 'script-gen'). */
+  flow: AuditFlow;
   profileLoaded: boolean;        // Q1
   reachedPromptBuilder: boolean; // Q2
   promptInclusion: PromptInclusionAudit; // Q3
@@ -242,6 +293,7 @@ export function auditPromptInclusion(
     { label: 'Wait Strategy', re: /synchroni[sz]ation|wait/i },
     { label: 'Logger', re: /logging|logger/i },
     { label: 'Locators', re: /locators?/i },
+    { label: 'Environment', re: /environment config|env files|uses dotenv/i },
   ];
   const detectedSections = probes.filter((p) => p.re.test(section)).map((p) => p.label);
   return { included: true, detectedSections, promptSection: section };
@@ -254,6 +306,53 @@ export function auditPromptInclusion(
 export interface AuditOptions {
   /** Only audit files matching this predicate (default: specs + data modules). */
   includeFile?: (path: string) => boolean;
+  /**
+   * Asset categories detected in the LLM prompt (from auditPromptInclusion).
+   * When supplied, each FAIL row is attributed to MISSING_FROM_PROMPT vs
+   * IN_PROMPT_IGNORED. When omitted, a FAIL on an asset the repo HAS defaults to
+   * IN_PROMPT_IGNORED (we cannot prove the prompt omitted it).
+   */
+  promptDetections?: string[] | null;
+}
+
+/** Which prompt-inclusion label(s) correspond to each checklist asset. */
+const ASSET_PROMPT_LABELS: Record<AuditAsset, string[]> = {
+  Framework: ['Framework'],
+  Environment: ['Environment'],
+  Logger: ['Logger'],
+  'Wait Strategy': ['Wait Strategy'],
+  'Test Data': ['Test Data', 'Helpers'],
+  'Page Objects': ['Page Objects'],
+  Completeness: [],
+};
+
+/**
+ * Attach the deterministic Generation Decision Report reason to each row, using
+ * the prompt-inclusion evidence to separate "never made it into the prompt"
+ * from "was in the prompt but the LLM ignored it".
+ */
+function annotateReasons(
+  rows: Array<Omit<AssetAudit, 'reason'>>,
+  detected: string[] | null,
+): AssetAudit[] {
+  return rows.map((row) => {
+    let reason: AuditReason;
+    if (row.status === 'PASS') {
+      reason = 'FOLLOWED';
+    } else if (row.status === 'NOT_APPLICABLE') {
+      reason = 'NO_MATCHING_ASSET';
+    } else if (row.asset === 'Completeness') {
+      reason = 'INCOMPLETE_GENERATION';
+    } else {
+      const labels = ASSET_PROMPT_LABELS[row.asset];
+      // Only claim MISSING_FROM_PROMPT when we actually inspected the prompt and
+      // the category is absent. Without prompt evidence we default to IGNORED.
+      const inPrompt =
+        detected == null ? true : labels.some((l) => detected.includes(l));
+      reason = inPrompt ? 'IN_PROMPT_IGNORED' : 'MISSING_FROM_PROMPT';
+    }
+    return { ...row, reason };
+  });
 }
 
 /** Strip line/block comments so string matches don't fire inside comments. */
@@ -319,7 +418,9 @@ export function auditGeneratedScripts(
   const pageObjectNames = (profile.pageObjects ?? []).map((p) => p.name);
   const hasPageObjects = pageObjectNames.length > 0;
 
-  const checklist: AssetAudit[] = [];
+  // Rows are built without a `reason`; annotateReasons fills it once the
+  // prompt-inclusion evidence is applied (see return).
+  const checklist: Array<Omit<AssetAudit, 'reason'>> = [];
   const countMatches = (re: RegExp, code: string) => (code.match(re) ?? []).length;
 
   /* ---- Framework ---- */
@@ -559,7 +660,10 @@ export function auditGeneratedScripts(
     });
   }
 
-  return { checklist, filesAudited: audited.length };
+  return {
+    checklist: annotateReasons(checklist, opts.promptDetections ?? null),
+    filesAudited: audited.length,
+  };
 }
 
 /**
@@ -572,12 +676,15 @@ export function auditRepositoryIntelligence(args: {
   files: GeneratedFileInput[];
   promptSection?: string | null;
   reachedPromptBuilder?: boolean;
+  flow?: AuditFlow;
   options?: AuditOptions;
 }): RepositoryIntelligenceAudit {
   const { profile, files, promptSection, reachedPromptBuilder, options } = args;
+  const flow = args.flow ?? 'script-gen';
   const promptInclusion = auditPromptInclusion(promptSection);
   if (!profile) {
     return {
+      flow,
       profileLoaded: false,
       reachedPromptBuilder: !!reachedPromptBuilder,
       promptInclusion,
@@ -585,8 +692,14 @@ export function auditRepositoryIntelligence(args: {
       filesAudited: 0,
     };
   }
-  const { checklist, filesAudited } = auditGeneratedScripts(profile, files, options);
+  // Feed the prompt-inclusion evidence into Q4 so each FAIL is attributed to
+  // MISSING_FROM_PROMPT vs IN_PROMPT_IGNORED (the Generation Decision Report).
+  const { checklist, filesAudited } = auditGeneratedScripts(profile, files, {
+    ...options,
+    promptDetections: promptInclusion.included ? promptInclusion.detectedSections : [],
+  });
   return {
+    flow,
     profileLoaded: true,
     reachedPromptBuilder: reachedPromptBuilder ?? promptInclusion.included,
     promptInclusion,
@@ -608,7 +721,7 @@ const STATUS_MARK: Record<AuditStatus, string> = {
 /** Render the audit as the developer-facing "Repository Intelligence Audit". */
 export function formatAudit(audit: RepositoryIntelligenceAudit): string {
   const lines: string[] = [];
-  lines.push('Repository Intelligence Audit');
+  lines.push(`Repository Intelligence Audit (${audit.flow})`);
   lines.push(`  Q1 Profile loaded          : ${audit.profileLoaded ? 'YES' : 'NO'}`);
   lines.push(`  Q2 Reached Prompt Builder  : ${audit.reachedPromptBuilder ? 'YES' : 'NO'}`);
   lines.push(
@@ -620,14 +733,46 @@ export function formatAudit(audit: RepositoryIntelligenceAudit): string {
   lines.push('  Q4 Generated script followed it:');
   const pad = (s: string, n: number) => (s + ' '.repeat(n)).slice(0, n);
   for (const c of audit.checklist) {
-    lines.push(
-      `     ${pad(c.asset, 16)} ${pad(STATUS_MARK[c.status], 8)}` +
-        (c.status === 'FAIL'
-          ? `  expected: ${c.expected}  |  actual: ${c.actual}`
-          : c.status === 'PASS'
-          ? `  (${c.actual})`
-          : ''),
-    );
+    let tail = '';
+    if (c.status === 'FAIL') {
+      tail =
+        `  expected: ${c.expected}  |  actual: ${c.actual}` +
+        `  |  reason: ${REASON_TEXT[c.reason]}`;
+    } else if (c.status === 'PASS') {
+      tail = `  (${c.actual})`;
+    }
+    lines.push(`     ${pad(c.asset, 16)} ${pad(STATUS_MARK[c.status], 8)}${tail}`);
   }
   return lines.join('\n');
 }
+
+/* ------------------------------------------------------------------ */
+/*  Platform-wide facade                                               */
+/* ------------------------------------------------------------------ */
+
+/**
+ * `RepositoryIntelligenceAuditor` — the platform entry point. The four
+ * questions (loaded? in prompt? followed? why?) are NOT specific to Script
+ * Generation: Healing, the Migration Assistant, and any future repo-grounded
+ * feature all inject a repository prompt block and produce code, so they can be
+ * audited with the SAME primitives. These methods are thin, honest wrappers over
+ * the shared functions — no separate engine, no duplicated logic.
+ */
+export const RepositoryIntelligenceAuditor = {
+  /** Q3 only — inspect a prompt section for repo-context inclusion. */
+  auditPrompt: auditPromptInclusion,
+  /** Q4 only — audit generated/edited files against the profile. */
+  auditGeneration: auditGeneratedScripts,
+  /** Full Q1–Q4 audit for Script Generation (the default flow). */
+  audit: auditRepositoryIntelligence,
+  /** Full Q1–Q4 audit for a Healing run (same questions, healing artifacts). */
+  auditHealing: (args: Omit<Parameters<typeof auditRepositoryIntelligence>[0], 'flow'>) =>
+    auditRepositoryIntelligence({ ...args, flow: 'healing' }),
+  /** Full Q1–Q4 audit for a Migration Assistant run. */
+  auditMigration: (args: Omit<Parameters<typeof auditRepositoryIntelligence>[0], 'flow'>) =>
+    auditRepositoryIntelligence({ ...args, flow: 'migration' }),
+  /** Step 1 — the Repository Profile debug snapshot. */
+  summarizeProfile: summarizeProfileForDebug,
+  /** Render any audit as the developer-facing text block. */
+  format: formatAudit,
+} as const;

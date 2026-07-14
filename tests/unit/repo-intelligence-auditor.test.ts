@@ -22,8 +22,10 @@ import {
   auditGeneratedScripts,
   auditPromptInclusion,
   auditRepositoryIntelligence,
+  RepositoryIntelligenceAuditor,
   type AuditAsset,
   type AuditStatus,
+  type AuditReason,
 } from '../../src/script-gen/repo-intelligence-auditor';
 
 const FIXTURES = path.join(__dirname, '..', 'fixtures', 'repo-reuse');
@@ -71,6 +73,11 @@ function sauceDemoProfile(): RepositoryProfile {
 
 const statusOf = (checklist: Array<{ asset: AuditAsset; status: AuditStatus }>, asset: AuditAsset) =>
   checklist.find((c) => c.asset === asset)?.status;
+
+const reasonOf = (
+  checklist: Array<{ asset: AuditAsset; reason: AuditReason }>,
+  asset: AuditAsset,
+) => checklist.find((c) => c.asset === asset)?.reason;
 
 describe('summarizeProfileForDebug (Q1 evidence)', () => {
   it('surfaces the critical reusable assets for the debug panel', () => {
@@ -196,5 +203,84 @@ describe('auditRepositoryIntelligence — full Q1–Q4 assembly', () => {
     expect(audit.reachedPromptBuilder).toBe(true);
     expect(audit.promptInclusion.included).toBe(true);
     expect(audit.checklist.length).toBeGreaterThan(0);
+    expect(audit.flow).toBe('script-gen');
+  });
+});
+
+describe('Generation Decision Report — the deterministic Reason (no AI)', () => {
+  // A prompt that DID carry Test Data + Page Objects guidance, but NOT any
+  // environment/base-URL guidance. This lets the auditor separate "the prompt
+  // never told the LLM" (Environment) from "the LLM ignored it" (Test Data).
+  const promptWithDataButNoEnv = [
+    '--- REPO PATTERN GUIDE ---',
+    'Framework: playwright | Language: typescript',
+    'PAGE OBJECTS (instantiate & call): LoginPage [login]',
+    'TEST DATA ACCESS: getUser(key) from utils/testData.ts',
+    'STEP LOGGING — the repo reports progress via logger',
+  ].join('\n');
+
+  it('attributes each FAIL to the correct mechanism', () => {
+    const audit = auditRepositoryIntelligence({
+      profile: sauceDemoProfile(),
+      files: [
+        { path: 'tests/login.spec.ts', content: readFixture('broken-login.spec.ts.txt') },
+        { path: 'data/test-data.ts', content: readFixture('broken-test-data.ts.txt') },
+      ],
+      promptSection: promptWithDataButNoEnv,
+      reachedPromptBuilder: true,
+    });
+
+    // Environment guidance was NOT in the prompt → the Prompt Builder is the bug.
+    expect(statusOf(audit.checklist, 'Environment')).toBe('FAIL');
+    expect(reasonOf(audit.checklist, 'Environment')).toBe('MISSING_FROM_PROMPT');
+
+    // Test Data guidance WAS in the prompt, yet the output built a parallel
+    // module → the LLM ignored guidance.
+    expect(statusOf(audit.checklist, 'Test Data')).toBe('FAIL');
+    expect(reasonOf(audit.checklist, 'Test Data')).toBe('IN_PROMPT_IGNORED');
+
+    // Completeness is a generation defect, not a repo-guidance issue.
+    expect(statusOf(audit.checklist, 'Completeness')).toBe('FAIL');
+    expect(reasonOf(audit.checklist, 'Completeness')).toBe('INCOMPLETE_GENERATION');
+
+    // Honoured rows read FOLLOWED.
+    expect(reasonOf(audit.checklist, 'Page Objects')).toBe('FOLLOWED');
+  });
+
+  it('marks assets the repo does not have as NO_MATCHING_ASSET', () => {
+    // Strip page objects + env + data helpers → those rows become N/A.
+    const bare = sauceDemoProfile();
+    bare.pageObjects = [];
+    bare.environment = { envFiles: [], usesDotenv: false, configModule: null, envVars: [] } as any;
+    bare.helperFunctions = [];
+    const audit = auditRepositoryIntelligence({
+      profile: bare,
+      files: [{ path: 'tests/login.spec.ts', content: readFixture('good-login.spec.ts.txt') }],
+      promptSection: 'Framework: playwright',
+      reachedPromptBuilder: true,
+    });
+    expect(statusOf(audit.checklist, 'Page Objects')).toBe('NOT_APPLICABLE');
+    expect(reasonOf(audit.checklist, 'Page Objects')).toBe('NO_MATCHING_ASSET');
+  });
+});
+
+describe('RepositoryIntelligenceAuditor — platform-wide facade', () => {
+  it('exposes flow-tagged entry points that reuse the same primitives', () => {
+    const profile = sauceDemoProfile();
+    const files = [
+      { path: 'tests/login.spec.ts', content: readFixture('broken-login.spec.ts.txt') },
+    ];
+    const healing = RepositoryIntelligenceAuditor.auditHealing({ profile, files });
+    const migration = RepositoryIntelligenceAuditor.auditMigration({ profile, files });
+    expect(healing.flow).toBe('healing');
+    expect(migration.flow).toBe('migration');
+    // Same underlying audit → same findings, just a different flow label.
+    expect(statusOf(healing.checklist, 'Environment')).toBe('FAIL');
+    expect(statusOf(migration.checklist, 'Environment')).toBe('FAIL');
+    // Q3-only + Q4-only primitives are reachable from the facade too.
+    expect(RepositoryIntelligenceAuditor.auditPrompt('Framework: playwright').included).toBe(true);
+    expect(
+      RepositoryIntelligenceAuditor.auditGeneration(profile, files).checklist.length,
+    ).toBeGreaterThan(0);
   });
 });
