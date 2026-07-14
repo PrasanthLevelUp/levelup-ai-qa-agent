@@ -339,6 +339,74 @@ export async function searchIssues(
   }
 }
 
+/** The Jira fields we pull for a requirement — shared by all search paths. */
+const IMPORT_FIELDS = [
+  'summary',
+  'description',
+  'issuetype',
+  'status',
+  'priority',
+  'assignee',
+  'labels',
+  'updated',
+];
+
+/**
+ * Fetch a specific set of issues by key, in one shot, via a `key IN (...)` JQL
+ * query. This is the "Import by Issue Key" counterpart to searchIssues — it
+ * reuses the exact same fields, pagination, and mapping; only the JQL filter
+ * differs (specific keys instead of a whole project/issue-type). Keys are
+ * assumed already normalized/validated by the caller (see jira-issue-keys.ts).
+ */
+export async function searchIssuesByKeys(
+  config: JiraConfig,
+  issueKeys: string[],
+  maxResults = 200,
+): Promise<JiraImportedIssue[]> {
+  try {
+    const keys = (issueKeys || []).map((k) => k.trim()).filter(Boolean);
+    if (keys.length === 0) return [];
+
+    // key IN ("AUTH-123", "AUTH-124") — quote each key defensively.
+    const quoted = keys.map((k) => `"${k.replace(/"/g, '')}"`).join(', ');
+    const jql = `key IN (${quoted}) ORDER BY updated DESC`;
+
+    const issues: JiraImportedIssue[] = [];
+    let nextPageToken: string | undefined;
+
+    while (issues.length < maxResults) {
+      const body: Record<string, any> = {
+        jql,
+        maxResults: Math.min(100, maxResults - issues.length),
+        fields: IMPORT_FIELDS,
+      };
+      if (nextPageToken) body.nextPageToken = nextPageToken;
+
+      const res = await jiraFetch(config, '/rest/api/3/search/jql', {
+        method: 'POST',
+        body: JSON.stringify(body),
+      });
+      if (!res.ok) {
+        const errText = await res.text();
+        logger.error(MOD, 'searchIssuesByKeys failed', { status: res.status, body: errText.slice(0, 300) });
+        break;
+      }
+      const data = (await res.json()) as any;
+      const batch: any[] = data.issues || [];
+      for (const issue of batch) {
+        issues.push(mapIssue(config, issue));
+      }
+      nextPageToken = data.nextPageToken;
+      if (data.isLast || !nextPageToken || batch.length === 0) break;
+    }
+
+    return issues;
+  } catch (err) {
+    logger.error(MOD, 'searchIssuesByKeys error', { error: (err as Error).message });
+    return [];
+  }
+}
+
 /** Map a raw Jira issue payload into our requirement-friendly shape. */
 function mapIssue(config: JiraConfig, issue: any): JiraImportedIssue {
   const f = issue.fields || {};
