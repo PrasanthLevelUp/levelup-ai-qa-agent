@@ -43,6 +43,14 @@ import {
   mergeRewriteReports,
   type PageObjectRewriteReport,
 } from '../script-gen/page-object-rewriter';
+import {
+  summarizeProfileForDebug,
+  formatProfileSummary,
+  auditRepositoryIntelligence,
+  formatAudit,
+  type RepositoryProfileDebugSummary,
+  type RepositoryIntelligenceAudit,
+} from '../script-gen/repo-intelligence-auditor';
 import { auditFramework, type GenerationContext } from '../script-gen/framework-auditor';
 import { extractElementDescriptions } from '../utils/element-descriptions';
 import type { KnowledgeItem } from '../ai/knowledge-optimizer';
@@ -129,6 +137,19 @@ export interface TestToScriptResult {
   intelligence?: IntelligenceUsage;
   /** Framework audit analysis (Phase 1: Impact Analysis + Quality Report) */
   frameworkAnalysis?: import('../script-gen/framework-auditor').FrameworkAuditResult;
+  /**
+   * Snapshot of the Repository Profile that reached generation (Q1). Null when
+   * no repository profile was loaded (greenfield). Powers the developer
+   * Repository Intelligence debug panel and the "Profile Loaded" log.
+   */
+  profileDebug?: RepositoryProfileDebugSummary | null;
+  /**
+   * Repository Intelligence Audit (Q1–Q4): did the profile load, reach the
+   * prompt builder, get included in the LLM prompt, and did the generated
+   * scripts follow it (per-asset checklist)? Diagnostic only — no score, no
+   * gate. Always attached when a repo profile was present.
+   */
+  repositoryIntelligenceAudit?: RepositoryIntelligenceAudit;
 }
 
 /**
@@ -176,6 +197,8 @@ interface IntelligenceBundle {
    * (loginPage.login(...)) instead of raw `page.locator(...)` sequences.
    */
   repoProfile?: RepositoryProfile;
+  /** Step 1/2 debug snapshot of the loaded repo profile (for logging + panel). */
+  profileDebug?: RepositoryProfileDebugSummary;
   /**
    * Real base URL from the Application Profile (e.g. https://www.saucedemo.com/).
    * Used to overwrite the generated `page.goto(...)` so scripts never navigate
@@ -521,6 +544,39 @@ export class TestToScriptEngine {
       }
     }
 
+    // ── Repository Intelligence Audit (diagnostic, NEVER a gate).
+    //    Answers 4 questions on real data: (Q1) did the Repository Profile
+    //    load? (Q2) did it reach the Prompt Builder? (Q3) was it actually
+    //    included in the LLM prompt — showing the exact prompt section? (Q4)
+    //    did the generated script follow it — a per-asset PASS/FAIL checklist.
+    //    No score, no threshold, no enforcement. Runs only when a profile was
+    //    loaded (otherwise the run is greenfield and there is nothing to audit).
+    let repositoryIntelligenceAudit: RepositoryIntelligenceAudit | undefined;
+    if (intel.repoProfile) {
+      try {
+        repositoryIntelligenceAudit = auditRepositoryIntelligence({
+          profile: intel.repoProfile,
+          files: files.map((f) => ({ path: f.filePath, content: f.content })),
+          promptSection: intel.repoGuide?.promptBlock ?? null,
+          reachedPromptBuilder: !!intel.repoGuide,
+        });
+        const anyFail = repositoryIntelligenceAudit.checklist.some(
+          (row) => row.status === 'FAIL',
+        );
+        const rendered = formatAudit(repositoryIntelligenceAudit);
+        if (anyFail) {
+          logger.warn(MOD, `Repository Intelligence Audit — divergences found\n${rendered}`);
+        } else {
+          logger.info(MOD, `Repository Intelligence Audit\n${rendered}`);
+        }
+      } catch (auditErr: any) {
+        // A diagnostic must never break generation.
+        logger.warn(MOD, 'Repository Intelligence Audit failed (non-blocking)', {
+          error: auditErr?.message,
+        });
+      }
+    }
+
     return {
       requirementId,
       requirementTitle: requirement.title,
@@ -530,6 +586,8 @@ export class TestToScriptEngine {
       coverage,
       intelligence,
       ...(frameworkAnalysis ? { frameworkAnalysis } : {}),
+      ...(intel.profileDebug ? { profileDebug: intel.profileDebug } : {}),
+      ...(repositoryIntelligenceAudit ? { repositoryIntelligenceAudit } : {}),
     };
   }
 
@@ -610,6 +668,30 @@ export class TestToScriptEngine {
         repoProfile = await getRepositoryContext(String(input.repositoryId), companyId, input.projectId);
         if (repoProfile) {
           bundle.repoProfile = repoProfile;
+          // ── Step 1: "Repository Profile Loaded" — prove the profile reached
+          //    generation, with the concrete assets it carries. If any critical
+          //    bucket is empty this log makes it obvious BEFORE prompt building.
+          const profileDebug = summarizeProfileForDebug(repoProfile, {
+            repositoryId: input.repositoryId ?? null,
+          });
+          bundle.profileDebug = profileDebug;
+          logger.info(MOD, `📥 Repository Profile Loaded\n${formatProfileSummary(profileDebug)}`, {
+            repositoryId: profileDebug.repositoryId,
+            pageObjects: profileDebug.pageObjects.length,
+            utilities: profileDebug.utilities.length,
+            businessFlows: profileDebug.businessFlows,
+            testSuites: profileDebug.testSuites,
+            envConfigModule: profileDebug.envConfigModule,
+            looksComplete: profileDebug.looksComplete,
+          });
+          if (!profileDebug.looksComplete) {
+            logger.warn(
+              MOD,
+              '⚠️ Repository Profile is INCOMPLETE — one or more critical asset ' +
+                'buckets (page objects / utilities / business flows / test suites) ' +
+                'are empty. Generated scripts may fall back to generic code.',
+            );
+          }
           bundle.repoGuide = analyzeRepoPatterns(repoProfile);
           if (bundle.repoGuide) {
             logger.info(MOD, '✅ Repo patterns loaded for grounding', {
@@ -620,6 +702,17 @@ export class TestToScriptEngine {
               pageObjects: bundle.repoGuide.summary.pageObjects.length,
             });
           }
+        } else if (input.repositoryId) {
+          // Explicit, loud signal: a repositoryId WAS supplied but no scanned
+          // profile came back — this is the upstream gate failure the audit is
+          // designed to surface (nothing to reuse → generic scripts).
+          logger.warn(
+            MOD,
+            `❌ Repository Profile MISSING for repositoryId=${input.repositoryId} ` +
+              `(companyId=${companyId}, projectId=${input.projectId ?? 'none'}). ` +
+              'No scanned repository_contexts row matched — generation will be ' +
+              'greenfield and cannot reuse repository assets.',
+          );
         }
       } catch (err: any) {
         logger.warn(MOD, 'Repo context load failed (non-blocking)', { error: err?.message });
