@@ -43,6 +43,13 @@ import {
   mergeRewriteReports,
   type PageObjectRewriteReport,
 } from '../script-gen/page-object-rewriter';
+import {
+  summarizeProfileForDebug,
+  formatProfileSummary,
+  verifyRepoReuse,
+  type RepositoryProfileDebugSummary,
+  type ReuseVerificationReport,
+} from '../script-gen/repo-reuse-verifier';
 import { auditFramework, type GenerationContext } from '../script-gen/framework-auditor';
 import { extractElementDescriptions } from '../utils/element-descriptions';
 import type { KnowledgeItem } from '../ai/knowledge-optimizer';
@@ -88,6 +95,16 @@ export interface TestToScriptInput {
   framework?: 'playwright';          // future: cypress, selenium
   baseUrl?: string;                   // the application URL for navigate()
   outputDir?: string;                 // e.g. "tests/generated"
+  /**
+   * When true, a repository reuse score below the threshold (or any CRITICAL
+   * violation) makes generation THROW instead of returning poor scripts
+   * (Step 4 gate). Defaults to false: the audit still runs and is attached to
+   * the result, but the pipeline only WARNs. Reversible / non-breaking.
+   * Overridable globally via SCRIPTGEN_ENFORCE_REPO_REUSE=true.
+   */
+  enforceRepoReuse?: boolean;
+  /** Custom reuse pass mark (0–100). Defaults to DEFAULT_REUSE_THRESHOLD (80). */
+  repoReuseThreshold?: number;
 }
 
 export interface GeneratedScriptFile {
@@ -129,6 +146,18 @@ export interface TestToScriptResult {
   intelligence?: IntelligenceUsage;
   /** Framework audit analysis (Phase 1: Impact Analysis + Quality Report) */
   frameworkAnalysis?: import('../script-gen/framework-auditor').FrameworkAuditResult;
+  /**
+   * Step 1/2 snapshot of the Repository Profile that reached generation. Null
+   * when no repository profile was loaded (greenfield). Powers the developer
+   * Repository Intelligence debug panel and the "Profile Loaded" log.
+   */
+  profileDebug?: RepositoryProfileDebugSummary | null;
+  /**
+   * Step 3/4 deterministic post-generation reuse audit: did the emitted scripts
+   * actually honour the repository's reusable assets, or fall back to generic,
+   * hardcoded code? Always attached when a repo profile was present.
+   */
+  reuseVerification?: ReuseVerificationReport;
 }
 
 /**
@@ -176,6 +205,8 @@ interface IntelligenceBundle {
    * (loginPage.login(...)) instead of raw `page.locator(...)` sequences.
    */
   repoProfile?: RepositoryProfile;
+  /** Step 1/2 debug snapshot of the loaded repo profile (for logging + panel). */
+  profileDebug?: RepositoryProfileDebugSummary;
   /**
    * Real base URL from the Application Profile (e.g. https://www.saucedemo.com/).
    * Used to overwrite the generated `page.goto(...)` so scripts never navigate
@@ -521,6 +552,61 @@ export class TestToScriptEngine {
       }
     }
 
+    // ── Step 3/4: deterministic post-generation Repository Reuse audit.
+    //    Runs ONLY when a repository profile was actually loaded (otherwise the
+    //    run is greenfield and there is nothing to reuse). The score is always
+    //    attached; Step 4 only THROWS when enforcement is explicitly opted in.
+    let reuseVerification: ReuseVerificationReport | undefined;
+    if (intel.repoProfile) {
+      try {
+        const threshold =
+          input.repoReuseThreshold ??
+          (Number.isFinite(Number(process.env.SCRIPTGEN_REPO_REUSE_THRESHOLD))
+            ? Number(process.env.SCRIPTGEN_REPO_REUSE_THRESHOLD)
+            : undefined);
+        reuseVerification = verifyRepoReuse(
+          intel.repoProfile,
+          files.map((f) => ({ path: f.filePath, content: f.content })),
+          threshold != null ? { threshold } : {},
+        );
+        const logPayload = {
+          score: reuseVerification.score,
+          threshold: reuseVerification.threshold,
+          passed: reuseVerification.passed,
+          filesAudited: reuseVerification.filesAudited,
+          violations: reuseVerification.violations.map(
+            (v) => `[${v.severity}] ${v.ruleId} (${v.file ?? '-'}) x${v.occurrences}`,
+          ),
+        };
+        if (reuseVerification.passed) {
+          logger.info(MOD, `✅ ${reuseVerification.verdict}`, logPayload);
+        } else {
+          logger.warn(MOD, `🚨 ${reuseVerification.verdict}`, logPayload);
+        }
+
+        const enforce =
+          input.enforceRepoReuse ?? process.env.SCRIPTGEN_ENFORCE_REPO_REUSE === 'true';
+        if (enforce && !reuseVerification.passed) {
+          const critical = reuseVerification.violations
+            .filter((v) => v.severity === 'critical' || v.severity === 'high')
+            .map((v) => `${v.ruleId}: ${v.message}`)
+            .join('; ');
+          throw new Error(
+            `${reuseVerification.verdict} — generation rejected (enforceRepoReuse). ` +
+              `Violations: ${critical || 'reuse score below threshold'}`,
+          );
+        }
+      } catch (verErr: any) {
+        // A thrown ENFORCE error must propagate; a verifier bug must not.
+        if (/generation rejected \(enforceRepoReuse\)/.test(verErr?.message ?? '')) {
+          throw verErr;
+        }
+        logger.warn(MOD, 'Repo reuse verification failed (non-blocking)', {
+          error: verErr?.message,
+        });
+      }
+    }
+
     return {
       requirementId,
       requirementTitle: requirement.title,
@@ -530,6 +616,8 @@ export class TestToScriptEngine {
       coverage,
       intelligence,
       ...(frameworkAnalysis ? { frameworkAnalysis } : {}),
+      ...(intel.profileDebug ? { profileDebug: intel.profileDebug } : {}),
+      ...(reuseVerification ? { reuseVerification } : {}),
     };
   }
 
@@ -610,6 +698,30 @@ export class TestToScriptEngine {
         repoProfile = await getRepositoryContext(String(input.repositoryId), companyId, input.projectId);
         if (repoProfile) {
           bundle.repoProfile = repoProfile;
+          // ── Step 1: "Repository Profile Loaded" — prove the profile reached
+          //    generation, with the concrete assets it carries. If any critical
+          //    bucket is empty this log makes it obvious BEFORE prompt building.
+          const profileDebug = summarizeProfileForDebug(repoProfile, {
+            repositoryId: input.repositoryId ?? null,
+          });
+          bundle.profileDebug = profileDebug;
+          logger.info(MOD, `📥 Repository Profile Loaded\n${formatProfileSummary(profileDebug)}`, {
+            repositoryId: profileDebug.repositoryId,
+            pageObjects: profileDebug.pageObjects.length,
+            utilities: profileDebug.utilities.length,
+            businessFlows: profileDebug.businessFlows,
+            testSuites: profileDebug.testSuites,
+            envConfigModule: profileDebug.envConfigModule,
+            looksComplete: profileDebug.looksComplete,
+          });
+          if (!profileDebug.looksComplete) {
+            logger.warn(
+              MOD,
+              '⚠️ Repository Profile is INCOMPLETE — one or more critical asset ' +
+                'buckets (page objects / utilities / business flows / test suites) ' +
+                'are empty. Generated scripts may fall back to generic code.',
+            );
+          }
           bundle.repoGuide = analyzeRepoPatterns(repoProfile);
           if (bundle.repoGuide) {
             logger.info(MOD, '✅ Repo patterns loaded for grounding', {
@@ -620,6 +732,17 @@ export class TestToScriptEngine {
               pageObjects: bundle.repoGuide.summary.pageObjects.length,
             });
           }
+        } else if (input.repositoryId) {
+          // Explicit, loud signal: a repositoryId WAS supplied but no scanned
+          // profile came back — this is the upstream gate failure the audit is
+          // designed to surface (nothing to reuse → generic scripts).
+          logger.warn(
+            MOD,
+            `❌ Repository Profile MISSING for repositoryId=${input.repositoryId} ` +
+              `(companyId=${companyId}, projectId=${input.projectId ?? 'none'}). ` +
+              'No scanned repository_contexts row matched — generation will be ' +
+              'greenfield and cannot reuse repository assets.',
+          );
         }
       } catch (err: any) {
         logger.warn(MOD, 'Repo context load failed (non-blocking)', { error: err?.message });

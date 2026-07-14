@@ -1,0 +1,140 @@
+import { test, expect } from '@playwright/test';
+import { getRecord } from '../data/test-data';
+
+test.describe('Cart — 6 scenarios', () => {
+  test('Verify that checkout is rejected when shipping information is invalid.', async ({ page }) => {
+    // @tc:TC1967
+    await page.goto('https://www.saucedemo.com/');
+    await page.waitForLoadState('domcontentloaded');
+
+    throw new Error("Unsupported step — Script Gen could not emit a grounded action for: \"Enter an invalid First Name in the First Name field\". Fix the test case or add support; never ship a half-generated spec.");
+
+    throw new Error("Unsupported step — Script Gen could not emit a grounded action for: \"Enter an invalid Last Name in the Last Name field\". Fix the test case or add support; never ship a half-generated spec.");
+
+    throw new Error("Unsupported step — Script Gen could not emit a grounded action for: \"Enter an invalid Zip/Postal Code in the Zip/Postal Code field\". Fix the test case or add support; never ship a half-generated spec.");
+
+    throw new Error("Unsupported step — Script Gen could not emit a grounded action for: \"Enter an invalid cancel in the cancel field\". Fix the test case or add support; never ship a half-generated spec.");
+
+    throw new Error("Unsupported step — Script Gen could not emit a grounded action for: \"Enter an invalid continue in the continue field\". Fix the test case or add support; never ship a half-generated spec.");
+
+    await page.locator('[data-test="login-button"]').click();
+    await page.waitForLoadState('domcontentloaded');
+
+    await expect(page.locator('[data-test="error"]')).toBeVisible();
+    await expect(page.locator('[data-test="error"]')).toContainText('do not match');
+    await expect(page).toHaveURL('https://www.saucedemo.com/');
+  });
+
+  test('Verify that the user is required to enter shipping information when proceeding through checkout.', async ({ page }) => {
+    // @tc:TC1974
+    const user = getRecord("valid_users");
+
+    await page.goto('https://www.saucedemo.com/');
+    await page.waitForLoadState('domcontentloaded');
+
+    throw new Error("Unsupported step — Script Gen could not emit a grounded action for: \"Enter a valid First Name in the First Name field\". Fix the test case or add support; never ship a half-generated spec.");
+
+    throw new Error("Unsupported step — Script Gen could not emit a grounded action for: \"Enter a valid Last Name in the Last Name field\". Fix the test case or add support; never ship a half-generated spec.");
+
+    throw new Error("Unsupported step — Script Gen could not emit a grounded action for: \"Enter a valid Zip/Postal Code in the Zip/Postal Code field\". Fix the test case or add support; never ship a half-generated spec.");
+
+    throw new Error("Unsupported step — Script Gen could not emit a grounded action for: \"Enter a valid cancel in the cancel field\". Fix the test case or add support; never ship a half-generated spec.");
+
+    throw new Error("Unsupported step — Script Gen could not emit a grounded action for: \"Enter a valid continue in the continue field\". Fix the test case or add support; never ship a half-generated spec.");
+
+    await page.locator('[data-test="login-button"]').click();
+    await page.waitForLoadState('domcontentloaded');
+
+    await expect(page.locator('[data-test="title"]')).toBeVisible();
+  });
+
+  test('Verify that the application displays an order confirmation message when checkout is successful.', async ({ page }) => {
+    // @tc:TC1977
+    const user = getRecord("valid_users");
+
+    await page.goto('https://www.saucedemo.com/');
+    await page.waitForLoadState('domcontentloaded');
+
+    throw new Error("Unsupported step — Script Gen could not emit a grounded action for: \"Enter a valid First Name in the First Name field\". Fix the test case or add support; never ship a half-generated spec.");
+
+    throw new Error("Unsupported step — Script Gen could not emit a grounded action for: \"Enter a valid Last Name in the Last Name field\". Fix the test case or add support; never ship a half-generated spec.");
+
+    throw new Error("Unsupported step — Script Gen could not emit a grounded action for: \"Enter a valid Zip/Postal Code in the Zip/Postal Code field\". Fix the test case or add support; never ship a half-generated spec.");
+
+    throw new Error("Unsupported step — Script Gen could not emit a grounded action for: \"Enter a valid cancel in the cancel field\". Fix the test case or add support; never ship a half-generated spec.");
+
+    throw new Error("Unsupported step — Script Gen could not emit a grounded action for: \"Enter a valid continue in the continue field\". Fix the test case or add support; never ship a half-generated spec.");
+
+    await page.locator('[data-test="login-button"]').click();
+    await page.waitForLoadState('domcontentloaded');
+
+    await expect(page.getByText(/thanking the user for the order\./i).first()).toBeVisible();
+  });
+
+  test('Verify that checkout cannot continue when mandatory shipping information is missing.', async ({ page }) => {
+    // @tc:TC1982
+    await page.goto('https://www.saucedemo.com/');
+    await page.waitForLoadState('domcontentloaded');
+
+    throw new Error("Unsupported step — Script Gen could not emit a grounded action for: \"Enter an invalid First Name in the First Name field\". Fix the test case or add support; never ship a half-generated spec.");
+
+    throw new Error("Unsupported step — Script Gen could not emit a grounded action for: \"Enter an invalid Last Name in the Last Name field\". Fix the test case or add support; never ship a half-generated spec.");
+
+    throw new Error("Unsupported step — Script Gen could not emit a grounded action for: \"Enter an invalid Zip/Postal Code in the Zip/Postal Code field\". Fix the test case or add support; never ship a half-generated spec.");
+
+    throw new Error("Unsupported step — Script Gen could not emit a grounded action for: \"Enter an invalid cancel in the cancel field\". Fix the test case or add support; never ship a half-generated spec.");
+
+    throw new Error("Unsupported step — Script Gen could not emit a grounded action for: \"Enter an invalid continue in the continue field\". Fix the test case or add support; never ship a half-generated spec.");
+
+    await page.locator('[data-test="login-button"]').click();
+    await page.waitForLoadState('domcontentloaded');
+
+    await expect(page.locator('[data-test="error"]')).toBeVisible();
+    await expect(page.locator('[data-test="error"]')).toContainText('is required');
+    await expect(page).toHaveURL('https://www.saucedemo.com/');
+  });
+
+  test('Verify that checkout enforces the boundary condition when testing minimum product quantity in the cart.', async ({ page }) => {
+    // @tc:TC1983
+    await page.goto('https://www.saucedemo.com/');
+    await page.waitForLoadState('domcontentloaded');
+
+    throw new Error("Unsupported step — Script Gen could not emit a grounded action for: \"Enter a boundary-length First Name (at, below and above the limit) in the First Name field\". Fix the test case or add support; never ship a half-generated spec.");
+
+    throw new Error("Unsupported step — Script Gen could not emit a grounded action for: \"Enter a boundary-length Last Name (at, below and above the limit) in the Last Name field\". Fix the test case or add support; never ship a half-generated spec.");
+
+    throw new Error("Unsupported step — Script Gen could not emit a grounded action for: \"Enter a boundary-length Zip/Postal Code (at, below and above the limit) in the Zip/Postal Code field\". Fix the test case or add support; never ship a half-generated spec.");
+
+    throw new Error("Unsupported step — Script Gen could not emit a grounded action for: \"Enter a boundary-length cancel (at, below and above the limit) in the cancel field\". Fix the test case or add support; never ship a half-generated spec.");
+
+    throw new Error("Unsupported step — Script Gen could not emit a grounded action for: \"Enter a boundary-length continue (at, below and above the limit) in the continue field\". Fix the test case or add support; never ship a half-generated spec.");
+
+    await page.locator('[data-test="login-button"]').click();
+    await page.waitForLoadState('domcontentloaded');
+
+    await expect(page.locator('[data-test="title"]')).toBeVisible();
+  });
+
+  test('Verify that product prices and totals are calculated correctly when proceeding through checkout.', async ({ page }) => {
+    // @tc:TC1984
+    const user = getRecord("valid_users");
+
+    await page.goto('https://www.saucedemo.com/');
+    await page.waitForLoadState('domcontentloaded');
+
+    throw new Error("Unsupported step — Script Gen could not emit a grounded action for: \"Enter a valid First Name in the First Name field\". Fix the test case or add support; never ship a half-generated spec.");
+
+    throw new Error("Unsupported step — Script Gen could not emit a grounded action for: \"Enter a valid Last Name in the Last Name field\". Fix the test case or add support; never ship a half-generated spec.");
+
+    throw new Error("Unsupported step — Script Gen could not emit a grounded action for: \"Enter a valid Zip/Postal Code in the Zip/Postal Code field\". Fix the test case or add support; never ship a half-generated spec.");
+
+    throw new Error("Unsupported step — Script Gen could not emit a grounded action for: \"Enter a valid cancel in the cancel field\". Fix the test case or add support; never ship a half-generated spec.");
+
+    throw new Error("Unsupported step — Script Gen could not emit a grounded action for: \"Enter a valid continue in the continue field\". Fix the test case or add support; never ship a half-generated spec.");
+
+    await page.locator('[data-test="login-button"]').click();
+    await page.waitForLoadState('domcontentloaded');
+
+    await expect(page.locator('[data-test="title"]')).toBeVisible();
+  });
+});

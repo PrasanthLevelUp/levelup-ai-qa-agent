@@ -1,0 +1,286 @@
+import { test, expect } from '@playwright/test';
+import { InventoryPage } from '../pages/InventoryPage';
+import { LoginPage } from '../pages/LoginPage';
+import { getRecord } from '../data/test-data';
+
+test.describe('Login — 16 scenarios', () => {
+  test('Verify that a user receives an order confirmation when completing checkout end-to-end.', async ({ page }) => {
+    // @tc:TC1964
+    const user = getRecord("valid_users");
+
+    const loginPage = new LoginPage(page);
+    const inventoryPage = new InventoryPage(page);
+
+    await page.goto('https://www.saucedemo.com/');
+    await page.waitForLoadState('domcontentloaded');
+
+    await loginPage.login(user.username ?? '', user.password ?? process.env.TEST_PASSWORD ?? '');
+
+    throw new Error("Unsupported step — Script Gen could not emit a grounded action for: \"Enter a valid login-button in the login-button field\". Fix the test case or add support; never ship a half-generated spec.");
+
+    await expect(page).toHaveURL(/inventory\.html/);
+    await expect(page.locator('[data-test="title"]')).toHaveText(/Products/i);
+    await inventoryPage.verifyInventoryLoaded();
+  });
+
+  test('Verify that tax and shipping are reflected in the order total when completing checkout.', async ({ page }) => {
+    // @tc:TC1965
+    const user = getRecord("valid_users");
+
+    const loginPage = new LoginPage(page);
+
+    await page.goto('https://www.saucedemo.com/');
+    await page.waitForLoadState('domcontentloaded');
+
+    await loginPage.login(user.username ?? '', user.password ?? process.env.TEST_PASSWORD ?? '');
+
+    throw new Error("Unsupported step — Script Gen could not emit a grounded action for: \"Enter a valid login-button in the login-button field\". Fix the test case or add support; never ship a half-generated spec.");
+
+    await expect(page.locator('[data-test="title"]')).toBeVisible();
+  });
+
+  test('Verify that the business goal is satisfied when the primary success path is exercised.', async ({ page }) => {
+    // @tc:TC1966
+    const user = getRecord("valid_users");
+
+    const loginPage = new LoginPage(page);
+    const inventoryPage = new InventoryPage(page);
+
+    await page.goto('https://www.saucedemo.com/');
+    await page.waitForLoadState('domcontentloaded');
+
+    await loginPage.login(user.username ?? '', user.password ?? process.env.TEST_PASSWORD ?? '');
+
+    throw new Error("Unsupported step — Script Gen could not emit a grounded action for: \"Enter a valid login-button in the login-button field\". Fix the test case or add support; never ship a half-generated spec.");
+
+    await expect(page).toHaveURL(/inventory\.html/);
+    await expect(page.locator('[data-test="title"]')).toHaveText(/Products/i);
+    await inventoryPage.verifyInventoryLoaded();
+  });
+
+  test('Verify that functional requirements are satisfied when the primary success path is exercised.', async ({ page }) => {
+    // @tc:TC1968
+    const user = getRecord("valid_users");
+
+    const loginPage = new LoginPage(page);
+    const inventoryPage = new InventoryPage(page);
+
+    await page.goto('https://www.saucedemo.com/');
+    await page.waitForLoadState('domcontentloaded');
+
+    await loginPage.login(user.username ?? '', user.password ?? process.env.TEST_PASSWORD ?? '');
+
+    throw new Error("Unsupported step — Script Gen could not emit a grounded action for: \"Enter a valid login-button in the login-button field\". Fix the test case or add support; never ship a half-generated spec.");
+
+    await expect(page).toHaveURL(/inventory\.html/);
+    await expect(page.locator('[data-test="title"]')).toHaveText(/Products/i);
+    await inventoryPage.verifyInventoryLoaded();
+  });
+
+  test('Verify that the user can log in when valid credentials are provided.', async ({ page }) => {
+    // @tc:TC1969
+    const user = getRecord("valid_users");
+
+    const loginPage = new LoginPage(page);
+    const inventoryPage = new InventoryPage(page);
+
+    await page.goto('https://www.saucedemo.com/');
+    await page.waitForLoadState('domcontentloaded');
+
+    await loginPage.login(user.username ?? '', user.password ?? process.env.TEST_PASSWORD ?? '');
+
+    throw new Error("Unsupported step — Script Gen could not emit a grounded action for: \"Enter a valid login-button in the login-button field\". Fix the test case or add support; never ship a half-generated spec.");
+
+    await expect(page).toHaveURL(/inventory\.html/);
+    await expect(page.locator('[data-test="title"]')).toHaveText(/Products/i);
+    await inventoryPage.verifyInventoryLoaded();
+  });
+
+  test('Verify that the user sees the list of available products when login is successful.', async ({ page }) => {
+    // @tc:TC1970
+    const user = getRecord("valid_users");
+
+    const loginPage = new LoginPage(page);
+    const inventoryPage = new InventoryPage(page);
+
+    await page.goto('https://www.saucedemo.com/');
+    await page.waitForLoadState('domcontentloaded');
+
+    await loginPage.login(user.username ?? '', user.password ?? process.env.TEST_PASSWORD ?? '');
+
+    throw new Error("Unsupported step — Script Gen could not emit a grounded action for: \"Enter a valid login-button in the login-button field\". Fix the test case or add support; never ship a half-generated spec.");
+
+    await expect(page).toHaveURL(/inventory\.html/);
+    await expect(page.locator('[data-test="title"]')).toHaveText(/Products/i);
+    await inventoryPage.verifyInventoryLoaded();
+  });
+
+  test('Verify that the user can add one or more products to the shopping cart when browsing products.', async ({ page }) => {
+    // @tc:TC1971
+    const user = getRecord("valid_users");
+
+    const loginPage = new LoginPage(page);
+    const inventoryPage = new InventoryPage(page);
+
+    await page.goto('https://www.saucedemo.com/');
+    await page.waitForLoadState('domcontentloaded');
+
+    await loginPage.login(user.username ?? '', user.password ?? process.env.TEST_PASSWORD ?? '');
+
+    throw new Error("Unsupported step — Script Gen could not emit a grounded action for: \"Enter a valid login-button in the login-button field\". Fix the test case or add support; never ship a half-generated spec.");
+
+    await expect(page.locator('[data-test="shopping-cart-link"]')).toBeVisible();
+    await inventoryPage.verifyInventoryLoaded();
+  });
+
+  test('Verify that the shopping cart displays the selected products with the correct quantity when items are added.', async ({ page }) => {
+    // @tc:TC1972
+    const user = getRecord("valid_users");
+
+    const loginPage = new LoginPage(page);
+
+    await page.goto('https://www.saucedemo.com/');
+    await page.waitForLoadState('domcontentloaded');
+
+    await loginPage.login(user.username ?? '', user.password ?? process.env.TEST_PASSWORD ?? '');
+
+    throw new Error("Unsupported step — Script Gen could not emit a grounded action for: \"Enter a valid login-button in the login-button field\". Fix the test case or add support; never ship a half-generated spec.");
+
+    await expect(page.locator('[data-test="shopping-cart-link"]')).toBeVisible();
+  });
+
+  test('Verify that the user can proceed to checkout when the cart contains products.', async ({ page }) => {
+    // @tc:TC1973
+    const user = getRecord("valid_users");
+
+    const loginPage = new LoginPage(page);
+
+    await page.goto('https://www.saucedemo.com/');
+    await page.waitForLoadState('domcontentloaded');
+
+    await loginPage.login(user.username ?? '', user.password ?? process.env.TEST_PASSWORD ?? '');
+
+    throw new Error("Unsupported step — Script Gen could not emit a grounded action for: \"Enter a valid login-button in the login-button field\". Fix the test case or add support; never ship a half-generated spec.");
+
+    await expect(page.locator('[data-test="title"]')).toBeVisible();
+  });
+
+  test('Verify that the application displays an order summary when the user reaches the final checkout step.', async ({ page }) => {
+    // @tc:TC1975
+    const user = getRecord("valid_users");
+
+    const loginPage = new LoginPage(page);
+
+    await page.goto('https://www.saucedemo.com/');
+    await page.waitForLoadState('domcontentloaded');
+
+    await loginPage.login(user.username ?? '', user.password ?? process.env.TEST_PASSWORD ?? '');
+
+    throw new Error("Unsupported step — Script Gen could not emit a grounded action for: \"Enter a valid login-button in the login-button field\". Fix the test case or add support; never ship a half-generated spec.");
+
+    await expect(page.locator('[data-test="title"]')).toBeVisible();
+  });
+
+  test('Verify that the user can complete the purchase when all checkout steps are satisfied.', async ({ page }) => {
+    // @tc:TC1976
+    const user = getRecord("valid_users");
+
+    const loginPage = new LoginPage(page);
+
+    await page.goto('https://www.saucedemo.com/');
+    await page.waitForLoadState('domcontentloaded');
+
+    await loginPage.login(user.username ?? '', user.password ?? process.env.TEST_PASSWORD ?? '');
+
+    throw new Error("Unsupported step — Script Gen could not emit a grounded action for: \"Enter a valid login-button in the login-button field\". Fix the test case or add support; never ship a half-generated spec.");
+
+    await expect(page.locator('[data-test="title"]')).toBeVisible();
+  });
+
+  test('Verify that the shopping cart is rejected when invalid credentials are provided during login.', async ({ page }) => {
+    // @tc:TC1978
+    const loginPage = new LoginPage(page);
+
+    await page.goto('https://www.saucedemo.com/');
+    await page.waitForLoadState('domcontentloaded');
+
+    await loginPage.login('invalid_user', process.env.TEST_PASSWORD ?? '');
+
+    throw new Error("Unsupported step — Script Gen could not emit a grounded action for: \"Enter an invalid login-button in the login-button field\". Fix the test case or add support; never ship a half-generated spec.");
+
+    await expect(page.locator('[data-test="error"]')).toBeVisible();
+    await expect(page.locator('[data-test="error"]')).toContainText('do not match');
+    await expect(page).toHaveURL('https://www.saucedemo.com/');
+  });
+
+  test('Verify that the user can log out successfully when the purchase is completed.', async ({ page }) => {
+    // @tc:TC1979
+    const user = getRecord("valid_users");
+
+    const loginPage = new LoginPage(page);
+
+    await page.goto('https://www.saucedemo.com/');
+    await page.waitForLoadState('domcontentloaded');
+
+    await loginPage.login(user.username ?? '', user.password ?? process.env.TEST_PASSWORD ?? '');
+
+    throw new Error("Unsupported step — Script Gen could not emit a grounded action for: \"Enter a valid login-button in the login-button field\". Fix the test case or add support; never ship a half-generated spec.");
+
+    await expect(page).toHaveURL('https://www.saucedemo.com/');
+    await expect(page.locator('[data-test="login-button"]')).toBeVisible();
+  });
+
+  test('Verify that business rules are satisfied when the primary success path is exercised.', async ({ page }) => {
+    // @tc:TC1980
+    const user = getRecord("valid_users");
+
+    const loginPage = new LoginPage(page);
+    const inventoryPage = new InventoryPage(page);
+
+    await page.goto('https://www.saucedemo.com/');
+    await page.waitForLoadState('domcontentloaded');
+
+    await loginPage.login(user.username ?? '', user.password ?? process.env.TEST_PASSWORD ?? '');
+
+    throw new Error("Unsupported step — Script Gen could not emit a grounded action for: \"Enter a valid login-button in the login-button field\". Fix the test case or add support; never ship a half-generated spec.");
+
+    await expect(page).toHaveURL(/inventory\.html/);
+    await expect(page.locator('[data-test="title"]')).toHaveText(/Products/i);
+    await inventoryPage.verifyInventoryLoaded();
+  });
+
+  test('Verify that the expected outcome is achieved when the primary success path is exercised.', async ({ page }) => {
+    // @tc:TC1985
+    const user = getRecord("valid_users");
+
+    const loginPage = new LoginPage(page);
+    const inventoryPage = new InventoryPage(page);
+
+    await page.goto('https://www.saucedemo.com/');
+    await page.waitForLoadState('domcontentloaded');
+
+    await loginPage.login(user.username ?? '', user.password ?? process.env.TEST_PASSWORD ?? '');
+
+    throw new Error("Unsupported step — Script Gen could not emit a grounded action for: \"Enter a valid login-button in the login-button field\". Fix the test case or add support; never ship a half-generated spec.");
+
+    await expect(page).toHaveURL(/inventory\.html/);
+    await expect(page.locator('[data-test="title"]')).toHaveText(/Products/i);
+    await inventoryPage.verifyInventoryLoaded();
+  });
+
+  test('Verify that the end-to-end purchase flow is rejected when invalid credentials are provided.', async ({ page }) => {
+    // @tc:TC1986
+    const loginPage = new LoginPage(page);
+
+    await page.goto('https://www.saucedemo.com/');
+    await page.waitForLoadState('domcontentloaded');
+
+    await loginPage.login('invalid_user', process.env.TEST_PASSWORD ?? '');
+
+    throw new Error("Unsupported step — Script Gen could not emit a grounded action for: \"Enter an invalid login-button in the login-button field\". Fix the test case or add support; never ship a half-generated spec.");
+
+    await expect(page.locator('[data-test="error"]')).toBeVisible();
+    await expect(page.locator('[data-test="error"]')).toContainText('do not match');
+    await expect(page).toHaveURL('https://www.saucedemo.com/');
+  });
+});
