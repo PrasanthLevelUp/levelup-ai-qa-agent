@@ -512,6 +512,50 @@ function requirementScenario(step: RequirementStep): PlannedScenarioWithProvenan
  * @param deep           Deep Coverage toggle (Sprint 5.2). When true, broadens
  *                       the baseline library with best-practice obligations.
  */
+/**
+ * Requirement-aware Deep Coverage sets (Sprint 6.x).
+ *
+ * Deep Coverage USED to expand every requirement to the SAME fixed 7 types
+ * (positive, negative, edge_cases, boundary, security, integration, role_based).
+ * That is right for a complex workflow but wasteful for a simple one — a login
+ * story does not need boundary/integration/role_based, yet paid tokens for them
+ * on BOTH the prompt (planned-scenario block) and completion (per-scenario
+ * output budget) sides. That's what tripled a login run's tokens (4.5k → 13k)
+ * for little added value.
+ *
+ * The fix is NOT a token cap (which would truncate genuine coverage on a big
+ * requirement — explicitly forbidden by the "budget never shrinks coverage"
+ * directive). Instead we make the deep set CONTEXT-AWARE: each QA category adds
+ * only the extra coverage types that actually matter for it. The user's own
+ * selection is always honoured on top of this (union) — we only decide what
+ * Deep ADDS, never what it removes.
+ */
+const DEEP_COVERAGE_TYPES_BY_CATEGORY: Record<QACategory, CoverageType[]> = {
+  // Auth: credential correctness + abuse resistance. No boundary/integration/RBAC.
+  authentication: ['positive', 'negative', 'edge_cases', 'security'],
+  // CRUD: field-level correctness + limits. No security/RBAC unless user asked.
+  crud: ['positive', 'negative', 'edge_cases', 'boundary'],
+  // Search: query handling + input limits.
+  search: ['positive', 'negative', 'edge_cases', 'boundary'],
+  // Checkout: money path — the widest legitimately-deep flow.
+  checkout: ['positive', 'negative', 'edge_cases', 'boundary', 'security', 'integration'],
+  // Payment: money path + gateway integration + fraud surface.
+  payment: ['positive', 'negative', 'edge_cases', 'boundary', 'security', 'integration'],
+  // Admin: privilege + access control is the whole point → role_based + security.
+  admin: ['positive', 'negative', 'edge_cases', 'security', 'role_based'],
+  // Workflow: multi-step state hand-off → integration matters, boundary rarely.
+  workflow: ['positive', 'negative', 'edge_cases', 'integration'],
+  // Reporting: correctness of aggregates + range limits.
+  reporting: ['positive', 'negative', 'edge_cases', 'boundary'],
+  // Import: file parsing + malformed input + downstream persistence.
+  import: ['positive', 'negative', 'edge_cases', 'boundary', 'integration'],
+  // Export: output correctness + large-set limits.
+  export: ['positive', 'negative', 'edge_cases', 'boundary'],
+  // Generic/unknown: stay conservative — do NOT invent security/RBAC surface for
+  // a feature we couldn't classify. Positive/negative/edge is the honest floor.
+  generic: ['positive', 'negative', 'edge_cases'],
+};
+
 export function planScenarios(
   input: Pick<RequirementInput, 'title' | 'description' | 'module' | 'businessFlow' | 'acceptanceCriteria'>,
   coverageTypes: CoverageType[],
@@ -523,11 +567,13 @@ export function planScenarios(
   const baseline = getBaselineScenarios(classification.category);
 
   // Respect the user's coverage selection for the LIBRARY only. If nothing is
-  // selected, fall back to positive. In Deep mode the selection is broadened to
-  // the full deep set so the library contributes more real cases.
-  const DEEP_TYPES: CoverageType[] = ['positive', 'negative', 'edge_cases', 'boundary', 'security', 'integration', 'role_based'];
+  // selected, fall back to positive. In Deep mode the selection is broadened —
+  // but by a REQUIREMENT-AWARE set (per category), not a fixed 7-type blast, so
+  // a simple requirement is not padded with irrelevant types (see the map above).
+  const deepTypes = DEEP_COVERAGE_TYPES_BY_CATEGORY[classification.category]
+    ?? DEEP_COVERAGE_TYPES_BY_CATEGORY.generic;
   const base: CoverageType[] = coverageTypes.length ? coverageTypes : ['positive'];
-  const selected = new Set<CoverageType>(deep ? [...base, ...DEEP_TYPES] : base);
+  const selected = new Set<CoverageType>(deep ? [...base, ...deepTypes] : base);
 
   const evidence = buildEvidence(input, knowledge);
 
