@@ -34,8 +34,10 @@ import {
   fetchProjects,
   fetchIssueTypes,
   searchIssues,
+  searchIssuesByKeys,
   type JiraImportedIssue,
 } from '../../integrations/jira';
+import { parseIssueKeys } from '../../integrations/jira-issue-keys';
 
 const MOD = 'requirements-routes';
 
@@ -131,6 +133,109 @@ function mapJiraCategory(issueType?: string): string | null {
   return null; // Story / Task -> let it stay uncategorized (user can set it)
 }
 
+/** Scope + context under which imported requirements are persisted. */
+interface ImportContext {
+  companyId: any;
+  projectId: any;
+  userId: any;
+  environmentId: any;
+  sprintId: any;
+}
+
+/** Summary returned by the shared Jira import routine. */
+interface ImportSummary {
+  imported: number;
+  updated: number;
+  skipped: number;
+  total: number;
+  requirements: any[];
+}
+
+/**
+ * Persist a batch of fetched Jira issues as requirements. This is the ONE
+ * shared import routine — both "Import All" (by project/type) and "Import by
+ * Issue Key" fetch issues differently but converge here, so conversion,
+ * dedup-by-source, and persistence behave identically. Re-importing an issue
+ * UPDATES it in place (matched by source + source_id) instead of duplicating.
+ */
+async function importIssuesAsRequirements(
+  issues: JiraImportedIssue[],
+  projectKey: string,
+  ctx: ImportContext,
+): Promise<ImportSummary> {
+  let imported = 0;
+  let updated = 0;
+  let skipped = 0;
+  const requirements: any[] = [];
+
+  for (const issue of issues) {
+    // Build the metadata envelope of live Jira facts shown in the Hub.
+    const jiraMeta = {
+      source: 'jira',
+      sourceId: issue.key,
+      jira: {
+        key: issue.key,
+        issueType: issue.issueType,
+        status: issue.status,
+        priority: issue.priority ?? null,
+        assignee: issue.assignee ?? null,
+        sprint: issue.sprint ?? null,
+        labels: issue.labels ?? [],
+        updated: issue.updated ?? null,
+        url: issue.url,
+        projectKey: projectKey || issue.key.split('-')[0],
+      },
+    };
+
+    const existing = await getRequirementBySourceId({
+      companyId: ctx.companyId,
+      projectId: ctx.projectId,
+      source: 'jira',
+      sourceId: issue.key,
+    });
+
+    if (existing) {
+      const row = await updateRequirementFromSource(existing.id, ctx.companyId, {
+        title: issue.summary,
+        description: issue.description || null,
+        priority: mapJiraPriority(issue.priority),
+        metadata: { ...(existing.metadata || {}), ...jiraMeta },
+        syncStatus: 'synced',
+      });
+      if (row) {
+        updated++;
+        requirements.push(row);
+      } else {
+        skipped++;
+      }
+      continue;
+    }
+
+    const row = await createRequirement({
+      companyId: ctx.companyId,
+      projectId: ctx.projectId,
+      title: issue.summary,
+      description: issue.description || null,
+      category: mapJiraCategory(issue.issueType),
+      priority: mapJiraPriority(issue.priority),
+      acceptanceCriteria: null,
+      status: mapJiraStatus(issue.status),
+      tags: issue.labels && issue.labels.length ? issue.labels : null,
+      createdBy: ctx.userId,
+      metadata: jiraMeta,
+      source: 'jira',
+      sourceId: issue.key,
+      syncStatus: 'synced',
+      environmentId: ctx.environmentId ?? null,
+      sprintId: ctx.sprintId ?? null,
+    });
+    imported++;
+    requirements.push(row);
+  }
+
+  return { imported, updated, skipped, total: issues.length, requirements };
+}
+
 export function createRequirementsRouter(): Router {
   const router = Router();
 
@@ -210,86 +315,92 @@ export function createRequirementsRouter(): Router {
       const cap = Math.min(Math.max(Number(maxResults) || 100, 1), 200);
       const issues: JiraImportedIssue[] = await searchIssues(config, projectKey, types, cap);
 
-      let imported = 0;
-      let updated = 0;
-      let skipped = 0;
-      const requirements: any[] = [];
-
-      for (const issue of issues) {
-        // Build the metadata envelope of live Jira facts shown in the Hub.
-        const jiraMeta = {
-          source: 'jira',
-          sourceId: issue.key,
-          jira: {
-            key: issue.key,
-            issueType: issue.issueType,
-            status: issue.status,
-            priority: issue.priority ?? null,
-            assignee: issue.assignee ?? null,
-            sprint: issue.sprint ?? null,
-            labels: issue.labels ?? [],
-            updated: issue.updated ?? null,
-            url: issue.url,
-            projectKey,
-          },
-        };
-
-        const existing = await getRequirementBySourceId({
-          companyId,
-          projectId,
-          source: 'jira',
-          sourceId: issue.key,
-        });
-
-        if (existing) {
-          const row = await updateRequirementFromSource(existing.id, companyId, {
-            title: issue.summary,
-            description: issue.description || null,
-            priority: mapJiraPriority(issue.priority),
-            metadata: { ...(existing.metadata || {}), ...jiraMeta },
-            syncStatus: 'synced',
-          });
-          if (row) {
-            updated++;
-            requirements.push(row);
-          } else {
-            skipped++;
-          }
-          continue;
-        }
-
-        const row = await createRequirement({
-          companyId,
-          projectId,
-          title: issue.summary,
-          description: issue.description || null,
-          category: mapJiraCategory(issue.issueType),
-          priority: mapJiraPriority(issue.priority),
-          acceptanceCriteria: null,
-          status: mapJiraStatus(issue.status),
-          tags: issue.labels && issue.labels.length ? issue.labels : null,
-          createdBy: userId,
-          metadata: jiraMeta,
-          source: 'jira',
-          sourceId: issue.key,
-          syncStatus: 'synced',
-          environmentId: environmentId ?? null,
-          sprintId: sprintId ?? null,
-        });
-        imported++;
-        requirements.push(row);
-      }
+      const summary = await importIssuesAsRequirements(issues, projectKey, {
+        companyId, projectId, userId, environmentId, sprintId,
+      });
 
       logger.info(MOD, 'Jira import complete', {
-        companyId, projectId, projectKey, types, imported, updated, skipped, total: issues.length,
+        companyId, projectId, projectKey, types,
+        imported: summary.imported, updated: summary.updated, skipped: summary.skipped, total: summary.total,
+      });
+
+      res.json({ success: true, data: summary });
+    } catch (error: any) {
+      logger.error(MOD, 'POST /jira/import failed', { error: error?.message });
+      res.status(500).json({ success: false, error: 'Failed to import from Jira' });
+    }
+  });
+
+  /* ─── Jira: import specific issues by key (STATIC) ───────────────────
+   * Body: { issueKeys: string | string[] }  (projectId optional; kept for
+   * forward-compat but not required — keys carry their own project prefix).
+   * Accepts comma/newline-separated keys or pasted Jira browse URLs. Keys are
+   * normalized + validated BEFORE calling Jira; invalid keys are rejected up
+   * front and never sent to Jira. Reuses the SAME import pipeline as the
+   * project-wide import (fetch → convert → dedup → persist). Returns
+   * { imported, updated, skipped, total, requested, notFound[], invalid[],
+   *   requirements }. */
+  router.post('/jira/import-by-keys', async (req: Request, res: Response) => {
+    try {
+      const companyId = (req as any).companyId;
+      const projectId = (req as any).projectId ?? null;
+      const userId = (req as any).userId ?? null;
+      const { environmentId, sprintId } = getContextFromRequest(req);
+
+      const { issueKeys } = req.body || {};
+      const { valid, invalid } = parseIssueKeys(issueKeys);
+
+      if (valid.length === 0) {
+        return res.status(400).json({
+          success: false,
+          error:
+            invalid.length > 0
+              ? `No valid Jira issue keys found. Invalid: ${invalid.join(', ')}`
+              : 'Provide at least one Jira issue key (e.g. AUTH-123).',
+          code: 'NO_VALID_ISSUE_KEYS',
+          data: { invalid },
+        });
+      }
+
+      const config = await getStoredJiraConfig();
+      if (!config) {
+        return res.status(400).json({
+          success: false,
+          error: 'Jira is not connected. Connect it under Tools → Jira first.',
+          code: 'JIRA_NOT_CONNECTED',
+        });
+      }
+
+      // Cap defensively; a single by-key import is not meant for bulk backlogs.
+      const cap = Math.min(valid.length, 200);
+      const issues: JiraImportedIssue[] = await searchIssuesByKeys(config, valid, cap);
+
+      // Keys that were valid in shape but not found in Jira (typo / no access).
+      const foundKeys = new Set(issues.map((i) => i.key.toUpperCase()));
+      const notFound = valid.filter((k) => !foundKeys.has(k.toUpperCase()));
+
+      const summary = await importIssuesAsRequirements(issues, '', {
+        companyId, projectId, userId, environmentId, sprintId,
+      });
+
+      logger.info(MOD, 'Jira import-by-keys complete', {
+        companyId, projectId,
+        requested: valid.length,
+        imported: summary.imported, updated: summary.updated, skipped: summary.skipped,
+        notFound: notFound.length, invalid: invalid.length,
       });
 
       res.json({
         success: true,
-        data: { imported, updated, skipped, total: issues.length, requirements },
+        data: {
+          ...summary,
+          requested: valid.length,
+          notFound,
+          invalid,
+        },
       });
     } catch (error: any) {
-      logger.error(MOD, 'POST /jira/import failed', { error: error?.message });
+      logger.error(MOD, 'POST /jira/import-by-keys failed', { error: error?.message });
       res.status(500).json({ success: false, error: 'Failed to import from Jira' });
     }
   });
