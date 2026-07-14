@@ -122,3 +122,92 @@ export function formatTokens(total: number | null): string {
   if (total < 1000) return `${total.toLocaleString('en-US')} tokens`;
   return `${(total / 1000).toFixed(1)}K tokens`;
 }
+
+/* ────────────────────────────────────────────────────────────────────────────
+ * Per-stage breakdown — "measure before optimizing".
+ *
+ * A single opaque total ("22,382 tokens") hides WHERE cost is spent. A stage
+ * breakdown itemizes every pipeline stage — deterministic (zero-LLM) ones too —
+ * with its own tokens + wall-clock, so we can see which stage dominates before
+ * touching anything. This is intentionally generic so any AI pipeline (Test
+ * Case Lab, Script Gen, Healing) can emit the same shape.
+ * ──────────────────────────────────────────────────────────────────────────── */
+
+/** One pipeline stage's cost. `null` tokens = unknown; `0` = genuinely zero. */
+export interface StageMetric {
+  /** Human-readable stage name, e.g. "Requirement Analysis", "Generation". */
+  stage: string;
+  /** LLM round-trips this stage made. `0` for a deterministic (code-only) stage. */
+  llmCalls: number;
+  /** Input tokens; `null` when unknown, `0` for deterministic stages. */
+  promptTokens: number | null;
+  /** Output tokens; `null` when unknown, `0` for deterministic stages. */
+  completionTokens: number | null;
+  /** Total tokens; `null` when unknown, `0` for deterministic stages. */
+  totalTokens: number | null;
+  /** Wall-clock spent in this stage, in milliseconds. */
+  durationMs: number;
+  /** True when the stage runs entirely in code (no LLM tokens spent). */
+  deterministic: boolean;
+  /** Optional short note, e.g. "skipped (below complexity gate)", "embeddings". */
+  note?: string;
+}
+
+/** Build a StageMetric, defaulting the token dimensions sanely. */
+export function stageMetric(opts: {
+  stage: string;
+  llmCalls?: number;
+  promptTokens?: number | null;
+  completionTokens?: number | null;
+  totalTokens?: number | null;
+  durationMs?: number;
+  deterministic?: boolean;
+  note?: string;
+}): StageMetric {
+  const deterministic = opts.deterministic ?? (opts.llmCalls ?? 0) === 0;
+  return {
+    stage: opts.stage,
+    llmCalls: opts.llmCalls ?? 0,
+    promptTokens: opts.promptTokens ?? (deterministic ? 0 : null),
+    completionTokens: opts.completionTokens ?? (deterministic ? 0 : null),
+    totalTokens: opts.totalTokens ?? (deterministic ? 0 : null),
+    durationMs: opts.durationMs ?? 0,
+    deterministic,
+    note: opts.note,
+  };
+}
+
+/** A stage plus its share of the run's total tokens (for "where did it go?"). */
+export interface StageShare extends StageMetric {
+  /** This stage's percentage of the run's total tokens (0–100, rounded). */
+  pctOfTokens: number;
+}
+
+/** Roll a list of stages into run totals + each stage's % of total tokens. */
+export function summarizeStages(stages: StageMetric[]): {
+  stages: StageShare[];
+  totalTokens: number | null;
+  promptTokens: number | null;
+  completionTokens: number | null;
+  totalDurationMs: number;
+  llmCalls: number;
+} {
+  let totalTokens: number | null = null;
+  let promptTokens: number | null = null;
+  let completionTokens: number | null = null;
+  let totalDurationMs = 0;
+  let llmCalls = 0;
+  for (const s of stages) {
+    totalTokens = addToken(totalTokens, s.totalTokens);
+    promptTokens = addToken(promptTokens, s.promptTokens);
+    completionTokens = addToken(completionTokens, s.completionTokens);
+    totalDurationMs += s.durationMs;
+    llmCalls += s.llmCalls;
+  }
+  const denom = totalTokens ?? 0;
+  const withShare: StageShare[] = stages.map(s => ({
+    ...s,
+    pctOfTokens: denom > 0 ? Math.round(((s.totalTokens ?? 0) / denom) * 100) : 0,
+  }));
+  return { stages: withShare, totalTokens, promptTokens, completionTokens, totalDurationMs, llmCalls };
+}
