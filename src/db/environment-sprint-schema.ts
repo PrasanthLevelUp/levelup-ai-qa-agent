@@ -97,6 +97,23 @@ const DEPRECATED_STAMP_TRIGGERS: Array<{ table: string; trigger: string }> = [
 ];
 
 /**
+ * Back-compat context columns that must still EXIST (nullable, no trigger) even
+ * though the artifact no longer OWNS/auto-stamps them. Scripts inherit sprint
+ * via their requirement link and requirements are env-independent, so neither
+ * is in the *_LINKED_TABLES lists above — meaning a FRESH install would not add
+ * these columns. But the persistence layer (createRequirement / logGeneratedScript)
+ * still writes them explicitly (as NULL), so the columns must be present or the
+ * INSERT fails on a brand-new database. We therefore ensure the columns exist
+ * WITHOUT attaching any auto-stamp trigger: unused, nullable, reversible. On
+ * existing deployments these ALTERs are no-ops (duplicate_column swallowed).
+ */
+const BACKCOMPAT_CONTEXT_COLUMNS: Array<{ table: string; column: string }> = [
+  { table: 'generated_scripts', column: 'environment_id' },
+  { table: 'generated_scripts', column: 'sprint_id' },
+  { table: 'requirements', column: 'environment_id' },
+];
+
+/**
  * Build the guarded ALTER ADD COLUMN statement for a link column on an existing
  * table. Wrapped in a DO block that swallows duplicate_column / undefined_table
  * so re-runs and missing-table environments are both safe.
@@ -255,6 +272,10 @@ export const ENV_SPRINT_STATEMENTS: EnvSprintStatement[] = [
     addLinkColumn(t, 'sprint_id'),
     linkIndex(t, 'sprint_id'),
   ]),
+  /* Back-compat: ensure inherited/legacy context columns exist (nullable, no
+   * trigger) so the persistence layer's explicit NULL writes don't break on a
+   * fresh database. See BACKCOMPAT_CONTEXT_COLUMNS above. */
+  ...BACKCOMPAT_CONTEXT_COLUMNS.map(({ table, column }) => addLinkColumn(table, column)),
 
   /* ─── 6. updated_at trigger ───────────────────────────────────────── */
   {
