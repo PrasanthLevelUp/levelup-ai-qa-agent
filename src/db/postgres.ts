@@ -15,6 +15,7 @@ import {
   applyEnvSprintSchema,
 } from './environment-sprint-schema';
 import { FEATURE_FLAGS } from '../config/features';
+import { buildDateFilter, buildEnvironmentFilter } from './filter-helpers';
 import {
   type ExecutionSettings,
   DEFAULT_EXECUTION_SETTINGS,
@@ -4342,14 +4343,30 @@ export interface FlakyTestSummary {
   affected_components: string[];
 }
 
-export async function getFlakyTests(companyId?: number, projectId?: number): Promise<FlakyTestSummary[]> {
+export async function getFlakyTests(
+  companyId?: number, projectId?: number,
+  // Sprint 1 (Workspace Context): optional Environment + Time scope. rca_analyses
+  // carries environment_id + created_at, so both are honoured. Additive — omit
+  // for the previous company/project-only behaviour.
+  scope: { environmentId?: number | null; startDate?: string | null; endDate?: string | null } = {},
+): Promise<FlakyTestSummary[]> {
   const pool = getPool();
   const pid = projectId && Number.isInteger(projectId) ? projectId : 0;
   const pfClause = pid ? `(project_id = ${pid} OR project_id IS NULL)` : '';
   // Compose WHERE/AND clauses combining company + project scoping.
   const aggConds = [companyId ? `company_id = ${companyId}` : '', pfClause].filter(Boolean);
-  const cf = aggConds.length ? `WHERE ${aggConds.join(' AND ')}` : '';
-  const cfAnd = (companyId ? ` AND company_id = ${companyId}` : '') + (pfClause ? ` AND ${pfClause}` : '');
+  // Additive parameterised scope (env + date) shared by both CTEs. Placeholders
+  // are bound once via `params`; Postgres allows referencing $n in both clauses.
+  const params: any[] = [];
+  let scopeClause = '';
+  scopeClause += buildEnvironmentFilter(params, { environmentId: scope.environmentId });
+  scopeClause += buildDateFilter(params, { startDate: scope.startDate, endDate: scope.endDate });
+  const cfBase = aggConds.length ? `WHERE ${aggConds.join(' AND ')}` : '';
+  // flaky_agg: needs a leading WHERE if any condition exists at all.
+  const cf = cfBase
+    ? `${cfBase}${scopeClause}`
+    : (scopeClause ? `WHERE ${scopeClause.replace(/^ AND /, '')}` : '');
+  const cfAnd = (companyId ? ` AND company_id = ${companyId}` : '') + (pfClause ? ` AND ${pfClause}` : '') + scopeClause;
   const result = await pool.query(`
     WITH flaky_agg AS (
       SELECT
@@ -4386,23 +4403,44 @@ export async function getFlakyTests(companyId?: number, projectId?: number): Pro
     FROM flaky_agg f
     LEFT JOIN latest_flaky l ON l.test_name = f.test_name
     ORDER BY f.flaky_count DESC, f.last_seen DESC
-  `);
+  `, params);
   return result.rows;
 }
 
-export async function getFlakyTrend(days: number = 30, companyId?: number): Promise<Array<{ date: string; flaky: number; total: number }>> {
+export async function getFlakyTrend(
+  days: number = 30, companyId?: number,
+  // Sprint 1 (Workspace Context): optional project + Environment + Time scope.
+  // When startDate/endDate are supplied they take precedence over the rolling
+  // `days` window; otherwise the legacy NOW() - INTERVAL window is preserved.
+  scope: { projectId?: number | null; environmentId?: number | null; startDate?: string | null; endDate?: string | null } = {},
+): Promise<Array<{ date: string; flaky: number; total: number }>> {
   const pool = getPool();
-  const cfAnd = companyId ? `AND company_id = ${companyId}` : '';
+  const params: any[] = [];
+  const conds: string[] = [];
+  if (companyId) { params.push(companyId); conds.push(`company_id = $${params.length}`); }
+  const pid = scope.projectId && Number.isInteger(scope.projectId) ? scope.projectId : 0;
+  if (pid) { params.push(pid); conds.push(`(project_id = $${params.length} OR project_id IS NULL)`); }
+  let dateClause = '';
+  if (scope.startDate || scope.endDate) {
+    dateClause = buildDateFilter(params, { startDate: scope.startDate, endDate: scope.endDate });
+  } else {
+    // Legacy rolling window (interpolated int is safe — `days` is parsed above callers).
+    dateClause = ` AND created_at >= NOW() - INTERVAL '${Math.max(1, Math.floor(days))} days'`;
+  }
+  const envClause = buildEnvironmentFilter(params, { environmentId: scope.environmentId });
+  const whereBody = [conds.join(' AND '), dateClause.replace(/^ AND /, ''), envClause.replace(/^ AND /, '')]
+    .filter(Boolean).join(' AND ');
+  const whereClause = whereBody ? `WHERE ${whereBody}` : '';
   const result = await pool.query(`
     SELECT
       DATE(created_at) AS date,
       COUNT(*) FILTER (WHERE is_flaky = true) AS flaky,
       COUNT(*) AS total
     FROM rca_analyses
-    WHERE created_at >= NOW() - INTERVAL '${days} days' ${cfAnd}
+    ${whereClause}
     GROUP BY DATE(created_at)
     ORDER BY date ASC
-  `);
+  `, params);
   return result.rows.map(r => ({
     date: r.date instanceof Date ? r.date.toISOString().split('T')[0] : String(r.date),
     flaky: parseInt(r.flaky, 10),
@@ -8217,18 +8255,23 @@ export async function getExecutionRecord(executionId: string): Promise<Execution
 
 /** List recent execution records for a project scope (most recent first). */
 export async function listExecutionRecords(
-  companyId?: number, projectId?: number, limit = 50
+  companyId?: number, projectId?: number, limit = 50,
+  // Sprint 1 (Workspace Time): optional date window. Environment is intentionally
+  // NOT supported here — execution_records has no environment_id column and we do
+  // not change the execution write path in Sprint 1 (the UI disables Environment
+  // for this page rather than silently ignoring it).
+  scope: { startDate?: string | null; endDate?: string | null } = {}
 ): Promise<ExecutionRecord[]> {
   const pool = getPool();
   try {
-    const r = await pool.query(
-      `SELECT record FROM execution_records
+    const params: any[] = [companyId ?? null, projectId ?? null];
+    let sql = `SELECT record FROM execution_records
        WHERE COALESCE(company_id, 0) = COALESCE($1, 0)
-         AND COALESCE(project_id, 0) = COALESCE($2, 0)
-       ORDER BY created_at DESC
-       LIMIT $3`,
-      [companyId ?? null, projectId ?? null, limit]
-    );
+         AND COALESCE(project_id, 0) = COALESCE($2, 0)`;
+    sql += buildDateFilter(params, { startDate: scope.startDate, endDate: scope.endDate });
+    params.push(limit);
+    sql += ` ORDER BY created_at DESC LIMIT $${params.length}`;
+    const r = await pool.query(sql, params);
     return r.rows.map((row) => coerceLegacyRecord(row.record as ExecutionRecord));
   } catch (err: any) {
     if (err?.code === '42P01' || err?.message?.includes('does not exist')) {

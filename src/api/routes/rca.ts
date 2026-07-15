@@ -9,6 +9,7 @@
 
 import { Router, type Request, type Response } from 'express';
 import { getRCA, getRCAsForJob, getRCAStats, getFlakyTests, getFlakyTrend, getFlakyHistory } from '../../db/postgres';
+import { parseScopeId, parseScopeDate } from '../../db/filter-helpers';
 import { RCAEngine } from '../../engines/rca-engine';
 import type { FailureDetails } from '../../core/failure-analyzer';
 
@@ -61,7 +62,16 @@ export function createRCARouter(): Router {
   router.get('/flaky', async (req: Request, res: Response) => {
     try {
       const cid = (req as any).companyId;
-      const tests = await getFlakyTests(cid);
+      // Sprint 1 (Workspace Context): honour project + Environment + Time scope
+      // from query params. NOTE: /api/rca is not behind projectContextMiddleware,
+      // so projectId is read from the query (forwarded by the dashboard proxy),
+      // fixing a prior gap where flaky results were company-wide only.
+      const projectId = parseScopeId(req.query.projectId) ?? undefined;
+      const tests = await getFlakyTests(cid, projectId, {
+        environmentId: parseScopeId(req.query.environmentId),
+        startDate: parseScopeDate(req.query.startDate),
+        endDate: parseScopeDate(req.query.endDate),
+      });
       const stats = await getRCAStats(cid);
       res.json({
         success: true,
@@ -85,7 +95,12 @@ export function createRCARouter(): Router {
     try {
       const cid = (req as any).companyId;
       const days = parseInt(String(req.query.days || '30')) || 30;
-      const trend = await getFlakyTrend(days, cid);
+      const trend = await getFlakyTrend(days, cid, {
+        projectId: parseScopeId(req.query.projectId),
+        environmentId: parseScopeId(req.query.environmentId),
+        startDate: parseScopeDate(req.query.startDate),
+        endDate: parseScopeDate(req.query.endDate),
+      });
       res.json({ success: true, data: trend });
     } catch (err: any) {
       console.error('[RCA] flaky trend error:', err);
