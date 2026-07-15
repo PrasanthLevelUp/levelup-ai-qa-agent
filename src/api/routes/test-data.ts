@@ -19,6 +19,7 @@ import {
   linkTestCaseToDataset, unlinkTestCaseFromDataset, getLinkedDatasets,
   getTestCasesForDatasetDetailed, listTestCasesForProject,
 } from '../../db/postgres';
+import { getContextFromRequest } from '../middleware/context';
 
 export function createTestDataRouter(): Router {
   const router = Router();
@@ -155,12 +156,19 @@ export function createTestDataRouter(): Router {
         return res.status(400).json({ error: 'name is required' });
       }
 
+      // Sprint 2 — test data is environment-specific, so it auto-inherits the
+      // active Workspace Environment (numeric FK) without the user re-picking it.
+      // The legacy string `environment` enum is still accepted for back-compat;
+      // undefined environment_id lets the DB trigger stamp the project default.
+      const { environmentId } = getContextFromRequest(req);
+
       const dataset = await createTestDataSet({
         companyId,
         projectId,
         name,
         description,
         environment: environment || 'shared',
+        environmentId: environmentId ?? null,
         createdBy: (req as any).userId,
       });
 

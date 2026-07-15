@@ -528,10 +528,11 @@ export function createScriptGenRouter(): Router {
 
       // ── Application Intelligence: check cache before crawling ──
       const projectId = (req as any).projectId as number | undefined;
-      // Write-path attribution — environment / sprint selected in the dashboard
-      // (forwarded as x-environment-id / x-sprint-id headers, resolved by
-      // contextMiddleware). Undefined values let the DB triggers stamp defaults.
-      const { environmentId, sprintId } = getContextFromRequest(req);
+      // Sprint 2 — a script is a design artifact: it is environment-INDEPENDENT
+      // (one script runs across QA/UAT/Prod) and INHERITS its sprint from the
+      // linked test case → requirement rather than duplicating it. So we persist
+      // NEITHER environment_id nor sprint_id on generated_scripts; context is
+      // derived via the RTM requirement link at read time.
       const crawlDecision = await crawlOrchestrator.decideCrawlStrategy(url, companyId, {
         forceFreshCrawl: forceFreshCrawl ?? false,
         authConfig: sanitizedAuthConfig,
@@ -1027,8 +1028,10 @@ export function createScriptGenRouter(): Router {
         files_generated: result.generatedFiles.map((f: GeneratedFile) => ({ path: f.path, size: f.content.length, type: f.type })),
         negative_tests_included: config.includeNegativeTests,
         intelligence_metadata: intelligenceMetadata,
-        environment_id: environmentId ?? null,
-        sprint_id: sprintId ?? null,
+        // Context inherited via the RTM requirement link (see requirement_id
+        // below) — a script is env-independent and never owns its own sprint.
+        environment_id: null,
+        sprint_id: null,
         // ── Sprint 4: RTM requirement link, provenance, locator report ──
         requirement_id: coverageRequirementId ?? null,
         generation_source: generationSource,
