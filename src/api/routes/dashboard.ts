@@ -24,6 +24,7 @@ import {
 } from '../../core/execution/execution-timeline';
 import { toDisplayStage } from '../../core/execution/execution-lifecycle';
 import { logger } from '../../utils/logger';
+import { buildDateFilter, buildEnvironmentFilter, parseScopeDate, parseScopeId } from '../../db/filter-helpers';
 
 const MOD = 'dashboard-api';
 
@@ -104,16 +105,31 @@ export function createDashboardRouter(): Router {
         : '';
       const pool = getPool();
 
+      // Sprint 1 (Workspace Context): additive Environment + Time scope.
+      // healing_actions carries environment_id + created_at, so both are honoured.
+      // params starts with [cid, limit]; scope placeholders are appended after.
+      const params: any[] = [cid, limit];
+      let scopeClause = '';
+      scopeClause += buildEnvironmentFilter(params, {
+        environmentId: parseScopeId(req.query.environmentId),
+        column: 'ha.environment_id',
+      });
+      scopeClause += buildDateFilter(params, {
+        startDate: parseScopeDate(req.query.startDate),
+        endDate: parseScopeDate(req.query.endDate),
+        column: 'ha.created_at',
+      });
+
       const { rows } = await pool.query(
         `SELECT ha.*, te.test_name AS exec_test_name,
                 pa.pr_url, pa.pr_number, pa.status AS pr_status
          FROM healing_actions ha
          LEFT JOIN test_executions te ON ha.test_execution_id = te.id
          LEFT JOIN pr_automations pa ON ha.pr_automation_id = pa.id
-         WHERE ($1::int IS NULL OR ha.company_id = $1) ${pidClause} ${statusClause}
+         WHERE ($1::int IS NULL OR ha.company_id = $1) ${pidClause} ${statusClause}${scopeClause}
          ORDER BY ha.created_at DESC
          LIMIT $2`,
-        [cid, limit],
+        params,
       );
 
       const result = rows.map((a: any) => {
@@ -235,7 +251,15 @@ export function createDashboardRouter(): Router {
       const limit = Math.min(parseInt(req.query.limit as string) || 50, 200);
       const cid = (req as any).companyId;
       const pid = req.query.projectId ? parseInt(req.query.projectId as string, 10) : undefined;
-      const records = await listExecutionRecords(cid, Number.isNaN(pid as number) ? undefined : pid, limit);
+      // Sprint 1 (Workspace Time): optional date window. Executions do NOT support
+      // Environment scoping (execution_records has no environment_id) — the UI
+      // disables that dimension rather than silently ignoring it.
+      const startDate = parseScopeDate(req.query.startDate);
+      const endDate = parseScopeDate(req.query.endDate);
+      const records = await listExecutionRecords(
+        cid, Number.isNaN(pid as number) ? undefined : pid, limit,
+        { startDate, endDate },
+      );
       // Return a compact list shape for the table (full record fetched per-row on click).
       const result = records.map((r) => ({
         executionId: r.executionId,
