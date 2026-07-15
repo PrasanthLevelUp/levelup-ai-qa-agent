@@ -46,6 +46,7 @@ import {
 } from '../../db/postgres';
 import type { Dataset } from '../../engines/dataset-resolver';
 import { buildApplicationProfileContext } from '../../utils/application-profile-context';
+import { getContextFromRequest } from '../middleware/context';
 import { ExportService } from '../../services/export-service';
 import { TemplateService } from '../../services/template-service';
 
@@ -231,7 +232,13 @@ export function createTestCoverageRouter(): Router {
 
       const companyId = (req as any).companyId;
       const projectId = (req as any).projectId;
-      logger.info(MOD, 'Generate request', { title, companyId, projectId, coverageTypes: selectedTypes, knowledgeItemIds, force: !!force });
+      // Sprint 2 — the generated test_requirement is the ROOT of the generation
+      // chain (→ scenarios → test cases), so it owns the active sprint context.
+      // Test design is environment-INDEPENDENT, so environment is never stamped;
+      // scenarios/cases inherit the sprint via their parent FK. Undefined lets
+      // the DB trigger stamp the project's current sprint.
+      const { sprintId } = getContextFromRequest(req);
+      logger.info(MOD, 'Generate request', { title, companyId, projectId, sprintId, coverageTypes: selectedTypes, knowledgeItemIds, force: !!force });
 
       // ── Issue #1: Duplicate prevention ──
       // Block regenerating for a requirement that is still 'generated' and already
@@ -617,6 +624,8 @@ export function createTestCoverageRouter(): Router {
           analysis: analysisWithKnowledge,
           companyId,
           projectId,
+          // Root of the chain owns the sprint; children inherit via FK.
+          sprintId: sprintId ?? null,
         });
         logger.info(MOD, 'Requirement persisted', { reqId });
       } catch (dbErr: any) {

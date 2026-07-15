@@ -7828,18 +7828,26 @@ export async function createTestRequirement(data: {
   acceptanceCriteria?: string; apiDocs?: string; releaseNotes?: string;
   module?: string; featureType?: string; riskLevel?: string; analysis?: any;
   companyId?: number; projectId?: number;
+  /**
+   * Sprint 2 — this is the ROOT of the generation chain
+   * (test_requirements → generated_test_scenarios → generated_test_cases), so
+   * it owns the sprint context. Scenarios and test cases inherit it via their
+   * parent FK — they store NO context columns of their own. Undefined lets the
+   * assign_current_sprint trigger stamp the project's current sprint.
+   */
+  sprintId?: number | null;
 }): Promise<number> {
   const pool = getPool();
   const r = await pool.query(
     `INSERT INTO test_requirements
        (title, description, jira_id, business_flow, acceptance_criteria, api_docs,
-        release_notes, module, feature_type, risk_level, analysis, company_id, project_id)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING id`,
+        release_notes, module, feature_type, risk_level, analysis, company_id, project_id, sprint_id)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING id`,
     [data.title, data.description, data.jiraId || null, data.businessFlow || null,
      data.acceptanceCriteria || null, data.apiDocs || null, data.releaseNotes || null,
      data.module || null, data.featureType || null, data.riskLevel || 'medium',
      data.analysis ? JSON.stringify(data.analysis) : null, data.companyId || null,
-     data.projectId || null]
+     data.projectId || null, data.sprintId ?? null]
   );
   return r.rows[0].id;
 }
@@ -9409,6 +9417,8 @@ export interface TestDataSet {
   name: string;
   description: string | null;
   environment: 'shared' | 'dev' | 'staging' | 'prod';
+  /** Sprint 2 — numeric FK to project_environments (workspace-inherited). Nullable. */
+  environment_id: number | null;
   version: number;
   is_active: boolean;
   created_by: string | null;
@@ -9435,14 +9445,22 @@ export async function createTestDataSet(data: {
   name: string;
   description?: string;
   environment?: 'shared' | 'dev' | 'staging' | 'prod';
+  /**
+   * Sprint 2 — numeric FK to project_environments, auto-inherited from the
+   * active Workspace Context. Test data is environment-specific, so this is the
+   * real scoping column going forward; the legacy string `environment` enum is
+   * kept for backward compatibility and migrated gradually. NULL lets the
+   * assign_default_environment trigger stamp the project's default env.
+   */
+  environmentId?: number | null;
   createdBy?: string;
 }): Promise<TestDataSet> {
   const pool = getPool();
   const { rows } = await pool.query(
-    `INSERT INTO test_data_sets (company_id, project_id, name, description, environment, created_by)
-     VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+    `INSERT INTO test_data_sets (company_id, project_id, name, description, environment, environment_id, created_by)
+     VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`,
     [data.companyId, data.projectId ?? null, data.name, data.description ?? null,
-     data.environment ?? 'shared', data.createdBy ?? null],
+     data.environment ?? 'shared', data.environmentId ?? null, data.createdBy ?? null],
   );
   return rows[0];
 }

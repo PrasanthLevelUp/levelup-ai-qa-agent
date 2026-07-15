@@ -36,13 +36,64 @@ export interface EnvSprintStatement {
   sql: string;
 }
 
-/** Tables that get the environment_id / sprint_id link columns + indexes. */
-const LINKED_TABLES = [
+/**
+ * Workspace-context linkage model (Sprint 2 — "how data is born").
+ * ================================================================
+ * Context is owned by the ROOT artifact and INHERITED by children via FK joins
+ * — never duplicated down the tree (Jira Epic → Story → Subtask). This avoids
+ * the synchronisation bug where re-pointing a parent to a new sprint would
+ * require rewriting every descendant row.
+ *
+ *   • Runtime artifacts answer "WHERE + WHEN did it execute?" → own BOTH
+ *     environment_id and sprint_id.
+ *   • Planning-root artifacts answer "WHAT are we building this sprint?" → own
+ *     sprint_id only (a design artifact is environment-independent: one
+ *     requirement / test case / script is exercised across QA, UAT, Prod — so
+ *     stamping it with a single environment would wrongly duplicate it per-env).
+ *   • Test data is environment-specific → owns environment_id (sprint optional,
+ *     not auto-stamped).
+ *   • Everything else (scenarios, test cases, scripts) inherits context through
+ *     its parent FK and stores NO context columns of its own.
+ */
+
+/** Runtime artifacts — scoped by BOTH environment and sprint. */
+const RUNTIME_LINKED_TABLES = [
   'healing_actions',
   'test_executions',
-  'generated_scripts',
   'rca_analyses',
-  'requirements',
+];
+
+/** Planning-root artifacts — scoped by sprint only (environment-independent). */
+const SPRINT_ONLY_TABLES = [
+  'requirements',       // RTM requirements (Requirements Hub)
+  'test_requirements',  // parent of generated scenarios → test cases
+];
+
+/** Environment-scoped artifacts — own environment_id (sprint optional). */
+const ENV_ONLY_TABLES = [
+  'test_data_sets',
+];
+
+/** Tables that receive an environment_id column + index + auto-stamp trigger. */
+const ENV_LINKED_TABLES = [...RUNTIME_LINKED_TABLES, ...ENV_ONLY_TABLES];
+
+/** Tables that receive a sprint_id column + index + auto-stamp trigger. */
+const SPRINT_LINKED_TABLES = [...RUNTIME_LINKED_TABLES, ...SPRINT_ONLY_TABLES];
+
+/**
+ * Legacy auto-stamp triggers to REMOVE. `generated_scripts` used to be stamped
+ * with both environment_id and sprint_id, and `requirements` with an
+ * environment_id — both violate the design above (a script inherits its sprint
+ * from its linked test case → requirement; a requirement is env-independent).
+ * We DROP the stray triggers so existing deployments stop auto-stamping, but
+ * LEAVE the now-unused columns in place (nullable) — non-destructive and
+ * trivially reversible. Each entry drops one trigger, guarded for missing
+ * tables / triggers so re-runs and fresh installs are both safe.
+ */
+const DEPRECATED_STAMP_TRIGGERS: Array<{ table: string; trigger: string }> = [
+  { table: 'generated_scripts', trigger: 'trg_generated_scripts_assign_current_sprint' },
+  { table: 'generated_scripts', trigger: 'trg_generated_scripts_assign_default_environment' },
+  { table: 'requirements', trigger: 'trg_requirements_assign_default_environment' },
 ];
 
 /**
@@ -192,11 +243,16 @@ export const ENV_SPRINT_STATEMENTS: EnvSprintStatement[] = [
     EXCEPTION WHEN duplicate_column THEN NULL; WHEN undefined_table THEN NULL; END $$;`,
   },
 
-  /* ─── 5. Link columns on existing domain tables ───────────────────── */
-  ...LINKED_TABLES.flatMap((t) => [
+  /* ─── 5. Link columns on existing domain tables ───────────────────────
+   * Environment-scoped tables get environment_id; sprint-scoped tables get
+   * sprint_id. Runtime tables appear in both lists and so get both. Idempotent
+   * ALTERs — safe on tables that already carry a column from an earlier phase. */
+  ...ENV_LINKED_TABLES.flatMap((t) => [
     addLinkColumn(t, 'environment_id'),
-    addLinkColumn(t, 'sprint_id'),
     linkIndex(t, 'environment_id'),
+  ]),
+  ...SPRINT_LINKED_TABLES.flatMap((t) => [
+    addLinkColumn(t, 'sprint_id'),
     linkIndex(t, 'sprint_id'),
   ]),
 
@@ -325,27 +381,38 @@ export const ENV_SPRINT_STATEMENTS: EnvSprintStatement[] = [
       END;
       $$ LANGUAGE plpgsql`,
   },
-  /* Attach the auto-stamp triggers to each linked table (guarded). */
-  ...LINKED_TABLES.flatMap((t) => [
-    {
-      label: `trg_${t}_assign_current_sprint`,
-      sql: `DO $$ BEGIN
-        DROP TRIGGER IF EXISTS trg_${t}_assign_current_sprint ON ${t};
-        CREATE TRIGGER trg_${t}_assign_current_sprint
-          BEFORE INSERT ON ${t}
-          FOR EACH ROW EXECUTE FUNCTION assign_current_sprint();
-      EXCEPTION WHEN undefined_table THEN NULL; END $$;`,
-    },
-    {
-      label: `trg_${t}_assign_default_environment`,
-      sql: `DO $$ BEGIN
-        DROP TRIGGER IF EXISTS trg_${t}_assign_default_environment ON ${t};
-        CREATE TRIGGER trg_${t}_assign_default_environment
-          BEFORE INSERT ON ${t}
-          FOR EACH ROW EXECUTE FUNCTION assign_default_environment();
-      EXCEPTION WHEN undefined_table THEN NULL; END $$;`,
-    },
-  ]),
+  /* Attach the sprint auto-stamp trigger to every sprint-linked table (guarded). */
+  ...SPRINT_LINKED_TABLES.map((t) => ({
+    label: `trg_${t}_assign_current_sprint`,
+    sql: `DO $$ BEGIN
+      DROP TRIGGER IF EXISTS trg_${t}_assign_current_sprint ON ${t};
+      CREATE TRIGGER trg_${t}_assign_current_sprint
+        BEFORE INSERT ON ${t}
+        FOR EACH ROW EXECUTE FUNCTION assign_current_sprint();
+    EXCEPTION WHEN undefined_table THEN NULL; END $$;`,
+  })),
+  /* Attach the environment auto-stamp trigger to every env-linked table (guarded). */
+  ...ENV_LINKED_TABLES.map((t) => ({
+    label: `trg_${t}_assign_default_environment`,
+    sql: `DO $$ BEGIN
+      DROP TRIGGER IF EXISTS trg_${t}_assign_default_environment ON ${t};
+      CREATE TRIGGER trg_${t}_assign_default_environment
+        BEFORE INSERT ON ${t}
+        FOR EACH ROW EXECUTE FUNCTION assign_default_environment();
+    EXCEPTION WHEN undefined_table THEN NULL; END $$;`,
+  })),
+
+  /* ─── 11. Remove deprecated auto-stamp triggers ───────────────────────
+   * Context is now inherited (not duplicated) for scripts, and requirements
+   * are environment-independent. Drop the stray triggers so existing
+   * deployments stop stamping; the underlying columns are left untouched
+   * (nullable, unused) — non-destructive and reversible. */
+  ...DEPRECATED_STAMP_TRIGGERS.map(({ table, trigger }) => ({
+    label: `drop_${trigger}`,
+    sql: `DO $$ BEGIN
+      DROP TRIGGER IF EXISTS ${trigger} ON ${table};
+    EXCEPTION WHEN undefined_table THEN NULL; END $$;`,
+  })),
 ];
 
 /** Table names this module adds — surfaced to verifySchema / health checks. */

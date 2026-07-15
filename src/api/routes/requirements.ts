@@ -226,7 +226,8 @@ async function importIssuesAsRequirements(
       source: 'jira',
       sourceId: issue.key,
       syncStatus: 'synced',
-      environmentId: ctx.environmentId ?? null,
+      // Environment intentionally omitted — requirements are env-independent.
+      environmentId: null,
       sprintId: ctx.sprintId ?? null,
     });
     imported++;
@@ -441,9 +442,11 @@ export function createRequirementsRouter(): Router {
       const companyId = (req as any).companyId;
       const projectId = (req as any).projectId ?? null;
       const userId = (req as any).userId ?? null;
-      // Write-path attribution — environment / sprint selected in the dashboard.
-      // Undefined values let the DB triggers stamp the project defaults.
-      const { environmentId, sprintId } = getContextFromRequest(req);
+      // Write-path attribution — a requirement belongs to a sprint/release but is
+      // environment-INDEPENDENT (the same requirement is verified across QA, UAT,
+      // Prod). So we persist only the active sprint; environment is never stamped.
+      // Undefined sprint lets the DB trigger stamp the project's current sprint.
+      const { sprintId } = getContextFromRequest(req);
       const {
         title,
         description,
@@ -481,7 +484,8 @@ export function createRequirementsRouter(): Router {
         tags: tags ?? null,
         createdBy: userId,
         metadata: metadata ?? null,
-        environmentId: environmentId ?? null,
+        // Environment intentionally omitted — requirements are env-independent.
+        environmentId: null,
         sprintId: sprintId ?? null,
       });
 
