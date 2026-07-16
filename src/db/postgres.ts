@@ -13746,6 +13746,13 @@ export async function getCoverageSummary(
   in_progress: number;
   not_tested: number;
   avg_coverage: number;
+  // Requirements Hub header stats. `imported_count` = everything not authored
+  // manually (Jira today; Azure DevOps / Linear later). `last_synced_at` is the
+  // most recent update to an imported requirement — a truthful proxy for "when
+  // did we last pull external data". NULL when nothing has been imported yet.
+  manual_count: number;
+  imported_count: number;
+  last_synced_at: string | null;
 }> {
   const pool = getPool();
   const values: any[] = [companyId];
@@ -13763,7 +13770,10 @@ export async function getCoverageSummary(
         COUNT(*) FILTER (WHERE status = 'Failed')::int AS failed,
         COUNT(*) FILTER (WHERE status = 'In Progress')::int AS in_progress,
         COUNT(*) FILTER (WHERE status = 'Not Tested')::int AS not_tested,
-        COALESCE(ROUND(AVG(coverage_percentage))::int, 0) AS avg_coverage
+        COALESCE(ROUND(AVG(coverage_percentage))::int, 0) AS avg_coverage,
+        COUNT(*) FILTER (WHERE COALESCE(source, 'manual') = 'manual')::int AS manual_count,
+        COUNT(*) FILTER (WHERE COALESCE(source, 'manual') <> 'manual')::int AS imported_count,
+        MAX(updated_at) FILTER (WHERE COALESCE(source, 'manual') <> 'manual') AS last_synced_at
      FROM requirements
      WHERE company_id = $1 AND deleted_at IS NULL${projectClause}`,
     values,
@@ -13778,6 +13788,11 @@ export async function getCoverageSummary(
     in_progress: row.in_progress ?? 0,
     not_tested: row.not_tested ?? 0,
     avg_coverage: row.avg_coverage ?? 0,
+    manual_count: row.manual_count ?? 0,
+    imported_count: row.imported_count ?? 0,
+    last_synced_at: row.last_synced_at
+      ? new Date(row.last_synced_at).toISOString()
+      : null,
   };
 }
 
