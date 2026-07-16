@@ -745,6 +745,14 @@ export function createScriptGenRouter(): Router {
                 skipped: true,
                 message: plan.summary,
                 requirementId: String(requirementId ?? 'inline'),
+                // ── Frozen explainability contract (see ScriptGenerationPlan) ──
+                // Every intelligence-driven response carries the same shape so
+                // the customer panel / RTM / Analytics never re-explain a
+                // decision differently.
+                generationDecision: plan.decision,
+                confidence: plan.telemetry.confidence,
+                reason: plan.reason,
+                generatedBecause: plan.generatedBecause,
                 // Repository Coverage (vs the Coverage Model) — deliberately
                 // kept distinct from Automation Progress (DB-linked automation %).
                 repositoryCoverage: intelligence.coverage.coverage,

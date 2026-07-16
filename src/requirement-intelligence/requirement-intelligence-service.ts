@@ -34,13 +34,19 @@
 import { assessRequirementCoverage } from '../requirement-coverage/requirement-coverage-engine';
 import type { RequirementInput } from '../requirement-coverage/types';
 import type { CoverageModel } from '../context/types';
-import { defaultGenerationPolicy, type GenerationPolicy } from './generation-policy';
+import { createDefaultGenerationPolicy, type GenerationPolicy } from './generation-policy';
 import type { RequirementIntelligence } from './types';
 
 export class RequirementIntelligenceService {
   private readonly policy: GenerationPolicy;
 
-  constructor(policy: GenerationPolicy = defaultGenerationPolicy) {
+  /**
+   * @param policy Injectable generation policy. Defaults to the coverage-based
+   *   policy with its SKIP confidence threshold resolved from the environment
+   *   (REQUIREMENT_SKIP_CONFIDENCE_THRESHOLD), so production can tune the gate
+   *   without code changes while tests inject an explicit policy.
+   */
+  constructor(policy: GenerationPolicy = createDefaultGenerationPolicy()) {
     this.policy = policy;
   }
 
@@ -54,7 +60,7 @@ export class RequirementIntelligenceService {
    */
   analyze(requirement: RequirementInput, models: CoverageModel[]): RequirementIntelligence {
     const coverage = assessRequirementCoverage(requirement, models);
-    const generation = this.policy.decide(coverage);
-    return { requirement, coverage, generation };
+    const { decision, reasons } = this.policy.decide(coverage);
+    return { requirement, coverage, generation: decision, generationReasons: reasons };
   }
 }

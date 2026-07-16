@@ -33,6 +33,28 @@ export type {
 } from '../requirement-coverage/types';
 export { GenerationDecision } from '../coverage-intelligence/types';
 
+/**
+ * The single, structured explanation of a generation decision — the SHARED
+ * object every consumer (telemetry, the customer "Generate Script" panel, RTM,
+ * Release Center, Analytics) renders. There is exactly ONE explanation shape so
+ * no two surfaces can ever explain the same decision differently.
+ *
+ * It is deliberately data, not prose: `coveredFlows` / `missingFlows` are the
+ * repository facts behind the decision, and `confidence` is how much the
+ * coverage verdict can be trusted. A UI turns these into "✓ Login Success /
+ * • Locked User"; a log serializes them verbatim. Naming is architecture: this
+ * is the explanation of the DECISION, hence it lives beside the decision, not
+ * inside the Coverage layer (which only measures facts).
+ */
+export interface DecisionReason {
+  /** Expected behaviors the repository ALREADY covers (the "✓ already covered" list). */
+  coveredFlows: string[];
+  /** Expected behaviors the repository does NOT cover (the "• generating / missing" list). */
+  missingFlows: string[];
+  /** Confidence in the coverage verdict, 0-100. Drives the SKIP confidence gate. */
+  confidence: number;
+}
+
 export interface RequirementIntelligence {
   /** The requirement this intelligence was computed for (echoed back for consumers). */
   requirement: RequirementInput;
@@ -40,6 +62,15 @@ export interface RequirementIntelligence {
   coverage: RequirementCoverage;
   /** DECISION: what Script Generation should do — SKIP · EXTEND · GENERATE. */
   generation: GenerationDecision;
+  /**
+   * WHY the decision landed where it did — specifically any OVERRIDE of the raw
+   * coverage-status mapping (e.g. a low-confidence COVERED downgraded to EXTEND
+   * emits `['Low confidence']`). Empty when the decision follows coverage status
+   * directly. Surfaced to consumers as `generatedBecause`. An array so future
+   * override rules (requirement updated, repository changed, manual override)
+   * append without a breaking contract change.
+   */
+  generationReasons: string[];
   /**
    * RESERVED — future Reuse Engine output (reusable code found for this
    * requirement). Not populated in the current sprint.

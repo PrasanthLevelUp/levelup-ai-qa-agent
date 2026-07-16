@@ -20,6 +20,7 @@ import type { RequirementCoverage, RequirementInput } from '../../src/requiremen
 function intel(
   generation: GenerationDecision,
   coverage: Partial<RequirementCoverage> & { status: RequirementCoverage['status'] },
+  generationReasons: string[] = [],
 ): RequirementIntelligence {
   const requirement: RequirementInput = { id: coverage.requirementId ?? 'REQ-1', title: 'A requirement' };
   const fullCoverage: RequirementCoverage = {
@@ -34,7 +35,7 @@ function intel(
     matchedFeature: coverage.matchedFeature ?? null,
     matches: coverage.matches ?? [],
   };
-  return { requirement, coverage: fullCoverage, generation };
+  return { requirement, coverage: fullCoverage, generation, generationReasons };
 }
 
 const consumer = new ScriptGenerationConsumer();
@@ -151,6 +152,61 @@ describe('ScriptGenerationConsumer — GENERATE (RIF)', () => {
     expect(plan.telemetry.flowsSkipped).toBe(0);
     expect(plan.telemetry.flowsGenerated).toBe(2);
     expect(plan.telemetry.estimatedTokenSavings).toBe(0);
+  });
+});
+
+describe('ScriptGenerationConsumer — explainability (Trusted Intelligence)', () => {
+  it('surfaces the structured DecisionReason (covered/missing flows + confidence) on the plan and telemetry', () => {
+    const plan = consumer.plan(
+      intel(GenerationDecision.EXTEND, {
+        status: 'PARTIAL',
+        coverage: 67,
+        confidence: 84,
+        coveredSlices: [
+          { flow: 'Login Success', testCaseIds: ['TC-1'] },
+          { flow: 'Login Failure', testCaseIds: ['TC-2'] },
+        ],
+        missingSlices: [{ flow: 'Locked User', testCaseIds: ['TC-3'] }],
+      }),
+    );
+    expect(plan.reason).toEqual({
+      coveredFlows: ['Login Success', 'Login Failure'],
+      missingFlows: ['Locked User'],
+      confidence: 84,
+    });
+    // Same object surfaced through telemetry, plus the top-level confidence mirror.
+    expect(plan.telemetry.reason).toEqual(plan.reason);
+    expect(plan.telemetry.confidence).toBe(84);
+  });
+
+  it('forwards the policy override reasons as generatedBecause (never re-derived)', () => {
+    // A low-confidence COVERED that the policy downgraded to EXTEND.
+    const plan = consumer.plan(
+      intel(
+        GenerationDecision.EXTEND,
+        {
+          status: 'COVERED',
+          coverage: 100,
+          confidence: 40,
+          coveredSlices: [{ flow: 'Login Success', testCaseIds: ['TC-1'] }],
+          missingSlices: [],
+        },
+        ['Low confidence'],
+      ),
+    );
+    expect(plan.generatedBecause).toEqual(['Low confidence']);
+    expect(plan.telemetry.generatedBecause).toEqual(['Low confidence']);
+  });
+
+  it('generatedBecause is empty when the decision followed coverage status directly', () => {
+    const plan = consumer.plan(
+      intel(GenerationDecision.GENERATE, {
+        status: 'MISSING',
+        coverage: 0,
+        missingSlices: [{ flow: 'checkout', testCaseIds: ['TC-9'] }],
+      }),
+    );
+    expect(plan.generatedBecause).toEqual([]);
   });
 });
 
