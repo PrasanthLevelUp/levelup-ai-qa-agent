@@ -408,7 +408,17 @@ const CATEGORY_SIGNALS: CategorySignal[] = [
   {
     category: 'workflow',
     weight: 0.75,
-    patterns: [/\bworkflow\b/, /\bapproval\b/, /\bapprove\b/, /\breject\b/, /\bmulti[\s-]?step\b/, /\bwizard\b/, /\bstate machine\b/, /\bstatus transition\b/, /\bstage\b/],
+    patterns: [
+      /\bworkflow\b/, /\bapproval\b/, /\bapprove\b/, /\breject\b/, /\bmulti[\s-]?step\b/,
+      /\bwizard\b/, /\bstate machine\b/, /\bstatus transition\b/, /\bstage\b/,
+      // Sprint 2 — request/approval routing signals: a submitted item routed to an
+      // approver (leave, time-off, expense, purchase requisition). Phrases are kept
+      // specific so a plain CRUD form is NOT swept into workflow — verified against
+      // all 10 gold benchmarks (only genuine approval flows reclassify).
+      /\bfor approval\b/, /\bpending approval\b/, /\bawaiting approval\b/,
+      /\bsent (to|for) (the )?(manager|approver|approval)\b/, /\brouted (to|for)\b/,
+      /\bmanager('?s)? approv/, /\bleave request\b/, /\btime[\s-]?off\b/,
+    ],
   },
   {
     category: 'crud',
@@ -699,6 +709,27 @@ export const QA_KNOWLEDGE_BASE: Record<Exclude<QACategory, 'generic'>, PlannedSc
     { id: 'wf-neg-reject', title: 'Rejection routes correctly', objective: 'Rejecting sends the item to the correct stage (back/terminated) per spec.', coverageType: 'negative', priority: 'P1', riskArea: 'Routing correctness', conditionalOnKeywords: ['reject', 'decline', 'deny'] },
     { id: 'wf-role-permissions', title: 'Only permitted roles can action a stage', objective: 'A user without the stage role cannot perform that stage action.', coverageType: 'role_based', priority: 'P1', riskArea: 'Segregation of duties', conditionalOnKeywords: ['role', 'approver', 'permission'] },
     { id: 'wf-edge-interrupt-resume', title: 'Interrupted workflow resumes correctly', objective: 'Leaving mid-workflow and returning preserves progress/state.', coverageType: 'edge_cases', priority: 'P2', riskArea: 'Flow resilience' },
+    // ── Request-and-approval domain depth (Sprint 2) ──────────────────────────
+    // A senior QA does not stop at "the workflow completes". When a workflow is a
+    // request routed to an approver (leave, time-off, expense, requisition), the
+    // request-entry fields, the business rules that guard them, the approval
+    // authority and the routing/notification each open their own validation
+    // opportunities. Every obligation below is keyword-gated so it surfaces ONLY
+    // when the requirement actually mentions that field / rule — no invention.
+    // All are typed positive/negative so they emit in the default (positive,
+    // negative, edge_cases) suite, not just under deep coverage.
+    { id: 'wf-pos-submit-request', title: 'Submit a valid request successfully', objective: 'A valid leave request with leave type, start date, end date and reason within balance is submitted successfully and created in a Pending state.', coverageType: 'positive', priority: 'P0', riskArea: 'Request submission', conditionalOnKeywords: ['leave', 'request', 'submit', 'time off', 'time-off'] },
+    { id: 'wf-neg-mandatory-fields', title: 'Mandatory request fields are required', objective: 'Submitting with a blank or missing start date, end date, leave type or reason is rejected with field-level validation.', coverageType: 'negative', priority: 'P0', riskArea: 'Input validation', conditionalOnKeywords: ['start date', 'end date', 'leave type', 'reason'] },
+    { id: 'wf-rule-date-order', title: 'End date before start date is rejected', objective: 'A request whose end date falls before the start date is rejected as an invalid date range.', coverageType: 'negative', priority: 'P0', riskArea: 'Date range validation', conditionalOnKeywords: ['start date', 'end date', 'date range', 'date'] },
+    { id: 'wf-rule-past-date', title: 'Past / backdated date is rejected', objective: 'A request with a start date in the past is rejected as a backdated request.', coverageType: 'negative', priority: 'P1', riskArea: 'Temporal validation', conditionalOnKeywords: ['start date', 'end date', 'date'] },
+    { id: 'wf-pos-balance-sufficient', title: 'Request within balance is accepted', objective: 'A request within the available leave balance is accepted because the balance is sufficient.', coverageType: 'positive', priority: 'P1', riskArea: 'Balance validation', conditionalOnKeywords: ['balance', 'quota', 'allowance'] },
+    { id: 'wf-rule-balance-insufficient', title: 'Request exceeding balance is rejected', objective: 'A request that exceeds the available leave balance is rejected for insufficient balance.', coverageType: 'negative', priority: 'P0', riskArea: 'Balance enforcement', conditionalOnKeywords: ['balance', 'quota', 'allowance'] },
+    { id: 'wf-pos-balance-deducted', title: 'Balance is deducted on approval', objective: 'On approval the leave balance is deducted and the request status is updated to approved.', coverageType: 'positive', priority: 'P1', riskArea: 'Data integrity', conditionalOnKeywords: ['balance', 'deduct', 'approval'] },
+    { id: 'wf-neg-rejection-status', title: 'Rejection updates the request status', objective: 'A manager rejection updates the request status to rejected and notifies the employee.', coverageType: 'negative', priority: 'P1', riskArea: 'Data integrity', conditionalOnKeywords: ['reject', 'rejection', 'status'] },
+    { id: 'wf-pos-manager-approve', title: 'Manager approves the request', objective: 'The assigned manager (approver) can approve the pending request and advance it to the approved state.', coverageType: 'positive', priority: 'P1', riskArea: 'Approval authority', conditionalOnKeywords: ['manager', 'approver', 'approval'] },
+    { id: 'wf-neg-unauthorized-approval', title: 'Unauthorized approval is blocked', objective: 'A user who is not the assigned approver cannot approve the request; an unauthorized approval is blocked.', coverageType: 'negative', priority: 'P1', riskArea: 'Segregation of duties', conditionalOnKeywords: ['approval', 'approve', 'manager', 'approver'] },
+    { id: 'wf-pos-route-pending', title: 'Request is routed to the manager for approval', objective: 'On submission the request is routed and sent to the manager, entering pending approval.', coverageType: 'positive', priority: 'P1', riskArea: 'Approval routing', conditionalOnKeywords: ['route', 'routed', 'pending', 'manager', 'approver', 'approval'] },
+    { id: 'wf-pos-notify', title: 'Notification is sent to the manager and employee', objective: 'A notification is sent to the manager on submission and to the employee on approval or rejection.', coverageType: 'positive', priority: 'P2', riskArea: 'Notification', conditionalOnKeywords: ['notif', 'notify', 'notification'] },
   ],
   reporting: [
     { id: 'rep-pos-accurate', title: 'Report shows accurate data', objective: 'Figures/aggregations match the underlying source data for a known dataset.', coverageType: 'positive', priority: 'P0', riskArea: 'Data accuracy', core: true },
