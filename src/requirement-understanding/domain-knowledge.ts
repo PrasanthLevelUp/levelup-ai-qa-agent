@@ -38,6 +38,8 @@ const FIELD_TYPE_HINTS: Array<[RegExp, FieldDataType]> = [
   [/\b(price|amount|salary|cost|quantity|qty|number|count|age|total|balance|rate)\b/i, 'number'],
   [/\b(status|role|department|type|category|gender|country|state|priority|stage)\b/i, 'enum'],
   [/\b(is[_-]?\w+|active|enabled|disabled|verified|approved)\b/i, 'boolean'],
+  // Common free-text nouns — kept last so more specific hints above win first.
+  [/\b(name|title|description|address|city|company|username|comment|note|label|subject|remarks?)\b/i, 'text'],
 ];
 
 /** Map a raw type hint from a crawl/schema to our data type. */
