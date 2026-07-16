@@ -68,6 +68,7 @@ function sauceDemoProfile(): RepositoryProfile {
     ] as any,
     preferredLocators: [], avoidPatterns: [], dependencies: [], assertionLibrary: 'playwright',
     hasApiLayer: false, hasCustomFixtures: true, hasMocking: false, hasVisualTesting: false, ciIntegration: null,
+    testInventory: [],
   };
 }
 

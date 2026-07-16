@@ -14,11 +14,6 @@ import {
   ENV_SPRINT_TABLES,
   applyEnvSprintSchema,
 } from './environment-sprint-schema';
-import {
-  REPOSITORY_INVENTORY_STATEMENTS,
-  REPOSITORY_INVENTORY_TABLES,
-  applyRepositoryInventorySchema,
-} from './repository-inventory-schema';
 import { FEATURE_FLAGS } from '../config/features';
 import { buildDateFilter, buildEnvironmentFilter } from './filter-helpers';
 import {
@@ -254,8 +249,6 @@ const REQUIRED_TABLES = [
   ...RTM_TABLES,
   // Environment & Sprint management (Phase 1 Foundation)
   ...ENV_SPRINT_TABLES,
-  // Repository Coverage Intelligence — Sprint RCI-1 (deterministic inventory)
-  ...REPOSITORY_INVENTORY_TABLES,
 ];
 
 export async function initDb(): Promise<void> {
@@ -1733,17 +1726,6 @@ async function initSchema(client: PoolClient): Promise<void> {
   // them. Idempotent + routed through the same safeExec runner.
   console.log('🔧 [DB] Phase ENV/SPRINT: Environment & Sprint management...');
   for (const stmt of ENV_SPRINT_STATEMENTS) {
-    await run(stmt.label, stmt.sql);
-  }
-
-  // ─── Phase RCI-1: Repository Test Inventory ─────────────────────
-  // Deterministic per-test inventory of existing test repositories, the
-  // foundation of Repository Coverage Intelligence. Applied after the
-  // repositories table (from migrateDefaultCompany/base schema) so the
-  // repository_id link target already exists. Idempotent + routed through the
-  // same safeExec runner.
-  console.log('🔧 [DB] Phase RCI-1: Repository Test Inventory...');
-  for (const stmt of REPOSITORY_INVENTORY_STATEMENTS) {
     await run(stmt.label, stmt.sql);
   }
 
@@ -13937,219 +13919,6 @@ export async function runEnvSprintMigration(): Promise<{ ok: number; fail: numbe
   });
   logger.info(MOD, `Env/Sprint migration complete (${result.ok} ok, ${result.fail} errors)`);
   return result;
-}
-
-/**
- * Run the Repository Test Inventory schema programmatically on demand (Sprint
- * RCI-1, mirrors runRTMMigration). Idempotent — safe to call repeatedly.
- */
-export async function runRepositoryInventoryMigration(): Promise<{ ok: number; fail: number }> {
-  const result = await applyRepositoryInventorySchema(getPool(), (label, err) => {
-    logger.error(MOD, `Repository inventory migration statement failed: ${label}`, { error: err.message });
-  });
-  logger.info(MOD, `Repository inventory migration complete (${result.ok} ok, ${result.fail} errors)`);
-  return result;
-}
-
-/* ════════════════════════════════════════════════════════════════════════
- * Repository Test Inventory — DB helpers (Sprint RCI-1)
- * Deterministic per-test inventory of existing test repositories.
- * ════════════════════════════════════════════════════════════════════════ */
-
-/** A single inventory row as extracted by the scanner (DB-agnostic shape). */
-export interface RepositoryInventoryRecordInput {
-  filePath: string;
-  testName: string;
-  feature: string | null;
-  flow: string | null;
-  page: string | null;
-  tags: string[];
-  assertions: string[];
-  pomMethods: string[];
-  framework: string;
-  confidence: number;
-  metadata: Record<string, any>;
-}
-
-/**
- * Replace the entire inventory for a repository scope with a freshly scanned
- * set. Runs in a transaction: delete-then-insert so the persisted inventory
- * always mirrors the CURRENT state of the repo (tests removed upstream vanish
- * from the inventory instead of lingering). Idempotent — re-scanning the same
- * repo yields the same rows.
- */
-export async function replaceRepositoryTestInventory(
-  companyId: number,
-  projectId: number | null,
-  repositoryId: number | null,
-  records: RepositoryInventoryRecordInput[],
-): Promise<{ inserted: number }> {
-  const client = await getPool().connect();
-  try {
-    await client.query('BEGIN');
-    // Scope the wipe to the exact (company, repo) pair. COALESCE keeps NULL
-    // repository_id (ad-hoc path scans) matching correctly.
-    await client.query(
-      `DELETE FROM repository_test_inventory
-       WHERE company_id = $1 AND COALESCE(repository_id, 0) = COALESCE($2, 0)`,
-      [companyId, repositoryId],
-    );
-
-    let inserted = 0;
-    for (const r of records) {
-      await client.query(
-        `INSERT INTO repository_test_inventory
-          (company_id, project_id, repository_id, file_path, test_name,
-           feature, flow, page, tags, assertions, pom_methods, framework,
-           confidence, metadata)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10::jsonb,$11::jsonb,$12,$13,$14::jsonb)
-         ON CONFLICT (company_id, COALESCE(repository_id, 0), file_path, test_name)
-         DO UPDATE SET
-           project_id = EXCLUDED.project_id,
-           feature = EXCLUDED.feature,
-           flow = EXCLUDED.flow,
-           page = EXCLUDED.page,
-           tags = EXCLUDED.tags,
-           assertions = EXCLUDED.assertions,
-           pom_methods = EXCLUDED.pom_methods,
-           framework = EXCLUDED.framework,
-           confidence = EXCLUDED.confidence,
-           metadata = EXCLUDED.metadata,
-           updated_at = NOW()`,
-        [
-          companyId,
-          projectId,
-          repositoryId,
-          r.filePath,
-          r.testName,
-          r.feature,
-          r.flow,
-          r.page,
-          JSON.stringify(r.tags ?? []),
-          JSON.stringify(r.assertions ?? []),
-          JSON.stringify(r.pomMethods ?? []),
-          r.framework,
-          r.confidence,
-          JSON.stringify(r.metadata ?? {}),
-        ],
-      );
-      inserted++;
-    }
-    await client.query('COMMIT');
-    logger.info(MOD, `Persisted ${inserted} inventory rows`, { companyId, projectId, repositoryId });
-    return { inserted };
-  } catch (err) {
-    await client.query('ROLLBACK');
-    throw err;
-  } finally {
-    client.release();
-  }
-}
-
-export interface RepositoryInventoryRow {
-  id: string;
-  repository_id: number | null;
-  file_path: string;
-  test_name: string;
-  feature: string | null;
-  flow: string | null;
-  page: string | null;
-  tags: string[];
-  assertions: string[];
-  pom_methods: string[];
-  framework: string | null;
-  confidence: number;
-  metadata: Record<string, any>;
-  created_at: string;
-  updated_at: string;
-}
-
-export interface RepositoryInventoryFeatureGroup {
-  feature: string;
-  testCount: number;
-  avgConfidence: number;
-  tests: RepositoryInventoryRow[];
-}
-
-export interface RepositoryInventoryResult {
-  totalTests: number;
-  totalFeatures: number;
-  frameworks: string[];
-  groups: RepositoryInventoryFeatureGroup[];
-}
-
-/**
- * Fetch the inventory for a scope, grouped by feature (with per-feature counts
- * and average confidence). Supports an optional free-text search over test
- * name / feature / page / flow / file path / tags. Pure read — no AI.
- */
-export async function getRepositoryTestInventoryGrouped(
-  companyId: number,
-  opts: {
-    projectId?: number | null;
-    repositoryId?: number | null;
-    search?: string;
-  } = {},
-): Promise<RepositoryInventoryResult> {
-  const p = getPool();
-  const params: any[] = [companyId];
-  let where = 'company_id = $1';
-
-  if (opts.repositoryId != null) {
-    params.push(opts.repositoryId);
-    where += ` AND repository_id = $${params.length}`;
-  }
-  if (opts.projectId != null) {
-    params.push(opts.projectId);
-    where += ` AND COALESCE(project_id, 0) = $${params.length}`;
-  }
-  if (opts.search && opts.search.trim()) {
-    params.push(`%${opts.search.trim().toLowerCase()}%`);
-    const i = params.length;
-    where += ` AND (
-      LOWER(test_name) LIKE $${i} OR
-      LOWER(COALESCE(feature,'')) LIKE $${i} OR
-      LOWER(COALESCE(page,'')) LIKE $${i} OR
-      LOWER(COALESCE(flow,'')) LIKE $${i} OR
-      LOWER(file_path) LIKE $${i} OR
-      LOWER(tags::text) LIKE $${i}
-    )`;
-  }
-
-  const res = await p.query(
-    `SELECT id, repository_id, file_path, test_name, feature, flow, page,
-            tags, assertions, pom_methods, framework, confidence, metadata,
-            created_at, updated_at
-     FROM repository_test_inventory
-     WHERE ${where}
-     ORDER BY feature NULLS LAST, test_name`,
-    params,
-  );
-
-  const groupsMap = new Map<string, RepositoryInventoryRow[]>();
-  const frameworks = new Set<string>();
-  for (const row of res.rows as RepositoryInventoryRow[]) {
-    if (row.framework) frameworks.add(row.framework);
-    const key = row.feature || 'Uncategorized';
-    if (!groupsMap.has(key)) groupsMap.set(key, []);
-    groupsMap.get(key)!.push(row);
-  }
-
-  const groups: RepositoryInventoryFeatureGroup[] = [...groupsMap.entries()]
-    .map(([feature, tests]) => ({
-      feature,
-      testCount: tests.length,
-      avgConfidence: Math.round(tests.reduce((s, t) => s + (t.confidence ?? 0), 0) / tests.length),
-      tests,
-    }))
-    .sort((a, b) => b.testCount - a.testCount || a.feature.localeCompare(b.feature));
-
-  return {
-    totalTests: res.rows.length,
-    totalFeatures: groups.length,
-    frameworks: [...frameworks],
-    groups,
-  };
 }
 
 /* ════════════════════════════════════════════════════════════════════════

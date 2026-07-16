@@ -107,6 +107,28 @@ export interface FileAnalysis {
   lineCount: number;
   hasFixtures: boolean;
   hasPageObject: boolean;
+  /**
+   * Per-test raw facts extracted from THIS file during the same AST pass
+   * (Sprint RCI-1). One entry per test()/it() declaration. These are raw
+   * signals only — feature/flow/page classification and confidence scoring
+   * happen later in the Repository Context Engine (extractTestInventory),
+   * keeping AST parsing and business classification cleanly separated.
+   */
+  tests: TestCaseAnalysis[];
+}
+
+/**
+ * Raw per-test facts captured by the AST analyzer (Sprint RCI-1). Purely
+ * mechanical extraction — no interpretation. The Repository Context Engine
+ * turns these into classified TestInventoryEntry records.
+ */
+export interface TestCaseAnalysis {
+  testName: string;
+  describeName: string | null;   // nearest enclosing describe/context/suite title
+  tags: string[];                // @smoke, @tc:TC1234, etc. (from title + body)
+  assertions: string[];          // matcher names / cypress should:... assertions
+  pomMethods: string[];          // Page-Object method calls exercised by the test
+  line: number;                  // 1-based line number of the test declaration
 }
 
 /* ------------------------------------------------------------------ */
@@ -223,6 +245,13 @@ export interface RepositoryProfile {
   businessFlows: BusinessFlow[];
   testSuites: TestSuiteInfo[];
 
+  // Repository Test Inventory (Sprint RCI-1): one deterministic entry per test
+  // already present in the repo, classified by feature/flow/page with a
+  // transparent confidence score. This is what "understand before generate"
+  // consumes — surfaced in the Repository Intelligence "Test Inventory" view
+  // and later mapped to requirements by Coverage Intelligence (RCI-2).
+  testInventory: TestInventoryEntry[];
+
   // Locator patterns
   preferredLocators: Array<{ pattern: string; count: number; example: string }>;
   avoidPatterns: string[];
@@ -258,6 +287,37 @@ export interface TestSuiteInfo {
   describeName: string | null;
   tags: string[];
   category: string;              // auth, navigation, crud, etc.
+}
+
+/* ------------------------------------------------------------------ */
+/*  Repository Test Inventory (Sprint RCI-1)                          */
+/* ------------------------------------------------------------------ */
+
+/**
+ * One deterministically-classified test discovered in the repository. Emitted
+ * by the Repository Context Engine's extractTestInventory() from the raw
+ * per-test facts the AST analyzer captured. NO LLM / embeddings / generation —
+ * pure static analysis, fully reproducible for a given tree.
+ */
+export interface TestInventoryEntry {
+  testName: string;
+  filePath: string;             // repo-relative source path
+  feature: string | null;       // e.g. 'Authentication', 'Checkout'
+  flow: string | null;          // e.g. 'login', 'add-to-cart'
+  page: string | null;          // page/screen under test (from POM or URL)
+  suite: string | null;         // enclosing describe/context title, if any
+  tags: string[];               // @smoke, @tc:TC1234, ...
+  assertions: string[];         // matcher names / cypress should:... assertions
+  pomMethods: string[];         // Page-Object methods the test exercises
+  framework: TestFramework;     // inherited from the repo-level detection
+  confidence: number;           // 0-100, transparent signal-based heuristic
+  /** Auditable breakdown of how feature/confidence were derived. */
+  metadata: {
+    line: number;
+    assertionCount: number;
+    pomMethodCount: number;
+    featureSource: 'describe' | 'keyword' | 'filename';
+  };
 }
 
 /* ------------------------------------------------------------------ */
