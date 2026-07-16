@@ -482,6 +482,176 @@ const MAX_REQUIREMENT_STEPS = 60;
 /** How close a scenario must be to a step (token overlap) to "cover" it. */
 const STEP_COVER_THRESHOLD = 0.34;
 
+/* ------------------------------------------------------------------ */
+/*  Field-aware expansion                                              */
+/*                                                                     */
+/*  A senior QA does NOT collapse validation into a single generic     */
+/*  "missing required field" case — they write a per-field check for   */
+/*  each input the form actually names (blank, whitespace, length,     */
+/*  type). The generic CRUD obligations state each CONCEPT once; this  */
+/*  pass expands the concept across the FIELDS the requirement names,  */
+/*  so the generated suite reads like a human wrote it. Pure +         */
+/*  deterministic; the fields are read from the requirement text and   */
+/*  never hardcoded.                                                   */
+/* ------------------------------------------------------------------ */
+
+type FieldKind = 'name' | 'id' | 'text';
+interface InputField { label: string; slug: string; kind: FieldKind; }
+
+/** Compound field nouns worth expanding, most-specific first so "first name"
+ *  wins over the bare "name". Deliberately small + generic. */
+const FIELD_NOUNS: string[] = [
+  'first name', 'last name', 'full name', 'middle name', 'display name',
+  'employee id', 'user id', 'product id', 'order id', 'employee code',
+  'name', 'email', 'phone', 'mobile', 'address', 'city', 'zip', 'postal code',
+  'username', 'title', 'description', 'quantity', 'price', 'sku', 'code',
+];
+
+/** File-ish fields are covered by the upload obligations — never text-expanded. */
+const FILE_FIELD_RE = /\b(photo|image|picture|avatar|file|attachment|document|logo)\b/;
+
+/** An explicit field-list clause: "entering X, Y and Z" / "with X, Y, Z". */
+const FIELD_CLAUSE_RE =
+  /\b(?:enter(?:ing)?|with|includ(?:ing|es?)|provid(?:e|ing)|input|containing|contains?|fields?|capturing?)\b[:\s]+([^.;]+)/i;
+
+function classifyFieldKind(label: string): FieldKind {
+  if (/\b(id|code|number|no)\b/.test(label)) return 'id';
+  if (/\bname\b/.test(label)) return 'name';
+  return 'text';
+}
+
+function titleCaseField(label: string): string {
+  return label.replace(/\b([a-z])/g, (_, c) => c.toUpperCase());
+}
+
+/** Extract the distinct input fields a requirement names. Two passes:
+ *  (a) an explicit list clause ("entering X, Y and Z");
+ *  (b) a scan for well-known field nouns anywhere in the text. */
+function extractInputFields(text: string): InputField[] {
+  const found = new Map<string, InputField>(); // slug -> field (dedup)
+  const add = (raw: string) => {
+    let label = raw.toLowerCase().trim()
+      .replace(/^(an?|the|its?|their|optional|new|valid|unique)\s+/g, '')
+      .replace(/[^a-z0-9 ]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+    label = label.replace(/\b(field|value|details?)$/, '').trim();
+    if (!label || label.length > 40) return;
+    if (label.split(' ').length > 4) return;
+    if (FILE_FIELD_RE.test(label)) return; // uploads handled by upload obligations
+    const slug = label.replace(/\s+/g, '-');
+    if (!slug || found.has(slug)) return;
+    found.set(slug, { label, slug, kind: classifyFieldKind(label) });
+  };
+
+  const lower = ` ${text.toLowerCase().replace(/\s+/g, ' ')} `;
+
+  const clause = text.match(FIELD_CLAUSE_RE);
+  if (clause) for (const frag of clause[1].split(/,|\band\b|\/|;/i)) add(frag);
+
+  for (const noun of FIELD_NOUNS) {
+    if (lower.includes(` ${noun} `) || lower.includes(` ${noun},`) || lower.includes(` ${noun}.`)) add(noun);
+  }
+
+  // If a specific name field (first/last name) was captured, drop the bare
+  // "name" — the specific fields are what a QA actually expands.
+  if ([...found.values()].some(f => f.kind === 'name' && f.slug !== 'name')) found.delete('name');
+
+  return [...found.values()];
+}
+
+/** Build the per-field validation + boundary scenarios a senior QA writes when
+ *  a data-entry form names its fields. Each objective literally names the field
+ *  so it reads like a hand-authored suite. Returns bare PlannedScenarios —
+ *  planScenarios tags them Standard/Deep coverage (assumption, never grounded). */
+function fieldAwareScenarios(fields: InputField[]): PlannedScenario[] {
+  if (fields.length === 0) return [];
+  const out: PlannedScenario[] = [];
+  const nameFields = fields.filter(f => f.kind === 'name');
+  const idFields = fields.filter(f => f.kind === 'id');
+  const textFields = fields.filter(f => f.kind === 'text');
+
+  // (1) Whitespace-only — a DISTINCT per-field check (trimming can be missed on
+  //     any single field). Emit for each named name/text field (cap 4).
+  for (const f of [...nameFields, ...textFields].slice(0, 4)) {
+    out.push({
+      id: `field-${f.slug}-whitespace`,
+      title: `${titleCaseField(f.label)} containing only whitespace is rejected`,
+      objective: `A ${f.label} value of only whitespace / spaces is trimmed to blank and rejected as required — whitespace-only ${f.label}.`,
+      coverageType: 'negative', priority: 'P1', riskArea: 'Input validation',
+    });
+  }
+
+  // (2) All-required-blank — one cross-field submit when 2+ required fields.
+  const requiredish = [...nameFields, ...idFields, ...textFields];
+  if (requiredish.length >= 2) {
+    const bothNames = nameFields.length >= 2 ? 'both names blank / ' : '';
+    out.push({
+      id: 'field-all-required-blank',
+      title: 'All required fields blank is rejected',
+      objective: `Submitting with ${bothNames}all required fields blank at once is rejected, with a validation error on every empty field.`,
+      coverageType: 'negative', priority: 'P1', riskArea: 'Input validation',
+    });
+  }
+
+  // (3) Numeric-in-name — once, on the first name field (a name-type rule).
+  if (nameFields.length) {
+    const f = nameFields[0];
+    out.push({
+      id: `field-${f.slug}-numeric`,
+      title: `Numeric digits in the ${f.label} are handled per rule`,
+      objective: `Numbers in name input — digits entered in the ${f.label} (e.g. "John123") — are validated per the field rule (digits in ${f.label}).`,
+      coverageType: 'negative', priority: 'P2', riskArea: 'Input validation',
+    });
+  }
+
+  // (4) Max-length accepted + one-over rejected — on the first name field and
+  //     each id field (representative boundaries a QA always checks).
+  for (const f of [...nameFields.slice(0, 1), ...idFields]) {
+    out.push({
+      id: `field-${f.slug}-max-accepted`,
+      title: `${titleCaseField(f.label)} at maximum length is accepted`,
+      objective: `A ${f.label} exactly at the maximum length is accepted and stored — ${f.label} max length boundary.`,
+      coverageType: 'boundary', priority: 'P2', riskArea: 'Boundary handling',
+    });
+    out.push({
+      id: `field-${f.slug}-over-max`,
+      title: `${titleCaseField(f.label)} over the maximum length is rejected`,
+      objective: `A ${f.label} one character over the maximum length is rejected — ${f.label} too long / exceeds max length.`,
+      coverageType: 'boundary', priority: 'P2', riskArea: 'Boundary handling',
+    });
+  }
+
+  // (5) Minimum single-character + (6) unicode/accented — once, on first name.
+  if (nameFields.length) {
+    const f = nameFields[0];
+    out.push({
+      id: `field-${f.slug}-min`,
+      title: `Single-character ${f.label} is accepted`,
+      objective: `A single character ${f.label} (minimum length name) is accepted at the lower boundary — one character name.`,
+      coverageType: 'boundary', priority: 'P2', riskArea: 'Boundary handling',
+    });
+    out.push({
+      id: `field-${f.slug}-unicode`,
+      title: `Unicode / accented characters in the ${f.label} are accepted`,
+      objective: `Unicode name input — accented / non-ascii characters in the ${f.label} (José, O'Brien) — are accepted and stored (special characters in name).`,
+      coverageType: 'boundary', priority: 'P2', riskArea: 'Boundary handling',
+    });
+  }
+
+  // (7) Leading zeros — per id field (must not be truncated to a number).
+  for (const f of idFields) {
+    out.push({
+      id: `field-${f.slug}-leading-zero`,
+      title: `Leading zeros in the ${f.label} are preserved`,
+      objective: `An ${f.label} entered with a leading zero (e.g. "007") is stored and displayed with the leading zero intact — not truncated to a number.`,
+      coverageType: 'boundary', priority: 'P2', riskArea: 'Data integrity',
+    });
+  }
+
+  return out;
+}
+
 /** Build a requirement-derived scenario for a step the baseline did not cover. */
 function requirementScenario(step: RequirementStep): PlannedScenarioWithProvenance {
   const isAC = step.source === 'acceptanceCriteria';
@@ -683,6 +853,32 @@ export function planScenarios(
           whyExists: `Standard Coverage: ${s.coverageType} check for a ${classification.category} feature — emitted because ${fam} coverage was explicitly selected (KB best-practice, not explicitly stated in this requirement)`,
           source: 'Standard Coverage',
           derivedFrom: `${classification.category} best-practice`,
+          assumption: true,
+          evidence: [],
+        },
+      });
+      emittedIds.add(s.id);
+    }
+  }
+
+  // ── Phase 3c: Field-aware expansion (data-entry forms) ──
+  // A senior QA writes a per-field validation/boundary check for each input the
+  // form names — not one generic "required field" case. For CRUD features we
+  // read the fields from the requirement and expand the universal
+  // validation/boundary concepts across them. Emitted only for the coverage
+  // families the run already includes (so a positive-only run is untouched) and
+  // tagged assumption-based (Standard/Deep Coverage) — never fake grounding.
+  if (classification.category === 'crud') {
+    const fieldText = `${input.title || ''}. ${input.description || ''}. ${input.acceptanceCriteria || ''}. ${input.businessFlow || ''}`;
+    for (const s of fieldAwareScenarios(extractInputFields(fieldText))) {
+      if (emittedIds.has(s.id)) continue;
+      if (!selected.has(s.coverageType)) continue;
+      scenarios.push({
+        ...s,
+        provenance: {
+          whyExists: `${deep ? 'Deep' : 'Standard'} Coverage: per-field ${s.coverageType} check for a field this requirement names — a senior QA writes one per field rather than one generic collapse (KB best-practice, not explicitly stated)`,
+          source: deep ? 'Deep Coverage' : 'Standard Coverage',
+          derivedFrom: 'field-aware expansion',
           assumption: true,
           evidence: [],
         },
