@@ -16,7 +16,7 @@
  * This is NOT:
  *   • a coverage score (82%)
  *   • a coverage health metric
- *   • a reuse %
+ *   • a skip %
  *
  * It is a simple count so Script Generation (CI-3) can see the breakdown before
  * deciding what to generate. No reports, no UI yet — that's CI-4.
@@ -38,7 +38,7 @@ export interface CoverageReport {
   planned: number;
   /** Count by decision — how many scenarios fall into each bucket. */
   breakdown: {
-    [GenerationDecision.REUSE]: number;
+    [GenerationDecision.SKIP]: number;
     [GenerationDecision.EXTEND]: number;
     [GenerationDecision.GENERATE]: number;
   };
@@ -56,7 +56,7 @@ export function aggregateCoverageReport(
   scenarioCoverage: ScenarioCoverage[],
 ): CoverageReport {
   const breakdown = {
-    [GenerationDecision.REUSE]: 0,
+    [GenerationDecision.SKIP]: 0,
     [GenerationDecision.EXTEND]: 0,
     [GenerationDecision.GENERATE]: 0,
   };
@@ -91,7 +91,7 @@ export function formatCoverageReport(report: CoverageReport): string {
   const pad = (n: number) => n.toString().padStart(3);
 
   lines.push(`  ${pad(report.planned)} Planned`);
-  lines.push(`  ${pad(report.breakdown[GenerationDecision.REUSE])} ${GENERATION_DECISION_LABEL[GenerationDecision.REUSE]}`);
+  lines.push(`  ${pad(report.breakdown[GenerationDecision.SKIP])} ${GENERATION_DECISION_LABEL[GenerationDecision.SKIP]}`);
   lines.push(`  ${pad(report.breakdown[GenerationDecision.EXTEND])} ${GENERATION_DECISION_LABEL[GenerationDecision.EXTEND]}`);
   lines.push(`  ${pad(report.breakdown[GenerationDecision.GENERATE])} ${GENERATION_DECISION_LABEL[GenerationDecision.GENERATE]}`);
 

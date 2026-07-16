@@ -15,7 +15,7 @@
  *       "status": "existing" | "partial" | "missing",
  *       "confidence": 0-100,
  *       "existingTest": "tests/login/locked-user.spec.ts :: locked out user ...",
- *       "recommendation": "reuse" | "extend" | "generate"
+ *       "recommendation": "skip" | "extend" | "generate"
  *     }
  *
  * DESIGN CONSTRAINTS (per product direction):
@@ -24,12 +24,13 @@
  *     judged existing/partial/missing. So the matcher is a classic TF-IDF cosine
  *     over normalized tokens, with QA-domain synonym canonicalization and a
  *     polarity guard. No network, no key, no model.
- *   • REUSE existing knowledge, do not invent a new scanner. The candidate tests
- *     come straight from the already-built RepositoryProfile (testSuites +
+ *   • LEVERAGE existing knowledge, do not invent a new scanner. The candidate
+ *     tests come straight from the already-built RepositoryProfile (testSuites +
  *     businessFlows). This module never re-reads the repo.
  *   • HONEST over clever. We never claim a match we cannot defend from token
- *     evidence. A negative scenario ("invalid password") will not be reported as
- *     "reuse" of a positive test ("valid login") just because they share words.
+ *     evidence. A negative scenario ("invalid password") will not be judged
+ *     already-covered ("skip") against a positive test ("valid login") just
+ *     because they share words.
  *
  * WHY NOT the existing SemanticSimilarityEngine / EmbeddingService?
  *   - SemanticSimilarityEngine (src/engines/semantic-similarity-engine.ts) is
@@ -38,7 +39,7 @@
  *   - EmbeddingService (src/services/embedding-service.ts) needs an OpenAI key
  *     and is gated behind FEATURE_FLAGS.REPO_INTELLIGENCE.VECTOR_SEARCH (off by
  *     default) — i.e. an LLM dependency that also would not run offline.
- *   So CI-1 reuses the *technique* (vectorize + cosine) in a deterministic,
+ *   So CI-1 borrows the *technique* (vectorize + cosine) in a deterministic,
  *   always-available form. An embedding-based scorer can be dropped in later
  *   behind the same `ScenarioScorer` seam WITHOUT changing any caller.
  */
@@ -101,9 +102,9 @@ export interface ScenarioCoverage {
 export interface DiscoveryOptions {
   /**
    * Score thresholds (cosine 0..1). Tuned conservatively: we would rather send a
-   * borderline scenario to "extend" than wrongly skip generation as "reuse".
+   * borderline scenario to "extend" than wrongly "skip" generation of new coverage.
    */
-  existingThreshold?: number; // >= → existing / reuse   (default 0.72)
+  existingThreshold?: number; // >= → existing / skip    (default 0.72)
   partialThreshold?: number;  // >= → partial  / extend  (default 0.40)
   /** How many alternatives to keep per scenario (default 3). */
   maxAlternatives?: number;
@@ -393,7 +394,7 @@ export function discoverForScenario(
 
   // Apply the polarity guard: a mismatch (positive scenario vs negative test or
   // vice versa) caps the score just below the "existing" line, so we recommend
-  // EXTEND rather than wrongly REUSE. This is what stops "valid login" being
+  // EXTEND rather than wrongly SKIP. This is what stops "valid login" being
   // reported as covered by "invalid login rejected".
   const adjusted = rawScores.map((score, i) => {
     const candPol = polarity(candidateTokens[i]);
@@ -455,8 +456,8 @@ export function discoverForScenario(
 
   if (best.score >= opts.existingThreshold) {
     status = 'existing';
-    recommendation = GenerationDecision.REUSE;
-    reason = `Strong match with an existing test — reuse it instead of generating a duplicate.`;
+    recommendation = GenerationDecision.SKIP;
+    reason = `Strong match with an existing test — skip generation instead of producing a duplicate.`;
   } else if (best.score >= opts.partialThreshold) {
     status = 'partial';
     recommendation = GenerationDecision.EXTEND;

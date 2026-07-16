@@ -135,7 +135,7 @@ describe('extractCandidates', () => {
 /* ------------------------------------------------------------------ */
 
 describe('acceptance criteria', () => {
-  it('"Locked / disabled account cannot log in" → EXISTING / reuse, points to locked-user.spec.ts', () => {
+  it('"Locked / disabled account cannot log in" → EXISTING / skip, points to locked-user.spec.ts', () => {
     const scenario: ScenarioLike = {
       id: 'auth-neg-locked-user',
       title: 'Locked / disabled account cannot log in',
@@ -145,7 +145,7 @@ describe('acceptance criteria', () => {
     };
     const [res] = discoverExistingTests([scenario], profile);
     expect(res.status).toBe('existing');
-    expect(res.recommendation).toBe(GenerationDecision.REUSE);
+    expect(res.recommendation).toBe(GenerationDecision.SKIP);
     expect(res.existingTest).toContain('tests/login/locked-user.spec.ts');
     expect(res.confidence).toBeGreaterThanOrEqual(72);
     expect(res.matchedOn).toContain('locked');
@@ -172,7 +172,7 @@ describe('acceptance criteria', () => {
 /* ------------------------------------------------------------------ */
 
 describe('polarity guard', () => {
-  it('a positive scenario is NOT reported as reuse of a negative test', () => {
+  it('a positive scenario is NOT reported as skip (already-covered) of a negative test', () => {
     const scenario: ScenarioLike = {
       id: 'auth-pos-valid-login',
       title: 'Valid credentials log in successfully',
@@ -181,16 +181,16 @@ describe('polarity guard', () => {
       riskArea: 'auth',
     };
     const [res] = discoverExistingTests([scenario], profile);
-    // There IS a matching positive test, so this should be existing/reuse and
+    // There IS a matching positive test, so this should be existing/skip and
     // must point at the valid-login spec, never the invalid/locked ones.
     expect(res.existingTest).toContain('valid-login.spec.ts');
     expect(res.status).toBe('existing');
   });
 
-  it('a negative scenario with no positive-safe match is capped below reuse', () => {
+  it('a negative scenario with no positive-safe match is capped below skip', () => {
     // "Invalid username shows error" shares polarity with invalid-login, so it
-    // reuses. But a NEGATIVE scenario matched only against a POSITIVE candidate
-    // must be capped to extend, never reuse.
+    // skips. But a NEGATIVE scenario matched only against a POSITIVE candidate
+    // must be capped to extend, never skip.
     const cands: ExistingTestCandidate[] = [
       {
         ref: 'tests/login/valid-login.spec.ts :: valid login succeeds',
@@ -213,7 +213,7 @@ describe('polarity guard', () => {
       cands.map((c) => tokenize(`${c.testName}`)),
       { existingThreshold: 0.72, partialThreshold: 0.4, maxAlternatives: 3, scorer: new TfidfCosineScorer() },
     );
-    expect(res.recommendation).not.toBe(GenerationDecision.REUSE);
+    expect(res.recommendation).not.toBe(GenerationDecision.SKIP);
   });
 });
 
@@ -276,6 +276,6 @@ describe('formatDiscovery', () => {
     const text = formatDiscovery(results);
     expect(text).toContain('Existing Test Discovery');
     expect(text).toMatch(/EXISTING|MISSING|PARTIAL/);
-    expect(text).toMatch(/REUSE|GENERATE|EXTEND/);
+    expect(text).toMatch(/SKIP|GENERATE|EXTEND/);
   });
 });

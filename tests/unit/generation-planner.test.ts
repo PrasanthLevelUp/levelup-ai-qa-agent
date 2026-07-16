@@ -56,11 +56,11 @@ describe('buildGenerationPlan', () => {
     const plan = buildGenerationPlan(scenarios, profile);
 
     // At least one reuse (locked user matches), at least one generate (session timeout/password reset)
-    expect(plan.reuse.length).toBeGreaterThanOrEqual(1);
+    expect(plan.skip.length).toBeGreaterThanOrEqual(1);
     expect(plan.generate.length).toBeGreaterThanOrEqual(1);
 
     // Total planned = sum of buckets
-    const total = plan.reuse.length + plan.extend.length + plan.generate.length;
+    const total = plan.skip.length + plan.extend.length + plan.generate.length;
     expect(total).toBe(scenarios.length);
 
     // generationQueue = extend + generate
@@ -69,7 +69,7 @@ describe('buildGenerationPlan', () => {
 
   it('returns empty buckets for an empty input', () => {
     const plan = buildGenerationPlan([], profile);
-    expect(plan.reuse.length).toBe(0);
+    expect(plan.skip.length).toBe(0);
     expect(plan.extend.length).toBe(0);
     expect(plan.generate.length).toBe(0);
     expect(plan.generationQueue.length).toBe(0);
@@ -86,7 +86,7 @@ describe('buildGenerationPlan', () => {
       businessFlows: [],
     } as unknown as RepositoryProfile);
 
-    expect(plan.reuse.length).toBe(0);
+    expect(plan.skip.length).toBe(0);
     expect(plan.extend.length).toBe(0);
     expect(plan.generate.length).toBe(2);
     expect(plan.generationQueue.length).toBe(2);
@@ -99,7 +99,7 @@ describe('buildGenerationPlan', () => {
     ];
 
     const plan = buildGenerationPlan(scenarios, profile);
-    const allItems = [...plan.reuse, ...plan.extend, ...plan.generate];
+    const allItems = [...plan.skip, ...plan.extend, ...plan.generate];
 
     for (const item of allItems) {
       expect(item.scenario).toBeDefined();
@@ -118,9 +118,9 @@ describe('buildGenerationPlan', () => {
 
     const plan = buildGenerationPlan(scenarios, profile);
 
-    // generationQueue must not contain any reuse items
+    // generationQueue must not contain any skip items
     for (const item of plan.generationQueue) {
-      expect(item.coverage.recommendation).not.toBe(GenerationDecision.REUSE);
+      expect(item.coverage.recommendation).not.toBe(GenerationDecision.SKIP);
     }
 
     // generationQueue is exactly extend + generate
@@ -136,7 +136,7 @@ describe('buildGenerationPlan', () => {
 describe('formatGenerationPlan', () => {
   it('renders the simple summary format', () => {
     const plan: GenerationPlan = {
-      reuse: [
+      skip: [
         {
           scenario: { id: 's1', title: 'A' },
           coverage: {
@@ -145,7 +145,7 @@ describe('formatGenerationPlan', () => {
             status: 'existing',
             confidence: 85,
             existingTest: 'a',
-            recommendation: GenerationDecision.REUSE,
+            recommendation: GenerationDecision.SKIP,
             matchedOn: [],
             reason: '',
             alternatives: [],
@@ -205,7 +205,7 @@ describe('formatGenerationPlan', () => {
     const text = formatGenerationPlan(plan);
     expect(text).toContain('Generation Plan');
     expect(text).toContain('  4 Planned');
-    expect(text).toContain('  1 Reuse');
+    expect(text).toContain('  1 Skip');
     expect(text).toContain('  1 Extend');
     expect(text).toContain('  2 Generate');
     expect(text).toContain('  3 In Generation Queue');
@@ -213,7 +213,7 @@ describe('formatGenerationPlan', () => {
 
   it('renders zeros for an empty plan', () => {
     const plan: GenerationPlan = {
-      reuse: [],
+      skip: [],
       extend: [],
       generate: [],
       generationQueue: [],
@@ -221,7 +221,7 @@ describe('formatGenerationPlan', () => {
 
     const text = formatGenerationPlan(plan);
     expect(text).toContain('  0 Planned');
-    expect(text).toContain('  0 Reuse');
+    expect(text).toContain('  0 Skip');
     expect(text).toContain('  0 Extend');
     expect(text).toContain('  0 Generate');
     expect(text).toContain('  0 In Generation Queue');
