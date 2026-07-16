@@ -252,6 +252,13 @@ export interface RepositoryProfile {
   // and later mapped to requirements by Coverage Intelligence (RCI-2).
   testInventory: TestInventoryEntry[];
 
+  // Coverage Summary (Repository Intelligence Phase 2): a deterministic
+  // per-feature rollup of the Test Inventory — how many tests exist for each
+  // feature area, so users immediately see where the repo is heavily tested
+  // versus sparse. NO requirements comparison here (that is Coverage
+  // Intelligence Phase 1 / RCI-2); this is pure aggregation of what exists.
+  coverageSummary: CoverageSummaryEntry[];
+
   // Locator patterns
   preferredLocators: Array<{ pattern: string; count: number; example: string }>;
   avoidPatterns: string[];
@@ -318,6 +325,20 @@ export interface TestInventoryEntry {
     pomMethodCount: number;
     featureSource: 'describe' | 'keyword' | 'filename';
   };
+}
+
+/**
+ * One row of the per-feature Coverage Summary — a deterministic rollup of the
+ * Test Inventory. This answers "where is this repo heavily tested vs sparse?"
+ * WITHOUT any requirements data. It is the bridge into Coverage Intelligence
+ * (Phase 1 / RCI-2), which will later compare these features against a
+ * requirements dataset to compute covered / partial / missing.
+ */
+export interface CoverageSummaryEntry {
+  feature: string;              // e.g. 'Authentication', 'Checkout'
+  testCount: number;            // number of inventory tests in this feature
+  percentage: number;          // share of total inventory tests, 0-100 (rounded)
+  avgConfidence: number;        // mean inventory confidence for this feature, 0-100
 }
 
 /* ------------------------------------------------------------------ */
