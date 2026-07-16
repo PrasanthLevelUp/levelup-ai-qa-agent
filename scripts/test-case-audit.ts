@@ -30,6 +30,9 @@ import * as fs from 'fs';
 import * as path from 'path';
 
 import { GOLD_BENCHMARKS, GoldBenchmark, GoldValidation } from './gold-benchmarks';
+// Coverage detection is shared with the QA-Architect scorer via coverage-match.ts
+// so a concept is judged "covered" by exactly the same rule everywhere.
+import { isCovered } from './coverage-match';
 import { understandRequirement } from '../src/requirement-understanding/requirement-understanding-engine';
 import { planValidations } from '../src/validation-planning/validation-planner';
 import {
@@ -60,43 +63,10 @@ function haystack(parts: (string | undefined)[]): string {
  * fixes false-negatives from naive substring matching WITHOUT moving the sealed
  * expectations toward the generator — a genuinely absent concept still misses.
  */
-const MATCH_STOPWORDS = new Set(['the', 'a', 'an', 'to', 'of', 'and', 'or', 'in', 'on', 'for', 'is', 'are', 'by', 'with', 'no']);
-function stem(w: string): string {
-  return w.replace(/(ing|edly|ed|es|s)$/i, '');
-}
-function significantWords(phrase: string): string[] {
-  return phrase
-    .toLowerCase()
-    .split(/[^a-z0-9]+/)
-    .filter((w) => w.length >= 3 && !MATCH_STOPWORDS.has(w))
-    .map(stem);
-}
-function hayTokens(hay: string): string[] {
-  return hay
-    .split(/[^a-z0-9]+/)
-    .filter((w) => w.length >= 3)
-    .map(stem);
-}
-/** A phrase word is present when a hay TOKEN equals it or begins with it (stemmed),
- *  so "search"→"searchable" and "expired"→"expired" match, but "all" does NOT
- *  match inside "manually" (token-boundary, not raw substring). */
-function wordPresent(w: string, toks: string[]): boolean {
-  return toks.some((t) => t === w || t.startsWith(w));
-}
-function phraseSatisfied(phrase: string, toks: string[], rawHay: string): boolean {
-  const words = significantWords(phrase);
-  if (words.length === 0) return rawHay.includes(phrase); // short tokens like "cvv", "zip"
-  return words.every((w) => wordPresent(w, toks));
-}
-function isCovered(v: GoldValidation, hay: string): boolean {
-  const toks = hayTokens(hay);
-  return v.match.some((m) => phraseSatisfied(m, toks, hay));
-}
-
 /** Concepts present in a haystack, expressed as the gold-validation names it satisfies. */
 function coveredNames(expected: GoldValidation[], hay: string): Set<string> {
   const s = new Set<string>();
-  for (const v of expected) if (isCovered(v, hay)) s.add(`${v.group} :: ${v.name}`);
+  for (const v of expected) if (isCovered(v, hay)) s.add(`${v.category} :: ${v.name}`);
   return s;
 }
 
@@ -152,7 +122,7 @@ function auditBenchmark(b: GoldBenchmark): BenchmarkAudit {
     ...model.entities.map((e) => e.name),
     ...model.actions.map((a) => a.name),
     ...model.fields.map((f) => `${f.name} ${f.required ? 'required' : ''}`),
-    ...model.businessRules.map((r) => r.statement),
+    ...model.businessRules.map((r) => r.name),
   ]);
   const s1Names = coveredNames(expected, s1Hay);
   stages.push({
@@ -163,7 +133,7 @@ function auditBenchmark(b: GoldBenchmark): BenchmarkAudit {
       entities: model.entities.map((e) => e.name),
       actions: model.actions.map((a) => a.name),
       fields: model.fields.map((f) => f.name),
-      businessRules: model.businessRules.map((r) => r.statement),
+      businessRules: model.businessRules.map((r) => r.name),
       confidence: model.confidence,
     },
     newInformationAdded: [...s1Names],
@@ -277,7 +247,7 @@ function auditBenchmark(b: GoldBenchmark): BenchmarkAudit {
 
     // gap table for this mode (final generated = planned scenarios)
     const rows = expected.map((v) => ({
-      validation: `${v.group} :: ${v.name}`,
+      validation: `${v.category} :: ${v.name}`,
       weight: v.weight,
       covered: isCovered(v, s3Hay),
     }));
@@ -306,7 +276,7 @@ function auditBenchmark(b: GoldBenchmark): BenchmarkAudit {
   //   B. Scenario Planner / KB depth — right category, but the KB has no such obligation (missing even at full+deep)
   //   C. Coverage selection — KB HAS it, but the default (positive-only) selection never emits it
   for (const v of expected) {
-    const key = `${v.group} :: ${v.name}`;
+    const key = `${v.category} :: ${v.name}`;
     const inFull = isCovered(v, fullHay);
     const inDefault = isCovered(v, defaultHay);
     if (inDefault) continue; // present in the default live suite → not lost
@@ -323,7 +293,7 @@ function auditBenchmark(b: GoldBenchmark): BenchmarkAudit {
   }
 
   const earliestLoss = [...earliestLossMap.entries()].map(([validation, lostAtStage]) => {
-    const v = expected.find((e) => `${e.group} :: ${e.name}` === validation)!;
+    const v = expected.find((e) => `${e.category} :: ${e.name}` === validation)!;
     return { validation, weight: v.weight, lostAtStage };
   });
 
