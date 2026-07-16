@@ -19,8 +19,8 @@
  */
 
 import { planScenarios } from '../../src/engines/scenario-planner';
-import { buildDraftTestCases } from '../../src/engines/scenario-builder';
-import { checks } from '../../src/engines/scenario-integrity';
+import { buildDraftTestCases, AUTOMATION_GATING_CHECKS } from '../../src/engines/scenario-builder';
+import { checks, validateScenarioIntegrity } from '../../src/engines/scenario-integrity';
 import type { CoverageType } from '../../src/engines/test-coverage-engine';
 
 // ---------------------------------------------------------------------------
@@ -210,6 +210,55 @@ describe('Rule 2 — test data matches the validation intent', () => {
     const xss = drafts.find((d) => /xss/i.test(d.scenarioId) || /xss|script/i.test(d.title));
     if (sql && xss) {
       expect(dataOf(sql)).not.toEqual(dataOf(xss));
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Rule 3 (full) — automation readiness is GATED on the deterministic integrity
+// report. The product rule: one wrong dimension ⇒ Needs Review, never
+// Automation Ready. This is a CONTRACT/property test over real builder output.
+// ---------------------------------------------------------------------------
+
+describe('Rule 3 (gate) — Automation Ready requires a clean correctness report', () => {
+  const plan = planScenarios(ADD_EMPLOYEE_REQ, COVERAGE, 'crud');
+  const { drafts } = buildDraftTestCases(plan, employeeKnowledge(), ADD_EMPLOYEE_REQ);
+
+  const reportFor = (d: any) =>
+    validateScenarioIntegrity({
+      title: d.title,
+      objective: d.objective,
+      coverageType: d.coverageType,
+      preconditions: d.preconditions,
+      steps: d.steps,
+      grounding: d.grounding,
+      expected: d.expected,
+      expectedResult: d.expectedResult,
+      testData: d.testData,
+      applicationFields: d.applicationFields,
+    });
+
+  it('never marks a case Automation Ready while a gating check is failing', () => {
+    for (const d of drafts) {
+      if (!d.automationReady) continue;
+      const report = reportFor(d);
+      const failingGates = report.checks.filter(
+        (c: any) => AUTOMATION_GATING_CHECKS.has(c.id) && !c.passed,
+      );
+      expect(failingGates).toEqual([]);
+    }
+  });
+
+  it('when a gating check fails, the case is Needs Review (not Automation Ready)', () => {
+    for (const d of drafts) {
+      const report = reportFor(d);
+      const failing = report.checks.filter(
+        (c: any) => AUTOMATION_GATING_CHECKS.has(c.id) && !c.passed,
+      );
+      if (failing.length > 0) {
+        expect(d.automationReady).toBe(false);
+        expect(d.needsReview).toBe(true);
+      }
     }
   });
 });

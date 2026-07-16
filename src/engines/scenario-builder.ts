@@ -55,6 +55,28 @@ import type {
   ScenarioPlan,
   ScenarioProvenance,
 } from './scenario-planner';
+// Reuse the EXISTING deterministic integrity validator to GATE automation
+// readiness. No new engine — the same nine checks that certify a case also
+// decide whether it may claim "Automation Ready". See AUTOMATION_GATING_CHECKS.
+import {
+  validateScenarioIntegrity,
+  type IntegrityCheckId,
+} from './scenario-integrity';
+
+/**
+ * The correctness dimensions that GATE automation readiness. These map 1:1 to
+ * the product rule — "Correct fields, Correct steps, Correct test data, Correct
+ * expected result" — so that if ANY one is wrong the case is Needs Review, never
+ * Automation Ready. Advisory checks (persona, preconditions, business flow,
+ * grounding-completeness) are deliberately NOT here: they inform confidence but
+ * must not, on their own, block a case from being automatable.
+ */
+export const AUTOMATION_GATING_CHECKS = new Set<IntegrityCheckId>([
+  'field_validity',
+  'step_completeness',
+  'test_data_suitability',
+  'expected_result_consistency',
+]);
 
 /**
  * Slug map: planner evidence source → the draft's `source` tag. This keeps the
@@ -473,7 +495,7 @@ function dataPhraseFor(scenario: DataIntentScenario, field: FieldLike): string {
   // that scenario. The more-specific script/xss signal takes precedence.
   if (/\bxss\b|<script|script payload|cross-site|script injection|alert\(/.test(intent)) return `the XSS payload "<script>alert(1)</script>"`;
   if (/\bsql\b|injection|1\s*=\s*1|or\s+1=1|drop table/.test(intent)) return `the SQL-injection string "' OR 1=1 --"`;
-  if (/duplicate|already exist|existing (record|employee|entry|id)|not unique/.test(intent)) return `a ${label} that already exists (a duplicate of a record already in the system)`;
+  if (/duplicate|already exist|existing (record|employee|entry|id)|not unique/.test(intent)) return `a ${label} that already exists (a duplicate of an existing record)`;
   if (isFile && /\.exe|invalid file|wrong (file )?type|not an image|disallow|virus|executable|unsupported/.test(intent)) return `an invalid file type (e.g. "virus.exe")`;
   if (isFile && /corrupt/.test(intent)) return `a corrupted image file (valid extension, unreadable content)`;
   if (/numeric|contains? a? ?number|digits? in|non-alpha|john123/.test(intent)) return `a ${label} containing numbers (e.g. "John123")`;
@@ -698,8 +720,37 @@ export function buildDraftTestCases(
         'The matched feature form exposes no real selectors yet — locators must be resolved before this case can be automated.',
       );
     }
+
+    // ── Deterministic correctness gate (Scenario ↔ Fields / Steps / Data /
+    // Expected) ── Run the SAME integrity validator that certifies the case and
+    // let it veto automation readiness. If any correctness-critical check finds a
+    // CLEAR defect (a foreign field, an empty/contradictory expected result,
+    // negative data on a positive case, a structurally incomplete step list) the
+    // case is downgraded to Needs Review with the validator's own reason. This is
+    // the product rule made mechanical: one wrong dimension ⇒ never Automation
+    // Ready. The validator is pure/deterministic and never throws.
+    const integrity = validateScenarioIntegrity({
+      title: scenario.title,
+      objective: scenario.objective,
+      coverageType: scenario.coverageType,
+      preconditions,
+      steps,
+      grounding,
+      expected,
+      expectedResult: expected.observable,
+      testData,
+      applicationFields,
+    });
+    const correctnessFailures = integrity.checks.filter(
+      (c) => AUTOMATION_GATING_CHECKS.has(c.id) && !c.passed,
+    );
+    for (const c of correctnessFailures) {
+      reviewReasons.push(`${c.label}: ${c.messages[0] || 'failed the deterministic correctness check.'}`);
+    }
+
     const needsReview = reviewReasons.length > 0;
-    const automationReady = featureFormResolved && usedRealSelector;
+    const automationReady =
+      featureFormResolved && usedRealSelector && correctnessFailures.length === 0;
 
     drafts.push({
       schemaVersion: 2,

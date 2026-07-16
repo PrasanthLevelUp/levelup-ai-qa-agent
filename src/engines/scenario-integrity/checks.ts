@@ -538,7 +538,14 @@ export function checkGroundingCompleteness(s: ScenarioForIntegrity): IntegrityCh
 //    ungrounded skeleton, or an older case), there is nothing to judge → pass.
 // ---------------------------------------------------------------------------
 
-const FIELD_REF_RE = /\bin the (.+?) field\b/gi;
+// Field references are emitted by the builder as "… in the <Label> field". The
+// capture EXCLUDES parentheses so a data phrase that itself contains "in the …"
+// inside a parenthetical (e.g. "(a duplicate of a record already in the system)")
+// cannot be mis-read as a field name — the regex then correctly locks onto the
+// real trailing "in the <Label> field". Labels are short field names, never
+// prose, so excluding "()" costs us nothing and removes a whole class of
+// false positives.
+const FIELD_REF_RE = /\bin the ([^()]+?) field\b/gi;
 
 /** Normalise a field label for comparison (lowercase, collapse whitespace). */
 function normField(s: string): string {
