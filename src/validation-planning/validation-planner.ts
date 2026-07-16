@@ -1,382 +1,435 @@
 /**
- * Validation Planner — taxonomy-driven.
+ * Validation Planner — obligation-driven.
  *
- * Consumes a BusinessModel (from the Requirement Understanding Engine) and
- * enumerates the validation points a balanced suite must cover — deterministic,
- * no LLM. This is the component that turns
+ * The engine discovers VALIDATION OBLIGATIONS from business risk, deduplicates
+ * them by intent, sizes the plan dynamically from a risk profile, respects what
+ * the repository already covers, and only at the very end projects the result
+ * onto the Positive/Negative/Edge vocabulary for presentation.
  *
- *     11 Positive / 1 Negative / 0 Edge   (GPT guessing coverage)
+ * It does NOT optimize for a count, a ratio, or a field-per-field expansion. It
+ * asks, per applicable risk dimension: "what must be validated here, and does it
+ * provide NEW validation?" — the questions a senior QA lead asks. The number of
+ * obligations emerges from the requirement's risk surface, not a target.
  *
- * into an intended, explainable mix — because it decides coverage the way an
- * experienced QA lead does.
- *
- * The old shape iterated FIELDS and emitted validations per field, which made
- * the suite size (and the positive count in particular) a function of how many
- * fields a form had. This walks the QA TAXONOMY instead:
- *
- *     Category → applicable Rules/Fields → Validation Point
- *
- * so positives belong to the CAPABILITY (one or two per action, regardless of
- * field count) and cross-field concerns (security, data integrity) are a few
- * category-level points that list the fields they touch, not one-per-field.
- *
- * The Scenario Planner will expand exactly one scenario per point; GPT only
- * writes the prose. Discovery of *what to test* lives here, in knowledge.
+ * Deterministic and LLM-free.
  */
 
 import type {
   BusinessModel,
   BusinessRuleModel,
   EntityModel,
+  EvidenceSource,
   FieldModel,
 } from '../requirement-understanding/types';
-import type { CoverageFamily } from '../engines/generation-quality-engine';
 import {
+  authorizationTemplate,
   boundaryTemplates,
   businessRuleTemplate,
   inputValidationTemplates,
-  permissionTemplate,
   DATA_INTEGRITY_CHECKS,
   FREE_TEXT_TYPES,
   SECURITY_PAYLOADS,
-  type ValidationTemplate,
+  type ObligationTemplate,
 } from './validation-catalog';
 import {
-  TAXONOMY_ORDER,
-  type PlannedCoverageMix,
-  type ValidationCategory,
+  DIMENSION_ORDER,
+  DIMENSION_TO_FAMILY,
+  type CoveragePresentation,
+  type ObligationTarget,
+  type PlanMetrics,
+  type RiskProfile,
+  type ValidationDimension,
+  type ValidationObligation,
   type ValidationPlan,
   type ValidationPlanOptions,
-  type ValidationPoint,
-  type ValidationTarget,
 } from './types';
-import type { EvidenceSource } from '../requirement-understanding/types';
 
 type Opts = Required<ValidationPlanOptions>;
+
+const SOURCE_RANK: Record<EvidenceSource, number> = {
+  repository: 1, requirement: 2, knowledge_base: 3, domain_inference: 4, llm_guess: 5,
+};
 
 function slug(s: string): string {
   return s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
 }
-
 function titleize(s: string): string {
   return s.replace(/\b\w/g, (c) => c.toUpperCase());
 }
-
-/** A target is an assumption unless it rests on observed/stated fact. */
 function isAssumption(source: EvidenceSource): boolean {
   return source !== 'repository' && source !== 'requirement';
 }
-
-/** Strongest (lowest-rank) evidence source among a set, for grouped points. */
-const SOURCE_RANK: Record<EvidenceSource, number> = {
-  repository: 1, requirement: 2, knowledge_base: 3, domain_inference: 4, llm_guess: 5,
-};
 function strongestSource(sources: EvidenceSource[]): EvidenceSource {
-  return sources.reduce((best, s) => (SOURCE_RANK[s] < SOURCE_RANK[best] ? s : best), 'domain_inference' as EvidenceSource);
+  return sources.reduce<EvidenceSource>((best, s) => (SOURCE_RANK[s] < SOURCE_RANK[best] ? s : best), 'domain_inference');
 }
 
 /* ------------------------------------------------------------------ */
-/*  A category planner: given the model, discover its points.          */
+/*  Risk profile — what drives dynamic sizing.                         */
 /* ------------------------------------------------------------------ */
 
-interface CategoryContext {
-  model: BusinessModel;
-  opts: Opts;
-  /** The free-text fields, computed once and shared by security/data-integrity. */
-  freeTextFields: FieldModel[];
-}
+function buildRiskProfile(model: BusinessModel, opts: Opts, freeText: FieldModel[]): RiskProfile {
+  const businessRuleCount = model.businessRules.length;
+  const inputCount = model.fields.length;
+  const securityExposureFields = freeText.length;
+  const hasAuthorization = model.businessRules.some((r) => r.ruleType === 'permission');
+  const externalDependencyCount = model.businessRules.filter((r) => r.ruleType === 'dependency').length;
 
-interface CategoryPlanner {
-  category: ValidationCategory;
-  discover(ctx: CategoryContext): ValidationPoint[];
-}
+  const applicable: ValidationDimension[] = [];
+  if (model.entities[0]) applicable.push('functional');
+  if (model.businessRules.some((r) => businessRuleTemplate(r.ruleType, 'x', 'x') !== null)) applicable.push('business_rule');
+  if (inputCount > 0) applicable.push('input_validation');
+  if (model.fields.some((f) => boundaryTemplates(f.dataType).length > 0)) applicable.push('boundary');
+  if (hasAuthorization) applicable.push('authorization');
+  if (opts.includeInputSafetyEdges && securityExposureFields > 0) {
+    applicable.push('security', 'data_integrity');
+  }
 
-/** Bind a per-field / per-rule template to a concrete element. */
-function bindTemplate(
-  tpl: ValidationTemplate,
-  category: ValidationCategory,
-  o: { target: ValidationTarget; appliesTo: string; displayName: string; source: EvidenceSource; assumption: boolean },
-): ValidationPoint {
+  // honest heuristic score over the risk signals → coarse label
+  const score =
+    businessRuleCount * 2 +
+    inputCount +
+    securityExposureFields * 2 +
+    (hasAuthorization ? 3 : 0) +
+    externalDependencyCount * 3;
+  const complexity: RiskProfile['complexity'] = score <= 5 ? 'simple' : score <= 14 ? 'moderate' : 'complex';
+
   return {
-    id: `${slug(o.appliesTo)}:${category}:${tpl.key}`,
-    category,
-    family: tpl.family,
-    title: tpl.title(o.displayName),
-    target: o.target,
-    appliesTo: o.appliesTo,
-    rationale: tpl.rationale,
-    source: o.source,
-    assumption: o.assumption,
+    businessRuleCount,
+    inputCount,
+    securityExposureFields,
+    hasAuthorization,
+    externalDependencyCount,
+    applicableDimensions: applicable,
+    complexity,
   };
 }
 
-/* ---- functional: happy paths, bounded by capability, not fields ---- */
-const functionalPlanner: CategoryPlanner = {
-  category: 'functional',
+/* ------------------------------------------------------------------ */
+/*  Binding a template to a concrete element → an obligation.          */
+/* ------------------------------------------------------------------ */
+
+function bind(
+  tpl: ObligationTemplate,
+  dimension: ValidationDimension,
+  o: {
+    elementKey: string;
+    displayName: string;
+    target: ObligationTarget;
+    appliesTo: string;
+    appliesToFields?: string[];
+    source: EvidenceSource;
+    assumption: boolean;
+  },
+): ValidationObligation {
+  const concept = tpl.concept(o.elementKey);
+  return {
+    id: `${concept}::${tpl.intent}`,
+    concept,
+    intent: tpl.intent,
+    dimension,
+    statement: tpl.statement(o.displayName),
+    riskAddressed: tpl.risk,
+    target: o.target,
+    appliesTo: o.appliesTo,
+    appliesToFields: o.appliesToFields,
+    source: o.source,
+    assumption: o.assumption,
+    status: 'gap',
+  };
+}
+
+/* ------------------------------------------------------------------ */
+/*  Dimension discoverers — each yields obligations only when it applies. */
+/* ------------------------------------------------------------------ */
+
+interface Ctx {
+  model: BusinessModel;
+  opts: Opts;
+  freeText: FieldModel[];
+}
+type Discoverer = { dimension: ValidationDimension; discover(ctx: Ctx): ValidationObligation[] };
+
+const functionalDiscoverer: Discoverer = {
+  dimension: 'functional',
   discover({ model }) {
     const entity = model.entities[0];
     if (!entity) return [];
-    const action = model.actions[0];
-    const verb = action ? action.name : 'Use';
+    const verb = model.actions[0]?.name ?? 'Use';
+    const key = entity.normalized;
     const src = entity.provenance.source;
-    const points: ValidationPoint[] = [
-      {
-        id: `${slug(entity.normalized)}:functional:happy-path`,
-        category: 'functional',
-        family: 'positive',
-        title: `Successfully ${verb} ${entity.name} with all valid data`,
-        target: 'entity',
-        appliesTo: entity.normalized,
-        rationale: 'The primary success path for the requirement must be verified.',
-        source: src,
-        assumption: isAssumption(src),
-      },
-    ];
-    // A second, distinct positive ONLY when there is a real distinction to draw:
-    // some fields are optional, so "created with only the mandatory fields" is a
-    // genuinely different path — not just another field permutation.
+    const out: ValidationObligation[] = [{
+      id: `${key}-capability::complete-happy-path`,
+      concept: `${key}-capability`,
+      intent: 'complete-happy-path',
+      dimension: 'functional',
+      statement: `Successfully ${verb} ${entity.name} with valid data`,
+      riskAddressed: 'If the primary success path fails, the feature delivers no value.',
+      target: 'capability',
+      appliesTo: key,
+      source: src,
+      assumption: isAssumption(src),
+      status: 'gap',
+    }];
+    // A minimal-required path is a genuinely DIFFERENT validation only when some
+    // fields are optional — otherwise it is the same happy path (no new intent).
     const hasRequired = model.fields.some((f) => f.required === true);
     const hasOptional = model.fields.some((f) => f.required !== true);
     if (hasRequired && hasOptional) {
-      points.push({
-        id: `${slug(entity.normalized)}:functional:minimal-required`,
-        category: 'functional',
-        family: 'positive',
-        title: `Successfully ${verb} ${entity.name} with only the mandatory fields`,
-        target: 'entity',
-        appliesTo: entity.normalized,
-        rationale: 'Optional fields must be omittable; the minimal valid path is a distinct success case.',
+      out.push({
+        id: `${key}-capability::complete-minimal-required`,
+        concept: `${key}-capability`,
+        intent: 'complete-minimal-required',
+        dimension: 'functional',
+        statement: `Successfully ${verb} ${entity.name} with only the mandatory fields`,
+        riskAddressed: 'Optional fields must be omittable; the minimal valid path can regress independently.',
+        target: 'capability',
+        appliesTo: key,
         source: src,
-        assumption: true, // "which fields are optional" is a shape inference, not a stated case
+        assumption: true,
+        status: 'gap',
       });
     }
-    return points;
+    return out;
   },
 };
 
-/* ---- business_rule: violations of discovered domain rules ---- */
-const businessRulePlanner: CategoryPlanner = {
-  category: 'business_rule',
+const businessRuleDiscoverer: Discoverer = {
+  dimension: 'business_rule',
   discover({ model }) {
-    const out: ValidationPoint[] = [];
+    const out: ValidationObligation[] = [];
     for (const rule of model.businessRules) {
+      const key = rule.appliesTo ?? rule.normalized;
       const displayName = rule.appliesTo ? titleize(rule.appliesTo) : rule.name;
-      const tpl = businessRuleTemplate(rule.ruleType, displayName);
+      const tpl = businessRuleTemplate(rule.ruleType, key, displayName);
       if (!tpl) continue;
-      out.push(
-        bindTemplate(tpl, 'business_rule', {
-          target: 'rule',
-          appliesTo: rule.appliesTo ?? rule.normalized,
-          displayName,
-          source: rule.provenance.source,
-          assumption: isAssumption(rule.provenance.source),
-        }),
-      );
+      out.push(bind(tpl, 'business_rule', {
+        elementKey: key, displayName, target: 'rule', appliesTo: key,
+        source: rule.provenance.source, assumption: isAssumption(rule.provenance.source),
+      }));
     }
     return out;
   },
 };
 
-/* ---- input_validation: per-field rejection of invalid input ---- */
-const inputValidationPlanner: CategoryPlanner = {
-  category: 'input_validation',
+const inputValidationDiscoverer: Discoverer = {
+  dimension: 'input_validation',
   discover({ model }) {
-    const out: ValidationPoint[] = [];
+    const out: ValidationObligation[] = [];
     for (const field of model.fields) {
-      const required = field.required === true;
-      const templates = inputValidationTemplates(field.dataType, required);
-      const fieldAssumed = isAssumption(field.provenance.source);
+      const templates = inputValidationTemplates(field.dataType, field.required === true);
       for (const tpl of templates) {
-        out.push(
-          bindTemplate(tpl, 'input_validation', {
-            target: 'field',
-            appliesTo: field.normalized,
-            displayName: field.name,
-            source: field.provenance.source,
-            // rejecting invalid input on a STATED field is a grounded expectation.
-            assumption: fieldAssumed,
-          }),
-        );
+        out.push(bind(tpl, 'input_validation', {
+          elementKey: field.normalized, displayName: field.name, target: 'field', appliesTo: field.normalized,
+          source: field.provenance.source, assumption: isAssumption(field.provenance.source),
+        }));
       }
     }
     return out;
   },
 };
 
-/* ---- boundary: per-field limits (capped by maxEdgePerField) ---- */
-const boundaryPlanner: CategoryPlanner = {
-  category: 'boundary',
+const boundaryDiscoverer: Discoverer = {
+  dimension: 'boundary',
   discover({ model, opts }) {
-    const out: ValidationPoint[] = [];
+    const out: ValidationObligation[] = [];
     for (const field of model.fields) {
       let templates = boundaryTemplates(field.dataType);
-      if (opts.maxEdgePerField > 0 && templates.length > opts.maxEdgePerField) {
-        templates = templates.slice(0, opts.maxEdgePerField);
+      if (opts.maxBoundaryPerField > 0 && templates.length > opts.maxBoundaryPerField) {
+        templates = templates.slice(0, opts.maxBoundaryPerField);
       }
       for (const tpl of templates) {
-        out.push(
-          bindTemplate(tpl, 'boundary', {
-            target: 'field',
-            appliesTo: field.normalized,
-            displayName: field.name,
-            source: field.provenance.source,
-            // a specific limit the requirement never spelled out is a best practice.
-            assumption: true,
-          }),
-        );
+        out.push(bind(tpl, 'boundary', {
+          elementKey: field.normalized, displayName: field.name, target: 'field', appliesTo: field.normalized,
+          source: field.provenance.source, assumption: true, // a specific limit is a best-practice inference
+        }));
       }
     }
     return out;
   },
 };
 
-/* ---- permission: authorization on the action ---- */
-const permissionPlanner: CategoryPlanner = {
-  category: 'permission',
+const authorizationDiscoverer: Discoverer = {
+  dimension: 'authorization',
   discover({ model }) {
-    const out: ValidationPoint[] = [];
+    const out: ValidationObligation[] = [];
     for (const rule of model.businessRules) {
       if (rule.ruleType !== 'permission') continue;
-      const displayName = rule.appliesTo
-        ? titleize(rule.appliesTo)
-        : model.entities[0]
-          ? model.entities[0].name
-          : rule.name;
-      const anchor = rule.appliesTo ?? model.entities[0]?.normalized ?? rule.normalized;
-      out.push(
-        bindTemplate(permissionTemplate(displayName), 'permission', {
-          target: 'rule',
-          appliesTo: anchor,
-          displayName,
-          source: rule.provenance.source,
-          assumption: isAssumption(rule.provenance.source),
-        }),
-      );
+      const entity = model.entities[0];
+      const key = rule.appliesTo ?? entity?.normalized ?? rule.normalized;
+      const displayName = rule.appliesTo ? titleize(rule.appliesTo) : entity ? entity.name : rule.name;
+      out.push(bind(authorizationTemplate(key, displayName), 'authorization', {
+        elementKey: key, displayName, target: 'rule', appliesTo: key,
+        source: rule.provenance.source, assumption: isAssumption(rule.provenance.source),
+      }));
     }
     return out;
   },
 };
 
-/** Build a category-level point that spans every free-text field. */
-function groupedPoint(
-  tpl: ValidationTemplate,
-  category: ValidationCategory,
-  freeText: FieldModel[],
-): ValidationPoint {
-  const fieldNames = freeText.map((f) => f.normalized);
+/** One field-agnostic obligation across every free-text input. */
+function grouped(tpl: ObligationTemplate, dimension: ValidationDimension, freeText: FieldModel[]): ValidationObligation {
+  const fields = freeText.map((f) => f.normalized);
+  const concept = tpl.concept('');
   return {
-    id: `${category}:${tpl.key}`,
-    category,
-    family: tpl.family,
-    title: tpl.title(''),
+    id: `${concept}::${tpl.intent}`,
+    concept,
+    intent: tpl.intent,
+    dimension,
+    statement: tpl.statement(''),
+    riskAddressed: tpl.risk,
     target: 'field',
-    appliesTo: fieldNames[0] ?? category,
-    appliesToFields: fieldNames,
-    rationale: tpl.rationale,
+    appliesTo: fields[0] ?? concept,
+    appliesToFields: fields,
     source: strongestSource(freeText.map((f) => f.provenance.source)),
-    assumption: true, // safety/integrity checks are best practice, never stated per field
+    assumption: true,
+    status: 'gap',
   };
 }
 
-/* ---- security: injection/script across free-text fields (grouped) ---- */
-const securityPlanner: CategoryPlanner = {
-  category: 'security',
-  discover({ opts, freeTextFields }) {
-    if (!opts.includeInputSafetyEdges || freeTextFields.length === 0) return [];
-    return SECURITY_PAYLOADS.map((tpl) => groupedPoint(tpl, 'security', freeTextFields));
+const securityDiscoverer: Discoverer = {
+  dimension: 'security',
+  discover({ opts, freeText }) {
+    if (!opts.includeInputSafetyEdges || freeText.length === 0) return [];
+    return SECURITY_PAYLOADS.map((t) => grouped(t, 'security', freeText));
   },
 };
 
-/* ---- data_integrity: unicode/emoji/whitespace across free-text (grouped) ---- */
-const dataIntegrityPlanner: CategoryPlanner = {
-  category: 'data_integrity',
-  discover({ opts, freeTextFields }) {
-    if (!opts.includeInputSafetyEdges || freeTextFields.length === 0) return [];
-    return DATA_INTEGRITY_CHECKS.map((tpl) => groupedPoint(tpl, 'data_integrity', freeTextFields));
+const dataIntegrityDiscoverer: Discoverer = {
+  dimension: 'data_integrity',
+  discover({ opts, freeText }) {
+    if (!opts.includeInputSafetyEdges || freeText.length === 0) return [];
+    return DATA_INTEGRITY_CHECKS.map((t) => grouped(t, 'data_integrity', freeText));
   },
 };
 
-/**
- * The taxonomy registry. Reserved categories (integration, recovery,
- * accessibility, localization, performance) are intentionally absent here: they
- * are declared in TAXONOMY_ORDER for ordering/extensibility, and adding one is a
- * matter of registering a planner — never of touching field logic.
- */
-const PLANNERS: CategoryPlanner[] = [
-  functionalPlanner,
-  businessRulePlanner,
-  inputValidationPlanner,
-  boundaryPlanner,
-  permissionPlanner,
-  securityPlanner,
-  dataIntegrityPlanner,
+const DISCOVERERS: Discoverer[] = [
+  functionalDiscoverer,
+  businessRuleDiscoverer,
+  inputValidationDiscoverer,
+  boundaryDiscoverer,
+  authorizationDiscoverer,
+  securityDiscoverer,
+  dataIntegrityDiscoverer,
 ];
 
-function summarize(points: ValidationPoint[]): PlannedCoverageMix {
-  const mix: PlannedCoverageMix = {
-    positive: 0, negative: 0, edge: 0, advanced: 0, total: points.length, label: '', byCategory: {},
-  };
-  for (const p of points) {
-    mix[p.family] += 1;
-    mix.byCategory[p.category] = (mix.byCategory[p.category] ?? 0) + 1;
-  }
-  mix.label = `Positive: ${mix.positive} · Negative: ${mix.negative} · Edge: ${mix.edge} · Advanced: ${mix.advanced}`;
-  return mix;
-}
-
-const CATEGORY_INDEX: Record<ValidationCategory, number> = TAXONOMY_ORDER.reduce(
-  (acc, cat, i) => { acc[cat] = i; return acc; },
-  {} as Record<ValidationCategory, number>,
+const DIM_INDEX: Record<ValidationDimension, number> = DIMENSION_ORDER.reduce(
+  (acc, d, i) => { acc[d] = i; return acc; },
+  {} as Record<ValidationDimension, number>,
 );
 
 /**
- * Plan the validations for a Business Model.
- *
- * Deterministic: same model + options → identical plan. Walks the QA taxonomy
- * top-down and lets each category discover the rules/fields it applies to.
- * De-duplicates points two categories could both imply, keeping the
- * strongest-sourced, grounded instance. Points are grouped in taxonomy order so
- * the plan reads like a QA lead's test plan.
+ * Is a discovered business rule explained by at least one obligation? Used for
+ * the businessRuleCoverage metric — precise per rule kind, so a rule whose
+ * empty-rejection collapsed into a field obligation still counts as addressed.
  */
+function ruleAddressed(rule: BusinessRuleModel, obligations: ValidationObligation[]): boolean {
+  const key = rule.appliesTo ?? rule.normalized;
+  const has = (pred: (o: ValidationObligation) => boolean) => obligations.some(pred);
+  switch (rule.ruleType) {
+    case 'unique':
+      return has((o) => o.concept === `${key}-uniqueness` && o.intent === 'reject-duplicate');
+    case 'dependency':
+      return has((o) => o.concept === `${key}-prerequisite`);
+    case 'mandatory':
+      return has((o) => o.concept === key && o.intent === 'reject-empty');
+    case 'permission':
+      // authorization obligations anchor to the entity when the rule names no
+      // explicit target, so match on the dimension (and the target when named).
+      return has((o) => o.dimension === 'authorization' && (rule.appliesTo ? o.appliesTo === key : true));
+    case 'range':
+    case 'length':
+      return has((o) => o.dimension === 'boundary' && o.appliesTo === key);
+    case 'format':
+      return has((o) => o.dimension === 'input_validation' && o.appliesTo === key);
+    default:
+      // 'other' rules carry no enforceable single validation — not counted against coverage.
+      return true;
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/*  Presentation projection — the ONLY place families exist.           */
+/* ------------------------------------------------------------------ */
+
+function project(obligations: ValidationObligation[]): CoveragePresentation {
+  const p: CoveragePresentation = { positive: 0, negative: 0, edge: 0, advanced: 0, total: obligations.length, label: '', byDimension: {} };
+  for (const o of obligations) {
+    p[DIMENSION_TO_FAMILY[o.dimension]] += 1;
+    p.byDimension[o.dimension] = (p.byDimension[o.dimension] ?? 0) + 1;
+  }
+  p.label = `Positive: ${p.positive} · Negative: ${p.negative} · Edge: ${p.edge} · Advanced: ${p.advanced}`;
+  return p;
+}
+
+/* ------------------------------------------------------------------ */
+/*  The planner.                                                       */
+/* ------------------------------------------------------------------ */
+
 export function planValidations(model: BusinessModel, options: ValidationPlanOptions = {}): ValidationPlan {
   const opts: Opts = {
     includeInputSafetyEdges: options.includeInputSafetyEdges ?? true,
-    maxEdgePerField: options.maxEdgePerField ?? 0,
+    maxBoundaryPerField: options.maxBoundaryPerField ?? 0,
+    alreadyCovered: options.alreadyCovered ?? [],
   };
+  const freeText = model.fields.filter((f) => FREE_TEXT_TYPES.has(f.dataType));
+  const ctx: Ctx = { model, opts, freeText };
+  const riskProfile = buildRiskProfile(model, opts, freeText);
 
-  const ctx: CategoryContext = {
-    model,
-    opts,
-    freeTextFields: model.fields.filter((f) => FREE_TEXT_TYPES.has(f.dataType)),
-  };
+  // 1. discover raw obligations across applicable dimensions
+  const raw: ValidationObligation[] = [];
+  for (const d of DISCOVERERS) raw.push(...d.discover(ctx));
 
-  const raw: ValidationPoint[] = [];
-  for (const planner of PLANNERS) raw.push(...planner.discover(ctx));
-
-  // de-dupe by id; on collision keep the strongest-sourced and grounded instance.
-  const byId = new Map<string, ValidationPoint>();
-  for (const p of raw) {
-    const existing = byId.get(p.id);
-    if (!existing) { byId.set(p.id, p); continue; }
-    const better = SOURCE_RANK[p.source] < SOURCE_RANK[existing.source] ? p : existing;
-    byId.set(p.id, { ...better, assumption: better.assumption && p.assumption });
+  // 2. dedup by intent signature (id). Two obligations that assert the same
+  //    validation of the same concept are ONE obligation — keep the strongest-
+  //    sourced, grounded instance, and count the collapse.
+  const byId = new Map<string, ValidationObligation>();
+  let duplicationEliminated = 0;
+  for (const o of raw) {
+    const existing = byId.get(o.id);
+    if (!existing) { byId.set(o.id, o); continue; }
+    duplicationEliminated += 1;
+    const better = SOURCE_RANK[o.source] < SOURCE_RANK[existing.source] ? o : existing;
+    byId.set(o.id, { ...better, assumption: better.assumption && o.assumption });
   }
 
-  const order: CoverageFamily[] = ['positive', 'negative', 'edge', 'advanced'];
-  const points = [...byId.values()].sort((a, b) => {
-    const byCat = CATEGORY_INDEX[a.category] - CATEGORY_INDEX[b.category];
-    if (byCat !== 0) return byCat;
-    const byFam = order.indexOf(a.family) - order.indexOf(b.family);
-    return byFam !== 0 ? byFam : a.id.localeCompare(b.id);
+  // 3. repository intelligence: mark obligations existing tests already satisfy.
+  const covered = new Set(opts.alreadyCovered);
+  let repositoryReuse = 0;
+  for (const [id, o] of byId) {
+    if (covered.has(id)) { byId.set(id, { ...o, status: 'covered' }); repositoryReuse += 1; }
+  }
+
+  // 4. order by dimension (QA reading order), then concept, then intent
+  const obligations = [...byId.values()].sort((a, b) => {
+    const byDim = DIM_INDEX[a.dimension] - DIM_INDEX[b.dimension];
+    if (byDim !== 0) return byDim;
+    return a.id.localeCompare(b.id);
   });
+
+  // 5. metrics (count-free success measures) + presentation projection
+  const producedDims = new Set(obligations.map((o) => o.dimension));
+  const applicable = riskProfile.applicableDimensions;
+  const dimensionCoverage = applicable.length === 0 ? 1 : applicable.filter((d) => producedDims.has(d)).length / applicable.length;
+
+  const rulesAddressed = model.businessRules.filter((r) => ruleAddressed(r, obligations)).length;
+  const businessRuleCoverage = riskProfile.businessRuleCount === 0 ? 1 : rulesAddressed / riskProfile.businessRuleCount;
+
+  const metrics: PlanMetrics = {
+    obligationsToGenerate: obligations.filter((o) => o.status === 'gap').length,
+    dimensionCoverage,
+    businessRuleCoverage,
+    duplicationEliminated,
+    repositoryReuse,
+  };
 
   return {
     requirementId: model.requirementId,
-    entity: model.entities[0]?.name ?? null,
-    points,
-    mix: summarize(points),
+    capability: model.entities[0]?.name ?? null,
+    riskProfile,
+    obligations,
+    metrics,
+    presentation: project(obligations),
   };
 }
 
-// re-exported for consumers that only need the entity/field types alongside the plan
 export type { BusinessModel, EntityModel, FieldModel, BusinessRuleModel };

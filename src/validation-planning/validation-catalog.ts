@@ -1,181 +1,163 @@
 /**
- * Validation Planning — the catalog (knowledge), indexed by QA category.
+ * Validation Planning — the catalog (knowledge), indexed by risk dimension.
  *
- * This is the knowledge a QA lead carries, organized the way the planner now
- * consumes it: by CATEGORY first, then "which fields/rules does this category
- * touch?". It is pure data + tiny selectors, kept apart from the planner loop so
- * "what an experienced QA engineer knows" lives in one reviewable place.
+ * This is the knowledge a senior QA lead carries, expressed as OBLIGATION
+ * TEMPLATES: for a given element, what must be validated, what NEW validation
+ * that provides, and which business RISK it guards against. Templates carry no
+ * Positive/Negative/Edge label — classification is a presentation concern the
+ * planner applies at the end, derived purely from the dimension.
  *
  * Two shapes of knowledge live here:
- *   1. Per-field templates a category asks for given a field's DATA TYPE
- *      (Input Validation → format rejection; Boundary → length/range).
- *   2. Category-level payloads that are field-agnostic and get applied ACROSS
- *      the free-text fields as a single point each (Security → SQL/XSS/script;
- *      Data Integrity → unicode/emoji/whitespace). This is what stops
- *      cross-field concerns from repeating once per field.
+ *   1. Per-field / per-rule templates a dimension asks for given a field's DATA
+ *      TYPE or a rule's kind.
+ *   2. Field-agnostic payloads (security, data integrity) that become ONE
+ *      obligation each, applied across every free-text input — so a cross-field
+ *      concern is expressed once, not repeated per field.
  *
- * Nothing here invents fields or rules — it only expands validations for
- * elements the Business Model already discovered. The planner can only ever be
- * as rich as the understanding it was given.
+ * Nothing here invents fields or rules — it expands obligations only for
+ * elements the Business Model already discovered.
  */
 
 import type { BusinessRuleKind, FieldDataType } from '../requirement-understanding/types';
-import type { CoverageFamily } from '../engines/generation-quality-engine';
 
 /**
- * One catalog entry, before it is bound to a concrete field/rule name. `family`
- * is stated explicitly (not derived from the category) because a single QA
- * category legitimately produces points of different coverage families — the
- * two axes are independent. The values here are exactly the CoverageFamily
- * union the Quality Validator grades on, so planner intent and auditor grading
- * speak the same language.
+ * One obligation template, before it is bound to a concrete element. `concept`
+ * is the dedup grouping (the business thing being validated); `intent` is the
+ * specific NEW validation. Together they form the intent signature the planner
+ * dedupes and matches repository reuse on.
  */
-export interface ValidationTemplate {
-  /** Stable slug fragment, unique within a (target, category). */
-  key: string;
-  /** The coverage family the Quality Validator will grade this under. */
-  family: CoverageFamily;
-  /** Builds the business-readable title from the element's display name. */
-  title: (name: string) => string;
-  /** WHY this validation exists — the knowledge justification. */
-  rationale: string;
+export interface ObligationTemplate {
+  /** Dedup grouping — the business concept, parameterized by the element's key. */
+  concept: (elementKey: string) => string;
+  /** The specific validation provided — stable within a concept. */
+  intent: string;
+  /** Business-readable statement built from the element's display name. */
+  statement: (name: string) => string;
+  /** The business RISK this guards against. */
+  risk: string;
 }
 
 /* ================================================================== */
-/*  INPUT VALIDATION — per-field rejection of invalid input            */
+/*  INPUT VALIDATION — can invalid data enter the system?             */
 /* ================================================================== */
 
-/** The empty-rejection negative, added when a field is required. */
-const REQUIRED_EMPTY: ValidationTemplate = {
-  key: 'empty',
-  family: 'negative',
-  title: (n) => `Reject empty ${n}`,
-  rationale: 'A required field must be rejected when left blank.',
+/** Emitted when a field is required — rejecting the empty value. */
+const REQUIRED_EMPTY: ObligationTemplate = {
+  concept: (k) => k,
+  intent: 'reject-empty',
+  statement: (n) => `Reject empty ${n}`,
+  risk: 'A required field left blank must not create an incomplete record.',
 };
 
-/** Format-rejection negatives implied by a field's data type (no boundary here). */
-const FORMAT_REJECTIONS: Partial<Record<FieldDataType, ValidationTemplate[]>> = {
+const FORMAT_REJECTIONS: Partial<Record<FieldDataType, ObligationTemplate[]>> = {
   email: [
-    { key: 'invalid-format', family: 'negative', title: (n) => `Reject malformed ${n}`, rationale: 'Email must match an address format; malformed input is rejected.' },
+    { concept: (k) => k, intent: 'reject-malformed', statement: (n) => `Reject malformed ${n}`, risk: 'A malformed address breaks delivery and identity assumptions.' },
   ],
   phone: [
-    { key: 'non-numeric', family: 'negative', title: (n) => `Reject letters/symbols in ${n}`, rationale: 'A phone must contain only permitted digits/format characters.' },
+    { concept: (k) => k, intent: 'reject-non-numeric', statement: (n) => `Reject letters/symbols in ${n}`, risk: 'Non-dialable input corrupts contact data.' },
   ],
   number: [
-    { key: 'non-numeric', family: 'negative', title: (n) => `Reject non-numeric ${n}`, rationale: 'Numeric fields must reject text input.' },
+    { concept: (k) => k, intent: 'reject-non-numeric', statement: (n) => `Reject non-numeric ${n}`, risk: 'Text in a numeric field breaks downstream arithmetic.' },
   ],
   date: [
-    { key: 'invalid-format', family: 'negative', title: (n) => `Reject malformed ${n}`, rationale: 'Non-date input must be rejected.' },
+    { concept: (k) => k, intent: 'reject-malformed', statement: (n) => `Reject malformed ${n}`, risk: 'Unparseable dates corrupt scheduling and reporting.' },
   ],
   url: [
-    { key: 'invalid-format', family: 'negative', title: (n) => `Reject malformed ${n}`, rationale: 'Non-URL input must be rejected.' },
+    { concept: (k) => k, intent: 'reject-malformed', statement: (n) => `Reject malformed ${n}`, risk: 'A non-URL value breaks links and integrations.' },
   ],
   enum: [
-    { key: 'invalid-value', family: 'negative', title: (n) => `Reject an invalid ${n} value`, rationale: 'A value outside the allowed set must be rejected.' },
+    { concept: (k) => k, intent: 'reject-invalid-value', statement: (n) => `Reject an out-of-set ${n} value`, risk: 'A value outside the allowed set corrupts referential integrity.' },
   ],
   password: [
-    { key: 'too-short', family: 'negative', title: (n) => `Reject a too-short ${n}`, rationale: 'Below the minimum strength/length must be rejected.' },
+    { concept: (k) => k, intent: 'reject-too-weak', statement: (n) => `Reject a too-weak ${n}`, risk: 'A weak secret undermines account security.' },
   ],
 };
 
-/**
- * Input-Validation templates for one field: the empty-rejection (when required)
- * plus any type-specific format rejections. All negative-family.
- */
-export function inputValidationTemplates(dataType: FieldDataType, required: boolean): ValidationTemplate[] {
-  const out: ValidationTemplate[] = [];
+export function inputValidationTemplates(dataType: FieldDataType, required: boolean): ObligationTemplate[] {
+  const out: ObligationTemplate[] = [];
   if (required) out.push(REQUIRED_EMPTY);
   out.push(...(FORMAT_REJECTIONS[dataType] ?? []));
   return out;
 }
 
 /* ================================================================== */
-/*  BOUNDARY — per-field limits (edge family)                          */
+/*  BOUNDARY — can limits be exceeded?                                */
 /* ================================================================== */
 
-const BOUNDARY_TEMPLATES: Partial<Record<FieldDataType, ValidationTemplate[]>> = {
+const BOUNDARY_TEMPLATES: Partial<Record<FieldDataType, ObligationTemplate[]>> = {
   text: [
-    { key: 'max-length', family: 'edge', title: (n) => `Enforce maximum length on ${n}`, rationale: 'Fields have an upper length bound that must be enforced.' },
-    { key: 'min-length', family: 'edge', title: (n) => `Enforce minimum length on ${n}`, rationale: 'Very short input at the lower bound must behave correctly.' },
+    { concept: (k) => `${k}-length`, intent: 'enforce-max-length', statement: (n) => `Enforce maximum length on ${n}`, risk: 'Unbounded text overflows storage and UI.' },
+    { concept: (k) => `${k}-length`, intent: 'enforce-min-length', statement: (n) => `Enforce minimum length on ${n}`, risk: 'Too-short input at the lower bound must behave correctly.' },
   ],
   email: [
-    { key: 'max-length', family: 'edge', title: (n) => `Enforce maximum ${n} length (254)`, rationale: 'RFC-bounded address length must be enforced.' },
+    { concept: (k) => `${k}-length`, intent: 'enforce-max-length', statement: (n) => `Enforce maximum ${n} length (254)`, risk: 'Over-long addresses violate the RFC bound and break storage.' },
   ],
   phone: [
-    { key: 'min-digits', family: 'edge', title: (n) => `Enforce minimum digits in ${n}`, rationale: 'Too-few digits at the lower bound must be rejected.' },
-    { key: 'max-digits', family: 'edge', title: (n) => `Enforce maximum digits in ${n}`, rationale: 'Too-many digits at the upper bound must be rejected.' },
+    { concept: (k) => `${k}-length`, intent: 'enforce-min-digits', statement: (n) => `Enforce minimum digits in ${n}`, risk: 'Too-few digits is not a dialable number.' },
+    { concept: (k) => `${k}-length`, intent: 'enforce-max-digits', statement: (n) => `Enforce maximum digits in ${n}`, risk: 'Too-many digits is not a valid number.' },
   ],
   number: [
-    { key: 'min', family: 'edge', title: (n) => `Enforce minimum ${n}`, rationale: 'Lower numeric bound must be enforced.' },
-    { key: 'max', family: 'edge', title: (n) => `Enforce maximum ${n}`, rationale: 'Upper numeric bound must be enforced.' },
+    { concept: (k) => `${k}-range`, intent: 'enforce-min', statement: (n) => `Enforce minimum ${n}`, risk: 'Values below the floor corrupt business logic.' },
+    { concept: (k) => `${k}-range`, intent: 'enforce-max', statement: (n) => `Enforce maximum ${n}`, risk: 'Values above the ceiling corrupt business logic.' },
   ],
   date: [
-    { key: 'range', family: 'edge', title: (n) => `Enforce allowed ${n} range`, rationale: 'Past/future bounds on the date must be enforced.' },
+    { concept: (k) => `${k}-range`, intent: 'enforce-range', statement: (n) => `Enforce allowed ${n} range`, risk: 'Out-of-range dates violate business constraints.' },
   ],
   password: [
-    { key: 'min-length', family: 'edge', title: (n) => `Enforce minimum ${n} length`, rationale: 'Lower length bound must be enforced.' },
-    { key: 'max-length', family: 'edge', title: (n) => `Enforce maximum ${n} length`, rationale: 'Upper length bound must be enforced.' },
+    { concept: (k) => `${k}-length`, intent: 'enforce-min-length', statement: (n) => `Enforce minimum ${n} length`, risk: 'Below the minimum length weakens the secret.' },
+    { concept: (k) => `${k}-length`, intent: 'enforce-max-length', statement: (n) => `Enforce maximum ${n} length`, risk: 'Unbounded secrets can be a denial-of-service vector.' },
   ],
 };
 
-/** Boundary templates for one field (empty for types without a meaningful limit). */
-export function boundaryTemplates(dataType: FieldDataType): ValidationTemplate[] {
+export function boundaryTemplates(dataType: FieldDataType): ObligationTemplate[] {
   return [...(BOUNDARY_TEMPLATES[dataType] ?? [])];
 }
 
 /* ================================================================== */
-/*  SECURITY & DATA INTEGRITY — category-level, applied across fields  */
+/*  SECURITY — can malicious input damage the application?            */
+/*  DATA INTEGRITY — can the application corrupt or lose data?        */
+/*  Both are field-agnostic: ONE obligation each, across free-text.   */
 /* ================================================================== */
 
-/**
- * Malicious-input payloads. These are NOT per-field — one point each, listing
- * every free-text field it should be exercised against. Injection is an
- * attemptable-but-illegal input, graded under the edge family.
- */
-export const SECURITY_PAYLOADS: ValidationTemplate[] = [
-  { key: 'sql-injection', family: 'edge', title: () => 'Neutralize SQL-like input in free-text fields', rationale: "User-editable text must not be interpreted as a query (e.g. \"' OR 1=1\")." },
-  { key: 'xss', family: 'edge', title: () => 'Neutralize script injection (XSS) in free-text fields', rationale: 'User-editable text must not execute as markup/script (e.g. <script>).' },
-  { key: 'script-input', family: 'edge', title: () => 'Neutralize template/command-like input in free-text fields', rationale: 'Expression/command syntax must be treated as literal text, not evaluated.' },
+export const SECURITY_PAYLOADS: ObligationTemplate[] = [
+  { concept: () => 'input-safety', intent: 'neutralize-sql', statement: () => 'Neutralize SQL-like input in free-text fields', risk: 'Unescaped input interpreted as a query enables data theft or loss.' },
+  { concept: () => 'input-safety', intent: 'neutralize-xss', statement: () => 'Neutralize script injection (XSS) in free-text fields', risk: 'Input executed as markup/script compromises other users.' },
+  { concept: () => 'input-safety', intent: 'neutralize-template', statement: () => 'Neutralize template/command-like input in free-text fields', risk: 'Expression/command syntax evaluated server-side enables RCE.' },
 ];
 
-/**
- * Data-integrity checks — unusual but LEGAL input that must be preserved, not
- * corrupted. Also category-level: one point each, across the free-text fields.
- */
-export const DATA_INTEGRITY_CHECKS: ValidationTemplate[] = [
-  { key: 'unicode', family: 'edge', title: () => 'Preserve unicode/accented characters in free-text fields', rationale: 'International names and symbols must round-trip without corruption.' },
-  { key: 'emoji', family: 'edge', title: () => 'Preserve emoji / multibyte input in free-text fields', rationale: 'Multibyte characters are a common storage/encoding edge.' },
-  { key: 'whitespace', family: 'edge', title: () => 'Trim leading/trailing whitespace in free-text fields', rationale: 'Padded or whitespace-only input is a common data-quality edge.' },
+export const DATA_INTEGRITY_CHECKS: ObligationTemplate[] = [
+  { concept: () => 'data-integrity', intent: 'preserve-unicode', statement: () => 'Preserve unicode/accented characters in free-text fields', risk: 'Corrupting international names loses or garbles customer data.' },
+  { concept: () => 'data-integrity', intent: 'preserve-emoji', statement: () => 'Preserve emoji / multibyte input in free-text fields', risk: 'Multibyte truncation corrupts stored data.' },
+  { concept: () => 'data-integrity', intent: 'trim-whitespace', statement: () => 'Trim leading/trailing whitespace in free-text fields', risk: 'Padded input creates silent duplicate / lookup-miss data.' },
 ];
 
-/** Data types treated as free-text for security / data-integrity purposes. */
 export const FREE_TEXT_TYPES: ReadonlySet<FieldDataType> = new Set<FieldDataType>(['text', 'email', 'url', 'password']);
 
 /* ================================================================== */
-/*  BUSINESS RULE & PERMISSION — from discovered rules                 */
+/*  BUSINESS RULE & AUTHORIZATION — from discovered rules             */
 /* ================================================================== */
 
 /**
- * The validation a business rule demands be tested — chiefly its VIOLATION.
- * Returns null for rule kinds a different category already owns, so nothing is
- * double-emitted:
- *   - mandatory  → Input Validation already emits the empty-rejection
- *   - format/length → field-type Input Validation / Boundary already cover it
- *   - range      → Boundary owns it
- *   - permission → the Permission category owns it
+ * The obligation a business rule creates. `mandatory` intentionally emits the
+ * SAME `reject-empty` intent a required field does — the planner's intent-dedup
+ * then collapses them into one obligation (and counts the collapse), rather than
+ * the catalog silently suppressing one. Returns null for kinds another
+ * dimension owns (range → boundary; permission → authorization; format/length →
+ * field templates).
  */
-export function businessRuleTemplate(ruleKind: BusinessRuleKind, targetName: string): ValidationTemplate | null {
+export function businessRuleTemplate(ruleKind: BusinessRuleKind, conceptKey: string, targetName: string): ObligationTemplate | null {
   switch (ruleKind) {
     case 'unique':
-      return { key: 'duplicate', family: 'negative', title: () => `Reject duplicate ${targetName}`, rationale: 'A uniqueness rule must reject a value that already exists.' };
+      return { concept: () => `${conceptKey}-uniqueness`, intent: 'reject-duplicate', statement: () => `Reject a duplicate ${targetName}`, risk: 'A duplicate breaks a uniqueness guarantee the business relies on.' };
     case 'dependency':
-      return { key: 'missing-prerequisite', family: 'negative', title: () => `Reject ${targetName} when its prerequisite is missing`, rationale: 'A dependency rule must be enforced when its precondition is unmet.' };
+      return { concept: () => `${conceptKey}-prerequisite`, intent: 'reject-missing-prerequisite', statement: () => `Reject ${targetName} when its prerequisite is missing`, risk: 'Acting without a satisfied precondition corrupts state.' };
+    case 'mandatory':
+      return { concept: () => conceptKey, intent: 'reject-empty', statement: () => `Reject empty ${targetName}`, risk: 'A required field left blank must not create an incomplete record.' };
     default:
       return null;
   }
 }
 
-/** Rule kinds the Permission category, not the Business-Rule category, owns. */
-export function permissionTemplate(targetName: string): ValidationTemplate {
-  return { key: 'unauthorized', family: 'advanced', title: () => `Block unauthorized user from ${targetName}`, rationale: 'A permission rule must deny users who lack the required role.' };
+export function authorizationTemplate(conceptKey: string, targetName: string): ObligationTemplate {
+  return { concept: () => `${conceptKey}-authorization`, intent: 'block-unauthorized', statement: () => `Block an unauthorized user from ${targetName}`, risk: 'An unauthorized action is a privilege-escalation and compliance breach.' };
 }

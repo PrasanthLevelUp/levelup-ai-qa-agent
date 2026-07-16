@@ -1,11 +1,11 @@
 /**
  * Validation Planning — public surface.
  *
- * The component that decides WHAT to validate by walking a QA taxonomy
- * (Category → applicable Rules/Fields → Point), so coverage balance stops being
- * GPT's guess and positives stop scaling with field count. Consumes a
- * BusinessModel from the Requirement Understanding Engine; feeds the Scenario
- * Planner.
+ * The engine that discovers VALIDATION OBLIGATIONS from business risk: what must
+ * be validated, deduplicated by intent, sized dynamically from a risk profile,
+ * and reconciled against what the repository already covers. Positive / Negative
+ * / Edge exists only in the derived presentation layer. Consumes a BusinessModel
+ * from the Requirement Understanding Engine; feeds the Scenario Planner.
  */
 
 export * from './types';
@@ -14,9 +14,9 @@ export {
   inputValidationTemplates,
   boundaryTemplates,
   businessRuleTemplate,
-  permissionTemplate,
+  authorizationTemplate,
   SECURITY_PAYLOADS,
   DATA_INTEGRITY_CHECKS,
   FREE_TEXT_TYPES,
-  type ValidationTemplate,
+  type ObligationTemplate,
 } from './validation-catalog';
