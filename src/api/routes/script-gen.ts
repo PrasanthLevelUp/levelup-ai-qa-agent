@@ -62,6 +62,12 @@ import { ProjectExportEngine } from '../../script-gen/project-export-engine';
 import { deterministicMetrics } from '../../ai/generation-metrics';
 import { RequirementIntelligenceService } from '../../requirement-intelligence/requirement-intelligence-service';
 import { ScriptGenerationConsumer } from '../../requirement-intelligence/script-generation-consumer';
+import { buildGenerationPlanView, type GenerationPlanView } from '../../requirement-intelligence/generation-plan-view';
+import {
+  savePlan as saveGenerationPlan,
+  getPlan as getGenerationPlan,
+  planFingerprint,
+} from '../../requirement-intelligence/generation-plan-store';
 import {
   resolveRequirementIntelligenceMode,
   isIntelligenceComputed,
@@ -122,6 +128,182 @@ export function createScriptGenRouter(): Router {
   const patternMatcher = new PatternMatcher();
   const fusionService = new IntelligenceFusionService();
 
+  /* ── Generation Plan (analyze only — NO generation) ──────────────────────
+   *
+   * POST /api/scripts/plan
+   *
+   * The pre-generation "Generation Plan" screen. Given the SAME inputs a
+   * generation would receive (requirementId / testCaseId / inline testCases +
+   * repoId), this endpoint runs the FROZEN intelligence pipeline
+   * (RequirementIntelligenceService → ScriptGenerationConsumer) and returns a
+   * render-ready plan — decision, confidence, covered vs missing flows, reused
+   * repository assets and an estimated-savings comparison — WITHOUT calling the
+   * ScriptGenEngine and WITHOUT any side effects (no crawl, no DB writes).
+   *
+   * It answers the three questions every AI feature must answer before it acts:
+   *   1. What did I analyze?  → repositoryCoverage + coverage model assets
+   *   2. What did I decide?   → decision (SKIP / EXTEND / GENERATE)
+   *   3. Why did I decide it? → generatedBecause (policy override reasons)
+   *
+   * The customer then approves the plan; the dashboard calls the existing
+   * /generate endpoint to EXECUTE it. This endpoint is deliberately cheap and
+   * read-only so the screen feels instant.
+   */
+  router.post('/plan', async (req: Request, res: Response) => {
+    try {
+      const {
+        repoId,
+        requirementId,
+        testCaseId,
+        testCases: inlineTestCasesRaw,
+        instructions,
+        scenario,
+      } = req.body ?? {};
+      const companyId = (req as any).companyId as number | undefined;
+      const projectId = (req as any).projectId as number | undefined;
+
+      // ── Resolve the test cases in scope (read-only; mirrors /generate) ──
+      let testCase: any = null;
+      if (testCaseId != null && companyId != null) {
+        testCase = await getTestCaseById(Number(testCaseId), companyId).catch(() => null);
+      }
+      let requirementTestCases: any[] = [];
+      if (!testCase && requirementId != null && companyId != null) {
+        requirementTestCases = await getTestCasesForRequirement(
+          String(requirementId),
+          companyId,
+        ).catch(() => []);
+      }
+      if (
+        !testCase &&
+        requirementTestCases.length === 0 &&
+        Array.isArray(inlineTestCasesRaw) &&
+        inlineTestCasesRaw.length > 0
+      ) {
+        requirementTestCases = inlineTestCasesRaw
+          .filter((tc: any) => tc && typeof tc === 'object')
+          .map((tc: any, i: number) => ({
+            id: tc.id ?? `upload-${i + 1}`,
+            title:
+              (typeof tc.title === 'string' && tc.title.trim()) ||
+              (typeof tc.scenario === 'string' && tc.scenario.trim()) ||
+              `Test case ${i + 1}`,
+          }));
+      }
+
+      // ── Load the repository Coverage Model (the intelligence substrate) ──
+      let repoProfile: import('../../context/types').RepositoryProfile | undefined;
+      if (repoId) {
+        repoProfile = (await getRepositoryContext(repoId, companyId, projectId)) ?? undefined;
+      }
+      const coverageModel = repoProfile?.coverageModel ?? [];
+
+      const scopedCases: any[] = testCase ? [testCase] : requirementTestCases;
+
+      // ── Fallback: nothing to analyze against (no coverage model, or no
+      // resolvable test cases) → an honest GENERATE-ALL plan. The screen still
+      // renders; it simply reports "no existing automation to analyze". This is
+      // the URL-only / plain-English generation case.
+      if (coverageModel.length === 0 || scopedCases.length === 0) {
+        const flowLabels =
+          scopedCases.length > 0
+            ? scopedCases.map((tc, i) => String(tc.title ?? `Flow ${i + 1}`))
+            : [String(scenario || instructions || 'Requested automation')];
+        const view: GenerationPlanView = {
+          decision: GenerationDecision.GENERATE,
+          repositoryCoverage: 0,
+          confidence: 0,
+          estimatedTokenSavings: 0,
+          savingsPercent: 0,
+          existingAutomation: [],
+          toGenerate: flowLabels.map((flow) => ({ flow, assets: [] })),
+          assetsReused: [],
+          comparison: {
+            withoutIntelligence: { scripts: flowLabels.length, estimatedTokens: 0 },
+            withIntelligence: { scripts: flowLabels.length, estimatedTokens: 0 },
+            reductionPercent: 0,
+          },
+          generatedBecause: [],
+          decisionNarrative:
+            coverageModel.length === 0
+              ? 'No connected repository Coverage Model is available, so existing automation cannot be analyzed. All requested flows will be generated.'
+              : 'No existing automation was found for this requirement. All requested flows will be generated.',
+          hasCoverageModel: coverageModel.length > 0,
+        };
+        // No frozen intelligence was computed (GENERATE-all fallback), so there
+        // is nothing to reuse at execution — /generate will run its normal path.
+        return res.status(200).json({
+          success: true,
+          planId: null,
+          plan: view,
+          requirementId: requirementId != null ? String(requirementId) : null,
+        });
+      }
+
+      // ── Compute the FROZEN intelligence + plan, then the render-ready view ──
+      // Behaviors bind each expected flow to its test case id UP FRONT (no title
+      // matching downstream) — exactly as /generate does.
+      const behaviors = scopedCases.map((tc) => ({
+        label: String(tc.title ?? ''),
+        testCaseIds: [String(tc.id)],
+      }));
+      const reqInput = {
+        id: String(requirementId ?? testCase?.id ?? 'inline'),
+        title: String(
+          instructions || scenario || scopedCases[0]?.title || `Requirement ${requirementId ?? 'inline'}`,
+        ),
+        behaviors,
+      };
+
+      const intelligence = new RequirementIntelligenceService().analyze(reqInput, coverageModel);
+      const plan = new ScriptGenerationConsumer().plan(intelligence);
+      const view = buildGenerationPlanView(plan, intelligence, coverageModel);
+
+      // Cache the FROZEN artifacts under a planId so approval → execution reuses
+      // this single analysis (see generation-plan-store). The fingerprint binds
+      // the plan to exactly the request it describes.
+      const planId = saveGenerationPlan({
+        fingerprint: planFingerprint({
+          requirementId,
+          testCaseId,
+          repoId,
+          testCaseIds: scopedCases.map((tc) => tc.id),
+        }),
+        intelligence,
+        plan,
+        view,
+      });
+
+      console.log(
+        '[ScriptGen] 🧭 Generation Plan',
+        JSON.stringify({
+          planId,
+          requirementId: reqInput.id,
+          decision: view.decision,
+          repositoryCoverage: view.repositoryCoverage,
+          confidence: view.confidence,
+          estimatedTokenSavings: view.estimatedTokenSavings,
+          covered: view.existingAutomation.length,
+          toGenerate: view.toGenerate.length,
+        }),
+      );
+
+      return res.status(200).json({
+        success: true,
+        planId,
+        plan: view,
+        requirementId: reqInput.id,
+      });
+    } catch (err: any) {
+      console.error('[ScriptGen] Plan error:', err?.message ?? err);
+      return res.status(500).json({
+        success: false,
+        error: 'Failed to build generation plan',
+        details: String(err?.message ?? err),
+      });
+    }
+  });
+
   /* ── Generate Test Scripts ──────────────────────────────── */
   router.post('/generate', async (req: Request, res: Response) => {
     const startTime = Date.now();
@@ -145,6 +327,10 @@ export function createScriptGenRouter(): Router {
         // (one explicit "Create Profile" action = one profile).
         persistProfile,
         testCaseId,
+        // Approved Generation Plan id (from POST /plan). When present + still
+        // valid, generation EXECUTES that already-computed plan instead of
+        // re-running the intelligence pipeline — one analysis, one execution.
+        planId,
         // ── Sprint 4: Enterprise Script Generation Enhancement ──
         requirementId,
         // Inline structured test cases from a CSV/Excel upload (no DB row). When
@@ -717,12 +903,30 @@ export function createScriptGenRouter(): Router {
             behaviors,
           };
 
-          const intelligence = new RequirementIntelligenceService().analyze(
-            reqInput,
-            repoProfile.coverageModel,
-          );
-          const plan = new ScriptGenerationConsumer().plan(intelligence);
-          riTelemetry = { ...plan.telemetry };
+          // Reuse the APPROVED plan when the request carries a valid planId that
+          // fingerprint-matches this request — the analysis already happened at
+          // /plan time (one analysis, one execution). Otherwise analyze now.
+          const approved = getGenerationPlan(planId);
+          const fingerprintNow = planFingerprint({
+            requirementId,
+            testCaseId,
+            repoId,
+            testCaseIds: requirementTestCases.map((tc) => tc.id),
+          });
+          const reusedApprovedPlan = !!approved && approved.fingerprint === fingerprintNow;
+
+          const intelligence =
+            reusedApprovedPlan && approved
+              ? approved.intelligence
+              : new RequirementIntelligenceService().analyze(reqInput, repoProfile.coverageModel);
+          const plan =
+            reusedApprovedPlan && approved
+              ? approved.plan
+              : new ScriptGenerationConsumer().plan(intelligence);
+          riTelemetry = { ...plan.telemetry, reusedApprovedPlan };
+          if (reusedApprovedPlan) {
+            console.log(`[ScriptGen] ✅ Executing approved Generation Plan planId=${planId}`);
+          }
 
           // Always log in shadow AND enabled — this is the measurement window.
           console.log(
