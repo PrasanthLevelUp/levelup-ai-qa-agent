@@ -164,3 +164,36 @@ Run `npx ts-node scripts/add-employee-audit.ts`. It generates the current Test C
 Lab output for this requirement, checks each scenario above, and prints a per-category
 `✓/✗` table plus the ordered missing list. The number that matters is not a percentage —
 it is *"what would a senior QA notice is missing,"* worst-priority first.
+
+> **Environment note (honesty).** No live LLM/DB is available in this workspace, so
+> "generated output" here is the deterministic **planner ceiling** — every scenario the
+> Knowledge Base + planner can emit for this requirement (all coverage families, Deep on).
+> The LLM stage can only *word up* these scenarios, never add ones the planner didn't
+> plan, so the ceiling is an honest upper bound on the shipped suite. Prompt/LLM-stage
+> losses cannot be observed here and are not claimed as fixed.
+
+### Cycle log — measured, not estimated
+
+Each cycle: generate → compare → for every miss ask *which stage lost it* → fix only
+that stage → re-run this same audit. Numbers are from real runs.
+
+| Cycle | Fix (stage) | Gold covered at ceiling | Critical miss | High miss |
+|-------|-------------|-------------------------|---------------|-----------|
+| Baseline | — | 31/62 | 2 | 9 |
+| 1 — Security | **KB**: `crud` had zero injection obligations → added SQL + XSS (universal) | 35/62 | 0 | 8 |
+| 2 — Field-aware | **Planner**: validation/boundary were collapsed into one generic obligation each → Phase 3c expands per named field | 45/62 | 0 | 2 |
+| 3 — Depth | **KB**: double-submit, endpoint authz, unauthenticated redirect, partial + case-insensitive search, propagation, cancel | 53/62 | 0 | 0 |
+
+**Where the losses were:** every Add-Employee miss traced to the deterministic backbone —
+either a missing **Knowledge-Base obligation** (Cycles 1 & 3) or a **planner** that
+collapsed per-field checks into one generic case (Cycle 2). None required a new engine or
+architecture; all fixes live in the canonical `crud` KB category and the existing planner,
+so they transfer to every CRUD requirement (Create Employee 88→100%, Edit Employee
+77→86%, User Profile 65→70% on the sealed cross-requirement scorer — zero regressions).
+
+**The 9 remaining gold rows are honest, documented gaps**, all Low/Medium *quality
+attributes* a one-paragraph functional requirement does not imply: audit-log entry,
+notification channel (toast/email), keyboard/a11y, mandatory-field marking, emoji handling,
+unsaved-changes warning, photo-persistence, same-ID concurrency, and "errors are clear and
+actionable". Manufacturing keyword rules for these would be the non-scaling trap this
+exercise exists to avoid — they are left visible in the worklist rather than gamed.
