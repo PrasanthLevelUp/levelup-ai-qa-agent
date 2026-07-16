@@ -754,6 +754,10 @@ export function createTestCoverageRouter(): Router {
                   expected: (tc as any).expected,
                   expectedResult: tc.expectedResult,
                   testData: tc.testData,
+                  // Field-validity (Step Validator) input: the feature's real
+                  // fields, so the certifier can flag any step referencing a
+                  // field that does not exist for this feature.
+                  applicationFields: (tc as any).applicationFields,
                 }),
               }),
               priority: tc.priority || 'P2',

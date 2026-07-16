@@ -44,9 +44,17 @@ export interface ScenarioForIntegrity {
   };
   expectedResult?: string;
   testData?: string;
+  /**
+   * The real field labels that EXIST for this feature (resolved by the builder's
+   * Field Resolver from the matched feature form). When present, the field-
+   * validity check verifies every field a step references is in this set —
+   * catching the "login fields leaked into an Add Employee flow" bug
+   * deterministically. Absent/empty ⇒ the check is skipped (nothing to judge).
+   */
+  applicationFields?: string[];
 }
 
-/** Stable identifiers for the eight deterministic integrity checks. */
+/** Stable identifiers for the nine deterministic integrity checks. */
 export type IntegrityCheckId =
   | 'persona_consistency'
   | 'coverage_polarity'
@@ -55,7 +63,8 @@ export type IntegrityCheckId =
   | 'step_completeness'
   | 'preconditions'
   | 'business_flow'
-  | 'grounding_completeness';
+  | 'grounding_completeness'
+  | 'field_validity';
 
 /**
  * Result of a single deterministic check. `passed` is advisory only — it feeds

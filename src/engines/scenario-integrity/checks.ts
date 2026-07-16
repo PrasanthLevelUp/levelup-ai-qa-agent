@@ -524,6 +524,64 @@ export function checkGroundingCompleteness(s: ScenarioForIntegrity): IntegrityCh
   };
 }
 
+// ---------------------------------------------------------------------------
+// 9. Field validity (Scenario ↔ Fields — the deterministic Step Validator)
+//    Every field a step references must EXIST for this feature. When the
+//    caller supplies the feature's real field set (`applicationFields`), any
+//    step that enters data into a field NOT in that set is a hallucinated
+//    field — e.g. "Enter … in the Username field" on an Add Employee feature
+//    whose only fields are First Name / Last Name / Employee ID. This is the
+//    check that catches login-form leakage and, more generally, any field an
+//    LLM invented that does not belong to the feature under test.
+//
+//    Deterministic and fail-open: with no field set to compare against (an
+//    ungrounded skeleton, or an older case), there is nothing to judge → pass.
+// ---------------------------------------------------------------------------
+
+const FIELD_REF_RE = /\bin the (.+?) field\b/gi;
+
+/** Normalise a field label for comparison (lowercase, collapse whitespace). */
+function normField(s: string): string {
+  return lc(s).replace(/\s+/g, ' ').trim();
+}
+
+export function checkFieldValidity(s: ScenarioForIntegrity): IntegrityCheckResult {
+  const label = 'Field validity';
+  const weight = 5; // High weight: a wrong field is a correctness (trust) defect.
+  const messages: string[] = [];
+
+  const known = (s.applicationFields ?? []).map(normField).filter(Boolean);
+  const steps = s.steps ?? [];
+
+  // Nothing to compare against ⇒ cannot judge ⇒ pass (never a false alarm).
+  if (known.length === 0 || steps.length === 0) {
+    return result({ id: 'field_validity', label, weight, score: 1, messages });
+  }
+
+  const knownSet = new Set(known);
+  const foreign = new Set<string>();
+  for (const step of steps) {
+    let m: RegExpExecArray | null;
+    FIELD_REF_RE.lastIndex = 0;
+    while ((m = FIELD_REF_RE.exec(step)) !== null) {
+      const ref = normField(m[1]);
+      // Ignore the generic fallback label the builder emits when a field has no
+      // name/label — it is not a claim about a specific real field.
+      if (!ref || ref === 'field') continue;
+      if (!knownSet.has(ref)) foreign.add(m[1].trim());
+    }
+  }
+
+  if (foreign.size > 0) {
+    messages.push(
+      `Steps reference field(s) that do NOT exist for this feature: "${Array.from(foreign).join('", "')}". ` +
+        `The feature's real fields are: ${known.join(', ')}. This case must be regenerated or marked Needs Review — it is not automation-ready.`,
+    );
+  }
+
+  return result({ id: 'field_validity', label, weight, score: foreign.size > 0 ? 0 : 1, messages });
+}
+
 /** All checks, in report order. */
 export const ALL_CHECKS = [
   checkPersonaConsistency,
@@ -534,4 +592,5 @@ export const ALL_CHECKS = [
   checkPreconditions,
   checkBusinessFlow,
   checkGroundingCompleteness,
+  checkFieldValidity,
 ];

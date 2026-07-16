@@ -49,7 +49,9 @@ describe('validateScenarioIntegrity — report shape & invariants', () => {
     expect(r.generationAllowed).toBe(true);
     expect(r.readinessScore).toBeGreaterThanOrEqual(90);
     expect(r.confidence).toBe('high');
-    expect(r.checks).toHaveLength(8);
+    // 9 checks: the 8 original consistency checks + the field-validity check
+    // (Scenario ↔ Fields Step Validator) added in Sprint 2.
+    expect(r.checks).toHaveLength(9);
     expect(r.warnings).toHaveLength(0);
   });
 

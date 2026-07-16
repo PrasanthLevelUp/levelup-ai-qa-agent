@@ -206,6 +206,25 @@ export interface DraftTestCase {
   provenance: ScenarioProvenance;
   /** True when the draft used at least one REAL selector from the App Profile. */
   grounded: boolean;
+  /**
+   * Deterministic review flag (Scenario ↔ Automation Ready). True when the draft
+   * could NOT be safely grounded to the FEATURE's real fields — i.e. no form in
+   * the App Profile matched this feature's vocabulary, so the steps are an
+   * honest skeleton rather than concrete field interactions. When true,
+   * `automationReady` is forced false and `reviewReasons` explains why, so the
+   * output shows "Needs Review" instead of a false "Automation Ready: YES".
+   */
+  needsReview: boolean;
+  /** Human-readable reasons the case needs review (empty when none). */
+  reviewReasons: string[];
+  /**
+   * The real field labels of the feature form this draft grounded on (empty when
+   * no feature form resolved). Lets the Scenario Integrity certifier verify that
+   * every field a step references actually EXISTS for this feature — the
+   * deterministic Step Validator that stops login fields leaking into an Add
+   * Employee flow.
+   */
+  applicationFields: string[];
 }
 
 export interface BuildDraftsResult {
@@ -293,6 +312,16 @@ export interface FormatterTestCase {
    * happens at the prompt boundary.
    */
   resolvedDataset?: ResolvedDatasetRecord;
+  /**
+   * Deterministic review flag carried through from the draft (Scenario ↔
+   * Automation Ready). Optional for back-compat with cases reconstructed from
+   * older DB rows. When true the case is "Needs Review", never automation-ready.
+   */
+  needsReview?: boolean;
+  /** Reasons the case needs review (empty/absent when none). */
+  reviewReasons?: string[];
+  /** Real field labels of the feature form this case grounded on (Step Validator input). */
+  applicationFields?: string[];
 }
 
 /* ------------------------------------------------------------------ */
@@ -321,16 +350,45 @@ function extractSelectors(steps: string[]): string[] {
 }
 
 /**
- * Score how well a form matches a scenario/category (distinct term hits over the
- * form's page + field names/labels). Used to pick the primary interaction form.
+ * Purely structural tokens that carry NO feature identity — HTML/URL scaffolding
+ * and filler words. We match on whole tokens (never substrings) over the form's
+ * field NAMES + LABELS only (never field TYPE), so the old collisions are already
+ * gone: "name"/"user" no longer match inside "username", and the type "text" is
+ * not considered at all. This stoplist only removes the remaining generic
+ * scaffolding so it can never tip the score toward a foreign form. Real field
+ * identities (email, password, first, last, employee, id, ...) are intentionally
+ * NOT here — they are exactly what makes a form recognisable.
+ */
+const FORM_STOP_TOKENS = new Set([
+  'value', 'form', 'input', 'field', 'submit', 'button',
+  'http', 'https', 'www', 'com', 'html', 'php',
+  'the', 'and', 'for', 'with', 'new', 'edit',
+]);
+
+/**
+ * Score how well a form belongs to a feature. Matching is on WHOLE tokens (not
+ * substrings) drawn from the form's field names + labels, minus generic
+ * stop-tokens. Substring matching was the trust bug: "name"/"user" matched
+ * inside "username" and the type "text" matched everything, so the login form
+ * scored against an Add-Employee feature and its fields leaked in.
  */
 function scoreForm(form: FormLike, terms: string[]): number {
-  const text = [
-    lc(form.page), lc(form.action),
-    ...(form.fields || []).flatMap(f => [lc(f.name), lc(f.label), lc(f.type)]),
-  ].join(' ');
+  const formTokens = new Set<string>();
+  const add = (raw: string) => {
+    for (const tok of toTerms(raw)) if (!FORM_STOP_TOKENS.has(tok)) formTokens.add(tok);
+  };
+  // Field identities are the strongest signal; the page/action path is a weaker
+  // but real one (a scenario often names the page — "log in", not the field).
+  // Both are tokenised whole (never substrings) and the field TYPE is excluded,
+  // so "username" no longer leaks the tokens "user"/"name" and the type "text"
+  // matches nothing.
+  for (const f of form.fields || []) { add(f.name || ''); add(f.label || ''); }
+  add(form.page || '');
+  add(form.action || '');
   let score = 0;
-  for (const t of terms) if (t && text.includes(t)) score += 1;
+  for (const t of terms) {
+    if (t && !FORM_STOP_TOKENS.has(t) && formTokens.has(t)) score += 1;
+  }
   return score;
 }
 
@@ -340,19 +398,32 @@ function toTerms(s: string): string[] {
 }
 
 /**
- * Pick the primary form for a scenario: the highest-scoring form against the
- * scenario terms; ties and no-match fall back to the first retrieved form
- * (retrieval already scoped forms to the plan, so index 0 is a safe default).
+ * FIELD RESOLVER (Scenario ↔ Fields).
+ *
+ * Pick the form that genuinely belongs to THIS feature: the highest-scoring form
+ * against the feature vocabulary (requirement title + scenario terms). Crucially,
+ * a form is only eligible to ground steps when it actually matches — if NOTHING
+ * matches (best score 0) we return `undefined` instead of falling back to an
+ * arbitrary form.
+ *
+ * WHY: the old "fall back to forms[0]" behaviour is exactly the trust bug — for
+ * an "Add Employee" feature whose App Profile only carries a login form, forms[0]
+ * (login) was silently chosen, so the steps referenced `username`/`password` and
+ * inherited the login form's real selectors, which then flipped Automation Ready
+ * to YES. Refusing to ground on a non-matching form makes the builder emit an
+ * honest, ungrounded skeleton that the caller marks "Needs Review" — incomplete
+ * but correct beats complete but wrong.
  */
 function pickForm(forms: FormLike[] | undefined, terms: string[]): FormLike | undefined {
   if (!forms?.length) return undefined;
-  let best = forms[0];
-  let bestScore = scoreForm(forms[0], terms);
-  for (let i = 1; i < forms.length; i++) {
-    const s = scoreForm(forms[i], terms);
-    if (s > bestScore) { best = forms[i]; bestScore = s; }
+  let best: FormLike | undefined;
+  let bestScore = 0;
+  for (const f of forms) {
+    const s = scoreForm(f, terms);
+    if (s > bestScore) { best = f; bestScore = s; }
   }
-  return best;
+  // No form matched the feature vocabulary → do NOT ground on a foreign form.
+  return bestScore > 0 ? best : undefined;
 }
 
 /** Pick the most relevant dataset for a scenario (term match, else first). */
@@ -375,9 +446,45 @@ function pickDataset(datasets: DatasetLike[] | undefined, terms: string[]): Data
  * the QA INTENT of the coverage type (valid vs invalid vs empty vs malicious) so
  * the model does not collapse every scenario into a happy path.
  */
-function dataPhraseFor(coverageType: string, field: FieldLike): string {
+interface DataIntentScenario {
+  coverageType: string;
+  title?: string;
+  objective?: string;
+  riskArea?: string;
+  id?: string;
+}
+
+function dataPhraseFor(scenario: DataIntentScenario, field: FieldLike): string {
   const label = field.label || field.name || 'value';
-  switch (coverageType) {
+  const ct = scenario.coverageType;
+  // The scenario's OWN intent — not just its coverage-type bucket — decides the
+  // data. This is Scenario ↔ Test Data: a "SQL injection" scenario must carry
+  // an injection string, an "XSS" scenario a script payload, a "duplicate"
+  // scenario an existing value — never the same default value for all of them.
+  const intent = lc(`${scenario.title} ${scenario.objective} ${scenario.riskArea} ${scenario.id}`);
+  const fieldText = lc(`${field.name} ${field.label} ${field.type}`);
+  const isFile = lc(field.type) === 'file' || /photo|image|upload|file|attach|document|resume|avatar/.test(fieldText);
+
+  // Specific-intent payloads (override the generic phrasing only when the
+  // scenario expresses a concrete intent; otherwise fall through to the
+  // coverage-type default so polarity words like valid/invalid survive).
+  // XSS is checked BEFORE SQL: the XSS scenario id is "…-injection-xss", which
+  // also contains "injection" — so SQL (which keys off "injection") must not win
+  // that scenario. The more-specific script/xss signal takes precedence.
+  if (/\bxss\b|<script|script payload|cross-site|script injection|alert\(/.test(intent)) return `the XSS payload "<script>alert(1)</script>"`;
+  if (/\bsql\b|injection|1\s*=\s*1|or\s+1=1|drop table/.test(intent)) return `the SQL-injection string "' OR 1=1 --"`;
+  if (/duplicate|already exist|existing (record|employee|entry|id)|not unique/.test(intent)) return `a ${label} that already exists (a duplicate of a record already in the system)`;
+  if (isFile && /\.exe|invalid file|wrong (file )?type|not an image|disallow|virus|executable|unsupported/.test(intent)) return `an invalid file type (e.g. "virus.exe")`;
+  if (isFile && /corrupt/.test(intent)) return `a corrupted image file (valid extension, unreadable content)`;
+  if (/numeric|contains? a? ?number|digits? in|non-alpha|john123/.test(intent)) return `a ${label} containing numbers (e.g. "John123")`;
+  if (/whitespace|spaces? only|space-only|only spaces|blank spaces/.test(intent)) return `a whitespace-only ${label} (e.g. "   ")`;
+  if (/unicode|accent|non-ascii|special character|emoji|diacritic/.test(intent)) return `a unicode ${label} (e.g. "தமிழ்", "李雷", "😊")`;
+  if (/\bmax(imum)?\b|too long|over the limit|exceed|length limit|character limit|501|500 char/.test(intent)) return `a ${label} longer than the maximum allowed length (e.g. 501 characters)`;
+  if (/\bmin(imum)?\b|single character|one char|too short/.test(intent)) return `a single-character ${label} (minimum boundary)`;
+  if (/leading zero/.test(intent)) return `a ${label} with leading zeros (e.g. "007")`;
+  if (/blank|empty|required|mandatory|missing/.test(intent)) return `a blank ${label} (leave it empty)`;
+
+  switch (ct) {
     case 'negative':
       return `an invalid ${label}`;
     case 'edge_cases':
@@ -482,6 +589,14 @@ export function buildDraftTestCases(
   const drafts: DraftTestCase[] = [];
   let groundedCount = 0;
 
+  // FIELD RESOLVER (Scenario ↔ Fields): the feature's identity comes from the
+  // requirement TITLE — the strongest, least noisy signal of which form belongs
+  // to this feature (the description may mention incidental auth words like
+  // "logged in" that would otherwise drag a scenario onto the login form). Every
+  // scenario is resolved against title terms ∪ its own terms, so a form is only
+  // grounded when it matches THIS feature's vocabulary.
+  const titleTerms = toTerms(input?.title || '');
+
   // The builder is a PURE TRANSFORM. It emits exactly one draft per planned
   // scenario and NEVER decides whether a scenario should exist — that decision
   // was already made (and justified with provenance) by the Scenario Planner,
@@ -489,7 +604,8 @@ export function buildDraftTestCases(
   // enriches each immutable planned scenario into a concrete, grounded draft.
   plan.scenarios.forEach((scenario, index) => {
     const scenarioTerms = toTerms(`${scenario.title} ${scenario.objective} ${scenario.riskArea}`);
-    const form = pickForm(ap?.forms, scenarioTerms);
+    const featureTerms = Array.from(new Set([...titleTerms, ...scenarioTerms]));
+    const form = pickForm(ap?.forms, featureTerms);
     const dataset = pickDataset(knowledge?.testData, scenarioTerms);
 
     // ── Steps ── business-readable action text ONLY. Technical grounding
@@ -515,7 +631,7 @@ export function buildDraftTestCases(
     for (const f of fields) {
       if (f.selector) usedRealSelector = true;
       const fieldLabel = f.label || f.name || 'field';
-      steps.push(`Enter ${dataPhraseFor(scenario.coverageType, f)} in the ${fieldLabel} field`);
+      steps.push(`Enter ${dataPhraseFor(scenario, f)} in the ${fieldLabel} field`);
       grounding.push({ stepIndex: steps.length, selector: f.selector, page: form?.page, control: fieldLabel });
     }
     if (form?.submitSelector) {
@@ -529,8 +645,13 @@ export function buildDraftTestCases(
       steps.push('Click the Submit button');
       grounding.push({ stepIndex: steps.length, page: form?.page, control: 'Submit' });
     }
+    if (!form) {
+      // No form matched THIS feature (or no App Profile at all). Emit an honest,
+      // ungrounded skeleton from the objective rather than fabricating field
+      // steps against a foreign form. The caller marks this "Needs Review".
+      steps.push(`Exercise the "${scenario.title}" scenario against the application`);
+    }
     if (!steps.length) {
-      // No App Profile at all — still produce a usable skeleton from the objective.
       steps.push(`Exercise the "${scenario.title}" scenario against the application`);
     }
     // NOTE: no generic "Observe and verify the outcome" step. Verification lives
@@ -561,6 +682,25 @@ export function buildDraftTestCases(
 
     const expected = buildExpected(scenario, form, ap);
 
+    // ── Scenario ↔ Automation Ready ── a case is automation-ready ONLY when a
+    // real feature form was resolved AND it yielded a real selector. If no form
+    // matched this feature, the steps are an honest skeleton — mark "Needs
+    // Review" and force automationReady false rather than lie with a YES.
+    const featureFormResolved = !!form;
+    const applicationFields = (form?.fields || []).map(f => f.label || f.name || 'field');
+    const reviewReasons: string[] = [];
+    if (!featureFormResolved) {
+      reviewReasons.push(
+        `No form in the App Profile matches the "${input?.title || scenario.title}" feature — the steps are an ungrounded skeleton. Confirm the real fields and selectors against the live UI before automating.`,
+      );
+    } else if (!usedRealSelector) {
+      reviewReasons.push(
+        'The matched feature form exposes no real selectors yet — locators must be resolved before this case can be automated.',
+      );
+    }
+    const needsReview = reviewReasons.length > 0;
+    const automationReady = featureFormResolved && usedRealSelector;
+
     drafts.push({
       schemaVersion: 2,
       scenarioIndex: index,
@@ -579,12 +719,15 @@ export function buildDraftTestCases(
       expectedResult: expected.observable,
       testData,
       tags: Array.from(new Set([category, scenario.coverageType])),
-      automationReady: usedRealSelector,
+      automationReady,
       selectorAvailability: usedRealSelector ? 'high' : 'unknown',
       source,
       sourceEvidence,
       provenance: scenario.provenance,
       grounded: usedRealSelector,
+      needsReview,
+      reviewReasons,
+      applicationFields,
     });
   });
 
@@ -680,6 +823,9 @@ export function draftToTestCase(draft: DraftTestCase, scenarioIndex: number): Fo
     source: draft.source,
     sourceEvidence: draft.sourceEvidence,
     provenance: draft.provenance,
+    needsReview: draft.needsReview,
+    reviewReasons: draft.reviewReasons ? draft.reviewReasons.slice() : [],
+    applicationFields: draft.applicationFields ? draft.applicationFields.slice() : [],
   };
 }
 
