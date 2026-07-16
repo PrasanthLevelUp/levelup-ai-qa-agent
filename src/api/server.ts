@@ -125,6 +125,7 @@ import { createIngestRouter } from './routes/ingest';
 import { apiKeysRouter } from './routes/api-keys';
 import { hooksRouter } from './routes/hooks';
 import { createRepoIntelligenceRouter } from './routes/repo-intelligence';
+import { createRepositoryInventoryRouter } from './routes/repository-inventory';
 import { createRepoIntelligence3CRouter } from './routes/repo-intelligence-3c';
 import { createRepoIntelWebhookRouter } from './routes/repo-intel-webhook';
 import { FEATURE_FLAGS } from '../config/features';
@@ -354,6 +355,8 @@ export function createServer(): express.Application {
   app.use('/api/billing', authMiddleware, companyMiddleware, sessionMiddleware, createBillingRouter());
   app.use('/api/keys', authMiddleware, companyMiddleware, sessionMiddleware, apiKeysRouter);
   app.use('/api/repo-intelligence', authMiddleware, companyMiddleware, sessionMiddleware, createRepoIntelligenceRouter());
+  // Sprint RCI-1: deterministic Repository Coverage Inventory (no LLM/embeddings/generation).
+  app.use('/api/repository-inventory', authMiddleware, companyMiddleware, sessionMiddleware, projectContextMiddleware, contextMiddleware, createRepositoryInventoryRouter());
   // Phase 3C: Health Intelligence + Impact Analysis + Knowledge Graph Lite.
   // Each route group is internally gated by its own feature flag (returns 404
   // when off), so mounting is unconditional and the default surface is unchanged.
