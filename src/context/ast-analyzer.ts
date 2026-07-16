@@ -9,7 +9,7 @@
  * structured, searchable knowledge.
  */
 
-import { Project, SourceFile, SyntaxKind, Node, FunctionDeclaration, MethodDeclaration, ClassDeclaration, ArrowFunction, VariableDeclaration } from 'ts-morph';
+import { Project, SourceFile, SyntaxKind, Node, FunctionDeclaration, MethodDeclaration, ClassDeclaration, ArrowFunction, VariableDeclaration, CallExpression } from 'ts-morph';
 import * as path from 'path';
 import * as fs from 'fs';
 import { logger } from '../utils/logger';
@@ -19,7 +19,23 @@ import type {
   ClassInfo,
   ImportInfo,
   Language,
+  TestCaseAnalysis,
 } from './types';
+
+/** Matcher names we recognise as assertions (Playwright web-first + Jest + chai). */
+const ASSERTION_MATCHERS = new Set([
+  'toBe', 'toEqual', 'toStrictEqual', 'toContain', 'toContainEqual', 'toMatch',
+  'toMatchObject', 'toHaveLength', 'toBeTruthy', 'toBeFalsy', 'toBeNull',
+  'toBeDefined', 'toBeUndefined', 'toBeGreaterThan', 'toBeLessThan',
+  // Playwright web-first assertions
+  'toHaveText', 'toContainText', 'toHaveValue', 'toHaveAttribute', 'toBeVisible',
+  'toBeHidden', 'toBeEnabled', 'toBeDisabled', 'toBeChecked', 'toHaveURL',
+  'toHaveTitle', 'toHaveCount', 'toHaveClass', 'toBeFocused', 'toBeEditable',
+  'toHaveScreenshot', 'toBeAttached', 'toHaveCSS', 'toHaveId',
+  // Chai / assert
+  'equal', 'deepEqual', 'strictEqual', 'isTrue', 'isFalse', 'exists',
+  'notEqual', 'include', 'lengthOf', 'ok', 'instanceOf',
+]);
 
 const MOD = 'ast-analyzer';
 
@@ -289,6 +305,9 @@ export class ASTAnalyzer {
     const imports = this.extractImports(sourceFile, relativePath);
     const exports = this.extractExports(sourceFile);
     const testCount = this.countTests(sourceFile);
+    // Per-test inventory facts (Sprint RCI-1) — extracted from the SAME parsed
+    // SourceFile, so there is no second parse pass / second scanner.
+    const tests = this.extractTests(sourceFile);
     const locatorPatterns = extractPatterns(content, LOCATOR_PATTERNS);
     const assertionPatterns = extractPatterns(content, ASSERTION_PATTERNS);
     const loggingPatterns = extractPatterns(content, LOGGING_PATTERNS);
@@ -313,6 +332,7 @@ export class ASTAnalyzer {
       lineCount: content.split('\n').length,
       hasFixtures: functions.some(f => f.category === 'fixture') || imports.some(i => i.module.includes('fixture')),
       hasPageObject: classes.some(c => c.category === 'page-object') || relativePath.toLowerCase().includes('page'),
+      tests,
     };
   }
 
@@ -564,6 +584,176 @@ export class ASTAnalyzer {
       }
     });
     return count;
+  }
+
+  /* ---------------------------------------------------------------- */
+  /*  Private: Per-test Inventory Facts (Sprint RCI-1)                 */
+  /* ---------------------------------------------------------------- */
+
+  /**
+   * Extract one raw fact record per test()/it() declaration from the already
+   * parsed SourceFile. Purely mechanical: name, enclosing describe, tags,
+   * assertions, and Page-Object method calls. Feature/flow/page classification
+   * and confidence scoring are the Repository Context Engine's job — this keeps
+   * the AST layer free of business interpretation.
+   */
+  private extractTests(sf: SourceFile): TestCaseAnalysis[] {
+    const out: TestCaseAnalysis[] = [];
+    // varName -> POM ClassName, from `const login = new LoginPage(page)`.
+    const pomVars = this.collectPomVariables(sf);
+
+    for (const call of sf.getDescendantsOfKind(SyntaxKind.CallExpression)) {
+      if (!this.isTestCall(call)) continue;
+      const testName = this.getStringArg(call);
+      if (!testName) continue; // dynamic title — cannot deterministically extract
+
+      const describeName = this.getEnclosingDescribe(call);
+      const bodyText = call.getText();
+
+      out.push({
+        testName,
+        describeName,
+        tags: this.extractTestTags(testName, bodyText),
+        assertions: this.extractTestAssertions(call),
+        pomMethods: this.extractPomMethods(call, pomVars),
+        line: call.getStartLineNumber(),
+      });
+    }
+    return out;
+  }
+
+  /** test(...) / it(...) / test.only(...) / it.skip(...). Excludes describe/step. */
+  private isTestCall(call: CallExpression): boolean {
+    const expr = call.getExpression();
+    if (Node.isIdentifier(expr)) {
+      const name = expr.getText();
+      return name === 'test' || name === 'it';
+    }
+    if (Node.isPropertyAccessExpression(expr)) {
+      const root = expr.getExpression().getText();
+      const prop = expr.getName();
+      if (root === 'test' || root === 'it') {
+        return ['only', 'skip', 'fixme', 'fail', 'serial'].includes(prop);
+      }
+    }
+    return false;
+  }
+
+  private isDescribeCall(call: CallExpression): boolean {
+    const expr = call.getExpression();
+    if (Node.isIdentifier(expr)) {
+      const n = expr.getText();
+      return n === 'describe' || n === 'context' || n === 'suite';
+    }
+    if (Node.isPropertyAccessExpression(expr)) {
+      const root = expr.getExpression().getText();
+      const prop = expr.getName();
+      return root === 'test' && (prop === 'describe' || prop === 'suite');
+    }
+    return false;
+  }
+
+  private getStringArg(call: CallExpression): string | null {
+    const arg = call.getArguments()[0];
+    if (!arg) return null;
+    if (Node.isStringLiteral(arg) || Node.isNoSubstitutionTemplateLiteral(arg)) {
+      return arg.getLiteralText().trim() || null;
+    }
+    if (Node.isTemplateExpression(arg)) {
+      const head = arg.getHead().getLiteralText().trim();
+      return head || null;
+    }
+    return null;
+  }
+
+  private getEnclosingDescribe(call: CallExpression): string | null {
+    let node: Node | undefined = call.getParent();
+    while (node) {
+      if (Node.isCallExpression(node) && this.isDescribeCall(node)) {
+        return this.getStringArg(node);
+      }
+      node = node.getParent();
+    }
+    return null;
+  }
+
+  /** `const x = new FooPage(...)` → { x: 'FooPage' } for POM-instance detection. */
+  private collectPomVariables(sf: SourceFile): Map<string, string> {
+    const map = new Map<string, string>();
+    for (const decl of sf.getDescendantsOfKind(SyntaxKind.VariableDeclaration)) {
+      const init = decl.getInitializer();
+      if (init && Node.isNewExpression(init)) {
+        const className = init.getExpression().getText();
+        if (/(Page|Screen|Component|View|PO|PageObject)$/.test(className)) {
+          map.set(decl.getName(), className);
+        }
+      }
+    }
+    return map;
+  }
+
+  /** A fixture-injected POM param like `loginPage` (ends in "page", not raw `page`). */
+  private looksLikePomVarName(name: string): boolean {
+    return name !== 'page' && /page$|screen$|component$|view$/i.test(name);
+  }
+
+  private extractTestTags(testName: string, bodyText: string): string[] {
+    const tags = new Set<string>();
+    const re = /@[\w:-]+/g;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(testName)) !== null) tags.add(m[0]);
+    while ((m = re.exec(bodyText)) !== null) tags.add(m[0]);
+    return [...tags];
+  }
+
+  private extractTestAssertions(call: CallExpression): string[] {
+    const found = new Set<string>();
+    for (const inner of call.getDescendantsOfKind(SyntaxKind.CallExpression)) {
+      const expr = inner.getExpression();
+      if (!Node.isPropertyAccessExpression(expr)) continue;
+      const method = expr.getName();
+
+      // Playwright / Jest: expect(...).matcher(...) (possibly behind .not/.resolves)
+      if (ASSERTION_MATCHERS.has(method)) {
+        const rootText = expr.getExpression().getText();
+        if (/(^|\W)expect\s*\(/.test(rootText) || /(^|\.)assert(\.|$)/.test(rootText)) {
+          found.add(method);
+          continue;
+        }
+      }
+      // Cypress: cy.get(...).should('be.visible') → should:be.visible
+      if (method === 'should') {
+        const rootText = expr.getExpression().getText();
+        if (/\bcy\b/.test(rootText) || /(^|\W)expect\s*\(/.test(rootText)) {
+          const firstArg = inner.getArguments()[0];
+          if (firstArg && (Node.isStringLiteral(firstArg) || Node.isNoSubstitutionTemplateLiteral(firstArg))) {
+            found.add(`should:${firstArg.getLiteralText()}`);
+          } else {
+            found.add('should');
+          }
+        }
+      }
+    }
+    return [...found];
+  }
+
+  private extractPomMethods(call: CallExpression, pomVars: Map<string, string>): string[] {
+    const found = new Set<string>();
+    for (const inner of call.getDescendantsOfKind(SyntaxKind.CallExpression)) {
+      const expr = inner.getExpression();
+      if (!Node.isPropertyAccessExpression(expr)) continue;
+      const method = expr.getName();
+      const receiver = expr.getExpression();
+      if (!Node.isIdentifier(receiver)) continue;
+      const varName = receiver.getText();
+
+      if (pomVars.has(varName)) {
+        found.add(`${pomVars.get(varName)}.${method}`);       // instantiated POM
+      } else if (this.looksLikePomVarName(varName)) {
+        found.add(`${varName}.${method}`);                     // fixture-injected POM
+      }
+    }
+    return [...found];
   }
 
   /* ---------------------------------------------------------------- */

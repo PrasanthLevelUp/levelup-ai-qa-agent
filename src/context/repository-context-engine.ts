@@ -26,6 +26,7 @@ import type {
   CodingStyle,
   BusinessFlow,
   TestSuiteInfo,
+  TestInventoryEntry,
   TestFramework,
   Language,
   TestPattern,
@@ -695,6 +696,190 @@ function extractBusinessFlows(repoRoot: string, analyses: FileAnalysis[]): Busin
 }
 
 /* ------------------------------------------------------------------ */
+/*  Repository Test Inventory (Sprint RCI-1)                          */
+/*                                                                     */
+/*  Deterministic per-test inventory built from the SAME AST pass that */
+/*  produced `analyses` — no second scanner, no LLM, no embeddings, no  */
+/*  generation. Classifies each test into feature/flow/page buckets and */
+/*  assigns a transparent, signal-based confidence score. This is one  */
+/*  more OUTPUT of the Repository Context Engine, persisted on the      */
+/*  RepositoryProfile and surfaced in the Repository Intelligence UI.   */
+/* ------------------------------------------------------------------ */
+
+/** Deterministic keyword → feature bucket. Order matters (first match wins). */
+const INVENTORY_FEATURE_KEYWORDS: Array<[RegExp, string]> = [
+  [/\b(login|log ?in|sign ?in|logout|log ?out|sign ?out|auth|credential|password|session)\b/i, 'Authentication'],
+  [/\b(checkout|payment|billing|order|purchase|pay)\b/i, 'Checkout'],
+  [/\b(cart|basket|add to cart|shopping)\b/i, 'Cart'],
+  [/\b(product|inventory|catalog|item|listing|browse)\b/i, 'Products'],
+  [/\b(search|filter|sort|query)\b/i, 'Search'],
+  [/\b(register|signup|sign ?up|onboard|account creation)\b/i, 'Registration'],
+  [/\b(profile|account|settings|preferences)\b/i, 'Account'],
+  [/\b(navigat|redirect|route|menu|link)\b/i, 'Navigation'],
+  [/\b(api|endpoint|request|response|status code)\b/i, 'API'],
+  [/\b(form|input|field|validation|submit)\b/i, 'Forms'],
+];
+
+/** Deterministic keyword → user flow. */
+const INVENTORY_FLOW_KEYWORDS: Array<[RegExp, string]> = [
+  [/\blogout|log ?out|sign ?out\b/i, 'logout'],
+  [/\blogin|log ?in|sign ?in|authenticat/i, 'login'],
+  [/\bcheckout|complete (the )?(purchase|order)|place order\b/i, 'checkout'],
+  [/\badd .*cart|add to cart\b/i, 'add-to-cart'],
+  [/\bremove .*cart\b/i, 'remove-from-cart'],
+  [/\bregister|sign ?up|create .*account\b/i, 'registration'],
+  [/\bsearch|filter|sort\b/i, 'search'],
+  [/\bnavigat|redirect|go to\b/i, 'navigation'],
+];
+
+function invTitleCase(s: string): string {
+  return s
+    .replace(/([a-z])([A-Z])/g, '$1 $2')
+    .replace(/[-_]+/g, ' ')
+    .split(/\s+/)
+    .filter(Boolean)
+    .map(w => w.charAt(0).toUpperCase() + w.slice(1))
+    .join(' ');
+}
+
+/** Strip trailing "— 16 scenarios", "(smoke)", counts, etc. from a describe title. */
+function cleanDescribeLabel(title: string): string {
+  return title
+    .replace(/[—–-]\s*\d+\s*scenario.*$/i, '')
+    .replace(/\(\s*\d+\s*(tests?|scenarios?)\s*\)\s*$/i, '')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+}
+
+/** True if a describe title is a short noun-ish label, not a full sentence. */
+function isCleanLabel(title: string): boolean {
+  const cleaned = cleanDescribeLabel(title);
+  const words = cleaned.split(/\s+/).filter(Boolean);
+  if (words.length === 0 || words.length > 4) return false;
+  if (/^(verify|ensure|check|test|should|when|given|it )/i.test(cleaned)) return false;
+  return true;
+}
+
+function keywordFeature(text: string): string | null {
+  for (const [re, feature] of INVENTORY_FEATURE_KEYWORDS) {
+    if (re.test(text)) return feature;
+  }
+  return null;
+}
+
+function deriveInventoryFeature(describeName: string | null, fileName: string, testName: string): { feature: string | null; source: 'describe' | 'keyword' | 'filename' } {
+  if (describeName && isCleanLabel(describeName)) {
+    return { feature: cleanDescribeLabel(describeName), source: 'describe' };
+  }
+  const kw = keywordFeature(`${describeName ?? ''} ${fileName} ${testName}`);
+  if (kw) return { feature: kw, source: 'keyword' };
+  const stem = fileName.replace(/\.(spec|test|cy|e2e)\.[jt]sx?$/i, '').replace(/\.[jt]sx?$/i, '');
+  const cleaned = stem.replace(/[-_]+/g, ' ').replace(/^verify\s+/i, '').trim();
+  return { feature: cleaned ? invTitleCase(cleaned) : null, source: 'filename' };
+}
+
+function deriveInventoryFlow(testName: string, describeName: string | null, feature: string | null): string | null {
+  const hay = `${testName} ${describeName ?? ''}`;
+  for (const [re, flow] of INVENTORY_FLOW_KEYWORDS) {
+    if (re.test(hay)) return flow;
+  }
+  if (feature) return feature.toLowerCase().replace(/\s+/g, '-');
+  return null;
+}
+
+function normalizePageName(raw: string): string {
+  const stripped = raw.replace(/(Page|Screen|Component|View|PageObject|PO)$/i, '');
+  return invTitleCase(stripped || raw);
+}
+
+function deriveInventoryPage(pomMethods: string[], bodyHints: string, fileName: string): string | null {
+  // 1. Prefer the POM class/var the test drives (the page under test).
+  if (pomMethods.length > 0) {
+    return normalizePageName(pomMethods[0].split('.')[0]);
+  }
+  // 2. URL hints, e.g. inventory.html or goto('.../checkout').
+  const urlMatch = bodyHints.match(/([a-z-]+)\.html/i) || bodyHints.match(/\/(\w[\w-]{2,})['"`)/]/);
+  if (urlMatch) {
+    const seg = urlMatch[1];
+    if (seg && !/^https?$/i.test(seg) && !/^www$/i.test(seg)) return invTitleCase(seg);
+  }
+  // 3. Fall back to the filename stem.
+  const stem = fileName.replace(/\.(spec|test|cy|e2e)\.[jt]sx?$/i, '').replace(/\.[jt]sx?$/i, '');
+  return stem ? invTitleCase(stem) : null;
+}
+
+/**
+ * Transparent confidence heuristic (0-100). Higher when more independent
+ * signals were extracted; the breakdown is stored in metadata for auditing.
+ */
+function scoreInventoryConfidence(sig: {
+  hasDescribe: boolean;
+  assertions: number;
+  tags: number;
+  pomMethods: number;
+  frameworkKnown: boolean;
+}): number {
+  let score = 40;                          // base: we found a named test
+  if (sig.assertions > 0) score += 20;     // it actually asserts something
+  if (sig.hasDescribe) score += 15;        // grouped under a real suite
+  if (sig.tags > 0) score += 10;           // explicit tags / TC ids
+  if (sig.pomMethods > 0) score += 10;     // exercises page objects
+  if (sig.frameworkKnown) score += 5;      // framework positively identified
+  return Math.max(0, Math.min(100, score));
+}
+
+/**
+ * Build the deterministic Repository Test Inventory from the per-test facts the
+ * AST analyzer already captured on each FileAnalysis. One entry per test.
+ */
+function extractTestInventory(analyses: FileAnalysis[], framework: TestFramework): TestInventoryEntry[] {
+  const entries: TestInventoryEntry[] = [];
+  const frameworkKnown = framework !== 'unknown';
+
+  for (const a of analyses) {
+    if (!a.tests || a.tests.length === 0) continue;
+    const fileName = path.basename(a.relativePath);
+
+    for (const t of a.tests) {
+      const { feature, source } = deriveInventoryFeature(t.describeName, fileName, t.testName);
+      const flow = deriveInventoryFlow(t.testName, t.describeName, feature);
+      // Page hints: POM methods + the test title (URL literals live in the body,
+      // but the AST layer already surfaced POM calls which are the stronger
+      // signal; the title covers the remaining ".html" / route cases).
+      const page = deriveInventoryPage(t.pomMethods, `${t.testName} ${t.tags.join(' ')}`, fileName);
+
+      entries.push({
+        testName: t.testName,
+        filePath: a.relativePath,
+        feature,
+        flow,
+        page,
+        suite: t.describeName,
+        tags: t.tags,
+        assertions: t.assertions,
+        pomMethods: t.pomMethods,
+        framework,
+        confidence: scoreInventoryConfidence({
+          hasDescribe: !!t.describeName,
+          assertions: t.assertions.length,
+          tags: t.tags.length,
+          pomMethods: t.pomMethods.length,
+          frameworkKnown,
+        }),
+        metadata: {
+          line: t.line,
+          assertionCount: t.assertions.length,
+          pomMethodCount: t.pomMethods.length,
+          featureSource: source,
+        },
+      });
+    }
+  }
+
+  return entries;
+}
+
+/* ------------------------------------------------------------------ */
 /*  Test Suite Extraction                                              */
 /* ------------------------------------------------------------------ */
 
@@ -1196,6 +1381,9 @@ export class RepositoryContextEngine {
     const codingStyle = detectCodingStyle(repoRoot, analyses);
     const businessFlows = extractBusinessFlows(repoRoot, analyses);
     const testSuites = extractTestSuites(repoRoot, analyses);
+    // Repository Test Inventory (Sprint RCI-1): per-test, classified, from the
+    // same AST pass. One scan → one more profile output.
+    const testInventory = extractTestInventory(analyses, framework);
     const preferredLocators = analyzePreferredLocators(repoRoot, analyses);
     const dependencies = detectDependencies(repoRoot);
     const ciIntegration = detectCI(repoRoot);
@@ -1290,6 +1478,7 @@ export class RepositoryContextEngine {
       environment: detectEnvironment(repoRoot, analyses, dependencies),
       businessFlows,
       testSuites,
+      testInventory,
       preferredLocators,
       avoidPatterns: locatorStrategy === 'data-testid' ? ['xpath', 'css-class-only'] : [],
       dependencies,
@@ -1314,6 +1503,7 @@ export class RepositoryContextEngine {
       dataFiles: profile.dataFiles.length, // PR #122
       flows: profile.businessFlows.length,
       suites: profile.testSuites.length,
+      inventoryTests: profile.testInventory.length,
       chunks: chunks.length,
       durationMs,
     });
