@@ -1,0 +1,446 @@
+{
+  "id": "login",
+  "label": "Login",
+  "requirement": {
+    "title": "User Login",
+    "description": "A registered user logs in with a username and password. Valid credentials grant access to the dashboard. Invalid credentials show a generic error. Accounts lock after repeated failures.",
+    "module": "Authentication",
+    "businessFlow": "User opens login page → enters credentials → submits → is authenticated and redirected, or sees an error",
+    "acceptanceCriteria": "Given a registered user, when correct credentials are entered, then a session is created and the user reaches the dashboard. When credentials are wrong the user stays on the login page with a non-enumerating error."
+  },
+  "classification": {
+    "category": "authentication",
+    "confidence": 1,
+    "matchedSignals": [
+      "login",
+      "authenticat",
+      "password",
+      "credential",
+      "lock",
+      "session"
+    ],
+    "expected": "authentication",
+    "correct": true
+  },
+  "stages": [
+    {
+      "stage": "1. Requirement Understanding",
+      "wired": false,
+      "input": {
+        "title": "User Login",
+        "description": "A registered user logs in with a username and password. Valid credentials grant access to the dashboard. Invalid credentials show a generic error. Accounts lock after repeated failures.",
+        "module": "Authentication",
+        "businessFlow": "User opens login page → enters credentials → submits → is authenticated and redirected, or sees an error",
+        "acceptanceCriteria": "Given a registered user, when correct credentials are entered, then a session is created and the user reaches the dashboard. When credentials are wrong the user stays on the login page with a non-enumerating error."
+      },
+      "output": {
+        "entities": [],
+        "actions": [
+          "Login",
+          "Read"
+        ],
+        "fields": [
+          "Username",
+          "Password"
+        ],
+        "businessRules": [
+          null,
+          null,
+          null
+        ],
+        "confidence": 84
+      },
+      "newInformationAdded": [],
+      "informationLost": []
+    },
+    {
+      "stage": "2. Validation Planning",
+      "wired": false,
+      "input": {
+        "entities": 0,
+        "fields": 2,
+        "rules": 3
+      },
+      "output": {
+        "capability": null,
+        "complexity": "moderate",
+        "applicableDimensions": [
+          "input_validation",
+          "boundary",
+          "security",
+          "data_integrity"
+        ],
+        "obligationCount": 11,
+        "obligations": [
+          "Reject a too-weak Password",
+          "Enforce maximum Password length",
+          "Enforce minimum Password length",
+          "Enforce maximum length on Username",
+          "Enforce minimum length on Username",
+          "Neutralize SQL-like input in free-text fields",
+          "Neutralize template/command-like input in free-text fields",
+          "Neutralize script injection (XSS) in free-text fields",
+          "Preserve emoji / multibyte input in free-text fields",
+          "Preserve unicode/accented characters in free-text fields",
+          "Trim leading/trailing whitespace in free-text fields"
+        ]
+      },
+      "newInformationAdded": [
+        "Credentials :: Whitespace trimming on identifier",
+        "Security :: SQL injection attempt blocked"
+      ],
+      "informationLost": []
+    },
+    {
+      "stage": "3. Scenario Planner (LIVE)",
+      "wired": true,
+      "input": {
+        "category": "authentication",
+        "coverageTypes": [
+          "positive"
+        ],
+        "deep": false
+      },
+      "output": {
+        "category": "authentication",
+        "plannedCount": 12,
+        "byType": {
+          "positive": 8,
+          "negative": 4
+        },
+        "scenarios": [
+          "Valid credentials log in successfully",
+          "Logout ends the session",
+          "A registered user, when correct credentials are entered, then…",
+          "Credentials are wrong the user stays on the login…",
+          "A registered user logs in with a username and…",
+          "Valid credentials grant access to the dashboard",
+          "Invalid credentials show a generic error",
+          "Accounts lock after repeated failures",
+          "User opens login page",
+          "Enters credentials",
+          "Submits",
+          "Is authenticated and redirected, or sees an error"
+        ]
+      },
+      "newInformationAdded": [
+        "Functional :: Valid credentials succeed",
+        "Functional :: Redirect to dashboard on success",
+        "Functional :: Session created on success",
+        "Credentials :: Wrong password rejected",
+        "Credentials :: Unknown user rejected",
+        "Security :: Account lockout after repeated failures",
+        "Security :: Error does not leak account existence",
+        "Authorization :: Locked / disabled account cannot log in",
+        "Workflow :: Logout"
+      ],
+      "informationLost": [
+        "Credentials :: Whitespace trimming on identifier",
+        "Security :: SQL injection attempt blocked"
+      ]
+    },
+    {
+      "stage": "4. LLM Prompt (LIVE)",
+      "wired": true,
+      "input": {
+        "plannedScenarios": 12
+      },
+      "output": {
+        "promptChars": 3852,
+        "instructsNoInvent": true,
+        "instructsNoDrop": true
+      },
+      "newInformationAdded": [
+        "Credentials :: Case handling on identifier",
+        "Workflow :: Error message on failure"
+      ],
+      "informationLost": []
+    },
+    {
+      "stage": "5. LLM Output (NOT executed)",
+      "wired": true,
+      "input": {
+        "note": "no live API/DB in harness"
+      },
+      "output": {
+        "note": "Prompt forbids add/drop, so Stage-3 plan is the coverage ceiling.",
+        "knownLeak": "resolveType() defaults an unlabelled/lost coverage-type link to 'positive' (test-coverage-engine ~L2399) → inflates positive count."
+      },
+      "newInformationAdded": [],
+      "informationLost": []
+    },
+    {
+      "stage": "6. Quality Validator (LIVE)",
+      "wired": true,
+      "input": {
+        "casesGraded": 12
+      },
+      "output": {
+        "riskScore": "LOW",
+        "passed": true,
+        "byFamily": {
+          "positive": 8,
+          "negative": 4,
+          "edge": 0,
+          "advanced": 0
+        },
+        "missingCategories": [],
+        "recommendations": [
+          "Balanced suite — no regeneration required."
+        ],
+        "regenerationGate": "buildQualityReport GRADES balance, but regeneration is behind GEN_QUALITY_REGEN (OFF by default) — measures the imbalance, ships it anyway."
+      },
+      "newInformationAdded": [],
+      "informationLost": []
+    }
+  ],
+  "gap": [
+    {
+      "mode": "default (positive only)",
+      "totalExpected": 18,
+      "covered": 9,
+      "missing": 9,
+      "coveragePercent": 50,
+      "criticalMissing": [],
+      "rows": [
+        {
+          "validation": "Functional :: Valid credentials succeed",
+          "weight": "critical",
+          "covered": true
+        },
+        {
+          "validation": "Functional :: Redirect to dashboard on success",
+          "weight": "medium",
+          "covered": true
+        },
+        {
+          "validation": "Functional :: Session created on success",
+          "weight": "high",
+          "covered": true
+        },
+        {
+          "validation": "Mandatory :: Username blank",
+          "weight": "high",
+          "covered": false
+        },
+        {
+          "validation": "Mandatory :: Password blank",
+          "weight": "high",
+          "covered": false
+        },
+        {
+          "validation": "Mandatory :: Both fields blank",
+          "weight": "high",
+          "covered": false
+        },
+        {
+          "validation": "Credentials :: Wrong password rejected",
+          "weight": "critical",
+          "covered": true
+        },
+        {
+          "validation": "Credentials :: Unknown user rejected",
+          "weight": "high",
+          "covered": true
+        },
+        {
+          "validation": "Credentials :: Whitespace trimming on identifier",
+          "weight": "medium",
+          "covered": false
+        },
+        {
+          "validation": "Credentials :: Case handling on identifier",
+          "weight": "medium",
+          "covered": false
+        },
+        {
+          "validation": "Security :: Account lockout after repeated failures",
+          "weight": "critical",
+          "covered": true
+        },
+        {
+          "validation": "Security :: Password masked",
+          "weight": "medium",
+          "covered": false
+        },
+        {
+          "validation": "Security :: Error does not leak account existence",
+          "weight": "high",
+          "covered": true
+        },
+        {
+          "validation": "Security :: SQL injection attempt blocked",
+          "weight": "high",
+          "covered": false
+        },
+        {
+          "validation": "Security :: Brute force / rate limiting",
+          "weight": "high",
+          "covered": false
+        },
+        {
+          "validation": "Authorization :: Locked / disabled account cannot log in",
+          "weight": "high",
+          "covered": true
+        },
+        {
+          "validation": "Workflow :: Error message on failure",
+          "weight": "medium",
+          "covered": false
+        },
+        {
+          "validation": "Workflow :: Logout",
+          "weight": "medium",
+          "covered": true
+        }
+      ]
+    },
+    {
+      "mode": "full (all families + deep)",
+      "totalExpected": 18,
+      "covered": 18,
+      "missing": 0,
+      "coveragePercent": 100,
+      "criticalMissing": [],
+      "rows": [
+        {
+          "validation": "Functional :: Valid credentials succeed",
+          "weight": "critical",
+          "covered": true
+        },
+        {
+          "validation": "Functional :: Redirect to dashboard on success",
+          "weight": "medium",
+          "covered": true
+        },
+        {
+          "validation": "Functional :: Session created on success",
+          "weight": "high",
+          "covered": true
+        },
+        {
+          "validation": "Mandatory :: Username blank",
+          "weight": "high",
+          "covered": true
+        },
+        {
+          "validation": "Mandatory :: Password blank",
+          "weight": "high",
+          "covered": true
+        },
+        {
+          "validation": "Mandatory :: Both fields blank",
+          "weight": "high",
+          "covered": true
+        },
+        {
+          "validation": "Credentials :: Wrong password rejected",
+          "weight": "critical",
+          "covered": true
+        },
+        {
+          "validation": "Credentials :: Unknown user rejected",
+          "weight": "high",
+          "covered": true
+        },
+        {
+          "validation": "Credentials :: Whitespace trimming on identifier",
+          "weight": "medium",
+          "covered": true
+        },
+        {
+          "validation": "Credentials :: Case handling on identifier",
+          "weight": "medium",
+          "covered": true
+        },
+        {
+          "validation": "Security :: Account lockout after repeated failures",
+          "weight": "critical",
+          "covered": true
+        },
+        {
+          "validation": "Security :: Password masked",
+          "weight": "medium",
+          "covered": true
+        },
+        {
+          "validation": "Security :: Error does not leak account existence",
+          "weight": "high",
+          "covered": true
+        },
+        {
+          "validation": "Security :: SQL injection attempt blocked",
+          "weight": "high",
+          "covered": true
+        },
+        {
+          "validation": "Security :: Brute force / rate limiting",
+          "weight": "high",
+          "covered": true
+        },
+        {
+          "validation": "Authorization :: Locked / disabled account cannot log in",
+          "weight": "high",
+          "covered": true
+        },
+        {
+          "validation": "Workflow :: Error message on failure",
+          "weight": "medium",
+          "covered": true
+        },
+        {
+          "validation": "Workflow :: Logout",
+          "weight": "medium",
+          "covered": true
+        }
+      ]
+    }
+  ],
+  "earliestLoss": [
+    {
+      "validation": "Mandatory :: Username blank",
+      "weight": "high",
+      "lostAtStage": "C. Coverage selection (KB has it; default positive-only never emits it)"
+    },
+    {
+      "validation": "Mandatory :: Password blank",
+      "weight": "high",
+      "lostAtStage": "C. Coverage selection (KB has it; default positive-only never emits it)"
+    },
+    {
+      "validation": "Mandatory :: Both fields blank",
+      "weight": "high",
+      "lostAtStage": "C. Coverage selection (KB has it; default positive-only never emits it)"
+    },
+    {
+      "validation": "Credentials :: Whitespace trimming on identifier",
+      "weight": "medium",
+      "lostAtStage": "C. Coverage selection (KB has it; default positive-only never emits it)"
+    },
+    {
+      "validation": "Credentials :: Case handling on identifier",
+      "weight": "medium",
+      "lostAtStage": "C. Coverage selection (KB has it; default positive-only never emits it)"
+    },
+    {
+      "validation": "Security :: Password masked",
+      "weight": "medium",
+      "lostAtStage": "C. Coverage selection (KB has it; default positive-only never emits it)"
+    },
+    {
+      "validation": "Security :: SQL injection attempt blocked",
+      "weight": "high",
+      "lostAtStage": "C. Coverage selection (KB has it; default positive-only never emits it)"
+    },
+    {
+      "validation": "Security :: Brute force / rate limiting",
+      "weight": "high",
+      "lostAtStage": "C. Coverage selection (KB has it; default positive-only never emits it)"
+    },
+    {
+      "validation": "Workflow :: Error message on failure",
+      "weight": "medium",
+      "lostAtStage": "C. Coverage selection (KB has it; default positive-only never emits it)"
+    }
+  ]
+}

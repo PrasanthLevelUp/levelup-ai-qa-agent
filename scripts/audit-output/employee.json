@@ -1,0 +1,547 @@
+{
+  "id": "employee",
+  "label": "Create Employee",
+  "requirement": {
+    "title": "Create Employee",
+    "description": "Admin can add a new employee by entering first name, last name, employee ID and an optional profile photo. Employee ID may be auto-generated or entered manually and must be unique. On save the employee is created and becomes searchable by ID and by name.",
+    "module": "HR / Employee Management",
+    "businessFlow": "Admin opens Add Employee form → fills fields → uploads photo → saves → sees confirmation → employee searchable",
+    "acceptanceCriteria": "Given an authorized admin, when a valid employee is submitted, then the record is created, a success notification is shown, the user is redirected to the employee list, and the new employee is immediately searchable by ID and name."
+  },
+  "classification": {
+    "category": "crud",
+    "confidence": 1,
+    "matchedSignals": [
+      "create",
+      "add",
+      "form",
+      "save",
+      "record"
+    ],
+    "expected": "crud",
+    "correct": true
+  },
+  "stages": [
+    {
+      "stage": "1. Requirement Understanding",
+      "wired": false,
+      "input": {
+        "title": "Create Employee",
+        "description": "Admin can add a new employee by entering first name, last name, employee ID and an optional profile photo. Employee ID may be auto-generated or entered manually and must be unique. On save the employee is created and becomes searchable by ID and by name.",
+        "module": "HR / Employee Management",
+        "businessFlow": "Admin opens Add Employee form → fills fields → uploads photo → saves → sees confirmation → employee searchable",
+        "acceptanceCriteria": "Given an authorized admin, when a valid employee is submitted, then the record is created, a success notification is shown, the user is redirected to the employee list, and the new employee is immediately searchable by ID and name."
+      },
+      "output": {
+        "entities": [
+          "Employee"
+        ],
+        "actions": [
+          "Create",
+          "Submit"
+        ],
+        "fields": [
+          "First Name",
+          "Last Name",
+          "Name"
+        ],
+        "businessRules": [
+          null
+        ],
+        "confidence": 90
+      },
+      "newInformationAdded": [
+        "Functional :: Create employee successfully"
+      ],
+      "informationLost": []
+    },
+    {
+      "stage": "2. Validation Planning",
+      "wired": false,
+      "input": {
+        "entities": 1,
+        "fields": 3,
+        "rules": 1
+      },
+      "output": {
+        "capability": "Employee",
+        "complexity": "moderate",
+        "applicableDimensions": [
+          "functional",
+          "business_rule",
+          "input_validation",
+          "boundary",
+          "security",
+          "data_integrity"
+        ],
+        "obligationCount": 14,
+        "obligations": [
+          "Successfully Create Employee with valid data",
+          "Reject a duplicate Unique rule",
+          "Enforce maximum length on First Name",
+          "Enforce minimum length on First Name",
+          "Enforce maximum length on Last Name",
+          "Enforce minimum length on Last Name",
+          "Enforce maximum length on Name",
+          "Enforce minimum length on Name",
+          "Neutralize SQL-like input in free-text fields",
+          "Neutralize template/command-like input in free-text fields",
+          "Neutralize script injection (XSS) in free-text fields",
+          "Preserve emoji / multibyte input in free-text fields",
+          "Preserve unicode/accented characters in free-text fields",
+          "Trim leading/trailing whitespace in free-text fields"
+        ]
+      },
+      "newInformationAdded": [
+        "Mandatory :: Whitespace-only names",
+        "Employee ID :: Duplicate ID rejected",
+        "Employee ID :: Max length ID"
+      ],
+      "informationLost": []
+    },
+    {
+      "stage": "3. Scenario Planner (LIVE)",
+      "wired": true,
+      "input": {
+        "category": "crud",
+        "coverageTypes": [
+          "positive"
+        ],
+        "deep": false
+      },
+      "output": {
+        "category": "crud",
+        "plannedCount": 11,
+        "byType": {
+          "positive": 11
+        },
+        "scenarios": [
+          "Create a record with valid data",
+          "An authorized admin, when a valid employee is submitted,…",
+          "Admin can add a new employee by entering first…",
+          "Employee ID may be auto-generated or entered manually and…",
+          "On save the employee is created and becomes searchable…",
+          "Admin opens Add Employee form",
+          "Fills fields",
+          "Uploads photo",
+          "Saves",
+          "Sees confirmation",
+          "Employee searchable"
+        ]
+      },
+      "newInformationAdded": [
+        "Functional :: Create with optional photo",
+        "Mandatory :: First name blank",
+        "Mandatory :: Last name blank",
+        "Employee ID :: Auto-generated ID",
+        "Employee ID :: Editable ID",
+        "Employee ID :: Empty ID",
+        "Photo :: Valid photo upload",
+        "Authorization :: Authorized user can create",
+        "Workflow :: Success notification shown",
+        "Workflow :: Redirect after save",
+        "Workflow :: Searchable immediately",
+        "Workflow :: Search by ID",
+        "Workflow :: Search by name"
+      ],
+      "informationLost": [
+        "Mandatory :: Whitespace-only names",
+        "Employee ID :: Max length ID"
+      ]
+    },
+    {
+      "stage": "4. LLM Prompt (LIVE)",
+      "wired": true,
+      "input": {
+        "plannedScenarios": 11
+      },
+      "output": {
+        "promptChars": 3701,
+        "instructsNoInvent": true,
+        "instructsNoDrop": true
+      },
+      "newInformationAdded": [],
+      "informationLost": []
+    },
+    {
+      "stage": "5. LLM Output (NOT executed)",
+      "wired": true,
+      "input": {
+        "note": "no live API/DB in harness"
+      },
+      "output": {
+        "note": "Prompt forbids add/drop, so Stage-3 plan is the coverage ceiling.",
+        "knownLeak": "resolveType() defaults an unlabelled/lost coverage-type link to 'positive' (test-coverage-engine ~L2399) → inflates positive count."
+      },
+      "newInformationAdded": [],
+      "informationLost": []
+    },
+    {
+      "stage": "6. Quality Validator (LIVE)",
+      "wired": true,
+      "input": {
+        "casesGraded": 11
+      },
+      "output": {
+        "riskScore": "MEDIUM",
+        "passed": true,
+        "byFamily": {
+          "positive": 11,
+          "negative": 0,
+          "edge": 0,
+          "advanced": 0
+        },
+        "missingCategories": [],
+        "recommendations": [
+          "Balanced suite — no regeneration required."
+        ],
+        "regenerationGate": "buildQualityReport GRADES balance, but regeneration is behind GEN_QUALITY_REGEN (OFF by default) — measures the imbalance, ships it anyway."
+      },
+      "newInformationAdded": [],
+      "informationLost": []
+    }
+  ],
+  "gap": [
+    {
+      "mode": "default (positive only)",
+      "totalExpected": 26,
+      "covered": 15,
+      "missing": 11,
+      "coveragePercent": 58,
+      "criticalMissing": [
+        "Authorization :: Unauthorized user blocked"
+      ],
+      "rows": [
+        {
+          "validation": "Functional :: Create employee successfully",
+          "weight": "critical",
+          "covered": true
+        },
+        {
+          "validation": "Functional :: Create with minimum required fields",
+          "weight": "medium",
+          "covered": false
+        },
+        {
+          "validation": "Functional :: Create with optional photo",
+          "weight": "medium",
+          "covered": true
+        },
+        {
+          "validation": "Mandatory :: First name blank",
+          "weight": "critical",
+          "covered": true
+        },
+        {
+          "validation": "Mandatory :: Last name blank",
+          "weight": "critical",
+          "covered": true
+        },
+        {
+          "validation": "Mandatory :: Both names blank",
+          "weight": "high",
+          "covered": false
+        },
+        {
+          "validation": "Mandatory :: Whitespace-only names",
+          "weight": "high",
+          "covered": false
+        },
+        {
+          "validation": "Employee ID :: Auto-generated ID",
+          "weight": "high",
+          "covered": true
+        },
+        {
+          "validation": "Employee ID :: Editable ID",
+          "weight": "medium",
+          "covered": true
+        },
+        {
+          "validation": "Employee ID :: Duplicate ID rejected",
+          "weight": "critical",
+          "covered": true
+        },
+        {
+          "validation": "Employee ID :: Empty ID",
+          "weight": "high",
+          "covered": true
+        },
+        {
+          "validation": "Employee ID :: Invalid ID format",
+          "weight": "high",
+          "covered": false
+        },
+        {
+          "validation": "Employee ID :: Leading zero preserved",
+          "weight": "medium",
+          "covered": false
+        },
+        {
+          "validation": "Employee ID :: Max length ID",
+          "weight": "high",
+          "covered": false
+        },
+        {
+          "validation": "Employee ID :: Special characters in ID",
+          "weight": "medium",
+          "covered": false
+        },
+        {
+          "validation": "Photo :: Valid photo upload",
+          "weight": "medium",
+          "covered": true
+        },
+        {
+          "validation": "Photo :: Invalid photo format",
+          "weight": "high",
+          "covered": false
+        },
+        {
+          "validation": "Photo :: Large photo file",
+          "weight": "high",
+          "covered": false
+        },
+        {
+          "validation": "Photo :: Corrupted image",
+          "weight": "medium",
+          "covered": false
+        },
+        {
+          "validation": "Authorization :: Authorized user can create",
+          "weight": "high",
+          "covered": true
+        },
+        {
+          "validation": "Authorization :: Unauthorized user blocked",
+          "weight": "critical",
+          "covered": false
+        },
+        {
+          "validation": "Workflow :: Success notification shown",
+          "weight": "high",
+          "covered": true
+        },
+        {
+          "validation": "Workflow :: Redirect after save",
+          "weight": "medium",
+          "covered": true
+        },
+        {
+          "validation": "Workflow :: Searchable immediately",
+          "weight": "high",
+          "covered": true
+        },
+        {
+          "validation": "Workflow :: Search by ID",
+          "weight": "medium",
+          "covered": true
+        },
+        {
+          "validation": "Workflow :: Search by name",
+          "weight": "medium",
+          "covered": true
+        }
+      ]
+    },
+    {
+      "mode": "full (all families + deep)",
+      "totalExpected": 26,
+      "covered": 18,
+      "missing": 8,
+      "coveragePercent": 69,
+      "criticalMissing": [
+        "Authorization :: Unauthorized user blocked"
+      ],
+      "rows": [
+        {
+          "validation": "Functional :: Create employee successfully",
+          "weight": "critical",
+          "covered": true
+        },
+        {
+          "validation": "Functional :: Create with minimum required fields",
+          "weight": "medium",
+          "covered": false
+        },
+        {
+          "validation": "Functional :: Create with optional photo",
+          "weight": "medium",
+          "covered": true
+        },
+        {
+          "validation": "Mandatory :: First name blank",
+          "weight": "critical",
+          "covered": true
+        },
+        {
+          "validation": "Mandatory :: Last name blank",
+          "weight": "critical",
+          "covered": true
+        },
+        {
+          "validation": "Mandatory :: Both names blank",
+          "weight": "high",
+          "covered": false
+        },
+        {
+          "validation": "Mandatory :: Whitespace-only names",
+          "weight": "high",
+          "covered": false
+        },
+        {
+          "validation": "Employee ID :: Auto-generated ID",
+          "weight": "high",
+          "covered": true
+        },
+        {
+          "validation": "Employee ID :: Editable ID",
+          "weight": "medium",
+          "covered": true
+        },
+        {
+          "validation": "Employee ID :: Duplicate ID rejected",
+          "weight": "critical",
+          "covered": true
+        },
+        {
+          "validation": "Employee ID :: Empty ID",
+          "weight": "high",
+          "covered": true
+        },
+        {
+          "validation": "Employee ID :: Invalid ID format",
+          "weight": "high",
+          "covered": true
+        },
+        {
+          "validation": "Employee ID :: Leading zero preserved",
+          "weight": "medium",
+          "covered": false
+        },
+        {
+          "validation": "Employee ID :: Max length ID",
+          "weight": "high",
+          "covered": true
+        },
+        {
+          "validation": "Employee ID :: Special characters in ID",
+          "weight": "medium",
+          "covered": false
+        },
+        {
+          "validation": "Photo :: Valid photo upload",
+          "weight": "medium",
+          "covered": true
+        },
+        {
+          "validation": "Photo :: Invalid photo format",
+          "weight": "high",
+          "covered": true
+        },
+        {
+          "validation": "Photo :: Large photo file",
+          "weight": "high",
+          "covered": false
+        },
+        {
+          "validation": "Photo :: Corrupted image",
+          "weight": "medium",
+          "covered": false
+        },
+        {
+          "validation": "Authorization :: Authorized user can create",
+          "weight": "high",
+          "covered": true
+        },
+        {
+          "validation": "Authorization :: Unauthorized user blocked",
+          "weight": "critical",
+          "covered": false
+        },
+        {
+          "validation": "Workflow :: Success notification shown",
+          "weight": "high",
+          "covered": true
+        },
+        {
+          "validation": "Workflow :: Redirect after save",
+          "weight": "medium",
+          "covered": true
+        },
+        {
+          "validation": "Workflow :: Searchable immediately",
+          "weight": "high",
+          "covered": true
+        },
+        {
+          "validation": "Workflow :: Search by ID",
+          "weight": "medium",
+          "covered": true
+        },
+        {
+          "validation": "Workflow :: Search by name",
+          "weight": "medium",
+          "covered": true
+        }
+      ]
+    }
+  ],
+  "earliestLoss": [
+    {
+      "validation": "Functional :: Create with minimum required fields",
+      "weight": "medium",
+      "lostAtStage": "B. Scenario Planner / KB depth (correct category, but no such obligation in the KB)"
+    },
+    {
+      "validation": "Mandatory :: Both names blank",
+      "weight": "high",
+      "lostAtStage": "B. Scenario Planner / KB depth (correct category, but no such obligation in the KB)"
+    },
+    {
+      "validation": "Mandatory :: Whitespace-only names",
+      "weight": "high",
+      "lostAtStage": "B. Scenario Planner / KB depth (correct category, but no such obligation in the KB)"
+    },
+    {
+      "validation": "Employee ID :: Invalid ID format",
+      "weight": "high",
+      "lostAtStage": "C. Coverage selection (KB has it; default positive-only never emits it)"
+    },
+    {
+      "validation": "Employee ID :: Leading zero preserved",
+      "weight": "medium",
+      "lostAtStage": "B. Scenario Planner / KB depth (correct category, but no such obligation in the KB)"
+    },
+    {
+      "validation": "Employee ID :: Max length ID",
+      "weight": "high",
+      "lostAtStage": "C. Coverage selection (KB has it; default positive-only never emits it)"
+    },
+    {
+      "validation": "Employee ID :: Special characters in ID",
+      "weight": "medium",
+      "lostAtStage": "B. Scenario Planner / KB depth (correct category, but no such obligation in the KB)"
+    },
+    {
+      "validation": "Photo :: Invalid photo format",
+      "weight": "high",
+      "lostAtStage": "C. Coverage selection (KB has it; default positive-only never emits it)"
+    },
+    {
+      "validation": "Photo :: Large photo file",
+      "weight": "high",
+      "lostAtStage": "B. Scenario Planner / KB depth (correct category, but no such obligation in the KB)"
+    },
+    {
+      "validation": "Photo :: Corrupted image",
+      "weight": "medium",
+      "lostAtStage": "B. Scenario Planner / KB depth (correct category, but no such obligation in the KB)"
+    },
+    {
+      "validation": "Authorization :: Unauthorized user blocked",
+      "weight": "critical",
+      "lostAtStage": "B. Scenario Planner / KB depth (correct category, but no such obligation in the KB)"
+    }
+  ]
+}

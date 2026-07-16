@@ -1,0 +1,582 @@
+{
+  "id": "checkout",
+  "label": "Checkout",
+  "requirement": {
+    "title": "Cart Checkout",
+    "description": "A shopper reviews the cart, enters a shipping address, applies an optional coupon, and pays. On success an order is created, inventory is decremented, and a confirmation is shown and emailed. Payment is by card.",
+    "module": "E-commerce / Checkout",
+    "businessFlow": "Cart → shipping address → coupon → payment → order confirmation + email",
+    "acceptanceCriteria": "Given a cart with in-stock items and valid payment, when the shopper checks out, then an order is created with the correct total (items + tax + shipping − discount), inventory is decremented, and a confirmation is shown and emailed."
+  },
+  "classification": {
+    "category": "checkout",
+    "confidence": 1,
+    "matchedSignals": [
+      "checkout",
+      "cart",
+      "order",
+      "shipping",
+      "coupon",
+      "tax"
+    ],
+    "expected": "checkout",
+    "correct": true
+  },
+  "stages": [
+    {
+      "stage": "1. Requirement Understanding",
+      "wired": false,
+      "input": {
+        "title": "Cart Checkout",
+        "description": "A shopper reviews the cart, enters a shipping address, applies an optional coupon, and pays. On success an order is created, inventory is decremented, and a confirmation is shown and emailed. Payment is by card.",
+        "module": "E-commerce / Checkout",
+        "businessFlow": "Cart → shipping address → coupon → payment → order confirmation + email",
+        "acceptanceCriteria": "Given a cart with in-stock items and valid payment, when the shopper checks out, then an order is created with the correct total (items + tax + shipping − discount), inventory is decremented, and a confirmation is shown and emailed."
+      },
+      "output": {
+        "entities": [
+          "Checkout"
+        ],
+        "actions": [],
+        "fields": [
+          "Address"
+        ],
+        "businessRules": [],
+        "confidence": 90
+      },
+      "newInformationAdded": [],
+      "informationLost": []
+    },
+    {
+      "stage": "2. Validation Planning",
+      "wired": false,
+      "input": {
+        "entities": 1,
+        "fields": 1,
+        "rules": 0
+      },
+      "output": {
+        "capability": "Checkout",
+        "complexity": "simple",
+        "applicableDimensions": [
+          "functional",
+          "input_validation",
+          "boundary",
+          "security",
+          "data_integrity"
+        ],
+        "obligationCount": 9,
+        "obligations": [
+          "Successfully Use Checkout with valid data",
+          "Enforce maximum length on Address",
+          "Enforce minimum length on Address",
+          "Neutralize SQL-like input in free-text fields",
+          "Neutralize template/command-like input in free-text fields",
+          "Neutralize script injection (XSS) in free-text fields",
+          "Preserve emoji / multibyte input in free-text fields",
+          "Preserve unicode/accented characters in free-text fields",
+          "Trim leading/trailing whitespace in free-text fields"
+        ]
+      },
+      "newInformationAdded": [
+        "Functional :: Checkout with valid cart and payment",
+        "Address :: Valid shipping address"
+      ],
+      "informationLost": []
+    },
+    {
+      "stage": "3. Scenario Planner (LIVE)",
+      "wired": true,
+      "input": {
+        "category": "checkout",
+        "coverageTypes": [
+          "positive"
+        ],
+        "deep": false
+      },
+      "output": {
+        "category": "checkout",
+        "plannedCount": 11,
+        "byType": {
+          "positive": 11
+        },
+        "scenarios": [
+          "Complete checkout with valid cart",
+          "Valid promo / coupon is applied",
+          "Tax and shipping calculated correctly",
+          "A cart with in-stock items and valid payment, when…",
+          "A shopper reviews the cart, enters a shipping address,…",
+          "On success an order is created, inventory is decremented,…",
+          "Payment is by card",
+          "Cart",
+          "Shipping address",
+          "Coupon",
+          "Order confirmation + email"
+        ]
+      },
+      "newInformationAdded": [
+        "Functional :: Apply valid coupon",
+        "Cart :: Empty cart blocked",
+        "Cart :: Out-of-stock item",
+        "Payment :: Valid card accepted",
+        "Pricing :: Correct total calculation",
+        "Pricing :: Tax applied",
+        "Pricing :: Shipping calculated",
+        "Pricing :: Coupon discount applied correctly",
+        "Address :: Missing required address field",
+        "Workflow :: Order confirmation shown",
+        "Workflow :: Confirmation email sent",
+        "Workflow :: Inventory decremented"
+      ],
+      "informationLost": []
+    },
+    {
+      "stage": "4. LLM Prompt (LIVE)",
+      "wired": true,
+      "input": {
+        "plannedScenarios": 11
+      },
+      "output": {
+        "promptChars": 3585,
+        "instructsNoInvent": true,
+        "instructsNoDrop": true
+      },
+      "newInformationAdded": [
+        "Functional :: Single item checkout",
+        "Functional :: Multiple items checkout",
+        "Security :: Payment over HTTPS / no card data logged"
+      ],
+      "informationLost": []
+    },
+    {
+      "stage": "5. LLM Output (NOT executed)",
+      "wired": true,
+      "input": {
+        "note": "no live API/DB in harness"
+      },
+      "output": {
+        "note": "Prompt forbids add/drop, so Stage-3 plan is the coverage ceiling.",
+        "knownLeak": "resolveType() defaults an unlabelled/lost coverage-type link to 'positive' (test-coverage-engine ~L2399) → inflates positive count."
+      },
+      "newInformationAdded": [],
+      "informationLost": []
+    },
+    {
+      "stage": "6. Quality Validator (LIVE)",
+      "wired": true,
+      "input": {
+        "casesGraded": 11
+      },
+      "output": {
+        "riskScore": "MEDIUM",
+        "passed": true,
+        "byFamily": {
+          "positive": 11,
+          "negative": 0,
+          "edge": 0,
+          "advanced": 0
+        },
+        "missingCategories": [],
+        "recommendations": [
+          "Balanced suite — no regeneration required."
+        ],
+        "regenerationGate": "buildQualityReport GRADES balance, but regeneration is behind GEN_QUALITY_REGEN (OFF by default) — measures the imbalance, ships it anyway."
+      },
+      "newInformationAdded": [],
+      "informationLost": []
+    }
+  ],
+  "gap": [
+    {
+      "mode": "default (positive only)",
+      "totalExpected": 29,
+      "covered": 14,
+      "missing": 15,
+      "coveragePercent": 48,
+      "criticalMissing": [
+        "Payment :: Declined card"
+      ],
+      "rows": [
+        {
+          "validation": "Functional :: Checkout with valid cart and payment",
+          "weight": "critical",
+          "covered": true
+        },
+        {
+          "validation": "Functional :: Single item checkout",
+          "weight": "medium",
+          "covered": false
+        },
+        {
+          "validation": "Functional :: Multiple items checkout",
+          "weight": "medium",
+          "covered": false
+        },
+        {
+          "validation": "Functional :: Apply valid coupon",
+          "weight": "high",
+          "covered": true
+        },
+        {
+          "validation": "Cart :: Empty cart blocked",
+          "weight": "high",
+          "covered": true
+        },
+        {
+          "validation": "Cart :: Out-of-stock item",
+          "weight": "critical",
+          "covered": true
+        },
+        {
+          "validation": "Cart :: Quantity exceeds stock",
+          "weight": "high",
+          "covered": false
+        },
+        {
+          "validation": "Payment :: Valid card accepted",
+          "weight": "high",
+          "covered": true
+        },
+        {
+          "validation": "Payment :: Declined card",
+          "weight": "critical",
+          "covered": false
+        },
+        {
+          "validation": "Payment :: Expired card",
+          "weight": "high",
+          "covered": false
+        },
+        {
+          "validation": "Payment :: Invalid CVV",
+          "weight": "high",
+          "covered": false
+        },
+        {
+          "validation": "Payment :: Insufficient funds",
+          "weight": "high",
+          "covered": false
+        },
+        {
+          "validation": "Payment :: Invalid card number format",
+          "weight": "high",
+          "covered": false
+        },
+        {
+          "validation": "Pricing :: Correct total calculation",
+          "weight": "critical",
+          "covered": true
+        },
+        {
+          "validation": "Pricing :: Tax applied",
+          "weight": "high",
+          "covered": true
+        },
+        {
+          "validation": "Pricing :: Shipping calculated",
+          "weight": "medium",
+          "covered": true
+        },
+        {
+          "validation": "Pricing :: Coupon discount applied correctly",
+          "weight": "high",
+          "covered": true
+        },
+        {
+          "validation": "Pricing :: Invalid / expired coupon rejected",
+          "weight": "high",
+          "covered": false
+        },
+        {
+          "validation": "Address :: Valid shipping address",
+          "weight": "medium",
+          "covered": true
+        },
+        {
+          "validation": "Address :: Missing required address field",
+          "weight": "high",
+          "covered": true
+        },
+        {
+          "validation": "Address :: Invalid postal code",
+          "weight": "medium",
+          "covered": false
+        },
+        {
+          "validation": "Security :: Payment over HTTPS / no card data logged",
+          "weight": "high",
+          "covered": false
+        },
+        {
+          "validation": "Security :: Authorization (logged-in vs guest)",
+          "weight": "medium",
+          "covered": false
+        },
+        {
+          "validation": "Workflow :: Order confirmation shown",
+          "weight": "high",
+          "covered": true
+        },
+        {
+          "validation": "Workflow :: Confirmation email sent",
+          "weight": "medium",
+          "covered": true
+        },
+        {
+          "validation": "Workflow :: Inventory decremented",
+          "weight": "high",
+          "covered": true
+        },
+        {
+          "validation": "Edge :: Double submission / duplicate order prevented",
+          "weight": "high",
+          "covered": false
+        },
+        {
+          "validation": "Edge :: Session timeout during checkout",
+          "weight": "medium",
+          "covered": false
+        },
+        {
+          "validation": "Edge :: Price change during checkout",
+          "weight": "medium",
+          "covered": false
+        }
+      ]
+    },
+    {
+      "mode": "full (all families + deep)",
+      "totalExpected": 29,
+      "covered": 17,
+      "missing": 12,
+      "coveragePercent": 59,
+      "criticalMissing": [
+        "Payment :: Declined card"
+      ],
+      "rows": [
+        {
+          "validation": "Functional :: Checkout with valid cart and payment",
+          "weight": "critical",
+          "covered": true
+        },
+        {
+          "validation": "Functional :: Single item checkout",
+          "weight": "medium",
+          "covered": false
+        },
+        {
+          "validation": "Functional :: Multiple items checkout",
+          "weight": "medium",
+          "covered": false
+        },
+        {
+          "validation": "Functional :: Apply valid coupon",
+          "weight": "high",
+          "covered": true
+        },
+        {
+          "validation": "Cart :: Empty cart blocked",
+          "weight": "high",
+          "covered": true
+        },
+        {
+          "validation": "Cart :: Out-of-stock item",
+          "weight": "critical",
+          "covered": true
+        },
+        {
+          "validation": "Cart :: Quantity exceeds stock",
+          "weight": "high",
+          "covered": false
+        },
+        {
+          "validation": "Payment :: Valid card accepted",
+          "weight": "high",
+          "covered": true
+        },
+        {
+          "validation": "Payment :: Declined card",
+          "weight": "critical",
+          "covered": false
+        },
+        {
+          "validation": "Payment :: Expired card",
+          "weight": "high",
+          "covered": true
+        },
+        {
+          "validation": "Payment :: Invalid CVV",
+          "weight": "high",
+          "covered": false
+        },
+        {
+          "validation": "Payment :: Insufficient funds",
+          "weight": "high",
+          "covered": false
+        },
+        {
+          "validation": "Payment :: Invalid card number format",
+          "weight": "high",
+          "covered": true
+        },
+        {
+          "validation": "Pricing :: Correct total calculation",
+          "weight": "critical",
+          "covered": true
+        },
+        {
+          "validation": "Pricing :: Tax applied",
+          "weight": "high",
+          "covered": true
+        },
+        {
+          "validation": "Pricing :: Shipping calculated",
+          "weight": "medium",
+          "covered": true
+        },
+        {
+          "validation": "Pricing :: Coupon discount applied correctly",
+          "weight": "high",
+          "covered": true
+        },
+        {
+          "validation": "Pricing :: Invalid / expired coupon rejected",
+          "weight": "high",
+          "covered": true
+        },
+        {
+          "validation": "Address :: Valid shipping address",
+          "weight": "medium",
+          "covered": true
+        },
+        {
+          "validation": "Address :: Missing required address field",
+          "weight": "high",
+          "covered": true
+        },
+        {
+          "validation": "Address :: Invalid postal code",
+          "weight": "medium",
+          "covered": false
+        },
+        {
+          "validation": "Security :: Payment over HTTPS / no card data logged",
+          "weight": "high",
+          "covered": false
+        },
+        {
+          "validation": "Security :: Authorization (logged-in vs guest)",
+          "weight": "medium",
+          "covered": false
+        },
+        {
+          "validation": "Workflow :: Order confirmation shown",
+          "weight": "high",
+          "covered": true
+        },
+        {
+          "validation": "Workflow :: Confirmation email sent",
+          "weight": "medium",
+          "covered": true
+        },
+        {
+          "validation": "Workflow :: Inventory decremented",
+          "weight": "high",
+          "covered": true
+        },
+        {
+          "validation": "Edge :: Double submission / duplicate order prevented",
+          "weight": "high",
+          "covered": false
+        },
+        {
+          "validation": "Edge :: Session timeout during checkout",
+          "weight": "medium",
+          "covered": false
+        },
+        {
+          "validation": "Edge :: Price change during checkout",
+          "weight": "medium",
+          "covered": false
+        }
+      ]
+    }
+  ],
+  "earliestLoss": [
+    {
+      "validation": "Functional :: Single item checkout",
+      "weight": "medium",
+      "lostAtStage": "B. Scenario Planner / KB depth (correct category, but no such obligation in the KB)"
+    },
+    {
+      "validation": "Functional :: Multiple items checkout",
+      "weight": "medium",
+      "lostAtStage": "B. Scenario Planner / KB depth (correct category, but no such obligation in the KB)"
+    },
+    {
+      "validation": "Cart :: Quantity exceeds stock",
+      "weight": "high",
+      "lostAtStage": "B. Scenario Planner / KB depth (correct category, but no such obligation in the KB)"
+    },
+    {
+      "validation": "Payment :: Declined card",
+      "weight": "critical",
+      "lostAtStage": "B. Scenario Planner / KB depth (correct category, but no such obligation in the KB)"
+    },
+    {
+      "validation": "Payment :: Expired card",
+      "weight": "high",
+      "lostAtStage": "C. Coverage selection (KB has it; default positive-only never emits it)"
+    },
+    {
+      "validation": "Payment :: Invalid CVV",
+      "weight": "high",
+      "lostAtStage": "B. Scenario Planner / KB depth (correct category, but no such obligation in the KB)"
+    },
+    {
+      "validation": "Payment :: Insufficient funds",
+      "weight": "high",
+      "lostAtStage": "B. Scenario Planner / KB depth (correct category, but no such obligation in the KB)"
+    },
+    {
+      "validation": "Payment :: Invalid card number format",
+      "weight": "high",
+      "lostAtStage": "C. Coverage selection (KB has it; default positive-only never emits it)"
+    },
+    {
+      "validation": "Pricing :: Invalid / expired coupon rejected",
+      "weight": "high",
+      "lostAtStage": "C. Coverage selection (KB has it; default positive-only never emits it)"
+    },
+    {
+      "validation": "Address :: Invalid postal code",
+      "weight": "medium",
+      "lostAtStage": "B. Scenario Planner / KB depth (correct category, but no such obligation in the KB)"
+    },
+    {
+      "validation": "Security :: Payment over HTTPS / no card data logged",
+      "weight": "high",
+      "lostAtStage": "B. Scenario Planner / KB depth (correct category, but no such obligation in the KB)"
+    },
+    {
+      "validation": "Security :: Authorization (logged-in vs guest)",
+      "weight": "medium",
+      "lostAtStage": "B. Scenario Planner / KB depth (correct category, but no such obligation in the KB)"
+    },
+    {
+      "validation": "Edge :: Double submission / duplicate order prevented",
+      "weight": "high",
+      "lostAtStage": "B. Scenario Planner / KB depth (correct category, but no such obligation in the KB)"
+    },
+    {
+      "validation": "Edge :: Session timeout during checkout",
+      "weight": "medium",
+      "lostAtStage": "B. Scenario Planner / KB depth (correct category, but no such obligation in the KB)"
+    },
+    {
+      "validation": "Edge :: Price change during checkout",
+      "weight": "medium",
+      "lostAtStage": "B. Scenario Planner / KB depth (correct category, but no such obligation in the KB)"
+    }
+  ]
+}

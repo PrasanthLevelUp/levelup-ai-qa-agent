@@ -1,0 +1,2598 @@
+[
+  {
+    "id": "employee",
+    "label": "Create Employee",
+    "requirement": {
+      "title": "Create Employee",
+      "description": "Admin can add a new employee by entering first name, last name, employee ID and an optional profile photo. Employee ID may be auto-generated or entered manually and must be unique. On save the employee is created and becomes searchable by ID and by name.",
+      "module": "HR / Employee Management",
+      "businessFlow": "Admin opens Add Employee form → fills fields → uploads photo → saves → sees confirmation → employee searchable",
+      "acceptanceCriteria": "Given an authorized admin, when a valid employee is submitted, then the record is created, a success notification is shown, the user is redirected to the employee list, and the new employee is immediately searchable by ID and name."
+    },
+    "classification": {
+      "category": "crud",
+      "confidence": 1,
+      "matchedSignals": [
+        "create",
+        "add",
+        "form",
+        "save",
+        "record"
+      ],
+      "expected": "crud",
+      "correct": true
+    },
+    "stages": [
+      {
+        "stage": "1. Requirement Understanding",
+        "wired": false,
+        "input": {
+          "title": "Create Employee",
+          "description": "Admin can add a new employee by entering first name, last name, employee ID and an optional profile photo. Employee ID may be auto-generated or entered manually and must be unique. On save the employee is created and becomes searchable by ID and by name.",
+          "module": "HR / Employee Management",
+          "businessFlow": "Admin opens Add Employee form → fills fields → uploads photo → saves → sees confirmation → employee searchable",
+          "acceptanceCriteria": "Given an authorized admin, when a valid employee is submitted, then the record is created, a success notification is shown, the user is redirected to the employee list, and the new employee is immediately searchable by ID and name."
+        },
+        "output": {
+          "entities": [
+            "Employee"
+          ],
+          "actions": [
+            "Create",
+            "Submit"
+          ],
+          "fields": [
+            "First Name",
+            "Last Name",
+            "Name"
+          ],
+          "businessRules": [
+            null
+          ],
+          "confidence": 90
+        },
+        "newInformationAdded": [
+          "Functional :: Create employee successfully"
+        ],
+        "informationLost": []
+      },
+      {
+        "stage": "2. Validation Planning",
+        "wired": false,
+        "input": {
+          "entities": 1,
+          "fields": 3,
+          "rules": 1
+        },
+        "output": {
+          "capability": "Employee",
+          "complexity": "moderate",
+          "applicableDimensions": [
+            "functional",
+            "business_rule",
+            "input_validation",
+            "boundary",
+            "security",
+            "data_integrity"
+          ],
+          "obligationCount": 14,
+          "obligations": [
+            "Successfully Create Employee with valid data",
+            "Reject a duplicate Unique rule",
+            "Enforce maximum length on First Name",
+            "Enforce minimum length on First Name",
+            "Enforce maximum length on Last Name",
+            "Enforce minimum length on Last Name",
+            "Enforce maximum length on Name",
+            "Enforce minimum length on Name",
+            "Neutralize SQL-like input in free-text fields",
+            "Neutralize template/command-like input in free-text fields",
+            "Neutralize script injection (XSS) in free-text fields",
+            "Preserve emoji / multibyte input in free-text fields",
+            "Preserve unicode/accented characters in free-text fields",
+            "Trim leading/trailing whitespace in free-text fields"
+          ]
+        },
+        "newInformationAdded": [
+          "Mandatory :: Whitespace-only names",
+          "Employee ID :: Duplicate ID rejected",
+          "Employee ID :: Max length ID"
+        ],
+        "informationLost": []
+      },
+      {
+        "stage": "3. Scenario Planner (LIVE)",
+        "wired": true,
+        "input": {
+          "category": "crud",
+          "coverageTypes": [
+            "positive"
+          ],
+          "deep": false
+        },
+        "output": {
+          "category": "crud",
+          "plannedCount": 11,
+          "byType": {
+            "positive": 11
+          },
+          "scenarios": [
+            "Create a record with valid data",
+            "An authorized admin, when a valid employee is submitted,…",
+            "Admin can add a new employee by entering first…",
+            "Employee ID may be auto-generated or entered manually and…",
+            "On save the employee is created and becomes searchable…",
+            "Admin opens Add Employee form",
+            "Fills fields",
+            "Uploads photo",
+            "Saves",
+            "Sees confirmation",
+            "Employee searchable"
+          ]
+        },
+        "newInformationAdded": [
+          "Functional :: Create with optional photo",
+          "Mandatory :: First name blank",
+          "Mandatory :: Last name blank",
+          "Employee ID :: Auto-generated ID",
+          "Employee ID :: Editable ID",
+          "Employee ID :: Empty ID",
+          "Photo :: Valid photo upload",
+          "Authorization :: Authorized user can create",
+          "Workflow :: Success notification shown",
+          "Workflow :: Redirect after save",
+          "Workflow :: Searchable immediately",
+          "Workflow :: Search by ID",
+          "Workflow :: Search by name"
+        ],
+        "informationLost": [
+          "Mandatory :: Whitespace-only names",
+          "Employee ID :: Max length ID"
+        ]
+      },
+      {
+        "stage": "4. LLM Prompt (LIVE)",
+        "wired": true,
+        "input": {
+          "plannedScenarios": 11
+        },
+        "output": {
+          "promptChars": 3701,
+          "instructsNoInvent": true,
+          "instructsNoDrop": true
+        },
+        "newInformationAdded": [],
+        "informationLost": []
+      },
+      {
+        "stage": "5. LLM Output (NOT executed)",
+        "wired": true,
+        "input": {
+          "note": "no live API/DB in harness"
+        },
+        "output": {
+          "note": "Prompt forbids add/drop, so Stage-3 plan is the coverage ceiling.",
+          "knownLeak": "resolveType() defaults an unlabelled/lost coverage-type link to 'positive' (test-coverage-engine ~L2399) → inflates positive count."
+        },
+        "newInformationAdded": [],
+        "informationLost": []
+      },
+      {
+        "stage": "6. Quality Validator (LIVE)",
+        "wired": true,
+        "input": {
+          "casesGraded": 11
+        },
+        "output": {
+          "riskScore": "MEDIUM",
+          "passed": true,
+          "byFamily": {
+            "positive": 11,
+            "negative": 0,
+            "edge": 0,
+            "advanced": 0
+          },
+          "missingCategories": [],
+          "recommendations": [
+            "Balanced suite — no regeneration required."
+          ],
+          "regenerationGate": "buildQualityReport GRADES balance, but regeneration is behind GEN_QUALITY_REGEN (OFF by default) — measures the imbalance, ships it anyway."
+        },
+        "newInformationAdded": [],
+        "informationLost": []
+      }
+    ],
+    "gap": [
+      {
+        "mode": "default (positive only)",
+        "totalExpected": 26,
+        "covered": 15,
+        "missing": 11,
+        "coveragePercent": 58,
+        "criticalMissing": [
+          "Authorization :: Unauthorized user blocked"
+        ],
+        "rows": [
+          {
+            "validation": "Functional :: Create employee successfully",
+            "weight": "critical",
+            "covered": true
+          },
+          {
+            "validation": "Functional :: Create with minimum required fields",
+            "weight": "medium",
+            "covered": false
+          },
+          {
+            "validation": "Functional :: Create with optional photo",
+            "weight": "medium",
+            "covered": true
+          },
+          {
+            "validation": "Mandatory :: First name blank",
+            "weight": "critical",
+            "covered": true
+          },
+          {
+            "validation": "Mandatory :: Last name blank",
+            "weight": "critical",
+            "covered": true
+          },
+          {
+            "validation": "Mandatory :: Both names blank",
+            "weight": "high",
+            "covered": false
+          },
+          {
+            "validation": "Mandatory :: Whitespace-only names",
+            "weight": "high",
+            "covered": false
+          },
+          {
+            "validation": "Employee ID :: Auto-generated ID",
+            "weight": "high",
+            "covered": true
+          },
+          {
+            "validation": "Employee ID :: Editable ID",
+            "weight": "medium",
+            "covered": true
+          },
+          {
+            "validation": "Employee ID :: Duplicate ID rejected",
+            "weight": "critical",
+            "covered": true
+          },
+          {
+            "validation": "Employee ID :: Empty ID",
+            "weight": "high",
+            "covered": true
+          },
+          {
+            "validation": "Employee ID :: Invalid ID format",
+            "weight": "high",
+            "covered": false
+          },
+          {
+            "validation": "Employee ID :: Leading zero preserved",
+            "weight": "medium",
+            "covered": false
+          },
+          {
+            "validation": "Employee ID :: Max length ID",
+            "weight": "high",
+            "covered": false
+          },
+          {
+            "validation": "Employee ID :: Special characters in ID",
+            "weight": "medium",
+            "covered": false
+          },
+          {
+            "validation": "Photo :: Valid photo upload",
+            "weight": "medium",
+            "covered": true
+          },
+          {
+            "validation": "Photo :: Invalid photo format",
+            "weight": "high",
+            "covered": false
+          },
+          {
+            "validation": "Photo :: Large photo file",
+            "weight": "high",
+            "covered": false
+          },
+          {
+            "validation": "Photo :: Corrupted image",
+            "weight": "medium",
+            "covered": false
+          },
+          {
+            "validation": "Authorization :: Authorized user can create",
+            "weight": "high",
+            "covered": true
+          },
+          {
+            "validation": "Authorization :: Unauthorized user blocked",
+            "weight": "critical",
+            "covered": false
+          },
+          {
+            "validation": "Workflow :: Success notification shown",
+            "weight": "high",
+            "covered": true
+          },
+          {
+            "validation": "Workflow :: Redirect after save",
+            "weight": "medium",
+            "covered": true
+          },
+          {
+            "validation": "Workflow :: Searchable immediately",
+            "weight": "high",
+            "covered": true
+          },
+          {
+            "validation": "Workflow :: Search by ID",
+            "weight": "medium",
+            "covered": true
+          },
+          {
+            "validation": "Workflow :: Search by name",
+            "weight": "medium",
+            "covered": true
+          }
+        ]
+      },
+      {
+        "mode": "full (all families + deep)",
+        "totalExpected": 26,
+        "covered": 18,
+        "missing": 8,
+        "coveragePercent": 69,
+        "criticalMissing": [
+          "Authorization :: Unauthorized user blocked"
+        ],
+        "rows": [
+          {
+            "validation": "Functional :: Create employee successfully",
+            "weight": "critical",
+            "covered": true
+          },
+          {
+            "validation": "Functional :: Create with minimum required fields",
+            "weight": "medium",
+            "covered": false
+          },
+          {
+            "validation": "Functional :: Create with optional photo",
+            "weight": "medium",
+            "covered": true
+          },
+          {
+            "validation": "Mandatory :: First name blank",
+            "weight": "critical",
+            "covered": true
+          },
+          {
+            "validation": "Mandatory :: Last name blank",
+            "weight": "critical",
+            "covered": true
+          },
+          {
+            "validation": "Mandatory :: Both names blank",
+            "weight": "high",
+            "covered": false
+          },
+          {
+            "validation": "Mandatory :: Whitespace-only names",
+            "weight": "high",
+            "covered": false
+          },
+          {
+            "validation": "Employee ID :: Auto-generated ID",
+            "weight": "high",
+            "covered": true
+          },
+          {
+            "validation": "Employee ID :: Editable ID",
+            "weight": "medium",
+            "covered": true
+          },
+          {
+            "validation": "Employee ID :: Duplicate ID rejected",
+            "weight": "critical",
+            "covered": true
+          },
+          {
+            "validation": "Employee ID :: Empty ID",
+            "weight": "high",
+            "covered": true
+          },
+          {
+            "validation": "Employee ID :: Invalid ID format",
+            "weight": "high",
+            "covered": true
+          },
+          {
+            "validation": "Employee ID :: Leading zero preserved",
+            "weight": "medium",
+            "covered": false
+          },
+          {
+            "validation": "Employee ID :: Max length ID",
+            "weight": "high",
+            "covered": true
+          },
+          {
+            "validation": "Employee ID :: Special characters in ID",
+            "weight": "medium",
+            "covered": false
+          },
+          {
+            "validation": "Photo :: Valid photo upload",
+            "weight": "medium",
+            "covered": true
+          },
+          {
+            "validation": "Photo :: Invalid photo format",
+            "weight": "high",
+            "covered": true
+          },
+          {
+            "validation": "Photo :: Large photo file",
+            "weight": "high",
+            "covered": false
+          },
+          {
+            "validation": "Photo :: Corrupted image",
+            "weight": "medium",
+            "covered": false
+          },
+          {
+            "validation": "Authorization :: Authorized user can create",
+            "weight": "high",
+            "covered": true
+          },
+          {
+            "validation": "Authorization :: Unauthorized user blocked",
+            "weight": "critical",
+            "covered": false
+          },
+          {
+            "validation": "Workflow :: Success notification shown",
+            "weight": "high",
+            "covered": true
+          },
+          {
+            "validation": "Workflow :: Redirect after save",
+            "weight": "medium",
+            "covered": true
+          },
+          {
+            "validation": "Workflow :: Searchable immediately",
+            "weight": "high",
+            "covered": true
+          },
+          {
+            "validation": "Workflow :: Search by ID",
+            "weight": "medium",
+            "covered": true
+          },
+          {
+            "validation": "Workflow :: Search by name",
+            "weight": "medium",
+            "covered": true
+          }
+        ]
+      }
+    ],
+    "earliestLoss": [
+      {
+        "validation": "Functional :: Create with minimum required fields",
+        "weight": "medium",
+        "lostAtStage": "B. Scenario Planner / KB depth (correct category, but no such obligation in the KB)"
+      },
+      {
+        "validation": "Mandatory :: Both names blank",
+        "weight": "high",
+        "lostAtStage": "B. Scenario Planner / KB depth (correct category, but no such obligation in the KB)"
+      },
+      {
+        "validation": "Mandatory :: Whitespace-only names",
+        "weight": "high",
+        "lostAtStage": "B. Scenario Planner / KB depth (correct category, but no such obligation in the KB)"
+      },
+      {
+        "validation": "Employee ID :: Invalid ID format",
+        "weight": "high",
+        "lostAtStage": "C. Coverage selection (KB has it; default positive-only never emits it)"
+      },
+      {
+        "validation": "Employee ID :: Leading zero preserved",
+        "weight": "medium",
+        "lostAtStage": "B. Scenario Planner / KB depth (correct category, but no such obligation in the KB)"
+      },
+      {
+        "validation": "Employee ID :: Max length ID",
+        "weight": "high",
+        "lostAtStage": "C. Coverage selection (KB has it; default positive-only never emits it)"
+      },
+      {
+        "validation": "Employee ID :: Special characters in ID",
+        "weight": "medium",
+        "lostAtStage": "B. Scenario Planner / KB depth (correct category, but no such obligation in the KB)"
+      },
+      {
+        "validation": "Photo :: Invalid photo format",
+        "weight": "high",
+        "lostAtStage": "C. Coverage selection (KB has it; default positive-only never emits it)"
+      },
+      {
+        "validation": "Photo :: Large photo file",
+        "weight": "high",
+        "lostAtStage": "B. Scenario Planner / KB depth (correct category, but no such obligation in the KB)"
+      },
+      {
+        "validation": "Photo :: Corrupted image",
+        "weight": "medium",
+        "lostAtStage": "B. Scenario Planner / KB depth (correct category, but no such obligation in the KB)"
+      },
+      {
+        "validation": "Authorization :: Unauthorized user blocked",
+        "weight": "critical",
+        "lostAtStage": "B. Scenario Planner / KB depth (correct category, but no such obligation in the KB)"
+      }
+    ]
+  },
+  {
+    "id": "login",
+    "label": "Login",
+    "requirement": {
+      "title": "User Login",
+      "description": "A registered user logs in with a username and password. Valid credentials grant access to the dashboard. Invalid credentials show a generic error. Accounts lock after repeated failures.",
+      "module": "Authentication",
+      "businessFlow": "User opens login page → enters credentials → submits → is authenticated and redirected, or sees an error",
+      "acceptanceCriteria": "Given a registered user, when correct credentials are entered, then a session is created and the user reaches the dashboard. When credentials are wrong the user stays on the login page with a non-enumerating error."
+    },
+    "classification": {
+      "category": "authentication",
+      "confidence": 1,
+      "matchedSignals": [
+        "login",
+        "authenticat",
+        "password",
+        "credential",
+        "lock",
+        "session"
+      ],
+      "expected": "authentication",
+      "correct": true
+    },
+    "stages": [
+      {
+        "stage": "1. Requirement Understanding",
+        "wired": false,
+        "input": {
+          "title": "User Login",
+          "description": "A registered user logs in with a username and password. Valid credentials grant access to the dashboard. Invalid credentials show a generic error. Accounts lock after repeated failures.",
+          "module": "Authentication",
+          "businessFlow": "User opens login page → enters credentials → submits → is authenticated and redirected, or sees an error",
+          "acceptanceCriteria": "Given a registered user, when correct credentials are entered, then a session is created and the user reaches the dashboard. When credentials are wrong the user stays on the login page with a non-enumerating error."
+        },
+        "output": {
+          "entities": [],
+          "actions": [
+            "Login",
+            "Read"
+          ],
+          "fields": [
+            "Username",
+            "Password"
+          ],
+          "businessRules": [
+            null,
+            null,
+            null
+          ],
+          "confidence": 84
+        },
+        "newInformationAdded": [],
+        "informationLost": []
+      },
+      {
+        "stage": "2. Validation Planning",
+        "wired": false,
+        "input": {
+          "entities": 0,
+          "fields": 2,
+          "rules": 3
+        },
+        "output": {
+          "capability": null,
+          "complexity": "moderate",
+          "applicableDimensions": [
+            "input_validation",
+            "boundary",
+            "security",
+            "data_integrity"
+          ],
+          "obligationCount": 11,
+          "obligations": [
+            "Reject a too-weak Password",
+            "Enforce maximum Password length",
+            "Enforce minimum Password length",
+            "Enforce maximum length on Username",
+            "Enforce minimum length on Username",
+            "Neutralize SQL-like input in free-text fields",
+            "Neutralize template/command-like input in free-text fields",
+            "Neutralize script injection (XSS) in free-text fields",
+            "Preserve emoji / multibyte input in free-text fields",
+            "Preserve unicode/accented characters in free-text fields",
+            "Trim leading/trailing whitespace in free-text fields"
+          ]
+        },
+        "newInformationAdded": [
+          "Credentials :: Whitespace trimming on identifier",
+          "Security :: SQL injection attempt blocked"
+        ],
+        "informationLost": []
+      },
+      {
+        "stage": "3. Scenario Planner (LIVE)",
+        "wired": true,
+        "input": {
+          "category": "authentication",
+          "coverageTypes": [
+            "positive"
+          ],
+          "deep": false
+        },
+        "output": {
+          "category": "authentication",
+          "plannedCount": 12,
+          "byType": {
+            "positive": 8,
+            "negative": 4
+          },
+          "scenarios": [
+            "Valid credentials log in successfully",
+            "Logout ends the session",
+            "A registered user, when correct credentials are entered, then…",
+            "Credentials are wrong the user stays on the login…",
+            "A registered user logs in with a username and…",
+            "Valid credentials grant access to the dashboard",
+            "Invalid credentials show a generic error",
+            "Accounts lock after repeated failures",
+            "User opens login page",
+            "Enters credentials",
+            "Submits",
+            "Is authenticated and redirected, or sees an error"
+          ]
+        },
+        "newInformationAdded": [
+          "Functional :: Valid credentials succeed",
+          "Functional :: Redirect to dashboard on success",
+          "Functional :: Session created on success",
+          "Credentials :: Wrong password rejected",
+          "Credentials :: Unknown user rejected",
+          "Security :: Account lockout after repeated failures",
+          "Security :: Error does not leak account existence",
+          "Authorization :: Locked / disabled account cannot log in",
+          "Workflow :: Logout"
+        ],
+        "informationLost": [
+          "Credentials :: Whitespace trimming on identifier",
+          "Security :: SQL injection attempt blocked"
+        ]
+      },
+      {
+        "stage": "4. LLM Prompt (LIVE)",
+        "wired": true,
+        "input": {
+          "plannedScenarios": 12
+        },
+        "output": {
+          "promptChars": 3852,
+          "instructsNoInvent": true,
+          "instructsNoDrop": true
+        },
+        "newInformationAdded": [
+          "Credentials :: Case handling on identifier",
+          "Workflow :: Error message on failure"
+        ],
+        "informationLost": []
+      },
+      {
+        "stage": "5. LLM Output (NOT executed)",
+        "wired": true,
+        "input": {
+          "note": "no live API/DB in harness"
+        },
+        "output": {
+          "note": "Prompt forbids add/drop, so Stage-3 plan is the coverage ceiling.",
+          "knownLeak": "resolveType() defaults an unlabelled/lost coverage-type link to 'positive' (test-coverage-engine ~L2399) → inflates positive count."
+        },
+        "newInformationAdded": [],
+        "informationLost": []
+      },
+      {
+        "stage": "6. Quality Validator (LIVE)",
+        "wired": true,
+        "input": {
+          "casesGraded": 12
+        },
+        "output": {
+          "riskScore": "LOW",
+          "passed": true,
+          "byFamily": {
+            "positive": 8,
+            "negative": 4,
+            "edge": 0,
+            "advanced": 0
+          },
+          "missingCategories": [],
+          "recommendations": [
+            "Balanced suite — no regeneration required."
+          ],
+          "regenerationGate": "buildQualityReport GRADES balance, but regeneration is behind GEN_QUALITY_REGEN (OFF by default) — measures the imbalance, ships it anyway."
+        },
+        "newInformationAdded": [],
+        "informationLost": []
+      }
+    ],
+    "gap": [
+      {
+        "mode": "default (positive only)",
+        "totalExpected": 18,
+        "covered": 9,
+        "missing": 9,
+        "coveragePercent": 50,
+        "criticalMissing": [],
+        "rows": [
+          {
+            "validation": "Functional :: Valid credentials succeed",
+            "weight": "critical",
+            "covered": true
+          },
+          {
+            "validation": "Functional :: Redirect to dashboard on success",
+            "weight": "medium",
+            "covered": true
+          },
+          {
+            "validation": "Functional :: Session created on success",
+            "weight": "high",
+            "covered": true
+          },
+          {
+            "validation": "Mandatory :: Username blank",
+            "weight": "high",
+            "covered": false
+          },
+          {
+            "validation": "Mandatory :: Password blank",
+            "weight": "high",
+            "covered": false
+          },
+          {
+            "validation": "Mandatory :: Both fields blank",
+            "weight": "high",
+            "covered": false
+          },
+          {
+            "validation": "Credentials :: Wrong password rejected",
+            "weight": "critical",
+            "covered": true
+          },
+          {
+            "validation": "Credentials :: Unknown user rejected",
+            "weight": "high",
+            "covered": true
+          },
+          {
+            "validation": "Credentials :: Whitespace trimming on identifier",
+            "weight": "medium",
+            "covered": false
+          },
+          {
+            "validation": "Credentials :: Case handling on identifier",
+            "weight": "medium",
+            "covered": false
+          },
+          {
+            "validation": "Security :: Account lockout after repeated failures",
+            "weight": "critical",
+            "covered": true
+          },
+          {
+            "validation": "Security :: Password masked",
+            "weight": "medium",
+            "covered": false
+          },
+          {
+            "validation": "Security :: Error does not leak account existence",
+            "weight": "high",
+            "covered": true
+          },
+          {
+            "validation": "Security :: SQL injection attempt blocked",
+            "weight": "high",
+            "covered": false
+          },
+          {
+            "validation": "Security :: Brute force / rate limiting",
+            "weight": "high",
+            "covered": false
+          },
+          {
+            "validation": "Authorization :: Locked / disabled account cannot log in",
+            "weight": "high",
+            "covered": true
+          },
+          {
+            "validation": "Workflow :: Error message on failure",
+            "weight": "medium",
+            "covered": false
+          },
+          {
+            "validation": "Workflow :: Logout",
+            "weight": "medium",
+            "covered": true
+          }
+        ]
+      },
+      {
+        "mode": "full (all families + deep)",
+        "totalExpected": 18,
+        "covered": 18,
+        "missing": 0,
+        "coveragePercent": 100,
+        "criticalMissing": [],
+        "rows": [
+          {
+            "validation": "Functional :: Valid credentials succeed",
+            "weight": "critical",
+            "covered": true
+          },
+          {
+            "validation": "Functional :: Redirect to dashboard on success",
+            "weight": "medium",
+            "covered": true
+          },
+          {
+            "validation": "Functional :: Session created on success",
+            "weight": "high",
+            "covered": true
+          },
+          {
+            "validation": "Mandatory :: Username blank",
+            "weight": "high",
+            "covered": true
+          },
+          {
+            "validation": "Mandatory :: Password blank",
+            "weight": "high",
+            "covered": true
+          },
+          {
+            "validation": "Mandatory :: Both fields blank",
+            "weight": "high",
+            "covered": true
+          },
+          {
+            "validation": "Credentials :: Wrong password rejected",
+            "weight": "critical",
+            "covered": true
+          },
+          {
+            "validation": "Credentials :: Unknown user rejected",
+            "weight": "high",
+            "covered": true
+          },
+          {
+            "validation": "Credentials :: Whitespace trimming on identifier",
+            "weight": "medium",
+            "covered": true
+          },
+          {
+            "validation": "Credentials :: Case handling on identifier",
+            "weight": "medium",
+            "covered": true
+          },
+          {
+            "validation": "Security :: Account lockout after repeated failures",
+            "weight": "critical",
+            "covered": true
+          },
+          {
+            "validation": "Security :: Password masked",
+            "weight": "medium",
+            "covered": true
+          },
+          {
+            "validation": "Security :: Error does not leak account existence",
+            "weight": "high",
+            "covered": true
+          },
+          {
+            "validation": "Security :: SQL injection attempt blocked",
+            "weight": "high",
+            "covered": true
+          },
+          {
+            "validation": "Security :: Brute force / rate limiting",
+            "weight": "high",
+            "covered": true
+          },
+          {
+            "validation": "Authorization :: Locked / disabled account cannot log in",
+            "weight": "high",
+            "covered": true
+          },
+          {
+            "validation": "Workflow :: Error message on failure",
+            "weight": "medium",
+            "covered": true
+          },
+          {
+            "validation": "Workflow :: Logout",
+            "weight": "medium",
+            "covered": true
+          }
+        ]
+      }
+    ],
+    "earliestLoss": [
+      {
+        "validation": "Mandatory :: Username blank",
+        "weight": "high",
+        "lostAtStage": "C. Coverage selection (KB has it; default positive-only never emits it)"
+      },
+      {
+        "validation": "Mandatory :: Password blank",
+        "weight": "high",
+        "lostAtStage": "C. Coverage selection (KB has it; default positive-only never emits it)"
+      },
+      {
+        "validation": "Mandatory :: Both fields blank",
+        "weight": "high",
+        "lostAtStage": "C. Coverage selection (KB has it; default positive-only never emits it)"
+      },
+      {
+        "validation": "Credentials :: Whitespace trimming on identifier",
+        "weight": "medium",
+        "lostAtStage": "C. Coverage selection (KB has it; default positive-only never emits it)"
+      },
+      {
+        "validation": "Credentials :: Case handling on identifier",
+        "weight": "medium",
+        "lostAtStage": "C. Coverage selection (KB has it; default positive-only never emits it)"
+      },
+      {
+        "validation": "Security :: Password masked",
+        "weight": "medium",
+        "lostAtStage": "C. Coverage selection (KB has it; default positive-only never emits it)"
+      },
+      {
+        "validation": "Security :: SQL injection attempt blocked",
+        "weight": "high",
+        "lostAtStage": "C. Coverage selection (KB has it; default positive-only never emits it)"
+      },
+      {
+        "validation": "Security :: Brute force / rate limiting",
+        "weight": "high",
+        "lostAtStage": "C. Coverage selection (KB has it; default positive-only never emits it)"
+      },
+      {
+        "validation": "Workflow :: Error message on failure",
+        "weight": "medium",
+        "lostAtStage": "C. Coverage selection (KB has it; default positive-only never emits it)"
+      }
+    ]
+  },
+  {
+    "id": "checkout",
+    "label": "Checkout",
+    "requirement": {
+      "title": "Cart Checkout",
+      "description": "A shopper reviews the cart, enters a shipping address, applies an optional coupon, and pays. On success an order is created, inventory is decremented, and a confirmation is shown and emailed. Payment is by card.",
+      "module": "E-commerce / Checkout",
+      "businessFlow": "Cart → shipping address → coupon → payment → order confirmation + email",
+      "acceptanceCriteria": "Given a cart with in-stock items and valid payment, when the shopper checks out, then an order is created with the correct total (items + tax + shipping − discount), inventory is decremented, and a confirmation is shown and emailed."
+    },
+    "classification": {
+      "category": "checkout",
+      "confidence": 1,
+      "matchedSignals": [
+        "checkout",
+        "cart",
+        "order",
+        "shipping",
+        "coupon",
+        "tax"
+      ],
+      "expected": "checkout",
+      "correct": true
+    },
+    "stages": [
+      {
+        "stage": "1. Requirement Understanding",
+        "wired": false,
+        "input": {
+          "title": "Cart Checkout",
+          "description": "A shopper reviews the cart, enters a shipping address, applies an optional coupon, and pays. On success an order is created, inventory is decremented, and a confirmation is shown and emailed. Payment is by card.",
+          "module": "E-commerce / Checkout",
+          "businessFlow": "Cart → shipping address → coupon → payment → order confirmation + email",
+          "acceptanceCriteria": "Given a cart with in-stock items and valid payment, when the shopper checks out, then an order is created with the correct total (items + tax + shipping − discount), inventory is decremented, and a confirmation is shown and emailed."
+        },
+        "output": {
+          "entities": [
+            "Checkout"
+          ],
+          "actions": [],
+          "fields": [
+            "Address"
+          ],
+          "businessRules": [],
+          "confidence": 90
+        },
+        "newInformationAdded": [],
+        "informationLost": []
+      },
+      {
+        "stage": "2. Validation Planning",
+        "wired": false,
+        "input": {
+          "entities": 1,
+          "fields": 1,
+          "rules": 0
+        },
+        "output": {
+          "capability": "Checkout",
+          "complexity": "simple",
+          "applicableDimensions": [
+            "functional",
+            "input_validation",
+            "boundary",
+            "security",
+            "data_integrity"
+          ],
+          "obligationCount": 9,
+          "obligations": [
+            "Successfully Use Checkout with valid data",
+            "Enforce maximum length on Address",
+            "Enforce minimum length on Address",
+            "Neutralize SQL-like input in free-text fields",
+            "Neutralize template/command-like input in free-text fields",
+            "Neutralize script injection (XSS) in free-text fields",
+            "Preserve emoji / multibyte input in free-text fields",
+            "Preserve unicode/accented characters in free-text fields",
+            "Trim leading/trailing whitespace in free-text fields"
+          ]
+        },
+        "newInformationAdded": [
+          "Functional :: Checkout with valid cart and payment",
+          "Address :: Valid shipping address"
+        ],
+        "informationLost": []
+      },
+      {
+        "stage": "3. Scenario Planner (LIVE)",
+        "wired": true,
+        "input": {
+          "category": "checkout",
+          "coverageTypes": [
+            "positive"
+          ],
+          "deep": false
+        },
+        "output": {
+          "category": "checkout",
+          "plannedCount": 11,
+          "byType": {
+            "positive": 11
+          },
+          "scenarios": [
+            "Complete checkout with valid cart",
+            "Valid promo / coupon is applied",
+            "Tax and shipping calculated correctly",
+            "A cart with in-stock items and valid payment, when…",
+            "A shopper reviews the cart, enters a shipping address,…",
+            "On success an order is created, inventory is decremented,…",
+            "Payment is by card",
+            "Cart",
+            "Shipping address",
+            "Coupon",
+            "Order confirmation + email"
+          ]
+        },
+        "newInformationAdded": [
+          "Functional :: Apply valid coupon",
+          "Cart :: Empty cart blocked",
+          "Cart :: Out-of-stock item",
+          "Payment :: Valid card accepted",
+          "Pricing :: Correct total calculation",
+          "Pricing :: Tax applied",
+          "Pricing :: Shipping calculated",
+          "Pricing :: Coupon discount applied correctly",
+          "Address :: Missing required address field",
+          "Workflow :: Order confirmation shown",
+          "Workflow :: Confirmation email sent",
+          "Workflow :: Inventory decremented"
+        ],
+        "informationLost": []
+      },
+      {
+        "stage": "4. LLM Prompt (LIVE)",
+        "wired": true,
+        "input": {
+          "plannedScenarios": 11
+        },
+        "output": {
+          "promptChars": 3585,
+          "instructsNoInvent": true,
+          "instructsNoDrop": true
+        },
+        "newInformationAdded": [
+          "Functional :: Single item checkout",
+          "Functional :: Multiple items checkout",
+          "Security :: Payment over HTTPS / no card data logged"
+        ],
+        "informationLost": []
+      },
+      {
+        "stage": "5. LLM Output (NOT executed)",
+        "wired": true,
+        "input": {
+          "note": "no live API/DB in harness"
+        },
+        "output": {
+          "note": "Prompt forbids add/drop, so Stage-3 plan is the coverage ceiling.",
+          "knownLeak": "resolveType() defaults an unlabelled/lost coverage-type link to 'positive' (test-coverage-engine ~L2399) → inflates positive count."
+        },
+        "newInformationAdded": [],
+        "informationLost": []
+      },
+      {
+        "stage": "6. Quality Validator (LIVE)",
+        "wired": true,
+        "input": {
+          "casesGraded": 11
+        },
+        "output": {
+          "riskScore": "MEDIUM",
+          "passed": true,
+          "byFamily": {
+            "positive": 11,
+            "negative": 0,
+            "edge": 0,
+            "advanced": 0
+          },
+          "missingCategories": [],
+          "recommendations": [
+            "Balanced suite — no regeneration required."
+          ],
+          "regenerationGate": "buildQualityReport GRADES balance, but regeneration is behind GEN_QUALITY_REGEN (OFF by default) — measures the imbalance, ships it anyway."
+        },
+        "newInformationAdded": [],
+        "informationLost": []
+      }
+    ],
+    "gap": [
+      {
+        "mode": "default (positive only)",
+        "totalExpected": 29,
+        "covered": 14,
+        "missing": 15,
+        "coveragePercent": 48,
+        "criticalMissing": [
+          "Payment :: Declined card"
+        ],
+        "rows": [
+          {
+            "validation": "Functional :: Checkout with valid cart and payment",
+            "weight": "critical",
+            "covered": true
+          },
+          {
+            "validation": "Functional :: Single item checkout",
+            "weight": "medium",
+            "covered": false
+          },
+          {
+            "validation": "Functional :: Multiple items checkout",
+            "weight": "medium",
+            "covered": false
+          },
+          {
+            "validation": "Functional :: Apply valid coupon",
+            "weight": "high",
+            "covered": true
+          },
+          {
+            "validation": "Cart :: Empty cart blocked",
+            "weight": "high",
+            "covered": true
+          },
+          {
+            "validation": "Cart :: Out-of-stock item",
+            "weight": "critical",
+            "covered": true
+          },
+          {
+            "validation": "Cart :: Quantity exceeds stock",
+            "weight": "high",
+            "covered": false
+          },
+          {
+            "validation": "Payment :: Valid card accepted",
+            "weight": "high",
+            "covered": true
+          },
+          {
+            "validation": "Payment :: Declined card",
+            "weight": "critical",
+            "covered": false
+          },
+          {
+            "validation": "Payment :: Expired card",
+            "weight": "high",
+            "covered": false
+          },
+          {
+            "validation": "Payment :: Invalid CVV",
+            "weight": "high",
+            "covered": false
+          },
+          {
+            "validation": "Payment :: Insufficient funds",
+            "weight": "high",
+            "covered": false
+          },
+          {
+            "validation": "Payment :: Invalid card number format",
+            "weight": "high",
+            "covered": false
+          },
+          {
+            "validation": "Pricing :: Correct total calculation",
+            "weight": "critical",
+            "covered": true
+          },
+          {
+            "validation": "Pricing :: Tax applied",
+            "weight": "high",
+            "covered": true
+          },
+          {
+            "validation": "Pricing :: Shipping calculated",
+            "weight": "medium",
+            "covered": true
+          },
+          {
+            "validation": "Pricing :: Coupon discount applied correctly",
+            "weight": "high",
+            "covered": true
+          },
+          {
+            "validation": "Pricing :: Invalid / expired coupon rejected",
+            "weight": "high",
+            "covered": false
+          },
+          {
+            "validation": "Address :: Valid shipping address",
+            "weight": "medium",
+            "covered": true
+          },
+          {
+            "validation": "Address :: Missing required address field",
+            "weight": "high",
+            "covered": true
+          },
+          {
+            "validation": "Address :: Invalid postal code",
+            "weight": "medium",
+            "covered": false
+          },
+          {
+            "validation": "Security :: Payment over HTTPS / no card data logged",
+            "weight": "high",
+            "covered": false
+          },
+          {
+            "validation": "Security :: Authorization (logged-in vs guest)",
+            "weight": "medium",
+            "covered": false
+          },
+          {
+            "validation": "Workflow :: Order confirmation shown",
+            "weight": "high",
+            "covered": true
+          },
+          {
+            "validation": "Workflow :: Confirmation email sent",
+            "weight": "medium",
+            "covered": true
+          },
+          {
+            "validation": "Workflow :: Inventory decremented",
+            "weight": "high",
+            "covered": true
+          },
+          {
+            "validation": "Edge :: Double submission / duplicate order prevented",
+            "weight": "high",
+            "covered": false
+          },
+          {
+            "validation": "Edge :: Session timeout during checkout",
+            "weight": "medium",
+            "covered": false
+          },
+          {
+            "validation": "Edge :: Price change during checkout",
+            "weight": "medium",
+            "covered": false
+          }
+        ]
+      },
+      {
+        "mode": "full (all families + deep)",
+        "totalExpected": 29,
+        "covered": 17,
+        "missing": 12,
+        "coveragePercent": 59,
+        "criticalMissing": [
+          "Payment :: Declined card"
+        ],
+        "rows": [
+          {
+            "validation": "Functional :: Checkout with valid cart and payment",
+            "weight": "critical",
+            "covered": true
+          },
+          {
+            "validation": "Functional :: Single item checkout",
+            "weight": "medium",
+            "covered": false
+          },
+          {
+            "validation": "Functional :: Multiple items checkout",
+            "weight": "medium",
+            "covered": false
+          },
+          {
+            "validation": "Functional :: Apply valid coupon",
+            "weight": "high",
+            "covered": true
+          },
+          {
+            "validation": "Cart :: Empty cart blocked",
+            "weight": "high",
+            "covered": true
+          },
+          {
+            "validation": "Cart :: Out-of-stock item",
+            "weight": "critical",
+            "covered": true
+          },
+          {
+            "validation": "Cart :: Quantity exceeds stock",
+            "weight": "high",
+            "covered": false
+          },
+          {
+            "validation": "Payment :: Valid card accepted",
+            "weight": "high",
+            "covered": true
+          },
+          {
+            "validation": "Payment :: Declined card",
+            "weight": "critical",
+            "covered": false
+          },
+          {
+            "validation": "Payment :: Expired card",
+            "weight": "high",
+            "covered": true
+          },
+          {
+            "validation": "Payment :: Invalid CVV",
+            "weight": "high",
+            "covered": false
+          },
+          {
+            "validation": "Payment :: Insufficient funds",
+            "weight": "high",
+            "covered": false
+          },
+          {
+            "validation": "Payment :: Invalid card number format",
+            "weight": "high",
+            "covered": true
+          },
+          {
+            "validation": "Pricing :: Correct total calculation",
+            "weight": "critical",
+            "covered": true
+          },
+          {
+            "validation": "Pricing :: Tax applied",
+            "weight": "high",
+            "covered": true
+          },
+          {
+            "validation": "Pricing :: Shipping calculated",
+            "weight": "medium",
+            "covered": true
+          },
+          {
+            "validation": "Pricing :: Coupon discount applied correctly",
+            "weight": "high",
+            "covered": true
+          },
+          {
+            "validation": "Pricing :: Invalid / expired coupon rejected",
+            "weight": "high",
+            "covered": true
+          },
+          {
+            "validation": "Address :: Valid shipping address",
+            "weight": "medium",
+            "covered": true
+          },
+          {
+            "validation": "Address :: Missing required address field",
+            "weight": "high",
+            "covered": true
+          },
+          {
+            "validation": "Address :: Invalid postal code",
+            "weight": "medium",
+            "covered": false
+          },
+          {
+            "validation": "Security :: Payment over HTTPS / no card data logged",
+            "weight": "high",
+            "covered": false
+          },
+          {
+            "validation": "Security :: Authorization (logged-in vs guest)",
+            "weight": "medium",
+            "covered": false
+          },
+          {
+            "validation": "Workflow :: Order confirmation shown",
+            "weight": "high",
+            "covered": true
+          },
+          {
+            "validation": "Workflow :: Confirmation email sent",
+            "weight": "medium",
+            "covered": true
+          },
+          {
+            "validation": "Workflow :: Inventory decremented",
+            "weight": "high",
+            "covered": true
+          },
+          {
+            "validation": "Edge :: Double submission / duplicate order prevented",
+            "weight": "high",
+            "covered": false
+          },
+          {
+            "validation": "Edge :: Session timeout during checkout",
+            "weight": "medium",
+            "covered": false
+          },
+          {
+            "validation": "Edge :: Price change during checkout",
+            "weight": "medium",
+            "covered": false
+          }
+        ]
+      }
+    ],
+    "earliestLoss": [
+      {
+        "validation": "Functional :: Single item checkout",
+        "weight": "medium",
+        "lostAtStage": "B. Scenario Planner / KB depth (correct category, but no such obligation in the KB)"
+      },
+      {
+        "validation": "Functional :: Multiple items checkout",
+        "weight": "medium",
+        "lostAtStage": "B. Scenario Planner / KB depth (correct category, but no such obligation in the KB)"
+      },
+      {
+        "validation": "Cart :: Quantity exceeds stock",
+        "weight": "high",
+        "lostAtStage": "B. Scenario Planner / KB depth (correct category, but no such obligation in the KB)"
+      },
+      {
+        "validation": "Payment :: Declined card",
+        "weight": "critical",
+        "lostAtStage": "B. Scenario Planner / KB depth (correct category, but no such obligation in the KB)"
+      },
+      {
+        "validation": "Payment :: Expired card",
+        "weight": "high",
+        "lostAtStage": "C. Coverage selection (KB has it; default positive-only never emits it)"
+      },
+      {
+        "validation": "Payment :: Invalid CVV",
+        "weight": "high",
+        "lostAtStage": "B. Scenario Planner / KB depth (correct category, but no such obligation in the KB)"
+      },
+      {
+        "validation": "Payment :: Insufficient funds",
+        "weight": "high",
+        "lostAtStage": "B. Scenario Planner / KB depth (correct category, but no such obligation in the KB)"
+      },
+      {
+        "validation": "Payment :: Invalid card number format",
+        "weight": "high",
+        "lostAtStage": "C. Coverage selection (KB has it; default positive-only never emits it)"
+      },
+      {
+        "validation": "Pricing :: Invalid / expired coupon rejected",
+        "weight": "high",
+        "lostAtStage": "C. Coverage selection (KB has it; default positive-only never emits it)"
+      },
+      {
+        "validation": "Address :: Invalid postal code",
+        "weight": "medium",
+        "lostAtStage": "B. Scenario Planner / KB depth (correct category, but no such obligation in the KB)"
+      },
+      {
+        "validation": "Security :: Payment over HTTPS / no card data logged",
+        "weight": "high",
+        "lostAtStage": "B. Scenario Planner / KB depth (correct category, but no such obligation in the KB)"
+      },
+      {
+        "validation": "Security :: Authorization (logged-in vs guest)",
+        "weight": "medium",
+        "lostAtStage": "B. Scenario Planner / KB depth (correct category, but no such obligation in the KB)"
+      },
+      {
+        "validation": "Edge :: Double submission / duplicate order prevented",
+        "weight": "high",
+        "lostAtStage": "B. Scenario Planner / KB depth (correct category, but no such obligation in the KB)"
+      },
+      {
+        "validation": "Edge :: Session timeout during checkout",
+        "weight": "medium",
+        "lostAtStage": "B. Scenario Planner / KB depth (correct category, but no such obligation in the KB)"
+      },
+      {
+        "validation": "Edge :: Price change during checkout",
+        "weight": "medium",
+        "lostAtStage": "B. Scenario Planner / KB depth (correct category, but no such obligation in the KB)"
+      }
+    ]
+  },
+  {
+    "id": "leave",
+    "label": "Leave Request",
+    "requirement": {
+      "title": "Submit Leave Request",
+      "description": "An employee submits a leave request selecting leave type, start date, end date and a reason. The request is validated against the leave balance and sent to the manager for approval. Approval or rejection updates the request status and notifies the employee.",
+      "module": "HR / Leave Management",
+      "businessFlow": "Employee fills leave form → validates dates and balance → submits → manager approves/rejects → status + notification",
+      "acceptanceCriteria": "Given an employee with sufficient balance, when a valid leave request is submitted, then it is created in Pending state, routed to the manager, and on approval the balance is deducted and the employee is notified."
+    },
+    "classification": {
+      "category": "crud",
+      "confidence": 0.8,
+      "matchedSignals": [
+        "form",
+        "submit"
+      ],
+      "expected": "workflow",
+      "correct": false
+    },
+    "stages": [
+      {
+        "stage": "1. Requirement Understanding",
+        "wired": false,
+        "input": {
+          "title": "Submit Leave Request",
+          "description": "An employee submits a leave request selecting leave type, start date, end date and a reason. The request is validated against the leave balance and sent to the manager for approval. Approval or rejection updates the request status and notifies the employee.",
+          "module": "HR / Leave Management",
+          "businessFlow": "Employee fills leave form → validates dates and balance → submits → manager approves/rejects → status + notification",
+          "acceptanceCriteria": "Given an employee with sufficient balance, when a valid leave request is submitted, then it is created in Pending state, routed to the manager, and on approval the balance is deducted and the employee is notified."
+        },
+        "output": {
+          "entities": [
+            "Leave"
+          ],
+          "actions": [
+            "Submit"
+          ],
+          "fields": [
+            "Manager",
+            "Status",
+            "Start Date"
+          ],
+          "businessRules": [
+            null
+          ],
+          "confidence": 87
+        },
+        "newInformationAdded": [
+          "Functional :: Submit valid leave request"
+        ],
+        "informationLost": []
+      },
+      {
+        "stage": "2. Validation Planning",
+        "wired": false,
+        "input": {
+          "entities": 1,
+          "fields": 3,
+          "rules": 1
+        },
+        "output": {
+          "capability": "Leave",
+          "complexity": "simple",
+          "applicableDimensions": [
+            "functional",
+            "input_validation",
+            "boundary"
+          ],
+          "obligationCount": 4,
+          "obligations": [
+            "Successfully Submit Leave with valid data",
+            "Reject malformed Start Date",
+            "Reject an out-of-set Status value",
+            "Enforce allowed Start Date range"
+          ]
+        },
+        "newInformationAdded": [
+          "Functional :: Multi-day leave",
+          "Date rules :: End date before start date rejected",
+          "Workflow :: Rejection updates status"
+        ],
+        "informationLost": []
+      },
+      {
+        "stage": "3. Scenario Planner (LIVE)",
+        "wired": true,
+        "input": {
+          "category": "crud",
+          "coverageTypes": [
+            "positive"
+          ],
+          "deep": false
+        },
+        "output": {
+          "category": "crud",
+          "plannedCount": 10,
+          "byType": {
+            "positive": 8,
+            "negative": 2
+          },
+          "scenarios": [
+            "Create a record with valid data",
+            "An employee with sufficient balance, when a valid leave…",
+            "An employee submits a leave request selecting leave type,…",
+            "The request is validated against the leave balance and…",
+            "Approval or rejection updates the request status and notifies…",
+            "Employee fills leave form",
+            "Validates dates and balance",
+            "Submits",
+            "Manager approves/rejects",
+            "Status + notification"
+          ]
+        },
+        "newInformationAdded": [
+          "Mandatory :: Leave type blank",
+          "Mandatory :: Reason blank",
+          "Balance :: Sufficient balance allowed",
+          "Balance :: Balance deducted on approval",
+          "Workflow :: Request routed to approver",
+          "Workflow :: Notification to manager",
+          "Workflow :: Approval updates status"
+        ],
+        "informationLost": [
+          "Functional :: Multi-day leave",
+          "Date rules :: End date before start date rejected"
+        ]
+      },
+      {
+        "stage": "4. LLM Prompt (LIVE)",
+        "wired": true,
+        "input": {
+          "plannedScenarios": 10
+        },
+        "output": {
+          "promptChars": 3666,
+          "instructsNoInvent": true,
+          "instructsNoDrop": true
+        },
+        "newInformationAdded": [
+          "Date rules :: Overlapping leave rejected",
+          "Date rules :: Max consecutive days boundary"
+        ],
+        "informationLost": []
+      },
+      {
+        "stage": "5. LLM Output (NOT executed)",
+        "wired": true,
+        "input": {
+          "note": "no live API/DB in harness"
+        },
+        "output": {
+          "note": "Prompt forbids add/drop, so Stage-3 plan is the coverage ceiling.",
+          "knownLeak": "resolveType() defaults an unlabelled/lost coverage-type link to 'positive' (test-coverage-engine ~L2399) → inflates positive count."
+        },
+        "newInformationAdded": [],
+        "informationLost": []
+      },
+      {
+        "stage": "6. Quality Validator (LIVE)",
+        "wired": true,
+        "input": {
+          "casesGraded": 10
+        },
+        "output": {
+          "riskScore": "LOW",
+          "passed": true,
+          "byFamily": {
+            "positive": 8,
+            "negative": 2,
+            "edge": 0,
+            "advanced": 0
+          },
+          "missingCategories": [],
+          "recommendations": [
+            "Balanced suite — no regeneration required."
+          ],
+          "regenerationGate": "buildQualityReport GRADES balance, but regeneration is behind GEN_QUALITY_REGEN (OFF by default) — measures the imbalance, ships it anyway."
+        },
+        "newInformationAdded": [],
+        "informationLost": []
+      }
+    ],
+    "gap": [
+      {
+        "mode": "default (positive only)",
+        "totalExpected": 25,
+        "covered": 9,
+        "missing": 16,
+        "coveragePercent": 36,
+        "criticalMissing": [
+          "Date rules :: End date before start date rejected",
+          "Balance :: Insufficient balance rejected"
+        ],
+        "rows": [
+          {
+            "validation": "Functional :: Submit valid leave request",
+            "weight": "critical",
+            "covered": true
+          },
+          {
+            "validation": "Functional :: Half-day leave",
+            "weight": "medium",
+            "covered": false
+          },
+          {
+            "validation": "Functional :: Multi-day leave",
+            "weight": "medium",
+            "covered": false
+          },
+          {
+            "validation": "Mandatory :: Start date blank",
+            "weight": "high",
+            "covered": false
+          },
+          {
+            "validation": "Mandatory :: End date blank",
+            "weight": "high",
+            "covered": false
+          },
+          {
+            "validation": "Mandatory :: Leave type blank",
+            "weight": "high",
+            "covered": true
+          },
+          {
+            "validation": "Mandatory :: Reason blank",
+            "weight": "medium",
+            "covered": true
+          },
+          {
+            "validation": "Date rules :: End date before start date rejected",
+            "weight": "critical",
+            "covered": false
+          },
+          {
+            "validation": "Date rules :: Past date rejected",
+            "weight": "high",
+            "covered": false
+          },
+          {
+            "validation": "Date rules :: Overlapping leave rejected",
+            "weight": "high",
+            "covered": false
+          },
+          {
+            "validation": "Date rules :: Max consecutive days boundary",
+            "weight": "medium",
+            "covered": false
+          },
+          {
+            "validation": "Balance :: Sufficient balance allowed",
+            "weight": "high",
+            "covered": true
+          },
+          {
+            "validation": "Balance :: Insufficient balance rejected",
+            "weight": "critical",
+            "covered": false
+          },
+          {
+            "validation": "Balance :: Balance deducted on approval",
+            "weight": "high",
+            "covered": true
+          },
+          {
+            "validation": "Authorization :: Employee submits own request",
+            "weight": "medium",
+            "covered": false
+          },
+          {
+            "validation": "Authorization :: Cannot submit for others",
+            "weight": "high",
+            "covered": false
+          },
+          {
+            "validation": "Authorization :: Manager approves",
+            "weight": "high",
+            "covered": false
+          },
+          {
+            "validation": "Authorization :: Unauthorized approval blocked",
+            "weight": "high",
+            "covered": false
+          },
+          {
+            "validation": "Workflow :: Request routed to approver",
+            "weight": "high",
+            "covered": true
+          },
+          {
+            "validation": "Workflow :: Notification to manager",
+            "weight": "medium",
+            "covered": true
+          },
+          {
+            "validation": "Workflow :: Approval updates status",
+            "weight": "high",
+            "covered": true
+          },
+          {
+            "validation": "Workflow :: Rejection updates status",
+            "weight": "high",
+            "covered": true
+          },
+          {
+            "validation": "Workflow :: Cancellation",
+            "weight": "medium",
+            "covered": false
+          },
+          {
+            "validation": "Edge :: Leave spanning weekend / holiday",
+            "weight": "medium",
+            "covered": false
+          },
+          {
+            "validation": "Edge :: Concurrent requests",
+            "weight": "medium",
+            "covered": false
+          }
+        ]
+      },
+      {
+        "mode": "full (all families + deep)",
+        "totalExpected": 25,
+        "covered": 13,
+        "missing": 12,
+        "coveragePercent": 52,
+        "criticalMissing": [
+          "Date rules :: End date before start date rejected",
+          "Balance :: Insufficient balance rejected"
+        ],
+        "rows": [
+          {
+            "validation": "Functional :: Submit valid leave request",
+            "weight": "critical",
+            "covered": true
+          },
+          {
+            "validation": "Functional :: Half-day leave",
+            "weight": "medium",
+            "covered": false
+          },
+          {
+            "validation": "Functional :: Multi-day leave",
+            "weight": "medium",
+            "covered": false
+          },
+          {
+            "validation": "Mandatory :: Start date blank",
+            "weight": "high",
+            "covered": true
+          },
+          {
+            "validation": "Mandatory :: End date blank",
+            "weight": "high",
+            "covered": true
+          },
+          {
+            "validation": "Mandatory :: Leave type blank",
+            "weight": "high",
+            "covered": true
+          },
+          {
+            "validation": "Mandatory :: Reason blank",
+            "weight": "medium",
+            "covered": true
+          },
+          {
+            "validation": "Date rules :: End date before start date rejected",
+            "weight": "critical",
+            "covered": false
+          },
+          {
+            "validation": "Date rules :: Past date rejected",
+            "weight": "high",
+            "covered": false
+          },
+          {
+            "validation": "Date rules :: Overlapping leave rejected",
+            "weight": "high",
+            "covered": true
+          },
+          {
+            "validation": "Date rules :: Max consecutive days boundary",
+            "weight": "medium",
+            "covered": true
+          },
+          {
+            "validation": "Balance :: Sufficient balance allowed",
+            "weight": "high",
+            "covered": true
+          },
+          {
+            "validation": "Balance :: Insufficient balance rejected",
+            "weight": "critical",
+            "covered": false
+          },
+          {
+            "validation": "Balance :: Balance deducted on approval",
+            "weight": "high",
+            "covered": true
+          },
+          {
+            "validation": "Authorization :: Employee submits own request",
+            "weight": "medium",
+            "covered": false
+          },
+          {
+            "validation": "Authorization :: Cannot submit for others",
+            "weight": "high",
+            "covered": false
+          },
+          {
+            "validation": "Authorization :: Manager approves",
+            "weight": "high",
+            "covered": false
+          },
+          {
+            "validation": "Authorization :: Unauthorized approval blocked",
+            "weight": "high",
+            "covered": false
+          },
+          {
+            "validation": "Workflow :: Request routed to approver",
+            "weight": "high",
+            "covered": true
+          },
+          {
+            "validation": "Workflow :: Notification to manager",
+            "weight": "medium",
+            "covered": true
+          },
+          {
+            "validation": "Workflow :: Approval updates status",
+            "weight": "high",
+            "covered": true
+          },
+          {
+            "validation": "Workflow :: Rejection updates status",
+            "weight": "high",
+            "covered": true
+          },
+          {
+            "validation": "Workflow :: Cancellation",
+            "weight": "medium",
+            "covered": false
+          },
+          {
+            "validation": "Edge :: Leave spanning weekend / holiday",
+            "weight": "medium",
+            "covered": false
+          },
+          {
+            "validation": "Edge :: Concurrent requests",
+            "weight": "medium",
+            "covered": false
+          }
+        ]
+      }
+    ],
+    "earliestLoss": [
+      {
+        "validation": "Functional :: Half-day leave",
+        "weight": "medium",
+        "lostAtStage": "A. Classification (routed to 'crud', senior QA expects 'workflow' — wrong KB consulted)"
+      },
+      {
+        "validation": "Functional :: Multi-day leave",
+        "weight": "medium",
+        "lostAtStage": "A. Classification (routed to 'crud', senior QA expects 'workflow' — wrong KB consulted)"
+      },
+      {
+        "validation": "Mandatory :: Start date blank",
+        "weight": "high",
+        "lostAtStage": "C. Coverage selection (KB has it; default positive-only never emits it)"
+      },
+      {
+        "validation": "Mandatory :: End date blank",
+        "weight": "high",
+        "lostAtStage": "C. Coverage selection (KB has it; default positive-only never emits it)"
+      },
+      {
+        "validation": "Date rules :: End date before start date rejected",
+        "weight": "critical",
+        "lostAtStage": "A. Classification (routed to 'crud', senior QA expects 'workflow' — wrong KB consulted)"
+      },
+      {
+        "validation": "Date rules :: Past date rejected",
+        "weight": "high",
+        "lostAtStage": "A. Classification (routed to 'crud', senior QA expects 'workflow' — wrong KB consulted)"
+      },
+      {
+        "validation": "Date rules :: Overlapping leave rejected",
+        "weight": "high",
+        "lostAtStage": "C. Coverage selection (KB has it; default positive-only never emits it)"
+      },
+      {
+        "validation": "Date rules :: Max consecutive days boundary",
+        "weight": "medium",
+        "lostAtStage": "C. Coverage selection (KB has it; default positive-only never emits it)"
+      },
+      {
+        "validation": "Balance :: Insufficient balance rejected",
+        "weight": "critical",
+        "lostAtStage": "A. Classification (routed to 'crud', senior QA expects 'workflow' — wrong KB consulted)"
+      },
+      {
+        "validation": "Authorization :: Employee submits own request",
+        "weight": "medium",
+        "lostAtStage": "A. Classification (routed to 'crud', senior QA expects 'workflow' — wrong KB consulted)"
+      },
+      {
+        "validation": "Authorization :: Cannot submit for others",
+        "weight": "high",
+        "lostAtStage": "A. Classification (routed to 'crud', senior QA expects 'workflow' — wrong KB consulted)"
+      },
+      {
+        "validation": "Authorization :: Manager approves",
+        "weight": "high",
+        "lostAtStage": "A. Classification (routed to 'crud', senior QA expects 'workflow' — wrong KB consulted)"
+      },
+      {
+        "validation": "Authorization :: Unauthorized approval blocked",
+        "weight": "high",
+        "lostAtStage": "A. Classification (routed to 'crud', senior QA expects 'workflow' — wrong KB consulted)"
+      },
+      {
+        "validation": "Workflow :: Cancellation",
+        "weight": "medium",
+        "lostAtStage": "A. Classification (routed to 'crud', senior QA expects 'workflow' — wrong KB consulted)"
+      },
+      {
+        "validation": "Edge :: Leave spanning weekend / holiday",
+        "weight": "medium",
+        "lostAtStage": "A. Classification (routed to 'crud', senior QA expects 'workflow' — wrong KB consulted)"
+      },
+      {
+        "validation": "Edge :: Concurrent requests",
+        "weight": "medium",
+        "lostAtStage": "A. Classification (routed to 'crud', senior QA expects 'workflow' — wrong KB consulted)"
+      }
+    ]
+  },
+  {
+    "id": "password-reset",
+    "label": "Password Reset",
+    "requirement": {
+      "title": "Password Reset",
+      "description": "A user requests a password reset by entering their email. A time-limited, single-use reset link is emailed. Using the link, the user sets a new password (with confirmation) that must meet complexity rules. The old password is then invalid.",
+      "module": "Authentication",
+      "businessFlow": "User requests reset → email with token link → opens link → sets new password → confirms → logs in with new password",
+      "acceptanceCriteria": "Given a registered email, when a reset is requested, then a single-use, time-limited link is emailed without revealing whether the account exists; using a valid link the user can set a complexity-compliant new password and the old one stops working."
+    },
+    "classification": {
+      "category": "authentication",
+      "confidence": 1,
+      "matchedSignals": [
+        "authenticat",
+        "password"
+      ],
+      "expected": "authentication",
+      "correct": true
+    },
+    "stages": [
+      {
+        "stage": "1. Requirement Understanding",
+        "wired": false,
+        "input": {
+          "title": "Password Reset",
+          "description": "A user requests a password reset by entering their email. A time-limited, single-use reset link is emailed. Using the link, the user sets a new password (with confirmation) that must meet complexity rules. The old password is then invalid.",
+          "module": "Authentication",
+          "businessFlow": "User requests reset → email with token link → opens link → sets new password → confirms → logs in with new password",
+          "acceptanceCriteria": "Given a registered email, when a reset is requested, then a single-use, time-limited link is emailed without revealing whether the account exists; using a valid link the user can set a complexity-compliant new password and the old one stops working."
+        },
+        "output": {
+          "entities": [
+            "Reset"
+          ],
+          "actions": [
+            "Create"
+          ],
+          "fields": [
+            "Email",
+            "Password"
+          ],
+          "businessRules": [
+            null,
+            null,
+            null
+          ],
+          "confidence": 85
+        },
+        "newInformationAdded": [
+          "Workflow :: Reset email sent"
+        ],
+        "informationLost": []
+      },
+      {
+        "stage": "2. Validation Planning",
+        "wired": false,
+        "input": {
+          "entities": 1,
+          "fields": 2,
+          "rules": 3
+        },
+        "output": {
+          "capability": "Reset",
+          "complexity": "moderate",
+          "applicableDimensions": [
+            "functional",
+            "input_validation",
+            "boundary",
+            "security",
+            "data_integrity"
+          ],
+          "obligationCount": 12,
+          "obligations": [
+            "Successfully Create Reset with valid data",
+            "Reject malformed Email",
+            "Reject a too-weak Password",
+            "Enforce maximum Email length (254)",
+            "Enforce maximum Password length",
+            "Enforce minimum Password length",
+            "Neutralize SQL-like input in free-text fields",
+            "Neutralize template/command-like input in free-text fields",
+            "Neutralize script injection (XSS) in free-text fields",
+            "Preserve emoji / multibyte input in free-text fields",
+            "Preserve unicode/accented characters in free-text fields",
+            "Trim leading/trailing whitespace in free-text fields"
+          ]
+        },
+        "newInformationAdded": [
+          "Functional :: Request reset with valid email",
+          "Validation :: Invalid email format",
+          "Validation :: Password complexity enforced",
+          "Workflow :: Success confirmation",
+          "Edge :: Whitespace in email trimmed",
+          "Edge :: Very long password boundary"
+        ],
+        "informationLost": []
+      },
+      {
+        "stage": "3. Scenario Planner (LIVE)",
+        "wired": true,
+        "input": {
+          "category": "authentication",
+          "coverageTypes": [
+            "positive"
+          ],
+          "deep": false
+        },
+        "output": {
+          "category": "authentication",
+          "plannedCount": 10,
+          "byType": {
+            "positive": 8,
+            "boundary": 1,
+            "negative": 1
+          },
+          "scenarios": [
+            "Valid credentials log in successfully",
+            "A registered email, when a reset is requested, then…",
+            "A user requests a password reset by entering their…",
+            "Using the link, the user sets a new password…",
+            "The old password is then invalid",
+            "User requests reset",
+            "Email with token link",
+            "Opens link",
+            "Sets new password",
+            "Confirms"
+          ]
+        },
+        "newInformationAdded": [
+          "Functional :: Reset with valid token",
+          "Functional :: Login with new password",
+          "Mandatory :: Email blank",
+          "Mandatory :: Confirm password blank",
+          "Validation :: New password same as old rejected",
+          "Security :: Invalid token rejected",
+          "Security :: Reused / single-use token",
+          "Workflow :: Old password invalidated"
+        ],
+        "informationLost": [
+          "Edge :: Whitespace in email trimmed",
+          "Edge :: Very long password boundary"
+        ]
+      },
+      {
+        "stage": "4. LLM Prompt (LIVE)",
+        "wired": true,
+        "input": {
+          "plannedScenarios": 10
+        },
+        "output": {
+          "promptChars": 3542,
+          "instructsNoInvent": true,
+          "instructsNoDrop": true
+        },
+        "newInformationAdded": [
+          "Validation :: Unknown email (no enumeration)"
+        ],
+        "informationLost": []
+      },
+      {
+        "stage": "5. LLM Output (NOT executed)",
+        "wired": true,
+        "input": {
+          "note": "no live API/DB in harness"
+        },
+        "output": {
+          "note": "Prompt forbids add/drop, so Stage-3 plan is the coverage ceiling.",
+          "knownLeak": "resolveType() defaults an unlabelled/lost coverage-type link to 'positive' (test-coverage-engine ~L2399) → inflates positive count."
+        },
+        "newInformationAdded": [],
+        "informationLost": []
+      },
+      {
+        "stage": "6. Quality Validator (LIVE)",
+        "wired": true,
+        "input": {
+          "casesGraded": 10
+        },
+        "output": {
+          "riskScore": "LOW",
+          "passed": true,
+          "byFamily": {
+            "positive": 8,
+            "negative": 1,
+            "edge": 1,
+            "advanced": 0
+          },
+          "missingCategories": [],
+          "recommendations": [
+            "Balanced suite — no regeneration required."
+          ],
+          "regenerationGate": "buildQualityReport GRADES balance, but regeneration is behind GEN_QUALITY_REGEN (OFF by default) — measures the imbalance, ships it anyway."
+        },
+        "newInformationAdded": [],
+        "informationLost": []
+      }
+    ],
+    "gap": [
+      {
+        "mode": "default (positive only)",
+        "totalExpected": 21,
+        "covered": 13,
+        "missing": 8,
+        "coveragePercent": 62,
+        "criticalMissing": [
+          "Security :: Expired token rejected"
+        ],
+        "rows": [
+          {
+            "validation": "Functional :: Request reset with valid email",
+            "weight": "critical",
+            "covered": true
+          },
+          {
+            "validation": "Functional :: Reset with valid token",
+            "weight": "critical",
+            "covered": true
+          },
+          {
+            "validation": "Functional :: Login with new password",
+            "weight": "high",
+            "covered": true
+          },
+          {
+            "validation": "Mandatory :: Email blank",
+            "weight": "high",
+            "covered": true
+          },
+          {
+            "validation": "Mandatory :: New password blank",
+            "weight": "high",
+            "covered": false
+          },
+          {
+            "validation": "Mandatory :: Confirm password blank",
+            "weight": "medium",
+            "covered": true
+          },
+          {
+            "validation": "Validation :: Invalid email format",
+            "weight": "high",
+            "covered": true
+          },
+          {
+            "validation": "Validation :: Unknown email (no enumeration)",
+            "weight": "high",
+            "covered": false
+          },
+          {
+            "validation": "Validation :: Password / confirm mismatch",
+            "weight": "high",
+            "covered": false
+          },
+          {
+            "validation": "Validation :: Password complexity enforced",
+            "weight": "high",
+            "covered": true
+          },
+          {
+            "validation": "Validation :: New password same as old rejected",
+            "weight": "medium",
+            "covered": true
+          },
+          {
+            "validation": "Security :: Expired token rejected",
+            "weight": "critical",
+            "covered": false
+          },
+          {
+            "validation": "Security :: Invalid token rejected",
+            "weight": "high",
+            "covered": true
+          },
+          {
+            "validation": "Security :: Reused / single-use token",
+            "weight": "high",
+            "covered": true
+          },
+          {
+            "validation": "Security :: Rate limiting on requests",
+            "weight": "high",
+            "covered": false
+          },
+          {
+            "validation": "Security :: Session invalidated after reset",
+            "weight": "medium",
+            "covered": false
+          },
+          {
+            "validation": "Workflow :: Reset email sent",
+            "weight": "high",
+            "covered": true
+          },
+          {
+            "validation": "Workflow :: Success confirmation",
+            "weight": "medium",
+            "covered": true
+          },
+          {
+            "validation": "Workflow :: Old password invalidated",
+            "weight": "high",
+            "covered": true
+          },
+          {
+            "validation": "Edge :: Whitespace in email trimmed",
+            "weight": "medium",
+            "covered": false
+          },
+          {
+            "validation": "Edge :: Very long password boundary",
+            "weight": "medium",
+            "covered": false
+          }
+        ]
+      },
+      {
+        "mode": "full (all families + deep)",
+        "totalExpected": 21,
+        "covered": 17,
+        "missing": 4,
+        "coveragePercent": 81,
+        "criticalMissing": [
+          "Security :: Expired token rejected"
+        ],
+        "rows": [
+          {
+            "validation": "Functional :: Request reset with valid email",
+            "weight": "critical",
+            "covered": true
+          },
+          {
+            "validation": "Functional :: Reset with valid token",
+            "weight": "critical",
+            "covered": true
+          },
+          {
+            "validation": "Functional :: Login with new password",
+            "weight": "high",
+            "covered": true
+          },
+          {
+            "validation": "Mandatory :: Email blank",
+            "weight": "high",
+            "covered": true
+          },
+          {
+            "validation": "Mandatory :: New password blank",
+            "weight": "high",
+            "covered": true
+          },
+          {
+            "validation": "Mandatory :: Confirm password blank",
+            "weight": "medium",
+            "covered": true
+          },
+          {
+            "validation": "Validation :: Invalid email format",
+            "weight": "high",
+            "covered": true
+          },
+          {
+            "validation": "Validation :: Unknown email (no enumeration)",
+            "weight": "high",
+            "covered": true
+          },
+          {
+            "validation": "Validation :: Password / confirm mismatch",
+            "weight": "high",
+            "covered": false
+          },
+          {
+            "validation": "Validation :: Password complexity enforced",
+            "weight": "high",
+            "covered": true
+          },
+          {
+            "validation": "Validation :: New password same as old rejected",
+            "weight": "medium",
+            "covered": true
+          },
+          {
+            "validation": "Security :: Expired token rejected",
+            "weight": "critical",
+            "covered": false
+          },
+          {
+            "validation": "Security :: Invalid token rejected",
+            "weight": "high",
+            "covered": true
+          },
+          {
+            "validation": "Security :: Reused / single-use token",
+            "weight": "high",
+            "covered": true
+          },
+          {
+            "validation": "Security :: Rate limiting on requests",
+            "weight": "high",
+            "covered": false
+          },
+          {
+            "validation": "Security :: Session invalidated after reset",
+            "weight": "medium",
+            "covered": true
+          },
+          {
+            "validation": "Workflow :: Reset email sent",
+            "weight": "high",
+            "covered": true
+          },
+          {
+            "validation": "Workflow :: Success confirmation",
+            "weight": "medium",
+            "covered": true
+          },
+          {
+            "validation": "Workflow :: Old password invalidated",
+            "weight": "high",
+            "covered": true
+          },
+          {
+            "validation": "Edge :: Whitespace in email trimmed",
+            "weight": "medium",
+            "covered": true
+          },
+          {
+            "validation": "Edge :: Very long password boundary",
+            "weight": "medium",
+            "covered": false
+          }
+        ]
+      }
+    ],
+    "earliestLoss": [
+      {
+        "validation": "Mandatory :: New password blank",
+        "weight": "high",
+        "lostAtStage": "C. Coverage selection (KB has it; default positive-only never emits it)"
+      },
+      {
+        "validation": "Validation :: Unknown email (no enumeration)",
+        "weight": "high",
+        "lostAtStage": "C. Coverage selection (KB has it; default positive-only never emits it)"
+      },
+      {
+        "validation": "Validation :: Password / confirm mismatch",
+        "weight": "high",
+        "lostAtStage": "B. Scenario Planner / KB depth (correct category, but no such obligation in the KB)"
+      },
+      {
+        "validation": "Security :: Expired token rejected",
+        "weight": "critical",
+        "lostAtStage": "B. Scenario Planner / KB depth (correct category, but no such obligation in the KB)"
+      },
+      {
+        "validation": "Security :: Rate limiting on requests",
+        "weight": "high",
+        "lostAtStage": "B. Scenario Planner / KB depth (correct category, but no such obligation in the KB)"
+      },
+      {
+        "validation": "Security :: Session invalidated after reset",
+        "weight": "medium",
+        "lostAtStage": "C. Coverage selection (KB has it; default positive-only never emits it)"
+      },
+      {
+        "validation": "Edge :: Whitespace in email trimmed",
+        "weight": "medium",
+        "lostAtStage": "C. Coverage selection (KB has it; default positive-only never emits it)"
+      },
+      {
+        "validation": "Edge :: Very long password boundary",
+        "weight": "medium",
+        "lostAtStage": "B. Scenario Planner / KB depth (correct category, but no such obligation in the KB)"
+      }
+    ]
+  }
+]

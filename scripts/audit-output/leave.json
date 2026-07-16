@@ -1,0 +1,544 @@
+{
+  "id": "leave",
+  "label": "Leave Request",
+  "requirement": {
+    "title": "Submit Leave Request",
+    "description": "An employee submits a leave request selecting leave type, start date, end date and a reason. The request is validated against the leave balance and sent to the manager for approval. Approval or rejection updates the request status and notifies the employee.",
+    "module": "HR / Leave Management",
+    "businessFlow": "Employee fills leave form → validates dates and balance → submits → manager approves/rejects → status + notification",
+    "acceptanceCriteria": "Given an employee with sufficient balance, when a valid leave request is submitted, then it is created in Pending state, routed to the manager, and on approval the balance is deducted and the employee is notified."
+  },
+  "classification": {
+    "category": "crud",
+    "confidence": 0.8,
+    "matchedSignals": [
+      "form",
+      "submit"
+    ],
+    "expected": "workflow",
+    "correct": false
+  },
+  "stages": [
+    {
+      "stage": "1. Requirement Understanding",
+      "wired": false,
+      "input": {
+        "title": "Submit Leave Request",
+        "description": "An employee submits a leave request selecting leave type, start date, end date and a reason. The request is validated against the leave balance and sent to the manager for approval. Approval or rejection updates the request status and notifies the employee.",
+        "module": "HR / Leave Management",
+        "businessFlow": "Employee fills leave form → validates dates and balance → submits → manager approves/rejects → status + notification",
+        "acceptanceCriteria": "Given an employee with sufficient balance, when a valid leave request is submitted, then it is created in Pending state, routed to the manager, and on approval the balance is deducted and the employee is notified."
+      },
+      "output": {
+        "entities": [
+          "Leave"
+        ],
+        "actions": [
+          "Submit"
+        ],
+        "fields": [
+          "Manager",
+          "Status",
+          "Start Date"
+        ],
+        "businessRules": [
+          null
+        ],
+        "confidence": 87
+      },
+      "newInformationAdded": [
+        "Functional :: Submit valid leave request"
+      ],
+      "informationLost": []
+    },
+    {
+      "stage": "2. Validation Planning",
+      "wired": false,
+      "input": {
+        "entities": 1,
+        "fields": 3,
+        "rules": 1
+      },
+      "output": {
+        "capability": "Leave",
+        "complexity": "simple",
+        "applicableDimensions": [
+          "functional",
+          "input_validation",
+          "boundary"
+        ],
+        "obligationCount": 4,
+        "obligations": [
+          "Successfully Submit Leave with valid data",
+          "Reject malformed Start Date",
+          "Reject an out-of-set Status value",
+          "Enforce allowed Start Date range"
+        ]
+      },
+      "newInformationAdded": [
+        "Functional :: Multi-day leave",
+        "Date rules :: End date before start date rejected",
+        "Workflow :: Rejection updates status"
+      ],
+      "informationLost": []
+    },
+    {
+      "stage": "3. Scenario Planner (LIVE)",
+      "wired": true,
+      "input": {
+        "category": "crud",
+        "coverageTypes": [
+          "positive"
+        ],
+        "deep": false
+      },
+      "output": {
+        "category": "crud",
+        "plannedCount": 10,
+        "byType": {
+          "positive": 8,
+          "negative": 2
+        },
+        "scenarios": [
+          "Create a record with valid data",
+          "An employee with sufficient balance, when a valid leave…",
+          "An employee submits a leave request selecting leave type,…",
+          "The request is validated against the leave balance and…",
+          "Approval or rejection updates the request status and notifies…",
+          "Employee fills leave form",
+          "Validates dates and balance",
+          "Submits",
+          "Manager approves/rejects",
+          "Status + notification"
+        ]
+      },
+      "newInformationAdded": [
+        "Mandatory :: Leave type blank",
+        "Mandatory :: Reason blank",
+        "Balance :: Sufficient balance allowed",
+        "Balance :: Balance deducted on approval",
+        "Workflow :: Request routed to approver",
+        "Workflow :: Notification to manager",
+        "Workflow :: Approval updates status"
+      ],
+      "informationLost": [
+        "Functional :: Multi-day leave",
+        "Date rules :: End date before start date rejected"
+      ]
+    },
+    {
+      "stage": "4. LLM Prompt (LIVE)",
+      "wired": true,
+      "input": {
+        "plannedScenarios": 10
+      },
+      "output": {
+        "promptChars": 3666,
+        "instructsNoInvent": true,
+        "instructsNoDrop": true
+      },
+      "newInformationAdded": [
+        "Date rules :: Overlapping leave rejected",
+        "Date rules :: Max consecutive days boundary"
+      ],
+      "informationLost": []
+    },
+    {
+      "stage": "5. LLM Output (NOT executed)",
+      "wired": true,
+      "input": {
+        "note": "no live API/DB in harness"
+      },
+      "output": {
+        "note": "Prompt forbids add/drop, so Stage-3 plan is the coverage ceiling.",
+        "knownLeak": "resolveType() defaults an unlabelled/lost coverage-type link to 'positive' (test-coverage-engine ~L2399) → inflates positive count."
+      },
+      "newInformationAdded": [],
+      "informationLost": []
+    },
+    {
+      "stage": "6. Quality Validator (LIVE)",
+      "wired": true,
+      "input": {
+        "casesGraded": 10
+      },
+      "output": {
+        "riskScore": "LOW",
+        "passed": true,
+        "byFamily": {
+          "positive": 8,
+          "negative": 2,
+          "edge": 0,
+          "advanced": 0
+        },
+        "missingCategories": [],
+        "recommendations": [
+          "Balanced suite — no regeneration required."
+        ],
+        "regenerationGate": "buildQualityReport GRADES balance, but regeneration is behind GEN_QUALITY_REGEN (OFF by default) — measures the imbalance, ships it anyway."
+      },
+      "newInformationAdded": [],
+      "informationLost": []
+    }
+  ],
+  "gap": [
+    {
+      "mode": "default (positive only)",
+      "totalExpected": 25,
+      "covered": 9,
+      "missing": 16,
+      "coveragePercent": 36,
+      "criticalMissing": [
+        "Date rules :: End date before start date rejected",
+        "Balance :: Insufficient balance rejected"
+      ],
+      "rows": [
+        {
+          "validation": "Functional :: Submit valid leave request",
+          "weight": "critical",
+          "covered": true
+        },
+        {
+          "validation": "Functional :: Half-day leave",
+          "weight": "medium",
+          "covered": false
+        },
+        {
+          "validation": "Functional :: Multi-day leave",
+          "weight": "medium",
+          "covered": false
+        },
+        {
+          "validation": "Mandatory :: Start date blank",
+          "weight": "high",
+          "covered": false
+        },
+        {
+          "validation": "Mandatory :: End date blank",
+          "weight": "high",
+          "covered": false
+        },
+        {
+          "validation": "Mandatory :: Leave type blank",
+          "weight": "high",
+          "covered": true
+        },
+        {
+          "validation": "Mandatory :: Reason blank",
+          "weight": "medium",
+          "covered": true
+        },
+        {
+          "validation": "Date rules :: End date before start date rejected",
+          "weight": "critical",
+          "covered": false
+        },
+        {
+          "validation": "Date rules :: Past date rejected",
+          "weight": "high",
+          "covered": false
+        },
+        {
+          "validation": "Date rules :: Overlapping leave rejected",
+          "weight": "high",
+          "covered": false
+        },
+        {
+          "validation": "Date rules :: Max consecutive days boundary",
+          "weight": "medium",
+          "covered": false
+        },
+        {
+          "validation": "Balance :: Sufficient balance allowed",
+          "weight": "high",
+          "covered": true
+        },
+        {
+          "validation": "Balance :: Insufficient balance rejected",
+          "weight": "critical",
+          "covered": false
+        },
+        {
+          "validation": "Balance :: Balance deducted on approval",
+          "weight": "high",
+          "covered": true
+        },
+        {
+          "validation": "Authorization :: Employee submits own request",
+          "weight": "medium",
+          "covered": false
+        },
+        {
+          "validation": "Authorization :: Cannot submit for others",
+          "weight": "high",
+          "covered": false
+        },
+        {
+          "validation": "Authorization :: Manager approves",
+          "weight": "high",
+          "covered": false
+        },
+        {
+          "validation": "Authorization :: Unauthorized approval blocked",
+          "weight": "high",
+          "covered": false
+        },
+        {
+          "validation": "Workflow :: Request routed to approver",
+          "weight": "high",
+          "covered": true
+        },
+        {
+          "validation": "Workflow :: Notification to manager",
+          "weight": "medium",
+          "covered": true
+        },
+        {
+          "validation": "Workflow :: Approval updates status",
+          "weight": "high",
+          "covered": true
+        },
+        {
+          "validation": "Workflow :: Rejection updates status",
+          "weight": "high",
+          "covered": true
+        },
+        {
+          "validation": "Workflow :: Cancellation",
+          "weight": "medium",
+          "covered": false
+        },
+        {
+          "validation": "Edge :: Leave spanning weekend / holiday",
+          "weight": "medium",
+          "covered": false
+        },
+        {
+          "validation": "Edge :: Concurrent requests",
+          "weight": "medium",
+          "covered": false
+        }
+      ]
+    },
+    {
+      "mode": "full (all families + deep)",
+      "totalExpected": 25,
+      "covered": 13,
+      "missing": 12,
+      "coveragePercent": 52,
+      "criticalMissing": [
+        "Date rules :: End date before start date rejected",
+        "Balance :: Insufficient balance rejected"
+      ],
+      "rows": [
+        {
+          "validation": "Functional :: Submit valid leave request",
+          "weight": "critical",
+          "covered": true
+        },
+        {
+          "validation": "Functional :: Half-day leave",
+          "weight": "medium",
+          "covered": false
+        },
+        {
+          "validation": "Functional :: Multi-day leave",
+          "weight": "medium",
+          "covered": false
+        },
+        {
+          "validation": "Mandatory :: Start date blank",
+          "weight": "high",
+          "covered": true
+        },
+        {
+          "validation": "Mandatory :: End date blank",
+          "weight": "high",
+          "covered": true
+        },
+        {
+          "validation": "Mandatory :: Leave type blank",
+          "weight": "high",
+          "covered": true
+        },
+        {
+          "validation": "Mandatory :: Reason blank",
+          "weight": "medium",
+          "covered": true
+        },
+        {
+          "validation": "Date rules :: End date before start date rejected",
+          "weight": "critical",
+          "covered": false
+        },
+        {
+          "validation": "Date rules :: Past date rejected",
+          "weight": "high",
+          "covered": false
+        },
+        {
+          "validation": "Date rules :: Overlapping leave rejected",
+          "weight": "high",
+          "covered": true
+        },
+        {
+          "validation": "Date rules :: Max consecutive days boundary",
+          "weight": "medium",
+          "covered": true
+        },
+        {
+          "validation": "Balance :: Sufficient balance allowed",
+          "weight": "high",
+          "covered": true
+        },
+        {
+          "validation": "Balance :: Insufficient balance rejected",
+          "weight": "critical",
+          "covered": false
+        },
+        {
+          "validation": "Balance :: Balance deducted on approval",
+          "weight": "high",
+          "covered": true
+        },
+        {
+          "validation": "Authorization :: Employee submits own request",
+          "weight": "medium",
+          "covered": false
+        },
+        {
+          "validation": "Authorization :: Cannot submit for others",
+          "weight": "high",
+          "covered": false
+        },
+        {
+          "validation": "Authorization :: Manager approves",
+          "weight": "high",
+          "covered": false
+        },
+        {
+          "validation": "Authorization :: Unauthorized approval blocked",
+          "weight": "high",
+          "covered": false
+        },
+        {
+          "validation": "Workflow :: Request routed to approver",
+          "weight": "high",
+          "covered": true
+        },
+        {
+          "validation": "Workflow :: Notification to manager",
+          "weight": "medium",
+          "covered": true
+        },
+        {
+          "validation": "Workflow :: Approval updates status",
+          "weight": "high",
+          "covered": true
+        },
+        {
+          "validation": "Workflow :: Rejection updates status",
+          "weight": "high",
+          "covered": true
+        },
+        {
+          "validation": "Workflow :: Cancellation",
+          "weight": "medium",
+          "covered": false
+        },
+        {
+          "validation": "Edge :: Leave spanning weekend / holiday",
+          "weight": "medium",
+          "covered": false
+        },
+        {
+          "validation": "Edge :: Concurrent requests",
+          "weight": "medium",
+          "covered": false
+        }
+      ]
+    }
+  ],
+  "earliestLoss": [
+    {
+      "validation": "Functional :: Half-day leave",
+      "weight": "medium",
+      "lostAtStage": "A. Classification (routed to 'crud', senior QA expects 'workflow' — wrong KB consulted)"
+    },
+    {
+      "validation": "Functional :: Multi-day leave",
+      "weight": "medium",
+      "lostAtStage": "A. Classification (routed to 'crud', senior QA expects 'workflow' — wrong KB consulted)"
+    },
+    {
+      "validation": "Mandatory :: Start date blank",
+      "weight": "high",
+      "lostAtStage": "C. Coverage selection (KB has it; default positive-only never emits it)"
+    },
+    {
+      "validation": "Mandatory :: End date blank",
+      "weight": "high",
+      "lostAtStage": "C. Coverage selection (KB has it; default positive-only never emits it)"
+    },
+    {
+      "validation": "Date rules :: End date before start date rejected",
+      "weight": "critical",
+      "lostAtStage": "A. Classification (routed to 'crud', senior QA expects 'workflow' — wrong KB consulted)"
+    },
+    {
+      "validation": "Date rules :: Past date rejected",
+      "weight": "high",
+      "lostAtStage": "A. Classification (routed to 'crud', senior QA expects 'workflow' — wrong KB consulted)"
+    },
+    {
+      "validation": "Date rules :: Overlapping leave rejected",
+      "weight": "high",
+      "lostAtStage": "C. Coverage selection (KB has it; default positive-only never emits it)"
+    },
+    {
+      "validation": "Date rules :: Max consecutive days boundary",
+      "weight": "medium",
+      "lostAtStage": "C. Coverage selection (KB has it; default positive-only never emits it)"
+    },
+    {
+      "validation": "Balance :: Insufficient balance rejected",
+      "weight": "critical",
+      "lostAtStage": "A. Classification (routed to 'crud', senior QA expects 'workflow' — wrong KB consulted)"
+    },
+    {
+      "validation": "Authorization :: Employee submits own request",
+      "weight": "medium",
+      "lostAtStage": "A. Classification (routed to 'crud', senior QA expects 'workflow' — wrong KB consulted)"
+    },
+    {
+      "validation": "Authorization :: Cannot submit for others",
+      "weight": "high",
+      "lostAtStage": "A. Classification (routed to 'crud', senior QA expects 'workflow' — wrong KB consulted)"
+    },
+    {
+      "validation": "Authorization :: Manager approves",
+      "weight": "high",
+      "lostAtStage": "A. Classification (routed to 'crud', senior QA expects 'workflow' — wrong KB consulted)"
+    },
+    {
+      "validation": "Authorization :: Unauthorized approval blocked",
+      "weight": "high",
+      "lostAtStage": "A. Classification (routed to 'crud', senior QA expects 'workflow' — wrong KB consulted)"
+    },
+    {
+      "validation": "Workflow :: Cancellation",
+      "weight": "medium",
+      "lostAtStage": "A. Classification (routed to 'crud', senior QA expects 'workflow' — wrong KB consulted)"
+    },
+    {
+      "validation": "Edge :: Leave spanning weekend / holiday",
+      "weight": "medium",
+      "lostAtStage": "A. Classification (routed to 'crud', senior QA expects 'workflow' — wrong KB consulted)"
+    },
+    {
+      "validation": "Edge :: Concurrent requests",
+      "weight": "medium",
+      "lostAtStage": "A. Classification (routed to 'crud', senior QA expects 'workflow' — wrong KB consulted)"
+    }
+  ]
+}
