@@ -11,6 +11,23 @@
  */
 
 /**
+ * A single expected behavior paired with the requirement's linked test case(s)
+ * that specify it. This is how the caller binds a behavior label to its source
+ * test case UP FRONT — at the boundary where both the label and the test case
+ * id are already known — so no fuzzy title matching is ever needed later.
+ */
+export interface ExpectedBehavior {
+  /** The behavior/flow label (same role as an entry in `expectedFlows`). */
+  label: string;
+  /**
+   * The requirement's linked test case id(s) that specify this behavior. May be
+   * empty when the caller has a label but no bound test case; the engine still
+   * classifies the behavior, it just emits an empty-id slice for it.
+   */
+  testCaseIds?: string[];
+}
+
+/**
  * The minimal requirement shape this engine needs. Callers (Requirements
  * module, Release Center, etc.) adapt their own richer requirement records down
  * to this. Only `id` and `title` are required; the optional hints sharpen the
@@ -28,6 +45,20 @@ export interface RequirementInput {
    * single expected behavior.
    */
   expectedFlows?: string[];
+  /**
+   * Structured expected behaviors, each paired with the requirement's linked
+   * test case id(s) that specify it. PREFERRED over `expectedFlows` when the
+   * caller knows which test case backs each behavior (e.g. the Script Gen route,
+   * which loads a requirement's linked test cases). When provided, the engine
+   * carries those ids through into `coveredSlices` / `missingSlices`, so the
+   * EXTEND path can slice generation down to exactly the MISSING behaviors'
+   * test cases WITHOUT any title/string matching downstream.
+   *
+   * Fully backward compatible: when omitted, `expectedFlows` (or the title) is
+   * used and the emitted slices simply carry empty `testCaseIds`. When both are
+   * given, `behaviors` wins.
+   */
+  behaviors?: ExpectedBehavior[];
   /** Pages/screens the requirement touches, if known. */
   pages?: string[];
   /** Free-form tags, if any. */
@@ -55,6 +86,20 @@ export interface BehaviorMatch {
 }
 
 /**
+ * A flow bucketed by the coverage verdict, carrying the requirement's linked
+ * test case id(s) that specify it. This is the structure the EXTEND path reads:
+ * `missingSlices` gives it the EXACT test cases to generate, by id — no title
+ * matching, no re-derivation. `testCaseIds` is empty when the caller provided
+ * only `expectedFlows` (no test-case bindings).
+ */
+export interface CoverageSlice {
+  /** The expected behavior label. */
+  flow: string;
+  /** The requirement's linked test case id(s) for this behavior. */
+  testCaseIds: string[];
+}
+
+/**
  * The verdict for one requirement against the Coverage Model.
  */
 export interface RequirementCoverage {
@@ -66,6 +111,17 @@ export interface RequirementCoverage {
   coveredFlows: string[];
   /** The requirement's expected behaviors that are NOT covered. */
   missingFlows: string[];
+  /**
+   * `coveredFlows`, each paired with its linked test case id(s). Same order as
+   * `coveredFlows`; `flow` values are identical. Carries the bindings the EXTEND
+   * path needs so it never has to re-match a flow to a test case by title.
+   */
+  coveredSlices: CoverageSlice[];
+  /**
+   * `missingFlows`, each paired with its linked test case id(s). The EXTEND path
+   * generates EXACTLY these test cases. Same order as `missingFlows`.
+   */
+  missingSlices: CoverageSlice[];
   /**
    * Confidence in this classification, 0-100. High when matches are strong
    * (flow/business-action) or when a "missing" verdict is unambiguous; lower
