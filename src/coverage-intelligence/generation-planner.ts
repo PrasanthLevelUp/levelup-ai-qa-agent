@@ -3,15 +3,15 @@
  * ============================================================================
  *
  * THE JOB (and ONLY this job for CI-3):
- *   Route planned scenarios into the three buckets (reuse, extend, generate)
- *   and produce the **Generation Plan** — the stable contract between Coverage
+ *   Route planned scenarios into the three buckets (skip, extend, generate)
+ *   and produce the **Generation Plan** — the stable contract between Generation
  *   Intelligence and Script Generation.
  *
  * Input: Planned scenarios + Repository Profile
  * Output:
  *
  *     {
- *       "reuse": [...],       // Existing tests fully cover these — skip generation
+ *       "skip": [...],        // Existing tests fully cover these — nothing to do
  *       "extend": [...],      // Partial matches — extend existing tests
  *       "generate": [...],    // No matches — new coverage
  *       "generationQueue": [extend + generate]  // The work Script Gen must do
@@ -19,7 +19,7 @@
  *
  * ARCHITECTURAL MILESTONE:
  *   After CI-3, Script Generation NEVER asks "Should I generate this?"
- *   Coverage Intelligence owns that decision. Script Generation ONLY generates
+ *   Generation Intelligence owns that decision. Script Generation ONLY generates
  *   the work items in generationQueue. This is the routing layer that separates
  *   "what to generate" from "how to generate."
  *
@@ -60,15 +60,15 @@ export interface GenerationPlanItem {
  * Coverage Intelligence and Script Generation.
  */
 export interface GenerationPlan {
-  /** Existing tests fully cover these scenarios → skip generation, reuse them. */
-  reuse: GenerationPlanItem[];
+  /** Existing tests fully cover these scenarios → nothing to generate, skip. */
+  skip: GenerationPlanItem[];
   /** Partial matches → extend the existing tests rather than duplicate. */
   extend: GenerationPlanItem[];
   /** No matching tests → this is new coverage, generate it. */
   generate: GenerationPlanItem[];
   /**
    * The work Script Generation must do = extend + generate.
-   * Script Generation ONLY touches this queue. It never decides reuse on its own.
+   * Script Generation ONLY touches this queue. It never decides to skip on its own.
    */
   generationQueue: GenerationPlanItem[];
 }
@@ -101,7 +101,7 @@ export function buildGenerationPlan(
   }
 
   // Partition by recommendation
-  const reuse: GenerationPlanItem[] = [];
+  const skip: GenerationPlanItem[] = [];
   const extend: GenerationPlanItem[] = [];
   const generate: GenerationPlanItem[] = [];
 
@@ -127,8 +127,8 @@ export function buildGenerationPlan(
     const item: GenerationPlanItem = { scenario, coverage };
 
     switch (coverage.recommendation) {
-      case GenerationDecision.REUSE:
-        reuse.push(item);
+      case GenerationDecision.SKIP:
+        skip.push(item);
         break;
       case GenerationDecision.EXTEND:
         extend.push(item);
@@ -142,7 +142,7 @@ export function buildGenerationPlan(
   // The generation queue is extend + generate (the work Script Gen must do)
   const generationQueue = [...extend, ...generate];
 
-  return { reuse, extend, generate, generationQueue };
+  return { skip, extend, generate, generationQueue };
 }
 
 /* ------------------------------------------------------------------ */
@@ -156,7 +156,7 @@ export function buildGenerationPlan(
  *
  *     Generation Plan
  *       12 Planned
- *        8 Reuse
+ *        8 Skip
  *        2 Extend
  *        2 Generate
  *       ---
@@ -166,9 +166,9 @@ export function formatGenerationPlan(plan: GenerationPlan): string {
   const lines: string[] = ['Generation Plan'];
   const pad = (n: number) => n.toString().padStart(3);
 
-  const planned = plan.reuse.length + plan.extend.length + plan.generate.length;
+  const planned = plan.skip.length + plan.extend.length + plan.generate.length;
   lines.push(`  ${pad(planned)} Planned`);
-  lines.push(`  ${pad(plan.reuse.length)} Reuse`);
+  lines.push(`  ${pad(plan.skip.length)} Skip`);
   lines.push(`  ${pad(plan.extend.length)} Extend`);
   lines.push(`  ${pad(plan.generate.length)} Generate`);
   lines.push(`  ---`);
