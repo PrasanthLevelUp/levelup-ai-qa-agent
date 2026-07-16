@@ -12,7 +12,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { RepositoryContextEngine } from '../../src/context/repository-context-engine';
-import type { TestInventoryEntry } from '../../src/context/types';
+import type { TestInventoryEntry, CoverageSummaryEntry } from '../../src/context/types';
 
 const tmpRoots: string[] = [];
 
@@ -30,6 +30,11 @@ function makeRepo(files: Record<string, string>): string {
 function scan(files: Record<string, string>): TestInventoryEntry[] {
   const root = makeRepo(files);
   return new RepositoryContextEngine().scan(root).profile.testInventory;
+}
+
+function scanCoverage(files: Record<string, string>): CoverageSummaryEntry[] {
+  const root = makeRepo(files);
+  return new RepositoryContextEngine().scan(root).profile.coverageSummary;
 }
 
 afterAll(() => {
@@ -172,5 +177,67 @@ describe('Repository Test Inventory (RCI-1)', () => {
       'src/util.ts': `export function add(a: number, b: number) { return a + b; }`,
     });
     expect(inv).toHaveLength(0);
+  });
+});
+
+describe('Coverage Summary (per-feature rollup)', () => {
+  it('rolls tests up by feature with counts, percentage and avg confidence', () => {
+    const cov = scanCoverage({
+      'package.json': PKG,
+      'tests/login.spec.ts': `
+        import { test, expect } from '@playwright/test';
+        test.describe('Authentication', () => {
+          test('valid login', async ({ page }) => { await expect(page).toHaveURL('/home'); });
+          test('invalid login', async ({ page }) => { await expect(page).toHaveText('error'); });
+          test('locked user', async ({ page }) => { await expect(page).toBeVisible(); });
+        });`,
+      'tests/checkout.spec.ts': `
+        import { test, expect } from '@playwright/test';
+        test.describe('Checkout', () => {
+          test('checkout with card', async ({ page }) => { await expect(page).toHaveURL('/done'); });
+        });`,
+    });
+
+    // Sorted by testCount desc → Authentication (3) before Checkout (1).
+    expect(cov.map((c) => c.feature)).toEqual(['Authentication', 'Checkout']);
+    expect(cov[0].testCount).toBe(3);
+    expect(cov[1].testCount).toBe(1);
+
+    // Percentages are of the 4-test total and sum back to 100.
+    expect(cov[0].percentage).toBe(75);
+    expect(cov[1].percentage).toBe(25);
+    expect(cov.reduce((s, c) => s + c.percentage, 0)).toBe(100);
+
+    // avgConfidence is a bounded mean.
+    for (const c of cov) {
+      expect(c.avgConfidence).toBeGreaterThanOrEqual(0);
+      expect(c.avgConfidence).toBeLessThanOrEqual(100);
+    }
+  });
+
+  it('is deterministic and total test counts match the inventory length', () => {
+    const files = {
+      'package.json': PKG,
+      'tests/a.spec.ts': `
+        import { test, expect } from '@playwright/test';
+        test.describe('Cart', () => {
+          test('add item', async ({ page }) => { await expect(page).toBeVisible(); });
+          test('remove item', async ({ page }) => { await expect(page).toBeVisible(); });
+        });`,
+    };
+    const first = scanCoverage(files);
+    const second = scanCoverage(files);
+    expect(JSON.stringify(first)).toBe(JSON.stringify(second));
+
+    const invCount = scan(files).length;
+    expect(first.reduce((s, c) => s + c.testCount, 0)).toBe(invCount);
+  });
+
+  it('is empty for a repo with no tests', () => {
+    const cov = scanCoverage({
+      'package.json': PKG,
+      'src/util.ts': `export function add(a: number, b: number) { return a + b; }`,
+    });
+    expect(cov).toHaveLength(0);
   });
 });

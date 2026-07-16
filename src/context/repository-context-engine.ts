@@ -27,6 +27,7 @@ import type {
   BusinessFlow,
   TestSuiteInfo,
   TestInventoryEntry,
+  CoverageSummaryEntry,
   TestFramework,
   Language,
   TestPattern,
@@ -880,6 +881,39 @@ function extractTestInventory(analyses: FileAnalysis[], framework: TestFramework
 }
 
 /* ------------------------------------------------------------------ */
+/*  Coverage Summary (per-feature rollup of the Test Inventory)        */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Deterministic aggregation of the Test Inventory into per-feature counts.
+ * Answers "where is this repo heavily tested vs sparse?" with NO requirements
+ * data and NO AI — it is the bridge into Coverage Intelligence (RCI-2).
+ * Sorted by testCount desc, then feature name asc for stable output.
+ */
+function buildCoverageSummary(inventory: TestInventoryEntry[]): CoverageSummaryEntry[] {
+  if (inventory.length === 0) return [];
+
+  const groups = new Map<string, { count: number; confidenceSum: number }>();
+  for (const t of inventory) {
+    const feature = t.feature && t.feature.trim() ? t.feature : 'Uncategorized';
+    const g = groups.get(feature) || { count: 0, confidenceSum: 0 };
+    g.count += 1;
+    g.confidenceSum += t.confidence;
+    groups.set(feature, g);
+  }
+
+  const total = inventory.length;
+  return Array.from(groups.entries())
+    .map(([feature, g]) => ({
+      feature,
+      testCount: g.count,
+      percentage: Math.round((g.count / total) * 100),
+      avgConfidence: Math.round(g.confidenceSum / g.count),
+    }))
+    .sort((a, b) => b.testCount - a.testCount || a.feature.localeCompare(b.feature));
+}
+
+/* ------------------------------------------------------------------ */
 /*  Test Suite Extraction                                              */
 /* ------------------------------------------------------------------ */
 
@@ -1384,6 +1418,9 @@ export class RepositoryContextEngine {
     // Repository Test Inventory (Sprint RCI-1): per-test, classified, from the
     // same AST pass. One scan → one more profile output.
     const testInventory = extractTestInventory(analyses, framework);
+    // Coverage Summary: deterministic per-feature rollup of the inventory —
+    // "where is this repo heavily tested vs sparse?" (no requirements yet).
+    const coverageSummary = buildCoverageSummary(testInventory);
     const preferredLocators = analyzePreferredLocators(repoRoot, analyses);
     const dependencies = detectDependencies(repoRoot);
     const ciIntegration = detectCI(repoRoot);
@@ -1479,6 +1516,7 @@ export class RepositoryContextEngine {
       businessFlows,
       testSuites,
       testInventory,
+      coverageSummary,
       preferredLocators,
       avoidPatterns: locatorStrategy === 'data-testid' ? ['xpath', 'css-class-only'] : [],
       dependencies,
@@ -1504,6 +1542,7 @@ export class RepositoryContextEngine {
       flows: profile.businessFlows.length,
       suites: profile.testSuites.length,
       inventoryTests: profile.testInventory.length,
+      coverageFeatures: profile.coverageSummary.length,
       chunks: chunks.length,
       durationMs,
     });
