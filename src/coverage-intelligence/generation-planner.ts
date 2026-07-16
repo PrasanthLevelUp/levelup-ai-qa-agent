@@ -37,7 +37,7 @@ import {
   type ScenarioCoverage,
   type DiscoveryOptions,
 } from './existing-test-discovery';
-import { CoverageDecision } from './types';
+import { GenerationDecision } from './types';
 import type { RepositoryProfile } from '../context/types';
 
 /* ------------------------------------------------------------------ */
@@ -115,7 +115,7 @@ export function buildGenerationPlan(
         status: 'missing',
         confidence: 0,
         existingTest: null,
-        recommendation: CoverageDecision.GENERATE,
+        recommendation: GenerationDecision.GENERATE,
         matchedOn: [],
         reason: 'No coverage decision available (internal error).',
         alternatives: [],
@@ -127,13 +127,13 @@ export function buildGenerationPlan(
     const item: GenerationPlanItem = { scenario, coverage };
 
     switch (coverage.recommendation) {
-      case CoverageDecision.REUSE:
+      case GenerationDecision.REUSE:
         reuse.push(item);
         break;
-      case CoverageDecision.EXTEND:
+      case GenerationDecision.EXTEND:
         extend.push(item);
         break;
-      case CoverageDecision.GENERATE:
+      case GenerationDecision.GENERATE:
         generate.push(item);
         break;
     }

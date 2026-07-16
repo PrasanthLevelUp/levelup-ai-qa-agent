@@ -70,6 +70,7 @@ function sauceDemoProfile(): RepositoryProfile {
     hasApiLayer: false, hasCustomFixtures: true, hasMocking: false, hasVisualTesting: false, ciIntegration: null,
     testInventory: [],
     coverageSummary: [],
+    coverageModel: [],
   };
 }
 
