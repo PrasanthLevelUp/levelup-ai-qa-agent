@@ -63,6 +63,8 @@ describe('RequirementIntelligenceService (RIF)', () => {
     const intel = service.analyze(req, MODELS);
     expect(intel.coverage.status).toBe('COVERED');
     expect(intel.generation).toBe(GenerationDecision.SKIP);
+    // A confident, fully-covered requirement is skipped with no override reasons.
+    expect(intel.generationReasons).toEqual([]);
   });
 
   it('composes a PARTIAL requirement into generation EXTEND', () => {
@@ -108,7 +110,7 @@ describe('RequirementIntelligenceService (RIF)', () => {
 
   it('honors an injected custom policy over the default', () => {
     // A policy that always SKIPs, regardless of the (MISSING) coverage.
-    const alwaysSkip: GenerationPolicy = { decide: () => GenerationDecision.SKIP };
+    const alwaysSkip: GenerationPolicy = { decide: () => ({ decision: GenerationDecision.SKIP, reasons: [] }) };
     const custom = new RequirementIntelligenceService(alwaysSkip);
     const req: RequirementInput = {
       id: 'REQ-3',
@@ -119,6 +121,25 @@ describe('RequirementIntelligenceService (RIF)', () => {
     const intel = custom.analyze(req, MODELS);
     expect(intel.coverage.status).toBe('MISSING'); // coverage is unchanged (a fact)
     expect(intel.generation).toBe(GenerationDecision.SKIP); // policy overrode the routing
+  });
+
+  it('forwards the policy\'s override reasons as generationReasons', () => {
+    // A low-confidence downgrade: the policy returns EXTEND + ['Low confidence'];
+    // the service must forward those reasons untouched (it never re-derives them).
+    const downgrade: GenerationPolicy = {
+      decide: () => ({ decision: GenerationDecision.EXTEND, reasons: ['Low confidence'] }),
+    };
+    const custom = new RequirementIntelligenceService(downgrade);
+    const req: RequirementInput = {
+      id: 'REQ-1',
+      title: 'User authentication',
+      feature: 'Authentication',
+      expectedFlows: ['valid user can sign in', 'locked out user sees error'],
+    };
+    const intel = custom.analyze(req, MODELS);
+    expect(intel.coverage.status).toBe('COVERED'); // coverage is unchanged (a fact)
+    expect(intel.generation).toBe(GenerationDecision.EXTEND); // policy downgraded it
+    expect(intel.generationReasons).toEqual(['Low confidence']);
   });
 
   it('is deterministic — the same inputs always yield the same intelligence', () => {
