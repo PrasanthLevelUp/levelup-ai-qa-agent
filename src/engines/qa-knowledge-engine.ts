@@ -640,6 +640,11 @@ export const QA_KNOWLEDGE_BASE: Record<Exclude<QACategory, 'generic'>, PlannedSc
     // positive-only run does not (no invention).
     { id: 'crud-neg-whitespace-only', title: 'Whitespace-only required fields are rejected', objective: 'A required field containing only spaces/tabs is treated as blank and blocked (input is trimmed before validation).', coverageType: 'negative', priority: 'P1', riskArea: 'Input validation' },
     { id: 'crud-neg-unauthorized', title: 'Unauthorized user cannot perform the operation', objective: 'A user without the required permission is blocked from create/update/delete with a forbidden/access-denied response — no partial write occurs.', coverageType: 'negative', priority: 'P1', riskArea: 'Authorization' },
+    // ── Injection / input-security obligations a senior QA always writes for any
+    // form that accepts free-text or an identifier. Universal to CRUD (not gated):
+    // every create/update surface with a text or ID field warrants injection testing. ──
+    { id: 'crud-neg-injection-sql', title: 'SQL-injection input is rejected safely', objective: 'A SQL injection string entered in a text field or the ID field is treated as ordinary invalid input — never executed as a query — and no record is created or exposed.', coverageType: 'negative', priority: 'P1', riskArea: 'Security / injection' },
+    { id: 'crud-neg-injection-xss', title: 'XSS / script payload is escaped, not executed', objective: 'A cross-site scripting (XSS) script payload or HTML markup injection entered in a field is stored escaped and never executed as script or markup when the value is later displayed.', coverageType: 'negative', priority: 'P1', riskArea: 'Security / injection' },
     // Post-write workflow: a created record must be persisted AND discoverable.
     { id: 'crud-pos-searchable', title: 'Created record is immediately searchable', objective: 'After a successful create the new record is findable straight away — searchable by ID and by name — with no reindex delay.', coverageType: 'positive', priority: 'P1', riskArea: 'Data retrieval / workflow', conditionalOnKeywords: ['search', 'searchable', 'find', 'lookup', 'list', 'directory'] },
     // ── File / attachment upload surface — gated so it only appears for features
