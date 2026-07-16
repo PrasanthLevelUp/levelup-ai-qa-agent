@@ -64,6 +64,11 @@ import { RequirementIntelligenceService } from '../../requirement-intelligence/r
 import { ScriptGenerationConsumer } from '../../requirement-intelligence/script-generation-consumer';
 import { buildGenerationPlanView, type GenerationPlanView } from '../../requirement-intelligence/generation-plan-view';
 import {
+  savePlan as saveGenerationPlan,
+  getPlan as getGenerationPlan,
+  planFingerprint,
+} from '../../requirement-intelligence/generation-plan-store';
+import {
   resolveRequirementIntelligenceMode,
   isIntelligenceComputed,
   isIntelligenceControlling,
@@ -225,8 +230,11 @@ export function createScriptGenRouter(): Router {
               : 'No existing automation was found for this requirement. All requested flows will be generated.',
           hasCoverageModel: coverageModel.length > 0,
         };
+        // No frozen intelligence was computed (GENERATE-all fallback), so there
+        // is nothing to reuse at execution — /generate will run its normal path.
         return res.status(200).json({
           success: true,
+          planId: null,
           plan: view,
           requirementId: requirementId != null ? String(requirementId) : null,
         });
@@ -251,9 +259,25 @@ export function createScriptGenRouter(): Router {
       const plan = new ScriptGenerationConsumer().plan(intelligence);
       const view = buildGenerationPlanView(plan, intelligence, coverageModel);
 
+      // Cache the FROZEN artifacts under a planId so approval → execution reuses
+      // this single analysis (see generation-plan-store). The fingerprint binds
+      // the plan to exactly the request it describes.
+      const planId = saveGenerationPlan({
+        fingerprint: planFingerprint({
+          requirementId,
+          testCaseId,
+          repoId,
+          testCaseIds: scopedCases.map((tc) => tc.id),
+        }),
+        intelligence,
+        plan,
+        view,
+      });
+
       console.log(
         '[ScriptGen] 🧭 Generation Plan',
         JSON.stringify({
+          planId,
           requirementId: reqInput.id,
           decision: view.decision,
           repositoryCoverage: view.repositoryCoverage,
@@ -266,6 +290,7 @@ export function createScriptGenRouter(): Router {
 
       return res.status(200).json({
         success: true,
+        planId,
         plan: view,
         requirementId: reqInput.id,
       });
@@ -302,6 +327,10 @@ export function createScriptGenRouter(): Router {
         // (one explicit "Create Profile" action = one profile).
         persistProfile,
         testCaseId,
+        // Approved Generation Plan id (from POST /plan). When present + still
+        // valid, generation EXECUTES that already-computed plan instead of
+        // re-running the intelligence pipeline — one analysis, one execution.
+        planId,
         // ── Sprint 4: Enterprise Script Generation Enhancement ──
         requirementId,
         // Inline structured test cases from a CSV/Excel upload (no DB row). When
@@ -874,12 +903,30 @@ export function createScriptGenRouter(): Router {
             behaviors,
           };
 
-          const intelligence = new RequirementIntelligenceService().analyze(
-            reqInput,
-            repoProfile.coverageModel,
-          );
-          const plan = new ScriptGenerationConsumer().plan(intelligence);
-          riTelemetry = { ...plan.telemetry };
+          // Reuse the APPROVED plan when the request carries a valid planId that
+          // fingerprint-matches this request — the analysis already happened at
+          // /plan time (one analysis, one execution). Otherwise analyze now.
+          const approved = getGenerationPlan(planId);
+          const fingerprintNow = planFingerprint({
+            requirementId,
+            testCaseId,
+            repoId,
+            testCaseIds: requirementTestCases.map((tc) => tc.id),
+          });
+          const reusedApprovedPlan = !!approved && approved.fingerprint === fingerprintNow;
+
+          const intelligence =
+            reusedApprovedPlan && approved
+              ? approved.intelligence
+              : new RequirementIntelligenceService().analyze(reqInput, repoProfile.coverageModel);
+          const plan =
+            reusedApprovedPlan && approved
+              ? approved.plan
+              : new ScriptGenerationConsumer().plan(intelligence);
+          riTelemetry = { ...plan.telemetry, reusedApprovedPlan };
+          if (reusedApprovedPlan) {
+            console.log(`[ScriptGen] ✅ Executing approved Generation Plan planId=${planId}`);
+          }
 
           // Always log in shadow AND enabled — this is the measurement window.
           console.log(
