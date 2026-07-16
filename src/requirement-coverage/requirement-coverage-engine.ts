@@ -30,6 +30,7 @@ import {
   RequirementCoverage,
   BehaviorMatch,
   CoverageMatchLevel,
+  CoverageSlice,
 } from './types';
 
 /* ------------------------------------------------------------------ */
@@ -246,10 +247,19 @@ export function assessRequirementCoverage(
   req: RequirementInput,
   models: CoverageModel[],
 ): RequirementCoverage {
-  // Expected behaviors: explicit list if given, else the title as one behavior.
-  const behaviors = (req.expectedFlows && req.expectedFlows.length > 0)
-    ? req.expectedFlows.filter(b => b && b.trim())
-    : [req.title];
+  // Expected behaviors, each paired with its linked test case id(s) so the
+  // verdict can be sliced back to exact test cases downstream (EXTEND) with NO
+  // title matching. Priority: structured `behaviors` (carry ids) → `expectedFlows`
+  // (ids empty) → the title as a single behavior (ids empty).
+  const behaviorInputs: { label: string; testCaseIds: string[] }[] =
+    (req.behaviors && req.behaviors.length > 0)
+      ? req.behaviors
+          .filter(b => b && typeof b.label === 'string' && b.label.trim())
+          .map(b => ({ label: b.label, testCaseIds: b.testCaseIds ?? [] }))
+      : (req.expectedFlows && req.expectedFlows.length > 0)
+        ? req.expectedFlows.filter(b => b && b.trim()).map(label => ({ label, testCaseIds: [] }))
+        : [{ label: req.title, testCaseIds: [] }];
+  const behaviors = behaviorInputs.map(b => b.label);
 
   const candidate = selectCandidate(req, models);
 
@@ -264,6 +274,8 @@ export function assessRequirementCoverage(
       coverage: 0,
       coveredFlows: [],
       missingFlows: [...behaviors],
+      coveredSlices: [],
+      missingSlices: behaviorInputs.map(b => ({ flow: b.label, testCaseIds: b.testCaseIds })),
       confidence: Math.round(NO_MODEL_CONF * 100),
       matchedFeature: null,
       matches,
@@ -286,6 +298,17 @@ export function assessRequirementCoverage(
 
   const coveredFlows = matches.filter(m => m.level !== 'NONE').map(m => m.behavior);
   const missingFlows = matches.filter(m => m.level === 'NONE').map(m => m.behavior);
+
+  // Bucket the SAME behaviors into slices carrying their test case id(s). matches
+  // is `behaviors.map(...)` so it shares index order with behaviorInputs — zip by
+  // index to keep each flow bound to the exact test case(s) the caller supplied.
+  const coveredSlices: CoverageSlice[] = [];
+  const missingSlices: CoverageSlice[] = [];
+  matches.forEach((m, i) => {
+    const slice: CoverageSlice = { flow: m.behavior, testCaseIds: behaviorInputs[i].testCaseIds };
+    if (m.level !== 'NONE') coveredSlices.push(slice);
+    else missingSlices.push(slice);
+  });
 
   const total = behaviors.length;
   const coveredCount = coveredFlows.length;
@@ -312,6 +335,8 @@ export function assessRequirementCoverage(
     coverage,
     coveredFlows,
     missingFlows,
+    coveredSlices,
+    missingSlices,
     confidence,
     matchedFeature: model.feature,
     matches,

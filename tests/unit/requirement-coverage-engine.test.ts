@@ -164,4 +164,73 @@ describe('Requirement Coverage Engine (RCI-2)', () => {
     const b = JSON.stringify(assessRequirementCoverage(req, MODELS));
     expect(a).toBe(b);
   });
+
+  // ── Coverage slices (RIF: flow → test-case bindings, no title matching) ──
+  describe('coverage slices', () => {
+    it('carries structured behaviors\' test case ids through into covered/missing slices', () => {
+      const req: RequirementInput = {
+        id: 'REQ-9',
+        title: 'User authentication',
+        feature: 'Authentication',
+        behaviors: [
+          { label: 'valid user can sign in', testCaseIds: ['TC-1'] },
+          { label: 'locked out user sees error', testCaseIds: ['TC-2'] },
+          { label: 'reset password via email', testCaseIds: ['TC-3'] },
+        ],
+      };
+      const res = assessRequirementCoverage(req, MODELS);
+      expect(res.status).toBe('PARTIAL');
+      // Covered slices carry the ids of the covered behaviors.
+      expect(res.coveredSlices).toEqual([
+        { flow: 'valid user can sign in', testCaseIds: ['TC-1'] },
+        { flow: 'locked out user sees error', testCaseIds: ['TC-2'] },
+      ]);
+      // Missing slices carry the exact id of the uncovered behavior — this is
+      // what the EXTEND path slices on.
+      expect(res.missingSlices).toEqual([
+        { flow: 'reset password via email', testCaseIds: ['TC-3'] },
+      ]);
+      // Slice flows mirror the flat string lists (same order, same values).
+      expect(res.coveredSlices.map(s => s.flow)).toEqual(res.coveredFlows);
+      expect(res.missingSlices.map(s => s.flow)).toEqual(res.missingFlows);
+    });
+
+    it('emits empty-id slices when only expectedFlows (no bindings) are given', () => {
+      const req: RequirementInput = {
+        id: 'REQ-10',
+        title: 'User authentication',
+        feature: 'Authentication',
+        expectedFlows: ['valid user can sign in', 'reset password via email'],
+      };
+      const res = assessRequirementCoverage(req, MODELS);
+      expect(res.coveredSlices).toEqual([{ flow: 'valid user can sign in', testCaseIds: [] }]);
+      expect(res.missingSlices).toEqual([{ flow: 'reset password via email', testCaseIds: [] }]);
+    });
+
+    it('populates missing slices (with ids) even when there is no candidate model', () => {
+      const req: RequirementInput = {
+        id: 'REQ-11',
+        title: 'Payments',
+        feature: 'Payments',
+        behaviors: [{ label: 'issue refund to card', testCaseIds: ['TC-99'] }],
+      };
+      const res = assessRequirementCoverage(req, []);
+      expect(res.status).toBe('MISSING');
+      expect(res.coveredSlices).toEqual([]);
+      expect(res.missingSlices).toEqual([{ flow: 'issue refund to card', testCaseIds: ['TC-99'] }]);
+    });
+
+    it('prefers behaviors over expectedFlows when both are supplied', () => {
+      const req: RequirementInput = {
+        id: 'REQ-12',
+        title: 'User authentication',
+        feature: 'Authentication',
+        expectedFlows: ['ignored flow that should not appear'],
+        behaviors: [{ label: 'valid user can sign in', testCaseIds: ['TC-7'] }],
+      };
+      const res = assessRequirementCoverage(req, MODELS);
+      expect(res.coveredFlows).toEqual(['valid user can sign in']);
+      expect(res.coveredSlices).toEqual([{ flow: 'valid user can sign in', testCaseIds: ['TC-7'] }]);
+    });
+  });
 });

@@ -25,7 +25,12 @@ import type { GenerationDecision } from '../coverage-intelligence/types';
 
 // Re-exported for consumer convenience so callers can import the whole
 // Requirement Intelligence surface from one module.
-export type { RequirementInput, RequirementCoverage } from '../requirement-coverage/types';
+export type {
+  RequirementInput,
+  RequirementCoverage,
+  ExpectedBehavior,
+  CoverageSlice,
+} from '../requirement-coverage/types';
 export { GenerationDecision } from '../coverage-intelligence/types';
 
 export interface RequirementIntelligence {

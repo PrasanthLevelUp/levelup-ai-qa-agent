@@ -60,6 +60,15 @@ import { AIReviewEngine } from '../../script-gen/ai-review-engine';
 import { ValidationRunner, computeReliabilityBreakdown, toPublicReliability } from '../../script-gen/validation-runner';
 import { ProjectExportEngine } from '../../script-gen/project-export-engine';
 import { deterministicMetrics } from '../../ai/generation-metrics';
+import { RequirementIntelligenceService } from '../../requirement-intelligence/requirement-intelligence-service';
+import { ScriptGenerationConsumer } from '../../requirement-intelligence/script-generation-consumer';
+import {
+  resolveRequirementIntelligenceMode,
+  isIntelligenceComputed,
+  isIntelligenceControlling,
+} from '../../requirement-intelligence/rollout-mode';
+import { GenerationDecision } from '../../coverage-intelligence/types';
+import type { ExpectedBehavior } from '../../requirement-coverage/types';
 import {
   createBranch,
   commitAll,
@@ -661,6 +670,112 @@ export function createScriptGenRouter(): Router {
         }
       }
 
+      // ─────────────────────────────────────────────────────────────────────
+      // Requirement Intelligence — the CONSUMER boundary.
+      //
+      // This is where Script Generation becomes a *consumer* of Requirement
+      // Intelligence instead of blindly generating for every requirement. The
+      // 361KB ScriptGenEngine below is NOT touched: this block only decides
+      // WHETHER to call it and WHICH test cases to pass. The engine still owns
+      // HOW scripts are produced.
+      //
+      // Rollout is a three-mode flag (REQUIREMENT_INTELLIGENCE_MODE), default
+      // `legacy` (zero behavior change):
+      //   • legacy   → this block is skipped entirely.
+      //   • shadow   → intelligence is computed + logged for measurement, but
+      //                the legacy flow still controls generation (no user impact).
+      //   • enabled  → intelligence CONTROLS generation (skip / extend / all).
+      //
+      // The consumer EXECUTES `intelligence.generation`; it never re-derives the
+      // decision from raw coverage. Coverage is measured once, upstream.
+      // ─────────────────────────────────────────────────────────────────────
+      const riMode = resolveRequirementIntelligenceMode(process.env, (m) =>
+        console.warn(`[ScriptGen] ${m}`),
+      );
+      let riTelemetry: Record<string, unknown> | undefined;
+      if (
+        isIntelligenceComputed(riMode) &&
+        requirementTestCases.length > 0 &&
+        repoProfile?.coverageModel &&
+        repoProfile.coverageModel.length > 0
+      ) {
+        try {
+          // Behaviors are bound to test cases EXPLICITLY here — at the one
+          // boundary where both the human-readable label (title) and the stable
+          // test-case id are known. No title matching happens downstream.
+          const behaviors: ExpectedBehavior[] = requirementTestCases.map((tc) => ({
+            label: String(tc.title ?? ''),
+            testCaseIds: [String(tc.id)],
+          }));
+          const reqInput = {
+            id: String(requirementId ?? 'inline'),
+            title: String(
+              instructions ||
+                requirementTestCases[0]?.title ||
+                `Requirement ${requirementId ?? 'inline'}`,
+            ),
+            behaviors,
+          };
+
+          const intelligence = new RequirementIntelligenceService().analyze(
+            reqInput,
+            repoProfile.coverageModel,
+          );
+          const plan = new ScriptGenerationConsumer().plan(intelligence);
+          riTelemetry = { ...plan.telemetry };
+
+          // Always log in shadow AND enabled — this is the measurement window.
+          console.log(
+            '[ScriptGen] 🧠 Requirement Intelligence',
+            JSON.stringify({
+              mode: riMode,
+              controlling: isIntelligenceControlling(riMode),
+              ...plan.telemetry,
+              summary: plan.summary,
+              warnings: plan.warnings,
+            }),
+          );
+
+          if (isIntelligenceControlling(riMode)) {
+            if (plan.decision === GenerationDecision.SKIP) {
+              // Requirement is already covered — do NOT call the engine.
+              return res.status(200).json({
+                success: true,
+                decision: 'skip',
+                skipped: true,
+                message: plan.summary,
+                requirementId: String(requirementId ?? 'inline'),
+                // Repository Coverage (vs the Coverage Model) — deliberately
+                // kept distinct from Automation Progress (DB-linked automation %).
+                repositoryCoverage: intelligence.coverage.coverage,
+                coverageStatus: intelligence.coverage.status,
+                coveredFlows: intelligence.coverage.coveredFlows,
+                telemetry: plan.telemetry,
+              });
+            }
+
+            if (
+              plan.decision === GenerationDecision.EXTEND &&
+              plan.testCaseIdsToGenerate !== null
+            ) {
+              // Generate ONLY the missing slice — an exact id subset, no matching.
+              const idsToGenerate = new Set(plan.testCaseIdsToGenerate);
+              requirementTestCases = requirementTestCases.filter((tc) =>
+                idsToGenerate.has(String(tc.id)),
+              );
+            }
+            // GENERATE (or EXTEND with null ids = generate all): leave the batch
+            // untouched and fall through to the engine.
+          }
+        } catch (riErr: any) {
+          // Intelligence is advisory infrastructure — never let it break a
+          // generation that would otherwise succeed. Fall back to legacy flow.
+          console.warn(
+            `[ScriptGen] Requirement Intelligence failed (non-blocking, falling back to legacy generation): ${riErr?.message}`,
+          );
+        }
+      }
+
       const config: GenerationConfig = {
         url,
         instructions: instructions || undefined,
@@ -1212,6 +1327,10 @@ export function createScriptGenRouter(): Router {
             testCaseId: testCase?.id ?? null,
             testCaseDataUsed: !!testCase,
             ...(folderDecision ? { folderDecision } : {}),
+            // Requirement Intelligence telemetry (shadow + enabled). Absent in
+            // legacy mode. Surfaces the skip/extend/generate decision and its
+            // estimated token savings alongside the generation that ran.
+            ...(riTelemetry ? { requirementIntelligence: riTelemetry } : {}),
           },
           // Sprint 4: locator resolution report (element → locator + confidence)
           ...(locatorReport ? { locatorReport } : {}),

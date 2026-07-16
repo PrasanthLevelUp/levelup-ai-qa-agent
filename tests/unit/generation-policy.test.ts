@@ -29,6 +29,8 @@ function coverage(partial: Partial<RequirementCoverage> & { status: RequirementC
     coverage: partial.coverage ?? 0,
     coveredFlows: partial.coveredFlows ?? [],
     missingFlows: partial.missingFlows ?? [],
+    coveredSlices: partial.coveredSlices ?? [],
+    missingSlices: partial.missingSlices ?? [],
     confidence: partial.confidence ?? 100,
     matchedFeature: partial.matchedFeature ?? null,
     matches: partial.matches ?? [],
