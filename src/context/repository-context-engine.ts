@@ -28,6 +28,7 @@ import type {
   TestSuiteInfo,
   TestInventoryEntry,
   CoverageSummaryEntry,
+  CoverageModel,
   TestFramework,
   Language,
   TestPattern,
@@ -914,6 +915,114 @@ function buildCoverageSummary(inventory: TestInventoryEntry[]): CoverageSummaryE
 }
 
 /* ------------------------------------------------------------------ */
+/*  Coverage Model (per-feature description of WHAT THE REPO COVERS)   */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Strip tag-style tokens (`@tc:TC1001`, `@smoke`, `[TC-42]`) and collapse
+ * whitespace out of a test title so distinct behaviors can be merged into a
+ * single named flow. Case is preserved for human-readable flow labels.
+ */
+function cleanFlowLabel(testName: string): string {
+  return testName
+    .replace(/@[\w:.-]+/g, ' ')        // @tc:TC1001, @smoke, @regression
+    .replace(/\[[^\]]*\]/g, ' ')        // [TC-42], [smoke]
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function uniqSorted(values: Iterable<string>): string[] {
+  return Array.from(new Set(Array.from(values).filter(v => v && v.trim())))
+    .sort((a, b) => a.localeCompare(b));
+}
+
+/**
+ * Build the per-feature Coverage Model — a structured description of WHAT THE
+ * REPOSITORY COVERS, derived purely and deterministically from the Test
+ * Inventory. This is the Repository side of Coverage Intelligence: the
+ * Requirement Coverage Engine later compares requirements against these models.
+ * NO requirements, reuse, generation, embeddings, or LLM here.
+ *
+ * Grouping: tests are grouped by feature (null/blank -> 'Uncategorized'). Within
+ * a feature, one CoverageFlow is produced per distinct cleaned test-behavior
+ * label; identically-titled tests across files are merged, accumulating their
+ * files and unioning their assertions. Features are sorted by testCount desc
+ * then name asc; flows likewise — for stable, diffable output.
+ */
+function buildCoverageModel(inventory: TestInventoryEntry[]): CoverageModel[] {
+  if (inventory.length === 0) return [];
+
+  // feature -> aggregation buckets
+  const features = new Map<string, {
+    flows: Map<string, { testCount: number; testFiles: Set<string>; assertions: Set<string> }>;
+    pageObjects: Set<string>;
+    helpers: Set<string>;
+    assertions: Set<string>;
+    testFiles: Set<string>;
+    testCount: number;
+  }>();
+
+  for (const t of inventory) {
+    const feature = t.feature && t.feature.trim() ? t.feature : 'Uncategorized';
+    let f = features.get(feature);
+    if (!f) {
+      f = {
+        flows: new Map(),
+        pageObjects: new Set(),
+        helpers: new Set(),
+        assertions: new Set(),
+        testFiles: new Set(),
+        testCount: 0,
+      };
+      features.set(feature, f);
+    }
+
+    f.testCount += 1;
+    if (t.filePath) f.testFiles.add(t.filePath);
+    if (t.page && t.page.trim()) f.pageObjects.add(t.page);
+    for (const h of t.pomMethods) if (h && h.trim()) f.helpers.add(h);
+    for (const a of t.assertions) if (a && a.trim()) f.assertions.add(a);
+
+    // Flow: one per distinct cleaned test-behavior label. The test title is the
+    // behavior (e.g. "valid user can sign in"); `t.flow` is only a coarse verb
+    // bucket, too lossy to name a flow. Fall back to flow/testName if cleaning
+    // strips everything, so a flow always has a label.
+    const label = cleanFlowLabel(t.testName)
+      || (t.flow && t.flow.trim() ? t.flow : t.testName);
+    let flow = f.flows.get(label);
+    if (!flow) {
+      flow = { testCount: 0, testFiles: new Set(), assertions: new Set() };
+      f.flows.set(label, flow);
+    }
+    flow.testCount += 1;
+    if (t.filePath) flow.testFiles.add(t.filePath);
+    for (const a of t.assertions) if (a && a.trim()) flow.assertions.add(a);
+  }
+
+  return Array.from(features.entries())
+    .map(([feature, f]) => ({
+      feature,
+      flows: Array.from(f.flows.entries())
+        .map(([name, fl]) => ({
+          name,
+          testCount: fl.testCount,
+          testFiles: uniqSorted(fl.testFiles),
+          assertions: uniqSorted(fl.assertions),
+        }))
+        .sort((a, b) => b.testCount - a.testCount || a.name.localeCompare(b.name)),
+      pageObjects: uniqSorted(f.pageObjects),
+      helpers: uniqSorted(f.helpers),
+      assertions: uniqSorted(f.assertions),
+      testFiles: uniqSorted(f.testFiles),
+      testCount: f.testCount,
+      // Reserved — not captured by the Test Inventory yet; kept empty, not faked.
+      browsers: [],
+      apiCalls: [],
+    }))
+    .sort((a, b) => b.testCount - a.testCount || a.feature.localeCompare(b.feature));
+}
+
+/* ------------------------------------------------------------------ */
 /*  Test Suite Extraction                                              */
 /* ------------------------------------------------------------------ */
 
@@ -1421,6 +1530,10 @@ export class RepositoryContextEngine {
     // Coverage Summary: deterministic per-feature rollup of the inventory —
     // "where is this repo heavily tested vs sparse?" (no requirements yet).
     const coverageSummary = buildCoverageSummary(testInventory);
+    // Coverage Model (Sprint RCI-2): per-feature description of WHAT THE REPO
+    // COVERS (flows, assertions, helpers, page objects) — the Repository side
+    // of Coverage Intelligence that the Requirement Coverage Engine consumes.
+    const coverageModel = buildCoverageModel(testInventory);
     const preferredLocators = analyzePreferredLocators(repoRoot, analyses);
     const dependencies = detectDependencies(repoRoot);
     const ciIntegration = detectCI(repoRoot);
@@ -1517,6 +1630,7 @@ export class RepositoryContextEngine {
       testSuites,
       testInventory,
       coverageSummary,
+      coverageModel,
       preferredLocators,
       avoidPatterns: locatorStrategy === 'data-testid' ? ['xpath', 'css-class-only'] : [],
       dependencies,
@@ -1543,6 +1657,7 @@ export class RepositoryContextEngine {
       suites: profile.testSuites.length,
       inventoryTests: profile.testInventory.length,
       coverageFeatures: profile.coverageSummary.length,
+      coverageModelFeatures: profile.coverageModel.length,
       chunks: chunks.length,
       durationMs,
     });

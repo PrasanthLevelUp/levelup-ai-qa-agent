@@ -259,6 +259,16 @@ export interface RepositoryProfile {
   // Intelligence Phase 1 / RCI-2); this is pure aggregation of what exists.
   coverageSummary: CoverageSummaryEntry[];
 
+  // Coverage Model (Coverage Intelligence — Repository side): a richer,
+  // per-feature description of WHAT THE REPOSITORY COVERS — the named
+  // behaviors/flows, the assertions exercised, the page objects and helper
+  // methods touched, and the test files involved. This is the deterministic
+  // structure the Requirement Coverage Engine compares requirements against
+  // (Requirement + CoverageModel → RequirementCoverage). It is derived from
+  // the Test Inventory in the same scan — NO requirements, NO reuse, NO
+  // generation, NO LLM. Answers "what does this feature actually cover?".
+  coverageModel: CoverageModel[];
+
   // Locator patterns
   preferredLocators: Array<{ pattern: string; count: number; example: string }>;
   avoidPatterns: string[];
@@ -339,6 +349,41 @@ export interface CoverageSummaryEntry {
   testCount: number;            // number of inventory tests in this feature
   percentage: number;          // share of total inventory tests, 0-100 (rounded)
   avgConfidence: number;        // mean inventory confidence for this feature, 0-100
+}
+
+/**
+ * One named behavior the repository covers within a feature — e.g. the
+ * "valid user can sign in" flow inside Authentication. Derived deterministically
+ * from the Test Inventory (one flow per distinct test behavior), carrying the
+ * assertions exercised and the files that implement it.
+ */
+export interface CoverageFlow {
+  name: string;                 // the behavior label (cleaned test title)
+  testCount: number;            // how many inventory tests express this behavior
+  testFiles: string[];          // distinct repo-relative files implementing it
+  assertions: string[];         // distinct assertion matchers exercised
+}
+
+/**
+ * The per-feature Coverage Model — a structured description of WHAT THE
+ * REPOSITORY COVERS for one feature area. This is the Repository side of
+ * Coverage Intelligence: the Requirement Coverage Engine compares requirements
+ * against these models. Pure deterministic aggregation of the Test Inventory —
+ * NO requirements, reuse, generation, or LLM.
+ */
+export interface CoverageModel {
+  feature: string;              // e.g. 'Authentication', 'Checkout'
+  flows: CoverageFlow[];        // named behaviors covered, sorted for stability
+  pageObjects: string[];        // distinct pages/screens this feature exercises
+  helpers: string[];            // distinct POM / helper methods the tests call
+  assertions: string[];         // union of assertion matchers across the feature
+  testFiles: string[];          // distinct test files in this feature
+  testCount: number;            // total inventory tests in this feature
+  // Reserved for later extraction sprints — NOT populated yet (kept empty
+  // rather than faked). Browser matrix and API-call surfacing require signals
+  // the Test Inventory does not capture today.
+  browsers: string[];
+  apiCalls: string[];
 }
 
 /* ------------------------------------------------------------------ */

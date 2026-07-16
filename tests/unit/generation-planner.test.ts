@@ -8,7 +8,7 @@ import {
   formatGenerationPlan,
   GenerationPlan,
 } from '../../src/coverage-intelligence/generation-planner';
-import { CoverageDecision } from '../../src/coverage-intelligence/types';
+import { GenerationDecision } from '../../src/coverage-intelligence/types';
 import type { ScenarioLike } from '../../src/coverage-intelligence/existing-test-discovery';
 import type { RepositoryProfile } from '../../src/context/types';
 
@@ -120,7 +120,7 @@ describe('buildGenerationPlan', () => {
 
     // generationQueue must not contain any reuse items
     for (const item of plan.generationQueue) {
-      expect(item.coverage.recommendation).not.toBe(CoverageDecision.REUSE);
+      expect(item.coverage.recommendation).not.toBe(GenerationDecision.REUSE);
     }
 
     // generationQueue is exactly extend + generate
@@ -145,7 +145,7 @@ describe('formatGenerationPlan', () => {
             status: 'existing',
             confidence: 85,
             existingTest: 'a',
-            recommendation: CoverageDecision.REUSE,
+            recommendation: GenerationDecision.REUSE,
             matchedOn: [],
             reason: '',
             alternatives: [],
@@ -161,7 +161,7 @@ describe('formatGenerationPlan', () => {
             status: 'partial',
             confidence: 50,
             existingTest: 'b',
-            recommendation: CoverageDecision.EXTEND,
+            recommendation: GenerationDecision.EXTEND,
             matchedOn: [],
             reason: '',
             alternatives: [],
@@ -177,7 +177,7 @@ describe('formatGenerationPlan', () => {
             status: 'missing',
             confidence: 0,
             existingTest: null,
-            recommendation: CoverageDecision.GENERATE,
+            recommendation: GenerationDecision.GENERATE,
             matchedOn: [],
             reason: '',
             alternatives: [],
@@ -191,7 +191,7 @@ describe('formatGenerationPlan', () => {
             status: 'missing',
             confidence: 0,
             existingTest: null,
-            recommendation: CoverageDecision.GENERATE,
+            recommendation: GenerationDecision.GENERATE,
             matchedOn: [],
             reason: '',
             alternatives: [],

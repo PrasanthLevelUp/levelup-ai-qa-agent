@@ -23,7 +23,7 @@
  */
 
 import type { ScenarioCoverage } from './existing-test-discovery';
-import { CoverageDecision, COVERAGE_DECISION_LABEL } from './types';
+import { GenerationDecision, GENERATION_DECISION_LABEL } from './types';
 
 /* ------------------------------------------------------------------ */
 /*  Public types                                                       */
@@ -38,9 +38,9 @@ export interface CoverageReport {
   planned: number;
   /** Count by decision — how many scenarios fall into each bucket. */
   breakdown: {
-    [CoverageDecision.REUSE]: number;
-    [CoverageDecision.EXTEND]: number;
-    [CoverageDecision.GENERATE]: number;
+    [GenerationDecision.REUSE]: number;
+    [GenerationDecision.EXTEND]: number;
+    [GenerationDecision.GENERATE]: number;
   };
 }
 
@@ -56,9 +56,9 @@ export function aggregateCoverageReport(
   scenarioCoverage: ScenarioCoverage[],
 ): CoverageReport {
   const breakdown = {
-    [CoverageDecision.REUSE]: 0,
-    [CoverageDecision.EXTEND]: 0,
-    [CoverageDecision.GENERATE]: 0,
+    [GenerationDecision.REUSE]: 0,
+    [GenerationDecision.EXTEND]: 0,
+    [GenerationDecision.GENERATE]: 0,
   };
 
   for (const sc of scenarioCoverage) {
@@ -91,9 +91,9 @@ export function formatCoverageReport(report: CoverageReport): string {
   const pad = (n: number) => n.toString().padStart(3);
 
   lines.push(`  ${pad(report.planned)} Planned`);
-  lines.push(`  ${pad(report.breakdown[CoverageDecision.REUSE])} ${COVERAGE_DECISION_LABEL[CoverageDecision.REUSE]}`);
-  lines.push(`  ${pad(report.breakdown[CoverageDecision.EXTEND])} ${COVERAGE_DECISION_LABEL[CoverageDecision.EXTEND]}`);
-  lines.push(`  ${pad(report.breakdown[CoverageDecision.GENERATE])} ${COVERAGE_DECISION_LABEL[CoverageDecision.GENERATE]}`);
+  lines.push(`  ${pad(report.breakdown[GenerationDecision.REUSE])} ${GENERATION_DECISION_LABEL[GenerationDecision.REUSE]}`);
+  lines.push(`  ${pad(report.breakdown[GenerationDecision.EXTEND])} ${GENERATION_DECISION_LABEL[GenerationDecision.EXTEND]}`);
+  lines.push(`  ${pad(report.breakdown[GenerationDecision.GENERATE])} ${GENERATION_DECISION_LABEL[GenerationDecision.GENERATE]}`);
 
   return lines.join('\n');
 }
