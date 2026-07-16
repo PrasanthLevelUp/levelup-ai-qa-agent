@@ -228,3 +228,61 @@ describe('buildQualityReport — the single call the pipeline makes', () => {
     expect([...CORE_FAMILIES]).toEqual(['positive', 'negative', 'edge']);
   });
 });
+
+describe('buildQualityReport — coverage loss is a defect, never a silent positive', () => {
+  // A case carrying the explicit 'unknown' sentinel is one the pipeline could NOT
+  // classify from the plan. The gate must FAIL, count it, and never treat it as
+  // positive. This is the regression guard for the "11 positive / 1 negative /
+  // 0 edge" silent collapse.
+  const withUnknown: QualityTestCase[] = [
+    { coverageType: 'positive', title: 'submit valid order', objective: 'checkout success', steps: ['add item', 'pay', 'confirm'] },
+    { coverageType: 'negative', title: 'declined card blocks order', objective: 'payment failure path', steps: ['add item', 'use declined card', 'expect error'] },
+    { coverageType: 'edge_cases', title: 'zero quantity boundary rejected', objective: 'quantity boundary', steps: ['set qty 0', 'expect validation'] },
+    { coverageType: 'unknown', title: 'unclassifiable case', objective: 'lost its type in the handoff', steps: ['do something', 'observe'] },
+  ];
+
+  it('fails the gate when any case is unknown', () => {
+    const report = buildQualityReport(withUnknown, {
+      selectedTypes: ['positive', 'negative', 'edge_cases'] as CoverageType[],
+    });
+    expect(report.unknownCount).toBe(1);
+    expect(report.passed).toBe(false);
+    expect(report.gateReasons.some(r => /unresolved coverage type|coverage loss/i.test(r))).toBe(true);
+    // It must lead the recommendations and must NOT be described as positive.
+    expect(report.recommendations[0]).toMatch(/lost their coverage type|never a positive/i);
+  });
+
+  it('carries the Coverage Loss metric when the planner count is supplied', () => {
+    const report = buildQualityReport(withUnknown, {
+      selectedTypes: ['positive', 'negative', 'edge_cases'] as CoverageType[],
+      plannerScenarioCount: 4,
+    });
+    expect(report.coverageLoss).toBeDefined();
+    expect(report.coverageLoss!.plannerCreated).toBe(4);
+    expect(report.coverageLoss!.llmReturned).toBe(4);
+    expect(report.coverageLoss!.unknown).toBe(1);
+    expect(report.coverageLoss!.lossPercent).toBe(25);
+  });
+
+  it('omits the Coverage Loss metric when no planner count is supplied', () => {
+    const report = buildQualityReport(withUnknown, {
+      selectedTypes: ['positive', 'negative', 'edge_cases'] as CoverageType[],
+    });
+    expect(report.coverageLoss).toBeUndefined();
+  });
+
+  it('a clean balanced suite reports zero coverage loss', () => {
+    const balanced: QualityTestCase[] = [
+      { coverageType: 'positive', title: 'submit valid order', objective: 'checkout success', steps: ['add item', 'pay', 'confirm'] },
+      { coverageType: 'negative', title: 'declined card blocks order', objective: 'payment failure path', steps: ['add item', 'use declined card', 'expect error'] },
+      { coverageType: 'edge_cases', title: 'zero quantity boundary rejected', objective: 'quantity boundary', steps: ['set qty 0', 'expect validation'] },
+    ];
+    const report = buildQualityReport(balanced, {
+      selectedTypes: ['positive', 'negative', 'edge_cases'] as CoverageType[],
+      plannerScenarioCount: 3,
+    });
+    expect(report.unknownCount).toBe(0);
+    expect(report.coverageLoss!.lossPercent).toBe(0);
+    expect(report.passed).toBe(true);
+  });
+});

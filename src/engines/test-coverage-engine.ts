@@ -1381,6 +1381,14 @@ Return ONLY valid JSON, no markdown fences.`;
     coverageTypeEvaluations: CoverageTypeEvaluation[];
     /** Sprint 5.1 — per-step Requirement Coverage KPI (guaranteed 100%). */
     requirementCoverage?: RequirementCoverage;
+    /**
+     * Sprint 1 (pipeline integrity) — the planner's own classification, carried
+     * out of generation as the SOURCE OF TRUTH for coverage type. Each entry pairs
+     * a stable `scenarioId` with the `coverageType` the planner assigned. The
+     * downstream resolver reads THIS (by id), never re-classifies or keyword-matches,
+     * and never defaults an unresolved case to positive.
+     */
+    plannedScenarios: { id: string; coverageType: string }[];
     tokensUsed: number;
     /** Prompt (input) tokens for the generation call. */
     promptTokens: number;
@@ -2041,6 +2049,9 @@ Return ONLY valid JSON. Address EVERY selected coverage type, organise scenarios
     return {
       scenarios, testCases, suggestedTestCases, missingRequirements, coverageTypeEvaluations,
       requirementCoverage: scenarioPlan?.requirementCoverage,
+      // Carry the planner's own id→type classification out as the source of truth
+      // for downstream coverage-type resolution (no re-classification, ever).
+      plannedScenarios: (scenarioPlan?.scenarios ?? []).map(s => ({ id: s.id, coverageType: s.coverageType })),
       tokensUsed: resp.tokensUsed,
       promptTokens: resp.promptTokens,
       completionTokens: resp.completionTokens,
@@ -2307,7 +2318,7 @@ Return ONLY valid JSON array.`;
       outputBudget, tierCfg.maxPromptChars, aiCoverageExpansion, deepCoverage,
     );
     const generationMs = Date.now() - generationStart;
-    const { scenarios: scenarios0, testCases: rawTestCases, missingRequirements, coverageTypeEvaluations, tokensUsed: t2, promptChars, intelligenceScore } = gen;
+    const { scenarios: scenarios0, testCases: rawTestCases, missingRequirements, coverageTypeEvaluations, tokensUsed: t2, promptChars, intelligenceScore, plannedScenarios } = gen;
     const p2 = gen.promptTokens ?? 0;      // generation prompt tokens
     const c2 = gen.completionTokens ?? 0;  // generation completion tokens
     const promptBreakdown = gen.promptBreakdown;
@@ -2391,13 +2402,35 @@ Return ONLY valid JSON array.`;
     // the default (planner Phase 3b), and this gate is the safety net + metric.
     let finalScenarios = scenarios0;
     let finalTestCases = dedupedTestCases;
-    const resolveType = (tc: TestCase, scen: TestScenario[]): string => {
+
+    // ── Sprint 1 — Coverage-type resolution (stable IDs, no silent positive) ──
+    // The planner is the SOURCE OF TRUTH for coverage type. We resolve each case's
+    // type by its stable `scenarioId` against the planner's own id→type map — never
+    // by re-classifying, keyword-matching, or inferring. The resolution order is:
+    //   1) an explicit type the case already carries,
+    //   2) the planner's classification for the case's stable scenarioId,
+    //   3) the positional scenarioIndex fallback (legacy LLM-authored cases),
+    //   4) 'unknown' — an explicit DEFECT sentinel. We NEVER default to 'positive':
+    //      an unresolved type means information was lost in the pipeline, and that
+    //      is surfaced (logged + counted + gated), not silently reclassified.
+    const coverageTypeById = new Map<string, string>();
+    for (const s of plannedScenarios ?? []) coverageTypeById.set(s.id, String(s.coverageType));
+    const resolveTypeDetailed = (
+      tc: TestCase, scen: TestScenario[],
+    ): { type: string; via: 'case' | 'scenarioId' | 'scenarioIndex' | 'unresolved' } => {
       const direct = (tc as any).coverageType;
-      if (direct) return String(direct);
+      if (direct) return { type: String(direct).toLowerCase().trim(), via: 'case' };
+      const sid = (tc as any).scenarioId;
+      if (sid && coverageTypeById.has(sid)) {
+        return { type: coverageTypeById.get(sid)!.toLowerCase().trim(), via: 'scenarioId' };
+      }
       const idx = (tc as any).scenarioIndex;
-      if (idx != null && scen[idx]) return scen[idx].coverageType;
-      return 'positive';
+      if (idx != null && scen[idx]) {
+        return { type: String(scen[idx].coverageType).toLowerCase().trim(), via: 'scenarioIndex' };
+      }
+      return { type: 'unknown', via: 'unresolved' };
     };
+    const resolveType = (tc: TestCase, scen: TestScenario[]): string => resolveTypeDetailed(tc, scen).type;
     const toQualityCases = (tcs: TestCase[], scen: TestScenario[]): QualityTestCase[] =>
       tcs.map(tc => ({
         coverageType: resolveType(tc, scen),
@@ -2406,18 +2439,56 @@ Return ONLY valid JSON array.`;
         steps: tc.steps,
       }));
 
+    // ── Phase 1 — Instrument the live path (planner → resolved) ───────────────
+    // A structured, zero-token trace so the planner's classification and the
+    // resolved outcome for every case are visible side-by-side in the logs. This
+    // is how the "11 positive / 1 negative / 0 edge" collapse becomes observable
+    // instead of hidden: any case resolved 'via: unresolved' is a leak.
+    const resolvedTrace = finalTestCases.map(tc => {
+      const r = resolveTypeDetailed(tc, finalScenarios);
+      return { scenarioId: (tc as any).scenarioId ?? null, via: r.via, type: r.type, title: tc.title };
+    });
+    const unknownCount = resolvedTrace.filter(r => r.type === 'unknown').length;
+    const coverageLossPercent = finalTestCases.length > 0
+      ? Math.round((unknownCount / finalTestCases.length) * 100)
+      : 0;
+    logger.info(MOD, 'Coverage classification trace (planner → resolved)', {
+      plannerCreated: (plannedScenarios ?? []).length,
+      planner: (plannedScenarios ?? []).map(s => ({ id: s.id, type: s.coverageType })),
+      resolved: resolvedTrace,
+    });
+    // The permanent Coverage Loss metric — one line that says whether information
+    // disappeared between the planner and the LLM, and where.
+    logger.info(MOD, 'Coverage Loss metric', {
+      plannerCreated: (plannedScenarios ?? []).length,
+      llmReturned: finalTestCases.length,
+      unknown: unknownCount,
+      coverageLossPercent,
+    });
+    if (unknownCount > 0) {
+      logger.error(MOD, 'Coverage-type LOSS detected — cases could not be classified from the plan', {
+        unknown: unknownCount,
+        llmReturned: finalTestCases.length,
+        coverageLossPercent,
+        offending: resolvedTrace.filter(r => r.type === 'unknown').slice(0, 10),
+      });
+    }
+
     let qualityReport: QualityReport | undefined;
     let qualityRegenerated = false;
     if (QUALITY_ENGINE_ENABLED) {
       qualityReport = buildQualityReport(
         toQualityCases(finalTestCases, finalScenarios),
-        { selectedTypes: coverageTypes },
+        { selectedTypes: coverageTypes, plannerScenarioCount: (plannedScenarios ?? []).length },
       );
       logger.info(MOD, 'Quality gate', {
         mix: qualityReport.coverageMix.label,
         risk: qualityReport.risk.score,
         missing: qualityReport.missingCategories,
         duplicateClusters: qualityReport.duplicates.length,
+        unknownCount: qualityReport.unknownCount,
+        coverageLoss: qualityReport.coverageLoss,
+        gateReasons: qualityReport.gateReasons,
         passed: qualityReport.passed,
       });
 
@@ -2440,7 +2511,7 @@ Return ONLY valid JSON array.`;
             // Re-audit after healing so the surfaced report reflects the final suite.
             qualityReport = buildQualityReport(
               toQualityCases(finalTestCases, finalScenarios),
-              { selectedTypes: coverageTypes },
+              { selectedTypes: coverageTypes, plannerScenarioCount: (plannedScenarios ?? []).length },
             );
             logger.info(MOD, 'Quality gate — regenerated missing categories', {
               added: healed.addedCases,

@@ -140,8 +140,33 @@ export interface QualityReport {
   missingTypes: CoverageType[];
   /** Plain-English next actions for the reviewer / the regeneration loop. */
   recommendations: string[];
+  /**
+   * Cases whose coverage type could NOT be resolved by the pipeline (arrived as
+   * the explicit sentinel 'unknown'). This is a PIPELINE DEFECT — an unknown type
+   * is never silently reclassified as positive. Non-zero means information was
+   * lost between the planner and the LLM handoff.
+   */
+  unknownCount: number;
+  /**
+   * Planner → LLM information-flow metric. Present only when the caller supplies
+   * the planner scenario count. `lossPercent = unknown / llmReturned`. This is the
+   * single number that says WHERE information disappeared: a non-zero loss means
+   * the planner classified coverage that the pipeline then failed to carry through.
+   */
+  coverageLoss?: {
+    plannerCreated: number;
+    llmReturned: number;
+    unknown: number;
+    lossPercent: number;
+  };
+  /**
+   * The concrete reasons the gate failed (empty when it passes). The gate BLOCKS
+   * on any of these — a coverage-type loss, a HIGH risk score, a selected family
+   * that came back empty/under-threshold, or duplicate clusters.
+   */
+  gateReasons: string[];
   /** True when the suite is balanced enough to accept as-is (no HIGH risk, no
-   *  missing selected category, no duplicate clusters). */
+   *  missing selected category, no duplicate clusters, and NO unresolved types). */
   passed: boolean;
 }
 
@@ -348,7 +373,12 @@ function cap(s: string): string {
  * ------------------------------------------------------------------------- */
 export function buildQualityReport(
   cases: QualityTestCase[],
-  opts?: { selectedTypes?: CoverageType[] },
+  opts?: {
+    selectedTypes?: CoverageType[];
+    /** The number of scenarios the PLANNER produced. When supplied, the report
+     *  carries the Coverage Loss metric (plannerCreated → llmReturned → unknown). */
+    plannerScenarioCount?: number;
+  },
 ): QualityReport {
   const selectedTypes = opts?.selectedTypes ?? [];
   const coverageMix = analyzeCoverageMix(cases);
@@ -375,11 +405,45 @@ export function buildQualityReport(
   if (duplicates.length > 0) {
     recommendations.push(`Merge ${duplicates.length} near-duplicate cluster${duplicates.length > 1 ? 's' : ''} into distinct flows.`);
   }
+
+  // ── Coverage loss — cases whose type could not be resolved (a defect) ──────
+  // These arrive as the explicit 'unknown' sentinel (the pipeline NEVER silently
+  // maps them to positive). A single non-zero here means the planner→LLM handoff
+  // dropped a classification, so it leads the recommendations and BLOCKS the gate.
+  const unknownCount = coverageMix.byType['unknown'] ?? 0;
+  if (unknownCount > 0) {
+    recommendations.unshift(
+      `${unknownCount} case${unknownCount > 1 ? 's' : ''} lost their coverage type in the pipeline — investigate the planner→LLM handoff. An unknown type is a defect, never a positive.`,
+    );
+  }
   if (recommendations.length === 0) {
     recommendations.push('Balanced suite — no regeneration required.');
   }
 
-  const passed = risk.score !== 'HIGH' && missingCategories.length === 0 && duplicates.length === 0;
+  // ── The gate — one explicit list of blocking reasons (empty ⇒ pass) ────────
+  const gateReasons: string[] = [];
+  if (unknownCount > 0) {
+    gateReasons.push(`${unknownCount} case(s) have an unresolved coverage type (coverage loss) — a pipeline defect.`);
+  }
+  if (risk.score === 'HIGH') {
+    gateReasons.push(`Coverage risk is HIGH — ${risk.reasons.join(' ')}`);
+  }
+  for (const fam of missingCategories) {
+    gateReasons.push(`Selected ${cap(fam)} coverage came back empty or below the minimum share.`);
+  }
+  if (duplicates.length > 0) {
+    gateReasons.push(`${duplicates.length} near-duplicate case cluster(s) detected.`);
+  }
+  const passed = gateReasons.length === 0;
+
+  const coverageLoss = opts?.plannerScenarioCount != null
+    ? {
+        plannerCreated: opts.plannerScenarioCount,
+        llmReturned: coverageMix.total,
+        unknown: unknownCount,
+        lossPercent: coverageMix.total > 0 ? Math.round((unknownCount / coverageMix.total) * 100) : 0,
+      }
+    : undefined;
 
   return {
     coverageMix,
@@ -388,6 +452,9 @@ export function buildQualityReport(
     missingCategories,
     missingTypes,
     recommendations,
+    unknownCount,
+    coverageLoss,
+    gateReasons,
     passed,
   };
 }

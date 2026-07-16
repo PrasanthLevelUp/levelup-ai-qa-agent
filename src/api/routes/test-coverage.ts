@@ -522,6 +522,37 @@ export function createTestCoverageRouter(): Router {
         gaps: result.coverageGaps.length,
       });
 
+      // ── Phase 4 — Quality Gate as a HARD BLOCK ────────────────────────────
+      // When the deterministic auditor fails a suite (unresolved coverage type,
+      // HIGH risk, a selected family that came back empty, or duplicate clusters),
+      // the pipeline must NOT silently ship it. "No export. No save. No response."
+      // Enforcement is gated behind GEN_QUALITY_GATE_BLOCKING so it can be turned
+      // on deliberately for a running deployment; when off, the report is still
+      // computed and surfaced (informational), preserving today's behaviour.
+      const GATE_BLOCKING = process.env.GEN_QUALITY_GATE_BLOCKING === 'true';
+      if (GATE_BLOCKING && result.qualityReport && result.qualityReport.passed === false) {
+        logger.error(MOD, 'Quality gate BLOCKED generation — suite not persisted', {
+          gateReasons: result.qualityReport.gateReasons,
+          coverageLoss: result.qualityReport.coverageLoss,
+          unknownCount: result.qualityReport.unknownCount,
+          mix: result.qualityReport.coverageMix?.label,
+          risk: result.qualityReport.risk?.score,
+        });
+        return res.status(422).json({
+          requirementId: null,
+          blocked: true,
+          _error: 'QUALITY_GATE_FAILED',
+          message:
+            'Generation blocked by the quality gate — the suite did not meet the coverage-integrity bar and was NOT saved. A developer must investigate the reasons below.',
+          qualityReport: result.qualityReport,
+          gateReasons: result.qualityReport.gateReasons,
+          coverageLoss: result.qualityReport.coverageLoss,
+          // Return the unsaved suite so a developer can inspect exactly what the
+          // pipeline produced — nothing is persisted, nothing is exported.
+          unsavedResult: result,
+        });
+      }
+
       // ── Intelligence provenance (proof) ──
       // Build an HONEST record of which intelligence sources actually fed the model
       // for this run. This is surfaced in the API response and persisted so the UI
