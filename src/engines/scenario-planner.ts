@@ -45,12 +45,20 @@
  *     computed downstream by the orchestrator (`computeConfidence`) so scoring
  *     is consistent across the whole platform and the Planner has one job.
  *
- * Coverage Types are a FILTER, never a creator. Selecting "negative" asks
- * "include the negative scenarios that the KB obligations / evidence justify" —
- * it can never conjure a CONDITIONAL scenario the requirement/AC/app/data never
- * mention. A bare "user can log in" requirement yields the category's core +
- * mandatory obligations (valid login, invalid credentials, required fields), not
- * a padded list of invented failures. Quality over quantity.
+ * Coverage Types authorise CATEGORIES; the Knowledge Base owns the CONTENT
+ * (Sprint 6.x). Two rules, no invention in either:
+ *   • A family the user did NOT select stays strictly evidence-grounded — Phase 2
+ *     only. It can never conjure a CONDITIONAL scenario the requirement / AC /
+ *     app / data never mention.
+ *   • A family the user EXPLICITLY selected (e.g. Negative, Edge) additionally
+ *     emits that category's KB-curated best-practice obligations (Phase 3b),
+ *     clearly tagged assumption / 'Standard Coverage'. Selecting the family IS
+ *     the instruction to test it; the content is still authored KNOWLEDGE, never
+ *     hallucinated. This is what makes a balanced Positive/Negative/Edge suite
+ *     the DEFAULT rather than something only Deep Research produces.
+ * A bare "user can log in" requirement therefore yields the category's core +
+ * mandatory obligations plus the KB obligations for whatever families the user
+ * asked for — not a padded list of invented failures. Quality over quantity.
  *
  * Every planned scenario carries its provenance:
  *
@@ -78,6 +86,8 @@ import {
   type NormalizedEvidence,
 } from './qa-knowledge-engine';
 
+import { coverageFamily, type CoverageFamily } from './generation-quality-engine';
+
 export type { ScenarioEvidence, EvidenceSource } from './qa-knowledge-engine';
 
 /** Where a scenario's justification came from (explicit evidence only). */
@@ -93,7 +103,17 @@ export type ProvenanceSource =
    * gated on explicit evidence in THIS requirement. Always carries assumption:true
    * so it is never mistaken for requirement-grounded coverage.
    */
-  | 'Deep Coverage';
+  | 'Deep Coverage'
+  /**
+   * Standard Coverage (Sprint 6.x) — a domain best-practice scenario emitted
+   * because the user EXPLICITLY selected its coverage family (e.g. Negative or
+   * Edge), even with Deep Coverage OFF. Like Deep Coverage it is grounded in the
+   * QA Knowledge Base's obligations for the detected category (NOT hallucinated)
+   * and always carries assumption:true, but it is authorised by the user's
+   * explicit type selection rather than the Deep toggle. This is what makes a
+   * balanced Positive/Negative/Edge suite the default.
+   */
+  | 'Standard Coverage';
 
 /** Map the machine evidence source to the human-readable provenance bucket. */
 const SOURCE_LABEL: Record<EvidenceSource, ProvenanceSource> = {
@@ -606,6 +626,62 @@ export function planScenarios(
         provenance: {
           whyExists: `Deep Coverage: standard ${classification.category} ${s.coverageType} check — domain best-practice, not explicitly stated in this requirement`,
           source: 'Deep Coverage',
+          derivedFrom: `${classification.category} best-practice`,
+          assumption: true,
+          evidence: [],
+        },
+      });
+      emittedIds.add(s.id);
+    }
+  }
+
+  // ── Phase 3b (balanced default): explicitly-selected coverage families ──
+  // Sprint 6.x — founder directive: a balanced Positive/Negative/Edge suite is
+  // the DEFAULT, not something only Deep Research produces. When the user
+  // EXPLICITLY selects a coverage family (Negative, Edge) in the UI, that
+  // selection IS an instruction to test that family — so we emit that family's
+  // KNOWN, KB-curated obligations as standard best-practice checks even with
+  // Deep OFF. This is NOT the planner "inventing" failures: every emitted
+  // scenario is a Knowledge-Base obligation authored for THIS feature category
+  // (see QA_KNOWLEDGE_BASE), it is clearly tagged assumption/standard-coverage,
+  // and families the user did NOT select stay strictly evidence-grounded
+  // (Phase 2 only). Selection authorises the category; the KB owns the content.
+  //
+  // Skipped when `deep` — Phase 3 above already emitted every selected AND
+  // deep-broadened obligation, so re-emitting here would duplicate.
+  if (!deep) {
+    const explicitFamilies = new Set<CoverageFamily>(base.map(t => coverageFamily(t)));
+    for (const s of baseline) {
+      if (emittedIds.has(s.id)) continue;
+      const fam = coverageFamily(s.coverageType);
+      // Only the CORE failure/edge families are balanced-by-default here:
+      //   • positive is requirement-guaranteed by Phase 1 → skip;
+      //   • advanced families (security / integration / role_based / performance)
+      //     stay strictly evidence-gated (Phase 2) or Deep-gated (Phase 3) — we do
+      //     NOT speculatively emit e.g. an injection or RBAC test for a bare
+      //     requirement that never mentions that surface. This preserves the
+      //     "no invention" invariant for advanced coverage while still making a
+      //     balanced Positive/Negative/Edge suite the default.
+      //   • and only families the user EXPLICITLY selected.
+      if (fam === 'positive' || fam === 'advanced' || !explicitFamilies.has(fam)) continue;
+      const obligation = getScenarioObligation(s);
+      if (obligation.condition === 'always') continue; // already grounded in Phase 2
+      // The KB's own signal for "this obligation tests a FEATURE-SPECIFIC
+      // mechanism, not a category-universal best practice" is
+      // `conditionalOnKeywords` (e.g. auth account-lockout, password-masking,
+      // unique-constraint). Those stay strictly evidence-gated (Phase 2) or
+      // Deep-gated (Phase 3): selecting a family must NOT conjure a test for a
+      // mechanism the requirement never mentions. Standard Coverage emits only
+      // the category-UNIVERSAL obligations (e.g. "missing required fields",
+      // "invalid formats", "field-length boundaries") — the ones that apply to
+      // essentially every feature in the category. This is the exact line that
+      // keeps balanced-by-default from becoming invention.
+      if (s.conditionalOnKeywords && s.conditionalOnKeywords.length > 0) continue;
+      scenarios.push({
+        ...s,
+        provenance: {
+          whyExists: `Standard Coverage: ${s.coverageType} check for a ${classification.category} feature — emitted because ${fam} coverage was explicitly selected (KB best-practice, not explicitly stated in this requirement)`,
+          source: 'Standard Coverage',
           derivedFrom: `${classification.category} best-practice`,
           assumption: true,
           evidence: [],

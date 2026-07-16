@@ -564,12 +564,16 @@ describe('applyPolish — canonical reconciliation', () => {
 });
 
 describe('No invention — authentication (quality over quantity)', () => {
-  it('a bare login does NOT emit ungrounded CONDITIONAL scenarios (no SQL injection / lockout / masking phantoms)', () => {
-    // This is the exact regression the refactor removes: previously a bare login
-    // produced a fixed 8-scenario baseline including scenarios NOTHING in the
-    // requirement justified. Now the planner emits the KB obligations (core +
-    // mandatory) plus only the CONDITIONAL scenarios the evidence supports, so
-    // the mechanism-specific phantoms must be ABSENT.
+  it('a bare login does NOT emit ungrounded FEATURE-SPECIFIC scenarios (no SQL injection / lockout / masking phantoms)', () => {
+    // The Sprint 6.x "Standard Coverage" balance fix does NOT relax this
+    // invariant for a bare login, because the phantom scenarios below are all
+    // FEATURE-SPECIFIC (gated on `conditionalOnKeywords` in the KB: lockout,
+    // injection, masking, identifier-format). Standard Coverage only emits
+    // category-UNIVERSAL obligations (e.g. required-fields, invalid-format) — it
+    // never conjures a mechanism the requirement never mentions. So a bare login
+    // still yields exactly the KB's `always` obligations (valid + invalid +
+    // required) and nothing feature-specific, even with negative/edge/security
+    // all selected.
     const plan = planScenarios(
       { title: 'User Login', description: 'User can log in successfully.' },
       ['positive', 'negative', 'edge_cases', 'security'],
@@ -581,8 +585,8 @@ describe('No invention — authentication (quality over quantity)', () => {
     for (const kb of ['auth-neg-empty-fields', 'auth-neg-wrong-password', 'auth-pos-valid']) {
       expect(ids.has(kb)).toBe(true);
     }
-    // The conditional (mechanism-specific) scenarios are gone — nothing in the
-    // bare requirement justifies them.
+    // The feature-specific (keyword-gated) scenarios are gone — nothing in the
+    // bare requirement justifies them, and Standard Coverage never emits them.
     expect(ids.has('auth-sec-injection')).toBe(false);
     expect(ids.has('auth-neg-invalid-identifier-format')).toBe(false);
     expect(ids.has('auth-edge-password-masking')).toBe(false);

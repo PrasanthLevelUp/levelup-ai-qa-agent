@@ -612,6 +612,12 @@ export function createTestCoverageRouter(): Router {
         // token usage per generation and so tier thresholds can be tuned from
         // real data.
         generationMetadata: result.stats?.generationMetadata,
+        // Sprint 6.x — Generation Quality Report. The deterministic, per-project
+        // auditor's verdict for THIS suite: coverage mix (Positive/Negative/Edge
+        // counts + label), duplicate clusters, missing categories, and an overall
+        // risk score. Persisted in the analysis JSONB so History can render the
+        // Coverage Mix + Risk badge without re-auditing.
+        qualityReport: result.qualityReport,
       };
 
       let reqId: number;

@@ -70,6 +70,10 @@ const PROVENANCE_SOURCE_SLUG: Record<ProvenanceSource, DraftTestCase['source']> 
   // Deep Coverage scenarios are domain best-practice, grounded in the QA
   // knowledge base obligations (never hallucinated). They relay as 'knowledge'.
   'Deep Coverage': 'knowledge',
+  // Standard Coverage scenarios (Sprint 6.x) are the same KB-obligation best-
+  // practice, authorised by an explicit coverage-family selection rather than
+  // the Deep toggle. Same provenance bucket — 'knowledge'.
+  'Standard Coverage': 'knowledge',
 };
 
 /* ------------------------------------------------------------------ */

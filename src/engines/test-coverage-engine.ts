@@ -39,6 +39,13 @@ import {
   type StepGrounding,
   type StructuredExpected,
 } from './scenario-builder';
+import {
+  buildQualityReport,
+  coverageFamily,
+  type QualityReport,
+  type QualityTestCase,
+  type RiskLevel as QualityRiskLevel,
+} from './generation-quality-engine';
 import type { Dataset } from './dataset-resolver';
 import { validateCanonicalTestCases } from './canonical-validator';
 import { validateQaStandard, violationsToInstructions } from './qa-standard-validator';
@@ -252,6 +259,15 @@ const GAP_ANALYSIS_MIN_COMPLEXITY = floatEnv('GEN_GAP_ANALYSIS_MIN_COMPLEXITY', 
  * candidates the LLM keeps only if the requirement/context supports them.
  */
 const SCENARIO_PLANNER_ENABLED = (process.env.GEN_SCENARIO_PLANNER || 'true').toLowerCase() !== 'false';
+
+/**
+ * Generation Quality Engine (Sprint 6.x) — a deterministic, ZERO-token audit of
+ * the generated suite (coverage mix, risk score, near-duplicate clusters,
+ * missing selected families). Default ON; set GEN_QUALITY_ENGINE=false to skip.
+ * The optional append-only regeneration of missing families is a SEPARATE opt-in
+ * (GEN_QUALITY_REGEN=true) since it spends an extra model round-trip.
+ */
+const QUALITY_ENGINE_ENABLED = (process.env.GEN_QUALITY_ENGINE || 'true').toLowerCase() !== 'false';
 
 /**
  * Prompt Optimizer — deterministic, ZERO-token trimming of the grounding
@@ -674,6 +690,15 @@ export interface GenerationResult {
    * legacy path. Surfaced to the API + dashboard.
    */
   intelligenceScore?: IntelligenceScore;
+  /**
+   * Sprint 6.x — Generation Quality Report. A deterministic, zero-token audit of
+   * the FINAL suite: coverage mix (Positive/Negative/Edge), risk score
+   * (LOW/MEDIUM/HIGH) with reasons, near-duplicate clusters, and any selected
+   * coverage family that came back empty/under threshold. Present whenever the
+   * quality engine ran (default ON). Surfaced to the API + dashboard so the
+   * engine is self-aware about its own balance.
+   */
+  qualityReport?: QualityReport;
   stats: {
     totalScenarios: number;
     totalTestCases: number;
@@ -750,6 +775,13 @@ export interface GenerationResult {
        *  total into the stages that actually spend tokens/time, each with its
        *  % share — so the real hot stage is visible before any optimization. */
       stageBreakdown?: StageShare[];
+      /** Sprint 6.x — Generation Quality Gate telemetry (self-awareness about
+       *  balance). Human summary of the coverage mix ("Positive: 11 · Negative:
+       *  1 · Edge: 0"), the risk score, and whether a targeted regeneration of
+       *  missing families ran. Persisted so History can render the mix + risk. */
+      coverageMix?: string;
+      qualityRisk?: QualityRiskLevel;
+      qualityRegenerated?: boolean;
     };
   };
 }
@@ -2155,6 +2187,13 @@ Return ONLY valid JSON array.`;
        * 3→5 expansion. Only an explicit "AI Coverage Expansion" opt-in widens it.
        */
       aiCoverageExpansion?: boolean;
+      /**
+       * Sprint 6.x — Generation Quality Gate. When false, skips the optional
+       * append-only regeneration of missing coverage families even if
+       * GEN_QUALITY_REGEN is enabled globally. The deterministic quality REPORT
+       * is always produced (unless GEN_QUALITY_ENGINE=false). Default: allowed.
+       */
+      qualityRegen?: boolean;
     }
   ): Promise<GenerationResult> {
     // The "Coverage Gap Analysis" toggle drives the separate assumption-based
@@ -2268,14 +2307,14 @@ Return ONLY valid JSON array.`;
       outputBudget, tierCfg.maxPromptChars, aiCoverageExpansion, deepCoverage,
     );
     const generationMs = Date.now() - generationStart;
-    const { scenarios, testCases: rawTestCases, missingRequirements, coverageTypeEvaluations, tokensUsed: t2, promptChars, intelligenceScore } = gen;
+    const { scenarios: scenarios0, testCases: rawTestCases, missingRequirements, coverageTypeEvaluations, tokensUsed: t2, promptChars, intelligenceScore } = gen;
     const p2 = gen.promptTokens ?? 0;      // generation prompt tokens
     const c2 = gen.completionTokens ?? 0;  // generation completion tokens
     const promptBreakdown = gen.promptBreakdown;
     const promptOptimization = gen.promptOptimization;
     let rawSuggested = gen.suggestedTestCases || [];
     logger.info(MOD, 'Test generation complete', {
-      scenarios: scenarios.length, testCases: rawTestCases.length,
+      scenarios: scenarios0.length, testCases: rawTestCases.length,
       suggested: rawSuggested.length, missingRequirements: missingRequirements.length, mode,
     });
 
@@ -2325,16 +2364,99 @@ Return ONLY valid JSON array.`;
         logger.info(MOD, 'Gap analysis skipped — not requested or below complexity gate');
         return { gaps: [], tokensUsed: 0, durationMs: 0 };
       }
-      const gapResult = await this.analyzeCoverageGaps(input, analysis, scenarios, knowledge);
+      const gapResult = await this.analyzeCoverageGaps(input, analysis, scenarios0, knowledge);
       logger.info(MOD, 'Gap analysis complete', { gaps: gapResult.gaps.length });
       return { ...gapResult, durationMs: Date.now() - gapStageStart };
     };
 
     const [dedupResult, gapResult] = await Promise.all([dedupWork(), gapWork()]);
-    const testCases = dedupResult.testCases;
+    const dedupedTestCases = dedupResult.testCases;
     const suggestedTestCases = dedupResult.suggestedTestCases;
     const duplicatesRemoved = dedupResult.removed;
     const gaps = gapResult.gaps;
+
+    // ── Phase 5c: Generation Quality Gate (Sprint 6.x) ──────────────────────
+    // A deterministic, ZERO-token audit of the just-generated suite: coverage
+    // mix (Positive/Negative/Edge), risk score, near-duplicate clusters, and any
+    // SELECTED coverage family that came back empty/under-threshold. This runs on
+    // EVERY generation (independent of Deep Coverage) so the engine is self-aware
+    // about its own balance — the exact "11 positive / 1 negative / 0 edge" class
+    // of failure is now measured, not shipped silently.
+    //
+    // When a selected family is missing, we optionally run ONE targeted, append-
+    // only regeneration pass (opt-in via GEN_QUALITY_REGEN) that pulls that
+    // category's KB best-practice for the missing families and merges only the
+    // gap-filling cases back in. It FAILS OPEN: any error leaves the first-pass
+    // suite untouched. Deep Coverage is never required — the balanced suite is
+    // the default (planner Phase 3b), and this gate is the safety net + metric.
+    let finalScenarios = scenarios0;
+    let finalTestCases = dedupedTestCases;
+    const resolveType = (tc: TestCase, scen: TestScenario[]): string => {
+      const direct = (tc as any).coverageType;
+      if (direct) return String(direct);
+      const idx = (tc as any).scenarioIndex;
+      if (idx != null && scen[idx]) return scen[idx].coverageType;
+      return 'positive';
+    };
+    const toQualityCases = (tcs: TestCase[], scen: TestScenario[]): QualityTestCase[] =>
+      tcs.map(tc => ({
+        coverageType: resolveType(tc, scen),
+        title: tc.title,
+        objective: tc.objective,
+        steps: tc.steps,
+      }));
+
+    let qualityReport: QualityReport | undefined;
+    let qualityRegenerated = false;
+    if (QUALITY_ENGINE_ENABLED) {
+      qualityReport = buildQualityReport(
+        toQualityCases(finalTestCases, finalScenarios),
+        { selectedTypes: coverageTypes },
+      );
+      logger.info(MOD, 'Quality gate', {
+        mix: qualityReport.coverageMix.label,
+        risk: qualityReport.risk.score,
+        missing: qualityReport.missingCategories,
+        duplicateClusters: qualityReport.duplicates.length,
+        passed: qualityReport.passed,
+      });
+
+      const QUALITY_REGEN_ENABLED = process.env.GEN_QUALITY_REGEN === 'true';
+      const shouldHeal = QUALITY_REGEN_ENABLED
+        && options?.qualityRegen !== false
+        && qualityReport.missingCategories.length > 0
+        && finalTestCases.length > 0;
+      if (shouldHeal) {
+        try {
+          const healed = await this.regenerateMissingCategories(
+            input, analysis, coverageTypes, knowledge, mode,
+            outputBudget, tierCfg.maxPromptChars,
+            finalScenarios, finalTestCases, qualityReport,
+          );
+          if (healed.addedCases > 0) {
+            finalScenarios = healed.scenarios;
+            finalTestCases = healed.testCases;
+            qualityRegenerated = true;
+            // Re-audit after healing so the surfaced report reflects the final suite.
+            qualityReport = buildQualityReport(
+              toQualityCases(finalTestCases, finalScenarios),
+              { selectedTypes: coverageTypes },
+            );
+            logger.info(MOD, 'Quality gate — regenerated missing categories', {
+              added: healed.addedCases,
+              mix: qualityReport.coverageMix.label,
+              risk: qualityReport.risk.score,
+            });
+          }
+        } catch (healErr: any) {
+          logger.warn(MOD, 'Quality regeneration failed — keeping first-pass suite (fail-open)', {
+            error: healErr?.message,
+          });
+        }
+      }
+    }
+    const scenarios = finalScenarios;
+    const testCases = finalTestCases;
     const t3 = gapResult.tokensUsed;
     const p3 = gapResult.promptTokens ?? 0;      // gap-analysis prompt tokens
     const c3 = gapResult.completionTokens ?? 0;  // gap-analysis completion tokens
@@ -2438,6 +2560,7 @@ Return ONLY valid JSON array.`;
       requirementCoverage: gen.requirementCoverage,
       mode,
       intelligenceScore,
+      qualityReport,
       stats: {
         totalScenarios: scenarios.length,
         totalTestCases: testCases.length,
@@ -2483,6 +2606,10 @@ Return ONLY valid JSON array.`;
           scenarioCount: scenarios.length,
           testCaseCount: testCases.length,
           stageBreakdown,
+          // Sprint 6.x — quality-gate telemetry (self-awareness about balance).
+          coverageMix: qualityReport?.coverageMix.label,
+          qualityRisk: qualityReport?.risk.score,
+          qualityRegenerated,
         },
       },
     };
@@ -2521,6 +2648,96 @@ Return ONLY valid JSON array.`;
       timestamp: result.stats.generationMetadata!.timestamp,
     });
     return result;
+  }
+
+  /**
+   * Sprint 6.x — targeted, APPEND-ONLY regeneration of the coverage families the
+   * Generation Quality Gate found missing (e.g. a suite that selected Edge but
+   * produced zero edge cases). It reuses the SAME generation path with Deep
+   * best-practice enabled so the planner emits the detected category's KB
+   * obligations for the missing families, then keeps ONLY the gap-filling,
+   * non-duplicate cases and their scenarios.
+   *
+   * Guarantees:
+   *   • Never removes or mutates first-pass output — purely additive.
+   *   • Only families the quality gate flagged as missing are merged back; the
+   *     extra Deep breadth is discarded, so it does not silently widen coverage.
+   *   • Near-duplicates (vs the existing suite and amongst the new cases) are
+   *     dropped via the deterministic quality detector — no extra tokens.
+   *   • Bounded to a single pass; the caller try/catches so it fails open.
+   */
+  private async regenerateMissingCategories(
+    input: RequirementInput,
+    analysis: RequirementAnalysis,
+    coverageTypes: CoverageType[],
+    knowledge: KnowledgeContext | undefined,
+    mode: GenerationMode,
+    outputBudget: number,
+    maxPromptChars: number,
+    existingScenarios: TestScenario[],
+    existingTestCases: TestCase[],
+    report: QualityReport,
+  ): Promise<{ scenarios: TestScenario[]; testCases: TestCase[]; addedCases: number }> {
+    const missing = new Set(report.missingCategories);
+    const noop = { scenarios: existingScenarios, testCases: existingTestCases, addedCases: 0 };
+
+    // Regenerate with Deep best-practice ON so the planner emits the category's
+    // KB obligations for the missing families; we filter to those families next.
+    const regen = await this.generateTestCoverage(
+      input, analysis, coverageTypes, knowledge, mode,
+      outputBudget, maxPromptChars, false, true /* deep */,
+    );
+
+    const typeOf = (tc: TestCase, scen: TestScenario[]): string => {
+      const direct = (tc as any).coverageType;
+      if (direct) return String(direct);
+      const idx = (tc as any).scenarioIndex;
+      if (idx != null && scen[idx]) return scen[idx].coverageType;
+      return 'positive';
+    };
+
+    // Keep only cases that fill a MISSING family.
+    const candidates = regen.testCases.filter(tc => missing.has(coverageFamily(typeOf(tc, regen.scenarios))));
+    if (candidates.length === 0) return noop;
+
+    // Reject near-duplicates against the existing suite AND amongst themselves,
+    // favouring the earliest (existing) case in each cluster.
+    const combined = [...existingTestCases, ...candidates];
+    const dupClusters = buildQualityReport(
+      combined.map(tc => ({ title: tc.title, objective: tc.objective, steps: tc.steps })),
+    ).duplicates;
+    const dropIdx = new Set<number>();
+    for (const cluster of dupClusters) {
+      const sorted = [...cluster.indices].sort((a, b) => a - b);
+      for (let k = 1; k < sorted.length; k++) {
+        if (sorted[k] >= existingTestCases.length) dropIdx.add(sorted[k]); // drop only NEW dupes
+      }
+    }
+    const kept = candidates.filter((_, i) => !dropIdx.has(existingTestCases.length + i));
+    if (kept.length === 0) return noop;
+
+    // Append kept cases' scenarios (remapping scenarioIndex) so persistence maps
+    // each new case to its correct coverage type instead of the first scenario.
+    const mergedScenarios = [...existingScenarios];
+    const idxMap = new Map<number, number>();
+    const remapped = kept.map(tc => {
+      const srcIdx = (tc as any).scenarioIndex as number | undefined;
+      let newIdx: number | undefined;
+      if (srcIdx != null && regen.scenarios[srcIdx]) {
+        if (!idxMap.has(srcIdx)) {
+          idxMap.set(srcIdx, mergedScenarios.length);
+          mergedScenarios.push(regen.scenarios[srcIdx]);
+        }
+        newIdx = idxMap.get(srcIdx);
+      }
+      return { ...tc, scenarioIndex: newIdx } as TestCase;
+    });
+
+    return {
+      scenarios: mergedScenarios,
+      testCases: [...existingTestCases, ...remapped],
+      addedCases: remapped.length,
+    };
   }
 
   /* ---- Semantic de-duplication of generated test cases ---- */
