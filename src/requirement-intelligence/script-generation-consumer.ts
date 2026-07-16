@@ -29,7 +29,7 @@
  */
 
 import { GenerationDecision } from '../coverage-intelligence/types';
-import type { RequirementIntelligence, DecisionReason } from './types';
+import type { RequirementIntelligence, DecisionAnalysis } from './types';
 
 /**
  * A rough, HONEST estimate of the tokens one generated spec would cost. Used
@@ -54,7 +54,7 @@ export interface GenerationDecisionTelemetry {
   /** The decision being executed (skip / extend / generate). */
   generationDecision: GenerationDecision;
   /**
-   * Confidence in the coverage verdict, 0-100 (mirror of `reason.confidence`,
+   * Confidence in the coverage verdict, 0-100 (mirror of `analysis.confidence`,
    * surfaced at the top level so every consumer reads it at one stable path —
    * it is the signal that gated the SKIP decision).
    */
@@ -68,11 +68,11 @@ export interface GenerationDecisionTelemetry {
   /** ESTIMATED tokens saved by not regenerating covered flows (see ESTIMATED_TOKENS_PER_FLOW). */
   estimatedTokenSavings: number;
   /**
-   * The structured, human-facing explanation of this decision — the SHARED
-   * DecisionReason object (covered vs missing flows + confidence). This is the
+   * The structured, human-facing analysis of this decision — the SHARED
+   * DecisionAnalysis object (covered vs missing flows + confidence). This is the
    * frozen explainability contract every surface renders.
    */
-  reason: DecisionReason;
+  analysis: DecisionAnalysis;
   /**
    * WHY generation happened when it did — the policy's override reasons (e.g.
    * `['Low confidence']` when a weak COVERED was downgraded to EXTEND). Empty
@@ -101,11 +101,11 @@ export interface ScriptGenerationPlan {
   /** Per-decision telemetry (route fills in runtime fields separately). */
   telemetry: GenerationDecisionTelemetry;
   /**
-   * The structured, human-facing explanation — the SHARED DecisionReason object.
+   * The structured, human-facing analysis — the SHARED DecisionAnalysis object.
    * Surfaced directly on the plan (not just inside telemetry) so a caller can
    * render the customer "Generate Script" panel without reaching into telemetry.
    */
-  reason: DecisionReason;
+  analysis: DecisionAnalysis;
   /** WHY generation happened (policy override reasons); mirrors telemetry.generatedBecause. */
   generatedBecause: string[];
   /** Human-readable one-liner for logs / a future UI panel. */
@@ -128,10 +128,10 @@ export class ScriptGenerationConsumer {
     const flowsCovered = coverage.coveredSlices.length;
     const warnings: string[] = [];
 
-    // The SHARED explanation object — built ONCE from coverage facts and the
-    // policy's override reasons, then threaded through every path so telemetry,
-    // logs, and any future UI all render the identical explanation.
-    const reason: DecisionReason = {
+    // The SHARED analysis object — built ONCE from coverage facts and threaded
+    // through every path so telemetry, logs, and any future UI all render the
+    // identical analysis.
+    const analysis: DecisionAnalysis = {
       coveredFlows: coverage.coveredFlows,
       missingFlows: coverage.missingFlows,
       confidence: coverage.confidence,
@@ -146,7 +146,7 @@ export class ScriptGenerationConsumer {
       generationDecision: generation,
       confidence: coverage.confidence,
       flowsTotal,
-      reason,
+      analysis,
       generatedBecause,
     };
 
@@ -163,7 +163,7 @@ export class ScriptGenerationConsumer {
             flowsGenerated: 0,
             estimatedTokenSavings: flowsTotal * this.tokensPerFlow,
           },
-          reason,
+          analysis,
           generatedBecause,
           summary: `SKIP — requirement already covered (${coverage.coverage}% repository coverage, ${flowsTotal} flow(s)); no generation required.`,
           warnings,
@@ -193,7 +193,7 @@ export class ScriptGenerationConsumer {
               // No safe slice → we regenerate everything → no saving claimed.
               estimatedTokenSavings: 0,
             },
-            reason,
+            analysis,
             generatedBecause,
             summary: `EXTEND — ${flowsGenerated} missing flow(s) but unbound; generating all (see warnings).`,
             warnings,
@@ -209,7 +209,7 @@ export class ScriptGenerationConsumer {
             flowsGenerated,
             estimatedTokenSavings: flowsCovered * this.tokensPerFlow,
           },
-          reason,
+          analysis,
           generatedBecause,
           summary: `EXTEND — generate ${flowsGenerated} missing flow(s) (${ids.length} test case(s)); ${flowsCovered} already covered.`,
           warnings,
@@ -229,7 +229,7 @@ export class ScriptGenerationConsumer {
             flowsGenerated: flowsTotal,
             estimatedTokenSavings: 0,
           },
-          reason,
+          analysis,
           generatedBecause,
           summary: `GENERATE — no existing coverage; generate all ${flowsTotal} flow(s).`,
           warnings,

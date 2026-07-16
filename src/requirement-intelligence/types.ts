@@ -34,19 +34,19 @@ export type {
 export { GenerationDecision } from '../coverage-intelligence/types';
 
 /**
- * The single, structured explanation of a generation decision — the SHARED
- * object every consumer (telemetry, the customer "Generate Script" panel, RTM,
- * Release Center, Analytics) renders. There is exactly ONE explanation shape so
- * no two surfaces can ever explain the same decision differently.
+ * The coverage analysis behind a generation decision — the SHARED data object
+ * every consumer (telemetry, the customer "Generate Script" panel, RTM, Release
+ * Center, Analytics) renders. There is exactly ONE analysis shape so no two
+ * surfaces can ever explain the same decision differently.
  *
  * It is deliberately data, not prose: `coveredFlows` / `missingFlows` are the
- * repository facts behind the decision, and `confidence` is how much the
- * coverage verdict can be trusted. A UI turns these into "✓ Login Success /
- * • Locked User"; a log serializes them verbatim. Naming is architecture: this
- * is the explanation of the DECISION, hence it lives beside the decision, not
- * inside the Coverage layer (which only measures facts).
+ * repository facts discovered by the intelligence layer, and `confidence` is how
+ * much the coverage verdict can be trusted. A UI turns these into "✓ Login
+ * Success / • Locked User"; a log serializes them verbatim. Naming is
+ * architecture: this is the ANALYSIS (evidence), not the reason the policy
+ * decided — that lives in `generatedBecause`.
  */
-export interface DecisionReason {
+export interface DecisionAnalysis {
   /** Expected behaviors the repository ALREADY covers (the "✓ already covered" list). */
   coveredFlows: string[];
   /** Expected behaviors the repository does NOT cover (the "• generating / missing" list). */

@@ -156,7 +156,7 @@ describe('ScriptGenerationConsumer — GENERATE (RIF)', () => {
 });
 
 describe('ScriptGenerationConsumer — explainability (Trusted Intelligence)', () => {
-  it('surfaces the structured DecisionReason (covered/missing flows + confidence) on the plan and telemetry', () => {
+  it('surfaces the structured DecisionAnalysis (covered/missing flows + confidence) on the plan and telemetry', () => {
     const plan = consumer.plan(
       intel(GenerationDecision.EXTEND, {
         status: 'PARTIAL',
@@ -169,13 +169,13 @@ describe('ScriptGenerationConsumer — explainability (Trusted Intelligence)', (
         missingSlices: [{ flow: 'Locked User', testCaseIds: ['TC-3'] }],
       }),
     );
-    expect(plan.reason).toEqual({
+    expect(plan.analysis).toEqual({
       coveredFlows: ['Login Success', 'Login Failure'],
       missingFlows: ['Locked User'],
       confidence: 84,
     });
     // Same object surfaced through telemetry, plus the top-level confidence mirror.
-    expect(plan.telemetry.reason).toEqual(plan.reason);
+    expect(plan.telemetry.analysis).toEqual(plan.analysis);
     expect(plan.telemetry.confidence).toBe(84);
   });
 

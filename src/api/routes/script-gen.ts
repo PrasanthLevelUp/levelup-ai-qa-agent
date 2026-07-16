@@ -750,8 +750,7 @@ export function createScriptGenRouter(): Router {
                 // the customer panel / RTM / Analytics never re-explain a
                 // decision differently.
                 generationDecision: plan.decision,
-                confidence: plan.telemetry.confidence,
-                reason: plan.reason,
+                analysis: plan.analysis,
                 generatedBecause: plan.generatedBecause,
                 // Repository Coverage (vs the Coverage Model) — deliberately
                 // kept distinct from Automation Progress (DB-linked automation %).
