@@ -52,6 +52,48 @@ At the API (`routes/test-coverage.ts`), when the gate fails the pipeline **does 
 
 ---
 
+## Benchmark: where is the 11 / 1 / 0 born? (evidence, not assumption)
+
+Before merging, one benchmark was run to prove *where* the imbalance originates,
+rather than assume it. The real production `planScenarios()` was executed for the
+"Add Employee" requirement (`scripts/coverage-origin-benchmark.ts`), capturing the
+coverage distribution at every checkpoint we can run deterministically here.
+
+| Selection | Planner Positive | Planner Negative | Planner Edge | Total |
+|-----------|:----------------:|:----------------:|:------------:|:-----:|
+| positive + negative + edge (Standard) | 13 | 7 | 2 | 22 |
+| positive + negative + edge (Deep)     | 16 | 7 | 3 | 26 |
+| positive only                         | 13 | 0 | 0 | 13 |
+
+**The planner does NOT produce 11 / 1 / 0.** With negative and edge selected it
+emits a balanced suite (7 negatives, 2–3 edges); with positive-only it correctly
+emits 13 / 0 / 0. There is no selection under which it produces the customer's
+"1 Negative / 0 Edge" shape — the planner emits either ~7 negatives or 0, never 1.
+
+**Conclusion (Case 1, not Case 2):** the imbalance is NOT born in the planner.
+A final suite of 11/1/0 (12 cases) derived from a balanced 22-case plan — with
+all-but-one survivor landing in Positive — is the exact signature of the old
+`resolveType()` silent default: metadata lost → defaulted Positive, one case kept
+its type → stayed Negative, edges dropped. This is precisely what Sprint 1 fixes.
+
+**Where the planner IS worth a later look:** it is positive-heavy (13 of 22 ≈ 59%,
+roughly one Positive per acceptance criterion). That is a coverage-**balance**
+concern for Sprint 2/3 (the coverage ceiling) — NOT the 11/1/0 collapse. The
+planner still generates negatives and edges; it does not zero them out.
+
+**Honest limits of this benchmark:**
+- No live LLM/DB in this environment, so checkpoint 2 (LLM output) is *inferred,
+  not observed*. The planner numbers are the deterministic ceiling; the new trace
+  logs (`Coverage classification trace` + `Coverage Loss metric`) will print the
+  exact planner→LLM→final numbers on one run in the running app — the final proof.
+- The benchmark uses the repo's gold "Create Employee" requirement; the customer's
+  literal requirement text may differ. Re-run the same script (or read the live
+  trace) against their exact input to confirm for that case.
+- If the customer had selected positive-only, 13/0/0 is correct behaviour, not a
+  bug — worth confirming what they actually selected.
+
+---
+
 ## Honest verification status
 
 What I **did** verify here:
