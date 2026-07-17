@@ -503,7 +503,113 @@ interface DataIntentScenario {
   id?: string;
 }
 
-function dataPhraseFor(scenario: DataIntentScenario, field: FieldLike): string {
+/* ------------------------------------------------------------------ */
+/*  SPRINT 3 — Scenario-specific Test Data                             */
+/*  ----------------------------------------------------------------   */
+/*  A scenario's test data must be EXECUTABLE and REALISTIC — never the */
+/*  generic "a valid First Name" a human cannot act on. The value is    */
+/*  chosen from grounded signals, in priority order:                    */
+/*    1. the scenario's INTENT (SQL / XSS / duplicate / whitespace /    */
+/*       numeric / …) — unchanged, already correct.                     */
+/*    2. requirement CONSTRAINTS (max / min length) — but ONLY when the  */
+/*       requirement actually states them. Boundary values are grounded  */
+/*       in the REAL number; no limit is ever invented.                  */
+/*    3. the field's TYPE / concept (email → address, date → date,       */
+/*       phone → number, …) via a small DETERMINISTIC sample library —   */
+/*       no LLM, no RNG, and no single hardcoded value. Selection is     */
+/*       hashed on (field + scenario) so the same field in the same      */
+/*       scenario is repeatable, yet values vary across fields and       */
+/*       scenarios (so a suite never reads as one fixed "Emma Watson").  */
+/*  When nothing is known we still emit a realistic "<Label> Example"    */
+/*  literal a tester can type — never "a valid <Label>".                 */
+/* ------------------------------------------------------------------ */
+
+/** Length constraints for a field, parsed from requirement text ONLY. */
+interface FieldConstraint { maxLen?: number; minLen?: number }
+
+/** Stable non-crypto hash → sample selection is deterministic and repeatable. */
+function stableHash(s: string): number {
+  let h = 0;
+  for (let i = 0; i < s.length; i++) h = (Math.imul(h, 31) + s.charCodeAt(i)) | 0;
+  return Math.abs(h);
+}
+
+/** Deterministic, realistic sample values keyed by field concept. Small on
+ *  purpose: enough variety that a suite does not repeat one fixed name, while
+ *  every value is a plausible business value a tester can enter verbatim. */
+const SAMPLE_LIBRARY: Record<string, string[]> = {
+  firstName: ['Emma', 'Priya', 'David', 'Aarav', 'Sophia', 'Miguel'],
+  middleName: ['Rose', 'Anne', 'James', 'Lee', 'Marie', 'Dev'],
+  lastName: ['Smith', 'Kumar', 'Johnson', 'Patel', 'Chen', 'Garcia'],
+  fullName: ['Emma Smith', 'Priya Kumar', 'David Johnson', 'Aarav Patel', 'Sophia Chen'],
+  username: ['jsmith', 'pkumar', 'dwong', 'achen', 'mgarcia'],
+  email: ['emma.smith@example.com', 'priya.kumar@example.com', 'david.johnson@example.com', 'aarav.patel@example.com'],
+  phone: ['9876543210', '9123456780', '8005551234', '7011234567'],
+  date: ['2025-03-14', '2024-11-22', '2025-08-30', '2026-01-09'],
+  age: ['28', '34', '42', '25', '51'],
+  url: ['https://example.com', 'https://portal.example.org', 'https://acme.example.com'],
+  city: ['London', 'Mumbai', 'Toronto', 'Austin', 'Singapore'],
+  department: ['Engineering', 'Finance', 'Human Resources', 'Marketing', 'Operations'],
+  company: ['Acme Corp', 'Globex', 'Initech', 'Umbrella Ltd'],
+  number: ['42', '7', '100', '18', '256'],
+};
+
+type FieldConcept = keyof typeof SAMPLE_LIBRARY | 'unknown';
+
+/** A stable key for a field (used for constraint lookup and sample hashing). */
+function fieldKey(f: FieldLike): string { return lc(`${f.name}|${f.label}`); }
+
+/** Detect a field's concept from its TYPE first (an <input type=email> is an
+ *  email whatever its label), then its name/label. */
+function fieldConcept(field: FieldLike): FieldConcept {
+  const t = lc(field.type);
+  const n = lc(`${field.name} ${field.label}`);
+  if (t === 'email' || /e-?mail/.test(n)) return 'email';
+  if (t === 'date' || /\b(date|dob|birth|joining|hire date|start date)\b/.test(n)) return 'date';
+  if (t === 'tel' || /\b(phone|mobile|telephone|contact number)\b/.test(n)) return 'phone';
+  if (t === 'url' || /\b(url|website|web ?site|link|homepage)\b/.test(n)) return 'url';
+  if (/middle ?name/.test(n)) return 'middleName'; // distinct pool so a row never reads "Emma … Emma"
+  if (/first ?name|given name|\bfname\b/.test(n)) return 'firstName';
+  if (/last ?name|surname|family name|\blname\b/.test(n)) return 'lastName';
+  if (/full ?name|employee name|customer name|contact name|^name$/.test(n)) return 'fullName';
+  if (/\bage\b/.test(n)) return 'age';
+  if (/\b(city|town)\b/.test(n)) return 'city';
+  if (/\b(department|dept|division)\b/.test(n)) return 'department';
+  if (/\b(company|organi[sz]ation|employer)\b/.test(n)) return 'company';
+  if (t === 'number' || /\b(amount|quantity|count|salary|price|number|total|qty)\b/.test(n)) return 'number';
+  return 'unknown';
+}
+
+/** Pick a realistic value for the field, deterministically. Returns a quoted
+ *  literal ready to drop into "Enter <x> in the <field> field". Falls back to a
+ *  readable "<Label> Example" literal (never "a valid <Label>"). */
+function sampleValueForField(field: FieldLike, scenarioId: string): string {
+  const concept = fieldConcept(field);
+  const label = field.label || field.name || 'value';
+  if (concept !== 'unknown') {
+    const lib = SAMPLE_LIBRARY[concept];
+    const value = lib[stableHash(`${fieldKey(field)}|${lc(scenarioId)}`) % lib.length];
+    return `"${value}"`;
+  }
+  return `"${label} Example"`;
+}
+
+/** A type-appropriate INVALID example (a format violation), or null when the
+ *  field has no obvious format to violate (then the caller keeps the generic
+ *  "an invalid <Label>" — honest, since a bare text field has no fixed format). */
+function invalidExampleForField(field: FieldLike): string | null {
+  switch (fieldConcept(field)) {
+    case 'email': return `an invalid email address (e.g. "not-an-email")`;
+    case 'phone': return `an invalid phone number (e.g. "123")`;
+    case 'url': return `a malformed URL (e.g. "ht!tp://")`;
+    case 'date': return `an invalid date (e.g. "2026-13-40")`;
+    case 'age':
+    case 'number': return `an out-of-range number (e.g. "-1")`;
+    default: return null;
+  }
+}
+
+function dataPhraseFor(scenario: DataIntentScenario, field: FieldLike, constraint?: FieldConstraint): string {
   const label = field.label || field.name || 'value';
   const ct = scenario.coverageType;
   // The scenario's OWN intent — not just its coverage-type bucket — decides the
@@ -513,8 +619,9 @@ function dataPhraseFor(scenario: DataIntentScenario, field: FieldLike): string {
   const intent = lc(`${scenario.title} ${scenario.objective} ${scenario.riskArea} ${scenario.id}`);
   const fieldText = lc(`${field.name} ${field.label} ${field.type}`);
   const isFile = lc(field.type) === 'file' || /photo|image|upload|file|attach|document|resume|avatar/.test(fieldText);
+  const scenarioId = scenario.id || '';
 
-  // Specific-intent payloads (override the generic phrasing only when the
+  // ── (1) Specific-intent payloads (override the generic phrasing only when the
   // scenario expresses a concrete intent; otherwise fall through to the
   // coverage-type default so polarity words like valid/invalid survive).
   // XSS is checked BEFORE SQL: the XSS scenario id is "…-injection-xss", which
@@ -528,25 +635,71 @@ function dataPhraseFor(scenario: DataIntentScenario, field: FieldLike): string {
   if (/numeric|contains? a? ?number|digits? in|non-alpha|john123/.test(intent)) return `a ${label} containing numbers (e.g. "John123")`;
   if (/whitespace|spaces? only|space-only|only spaces|blank spaces/.test(intent)) return `a whitespace-only ${label} (e.g. "   ")`;
   if (/unicode|accent|non-ascii|special character|emoji|diacritic/.test(intent)) return `a unicode ${label} (e.g. "தமிழ்", "李雷", "😊")`;
-  if (/\bmax(imum)?\b|too long|over the limit|exceed|length limit|character limit|501|500 char/.test(intent)) return `a ${label} longer than the maximum allowed length (e.g. 501 characters)`;
-  if (/\bmin(imum)?\b|single character|one char|too short/.test(intent)) return `a single-character ${label} (minimum boundary)`;
+
+  // ── (2) Length-boundary intents — grounded in the REAL max/min when the
+  // requirement states one; otherwise described WITHOUT a fabricated number.
+  // The scenario's own wording decides WHICH boundary (over-max vs under-min),
+  // so we never emit MAX+1 for a "too short" scenario or vice-versa.
+  if (/\bmax(imum)?\b|too long|over the limit|exceed|length limit|character limit|501|500 char/.test(intent)) {
+    return constraint?.maxLen !== undefined
+      ? `a ${label} of ${constraint.maxLen + 1} characters (1 over the ${constraint.maxLen}-character maximum)`
+      : `a ${label} longer than the maximum allowed length`;
+  }
+  if (/\bmin(imum)?\b|single character|one char|too short/.test(intent)) {
+    return constraint?.minLen !== undefined && constraint.minLen > 1
+      ? `a ${label} of ${constraint.minLen - 1} characters (1 under the ${constraint.minLen}-character minimum)`
+      : `a single-character ${label} (minimum boundary)`;
+  }
   if (/leading zero/.test(intent)) return `a ${label} with leading zeros (e.g. "007")`;
   if (/blank|empty|required|mandatory|missing/.test(intent)) return `a blank ${label} (leave it empty)`;
 
+  // ── (3) Coverage-type default — now type/field-aware and constraint-grounded
+  // instead of the old generic "a valid <Label>".
   switch (ct) {
     case 'negative':
-      return `an invalid ${label}`;
+      return invalidExampleForField(field) ?? `an invalid ${label}`;
     case 'edge_cases':
-      return `a boundary/edge ${label} (empty, whitespace, or unusual case)`;
+      return constraint?.maxLen !== undefined
+        ? `a boundary-length ${label} (at ${constraint.maxLen}, and 1 below and 1 above the limit)`
+        : `a boundary/edge ${label} (empty, whitespace, or unusual case)`;
     case 'boundary':
-      return `a boundary-length ${label} (at, below and above the limit)`;
+      return constraint?.maxLen !== undefined
+        ? `${label} values of ${constraint.maxLen - 1}, ${constraint.maxLen} and ${constraint.maxLen + 1} characters (below, at and above the ${constraint.maxLen}-character limit)`
+        : `a boundary-length ${label} (at, below and above the limit)`;
     case 'security':
       return `a malicious ${label} (e.g. an injection/script string)`;
     case 'role_based':
       return `a ${label} for a user WITHOUT the required role`;
-    default: // positive, integration, performance, …
-      return `a valid ${label}`;
+    default: // positive, integration, performance — realistic, executable value.
+      return isFile ? `a valid image file (e.g. "profile.jpg")` : sampleValueForField(field, scenarioId);
   }
+}
+
+/** Parse per-field length constraints from the requirement text — used ONLY when
+ *  the requirement actually states them (never invents a limit). A constraint is
+ *  attributed to a field only when the field's own name/label appears in the same
+ *  sentence as the number, so "First Name: max 30" binds to firstName and not to
+ *  some other field. Fail-open: returns an empty map when nothing is stated. */
+function extractFieldConstraints(input: RequirementLike | undefined, fields: FieldLike[]): Map<string, FieldConstraint> {
+  const map = new Map<string, FieldConstraint>();
+  const text = lc(`${input?.description ?? ''}. ${input?.acceptanceCriteria ?? ''}. ${input?.businessFlow ?? ''}`);
+  if (!text.trim() || !fields.length) return map;
+  const sentences = text.split(/[.;\n]+/);
+  for (const f of fields) {
+    const tokens = [lc(f.label), lc(f.name)].filter((t) => t && t.length > 1);
+    if (!tokens.length) continue;
+    for (const sentence of sentences) {
+      if (!tokens.some((tk) => sentence.includes(tk))) continue;
+      const maxM = sentence.match(/(?:max(?:imum)?|up to|no more than|at most|not exceed(?:ing)?|cannot exceed)\s*(?:of\s*|is\s*|:\s*)?(\d{1,4})\s*(?:characters|chars?|digits?|letters)?/);
+      const minM = sentence.match(/(?:min(?:imum)?|at least|no fewer than|no less than)\s*(?:of\s*|is\s*|:\s*)?(\d{1,4})\s*(?:characters|chars?|digits?|letters)?/);
+      if (!maxM && !minM) continue;
+      const existing = map.get(fieldKey(f)) ?? {};
+      if (maxM) existing.maxLen = parseInt(maxM[1], 10);
+      if (minM) existing.minLen = parseInt(minM[1], 10);
+      map.set(fieldKey(f), existing);
+    }
+  }
+  return map;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1081,6 +1234,13 @@ export function buildDraftTestCases(
   const featureVocab = Array.from(new Set([...titleTerms, ...groundedScenarioTerms]));
   const featureForm = pickForm(ap?.forms, featureVocab);
 
+  // ── SPRINT 3 — Scenario-specific Test Data ──
+  // Parse any length constraints the REQUIREMENT states for the resolved form's
+  // fields, ONCE (they are the same for every scenario). Empty when the
+  // requirement states none — in which case boundary values stay unnumbered
+  // rather than inventing a limit.
+  const fieldConstraints = extractFieldConstraints(input, featureForm?.fields || []);
+
   // The builder is a PURE TRANSFORM. It emits exactly one draft per planned
   // scenario and NEVER decides whether a scenario should exist — that decision
   // was already made (and justified with provenance) by the Scenario Planner,
@@ -1146,9 +1306,9 @@ export function buildDraftTestCases(
         // tester actually performs so the step is executable as written.
         const isFileField = lc(f.type) === 'file' || /photo|image|upload|file|attach|document|resume|avatar/.test(lc(`${f.name} ${f.label}`));
         if (isFileField) {
-          steps.push(`Upload ${dataPhraseFor(scenario, f)} for the ${fieldLabel}`);
+          steps.push(`Upload ${dataPhraseFor(scenario, f, fieldConstraints.get(fieldKey(f)))} for the ${fieldLabel}`);
         } else {
-          steps.push(`Enter ${dataPhraseFor(scenario, f)} in the ${fieldLabel} field`);
+          steps.push(`Enter ${dataPhraseFor(scenario, f, fieldConstraints.get(fieldKey(f)))} in the ${fieldLabel} field`);
         }
         grounding.push({ stepIndex: steps.length, selector: f.selector, page: stepForm.page, control: fieldLabel });
       }

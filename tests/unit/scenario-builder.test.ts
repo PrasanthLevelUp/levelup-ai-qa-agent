@@ -124,8 +124,15 @@ describe('buildDraftTestCases — grounding', () => {
 
     const pos = drafts.find(d => d.coverageType === 'positive');
     const neg = drafts.find(d => d.coverageType === 'negative');
-    expect(pos && pos.steps.join(' ')).toContain('valid');
-    expect(neg && neg.steps.join(' ')).toContain('invalid');
+    const posText = (pos && pos.steps.join(' ')) || '';
+    const negText = (neg && neg.steps.join(' ')) || '';
+    // Sprint 3: the positive intent no longer ships the generic word "valid"
+    // ("Enter a valid Email"). It now fills a realistic, scenario-specific,
+    // quoted value and MUST NOT read as invalid data.
+    expect(posText).toMatch(/Enter "[^"]+" in the Email field/);
+    expect(posText).not.toContain('invalid');
+    // The negative intent still exercises invalid data.
+    expect(negText).toContain('invalid');
   });
 });
 

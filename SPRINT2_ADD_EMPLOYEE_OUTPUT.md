@@ -8,10 +8,10 @@ Legend: 🟢 Automation Ready · 🟡 Needs Review · intent shown per scenario.
 - id: `crud-pos-create` · intent: **form_entry** · placeholder: no
 - steps:
   1. Open the page under test
-  2. Enter a valid First Name in the First Name field
-  3. Enter a valid Middle Name in the Middle Name field
-  4. Enter a valid Last Name in the Last Name field
-  5. Upload a valid Profile Photo for the Profile Photo
+  2. Enter "Emma" in the First Name field
+  3. Enter "Rose" in the Middle Name field
+  4. Enter "Smith" in the Last Name field
+  5. Upload a valid image file (e.g. "profile.jpg") for the Profile Photo
   6. Click the Save button
 
 ### 2. 🟡 Direct URL / API access is authorization-checked
@@ -35,10 +35,10 @@ Legend: 🟢 Automation Ready · 🟡 Needs Review · intent shown per scenario.
 - id: `crud-pos-cancel-discards` · intent: **navigation** · placeholder: no
 - steps:
   1. Open the page under test
-  2. Enter a valid First Name in the First Name field
-  3. Enter a valid Middle Name in the Middle Name field
-  4. Enter a valid Last Name in the Last Name field
-  5. Upload a valid Profile Photo for the Profile Photo
+  2. Enter "Sophia" in the First Name field
+  3. Enter "James" in the Middle Name field
+  4. Enter "Chen" in the Last Name field
+  5. Upload a valid image file (e.g. "profile.jpg") for the Profile Photo
   6. Click the Cancel button
   7. Return to the list and confirm the record was NOT created (the entered data was discarded)
 
@@ -46,10 +46,10 @@ Legend: 🟢 Automation Ready · 🟡 Needs Review · intent shown per scenario.
 - id: `crud-pos-searchable` · intent: **search** · placeholder: no
 - steps:
   1. Open the page under test
-  2. Enter a valid First Name in the First Name field
-  3. Enter a valid Middle Name in the Middle Name field
-  4. Enter a valid Last Name in the Last Name field
-  5. Upload a valid Profile Photo for the Profile Photo
+  2. Enter "David" in the First Name field
+  3. Enter "James" in the Middle Name field
+  4. Enter "Chen" in the Last Name field
+  5. Upload a valid image file (e.g. "profile.jpg") for the Profile Photo
   6. Click the Save button
   7. Open the records list / search page
   8. Search for the newly created record (by its identifier and by name)
@@ -59,10 +59,10 @@ Legend: 🟢 Automation Ready · 🟡 Needs Review · intent shown per scenario.
 - id: `crud-pos-search-partial` · intent: **search** · placeholder: no
 - steps:
   1. Open the page under test
-  2. Enter a valid First Name in the First Name field
-  3. Enter a valid Middle Name in the Middle Name field
-  4. Enter a valid Last Name in the Last Name field
-  5. Upload a valid Profile Photo for the Profile Photo
+  2. Enter "Emma" in the First Name field
+  3. Enter "James" in the Middle Name field
+  4. Enter "Smith" in the Last Name field
+  5. Upload a valid image file (e.g. "profile.jpg") for the Profile Photo
   6. Click the Save button
   7. Open the records list / search page
   8. Search for the newly created record (by its identifier and by name)
@@ -72,10 +72,10 @@ Legend: 🟢 Automation Ready · 🟡 Needs Review · intent shown per scenario.
 - id: `crud-pos-search-case-insensitive` · intent: **search** · placeholder: no
 - steps:
   1. Open the page under test
-  2. Enter a valid First Name in the First Name field
-  3. Enter a valid Middle Name in the Middle Name field
-  4. Enter a valid Last Name in the Last Name field
-  5. Upload a valid Profile Photo for the Profile Photo
+  2. Enter "Priya" in the First Name field
+  3. Enter "Dev" in the Middle Name field
+  4. Enter "Garcia" in the Last Name field
+  5. Upload a valid image file (e.g. "profile.jpg") for the Profile Photo
   6. Click the Save button
   7. Open the records list / search page
   8. Search for the newly created record (by its identifier and by name)
@@ -85,20 +85,20 @@ Legend: 🟢 Automation Ready · 🟡 Needs Review · intent shown per scenario.
 - id: `crud-pos-propagate-views` · intent: **form_entry** · placeholder: no
 - steps:
   1. Open the page under test
-  2. Enter a valid First Name in the First Name field
-  3. Enter a valid Middle Name in the Middle Name field
-  4. Enter a valid Last Name in the Last Name field
-  5. Upload a valid Profile Photo for the Profile Photo
+  2. Enter "David" in the First Name field
+  3. Enter "Rose" in the Middle Name field
+  4. Enter "Johnson" in the Last Name field
+  5. Upload a valid image file (e.g. "profile.jpg") for the Profile Photo
   6. Click the Save button
 
 ### 9. 🟢 Valid file upload is accepted and stored
 - id: `crud-pos-upload-valid` · intent: **file_upload** · placeholder: no
 - steps:
   1. Open the page under test
-  2. Enter a valid First Name in the First Name field
-  3. Enter a valid Middle Name in the Middle Name field
-  4. Enter a valid Last Name in the Last Name field
-  5. Upload a valid Profile Photo for the Profile Photo
+  2. Enter "David" in the First Name field
+  3. Enter "Marie" in the Middle Name field
+  4. Enter "Chen" in the Last Name field
+  5. Upload a valid image file (e.g. "profile.jpg") for the Profile Photo
   6. Click the Save button
 
 ### 10. 🟢 Invalid / unsupported file format is rejected
@@ -254,50 +254,50 @@ Legend: 🟢 Automation Ready · 🟡 Needs Review · intent shown per scenario.
 - id: `req-step-1` · intent: **form_entry** · placeholder: no
 - steps:
   1. Open the page under test
-  2. Enter a valid First Name in the First Name field
-  3. Enter a valid Middle Name in the Middle Name field
-  4. Enter a valid Last Name in the Last Name field
-  5. Upload a valid Profile Photo for the Profile Photo
+  2. Enter "Miguel" in the First Name field
+  3. Enter "Lee" in the Middle Name field
+  4. Enter "Kumar" in the Last Name field
+  5. Upload a valid image file (e.g. "profile.jpg") for the Profile Photo
   6. Click the Save button
 
 ### 26. 🟢 Admin can add a new employee by entering first…
 - id: `req-step-2` · intent: **form_entry** · placeholder: no
 - steps:
   1. Open the page under test
-  2. Enter a valid First Name in the First Name field
-  3. Enter a valid Middle Name in the Middle Name field
-  4. Enter a valid Last Name in the Last Name field
-  5. Upload a valid Profile Photo for the Profile Photo
+  2. Enter "Sophia" in the First Name field
+  3. Enter "James" in the Middle Name field
+  4. Enter "Johnson" in the Last Name field
+  5. Upload a valid image file (e.g. "profile.jpg") for the Profile Photo
   6. Click the Save button
 
 ### 27. 🟢 Employee ID may be auto-generated
 - id: `req-step-3` · intent: **form_entry** · placeholder: no
 - steps:
   1. Open the page under test
-  2. Enter a valid First Name in the First Name field
-  3. Enter a valid Middle Name in the Middle Name field
-  4. Enter a valid Last Name in the Last Name field
-  5. Upload a valid Profile Photo for the Profile Photo
+  2. Enter "Aarav" in the First Name field
+  3. Enter "Anne" in the Middle Name field
+  4. Enter "Patel" in the Last Name field
+  5. Upload a valid image file (e.g. "profile.jpg") for the Profile Photo
   6. Click the Save button
 
 ### 28. 🟢 On save the employee is created and becomes searchable…
 - id: `req-step-4` · intent: **form_entry** · placeholder: no
 - steps:
   1. Open the page under test
-  2. Enter a valid First Name in the First Name field
-  3. Enter a valid Middle Name in the Middle Name field
-  4. Enter a valid Last Name in the Last Name field
-  5. Upload a valid Profile Photo for the Profile Photo
+  2. Enter "David" in the First Name field
+  3. Enter "Rose" in the Middle Name field
+  4. Enter "Chen" in the Last Name field
+  5. Upload a valid image file (e.g. "profile.jpg") for the Profile Photo
   6. Click the Save button
 
 ### 29. 🟢 Only authorized admins may access the form
 - id: `req-step-5` · intent: **form_entry** · placeholder: no
 - steps:
   1. Open the page under test
-  2. Enter a valid First Name in the First Name field
-  3. Enter a valid Middle Name in the Middle Name field
-  4. Enter a valid Last Name in the Last Name field
-  5. Upload a valid Profile Photo for the Profile Photo
+  2. Enter "Priya" in the First Name field
+  3. Enter "Dev" in the Middle Name field
+  4. Enter "Garcia" in the Last Name field
+  5. Upload a valid image file (e.g. "profile.jpg") for the Profile Photo
   6. Click the Save button
 
 ---
