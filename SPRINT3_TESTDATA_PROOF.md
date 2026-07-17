@@ -36,7 +36,7 @@ carried no constraint metadata, and none was threaded from the requirement.
   requirement text and attributed to a field only when its name appears alongside the number.
   Whichever boundary the scenario requires is generated (MAX / MAX+1 / MIN / MIN−1).
 - **Never invent** a length / range / regex / uniqueness rule the requirement did not state.
-- **Unknown field fallback** → `"<Label> Example"` (e.g. `"Notes Example"`), never `"valid Notes"`.
+- **Unknown field fallback** → `"Sample <Label>"` (e.g. `"Sample Notes"`), never `"valid Notes"`.
 - **Preserved unchanged:** SQL, XSS, duplicate, whitespace, unicode and numeric intent payloads.
 
 ---
@@ -51,7 +51,7 @@ carried no constraint metadata, and none was threaded from the requirement.
 | Positive (Phone, type=tel) | `a valid Phone` | `"8005551234"` |
 | Positive (Age, type=number) | `a valid Age` | `"28"` |
 | Positive (Department) | `a valid Department` | `"Finance"` / `"Marketing"` … |
-| Positive (unknown "Notes") | `a valid Notes` | `"Notes Example"` |
+| Positive (unknown "Notes") | `a valid Notes` | `"Sample Notes"` |
 | Negative (Email) | `an invalid Email` | `an invalid email address (e.g. "not-an-email")` |
 | Negative (Phone) | `an invalid Phone` | `an invalid phone number (e.g. "123")` |
 | Negative (Age) | `an invalid Age` | `an out-of-range number (e.g. "-1")` |

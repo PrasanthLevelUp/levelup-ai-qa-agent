@@ -76,10 +76,10 @@ describe('Sprint 3 — generic "a valid <Field>" placeholder is eliminated', () 
     expect(empText).toMatch(/Enter "(Finance|Human Resources|Marketing|Engineering|Sales|Operations)" in the Department field/);
   });
 
-  it('an unknown field type falls back to "<Label> Example", never "a valid Notes"', () => {
+  it('an unknown field type falls back to "Sample <Label>", never "a valid Notes"', () => {
     expect(empText).not.toMatch(/a valid Notes/);
-    // "Notes" matches no concept → deterministic "<Label> Example" fallback.
-    expect(empText).toMatch(/Enter "Notes Example" in the Notes field/);
+    // "Notes" matches no concept → deterministic "Sample <Label>" fallback.
+    expect(empText).toMatch(/Enter "Sample Notes" in the Notes field/);
   });
 });
 

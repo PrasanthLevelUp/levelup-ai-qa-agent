@@ -520,7 +520,7 @@ interface DataIntentScenario {
 /*       hashed on (field + scenario) so the same field in the same      */
 /*       scenario is repeatable, yet values vary across fields and       */
 /*       scenarios (so a suite never reads as one fixed "Emma Watson").  */
-/*  When nothing is known we still emit a realistic "<Label> Example"    */
+/*  When nothing is known we still emit a readable "Sample <Label>"      */
 /*  literal a tester can type — never "a valid <Label>".                 */
 /* ------------------------------------------------------------------ */
 
@@ -582,7 +582,7 @@ function fieldConcept(field: FieldLike): FieldConcept {
 
 /** Pick a realistic value for the field, deterministically. Returns a quoted
  *  literal ready to drop into "Enter <x> in the <field> field". Falls back to a
- *  readable "<Label> Example" literal (never "a valid <Label>"). */
+ *  readable "Sample <Label>" literal (never "a valid <Label>"). */
 function sampleValueForField(field: FieldLike, scenarioId: string): string {
   const concept = fieldConcept(field);
   const label = field.label || field.name || 'value';
@@ -591,7 +591,8 @@ function sampleValueForField(field: FieldLike, scenarioId: string): string {
     const value = lib[stableHash(`${fieldKey(field)}|${lc(scenarioId)}`) % lib.length];
     return `"${value}"`;
   }
-  return `"${label} Example"`;
+  // Unknown field → "Sample <Label>" (adjective-first, more natural phrasing).
+  return `"Sample ${label}"`;
 }
 
 /** A type-appropriate INVALID example (a format violation), or null when the
