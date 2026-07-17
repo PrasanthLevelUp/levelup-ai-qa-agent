@@ -39,6 +39,12 @@ export interface ScenarioForIntegrity {
   }>;
   expected?: {
     observable?: string;
+    /**
+     * The canonical, machine-readable assertion list behind `observable`. When
+     * present, the Expected-Result-Provable check scores EACH assertion against
+     * the Observable / Grounded / Black-box conditions.
+     */
+    assertions?: string[];
     business?: string;
     technical?: { selector?: string; page?: string };
   };
@@ -64,7 +70,8 @@ export type IntegrityCheckId =
   | 'preconditions'
   | 'business_flow'
   | 'grounding_completeness'
-  | 'field_validity';
+  | 'field_validity'
+  | 'expected_result_provable';
 
 /**
  * Result of a single deterministic check. `passed` is advisory only — it feeds

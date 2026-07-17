@@ -81,6 +81,10 @@ export const AUTOMATION_GATING_CHECKS = new Set<IntegrityCheckId>([
   'step_completeness',
   'test_data_suitability',
   'expected_result_consistency',
+  // A "rich but not provable" expected result (server-side/DB internals,
+  // invented side-effects, invisible state) is NOT executable as-is — it gates
+  // automation readiness exactly like a wrong field or contradictory expected.
+  'expected_result_provable',
 ]);
 
 /**
@@ -164,7 +168,25 @@ export interface StepGrounding {
  * backward compatibility with every existing consumer/DB column.
  */
 export interface StructuredExpected {
+  /**
+   * The observable expected result as a QA reads it. Now a business-observable
+   * ASSERTION CHECKLIST (one line per independent assertion, "✓ "-prefixed),
+   * not a single generic "the action succeeds" sentence — see `assertions`.
+   * Kept as a string because every existing consumer/DB column/renderer reads
+   * it; the multi-line form renders as a checklist wherever text wraps (CSV /
+   * XLSX wrapText, manual UI, BDD Then).
+   */
   observable: string;
+  /**
+   * The canonical, machine-readable list the `observable` string is built from.
+   * Each entry is ONE independent, user-observable assertion an automation
+   * engineer can turn into a single `expect(...)` — "What changed? What stayed
+   * unchanged? What became visible / searchable / persistent? What rule was
+   * enforced?". Derived ONLY from data already available (scenario coverage
+   * type + declared objective, the resolved form's fields, and the App Profile
+   * pages) — never a new inference engine.
+   */
+  assertions?: string[];
   business?: string;
   technical?: { selector?: string; page?: string };
 }
@@ -527,50 +549,116 @@ function dataPhraseFor(scenario: DataIntentScenario, field: FieldLike): string {
   }
 }
 
+/* ------------------------------------------------------------------ */
+/*  Expected-result assertion helpers                                  */
+/*  ---------------------------------------------------------------    */
+/*  These turn the data we ALREADY have — the requirement title, the   */
+/*  scenario's declared coverage type + objective, the resolved form's */
+/*  fields, and the App Profile pages — into a business-observable     */
+/*  assertion CHECKLIST. No new engine, no new planner field, no LLM:  */
+/*  pure functions over existing inputs.                               */
+/* ------------------------------------------------------------------ */
+
+/**
+ * The business ENTITY a requirement operates on, e.g. "Add Employee" →
+ * "Employee". Strips a leading CRUD verb + article and a trailing generic noun
+ * (form/page/record/…) from the requirement title. Falls back to "record" so
+ * assertions always read naturally. Pure string derivation from the requirement
+ * — never a lookup or a guess about behaviour.
+ */
+function deriveEntity(input: RequirementLike | undefined): string {
+  const raw = (input?.title || '').trim();
+  if (raw) {
+    let s = raw
+      .replace(/^(add|create|edit|update|new|register|delete|remove|manage|view|search|assign)\s+/i, '')
+      .replace(/^\s*(a|an|the)\s+/i, '')
+      .replace(/\s+(form|page|screen|record|registration|creation|management|details|module|feature)$/i, '')
+      .trim();
+    if (s) return s;
+  }
+  return 'record';
+}
+
+/** The human name of the list/index surface, e.g. "Employees list". */
+function deriveListName(ap: ProfileLike | undefined, entity: string): string {
+  const listPage = (ap?.pages || []).find(p =>
+    /\b(list|index|directory|all|table|grid)\b/i.test(`${p.pageType || ''} ${p.title || ''}`),
+  );
+  return listPage?.title ? `${listPage.title} list`.replace(/\slist\slist$/i, ' list') : `${entity} list`;
+}
+
+/** Visible (non-hidden) field labels joined for prose: "A, B and C". */
+function enteredFieldsPhrase(form: FormLike | undefined): string | null {
+  const labels = (form?.fields || [])
+    .filter(f => (f.type || '').toLowerCase() !== 'hidden')
+    .map(f => (f.label || f.name || '').trim())
+    .filter(Boolean);
+  if (!labels.length) return null;
+  if (labels.length === 1) return labels[0];
+  return `${labels.slice(0, -1).join(', ')} and ${labels[labels.length - 1]}`;
+}
+
+/** The form's identifier-ish field label (Employee ID, code, number …). */
+function identifierFieldLabel(form: FormLike | undefined): string | null {
+  const f = (form?.fields || []).find(x =>
+    /\b(id|identifier|code|number|reference)\b/i.test(`${x.name || ''} ${x.label || ''}`),
+  );
+  return f ? (f.label || f.name || '').trim() || null : null;
+}
+
+/**
+ * The specific field a field-scoped scenario targets, by matching a form field
+ * LABEL that appears in the scenario's own title/objective (longest match wins).
+ * Reads the scenario's declared text only — it does not infer new intent.
+ */
+function targetFieldLabel(
+  scenario: PlannedScenarioWithProvenance,
+  form: FormLike | undefined,
+): string | null {
+  const hay = `${scenario.title} ${scenario.objective}`.toLowerCase();
+  let best: string | null = null;
+  for (const f of form?.fields || []) {
+    const label = (f.label || f.name || '').trim();
+    if (label && hay.includes(label.toLowerCase())) {
+      if (!best || label.length > best.length) best = label;
+    }
+  }
+  return best;
+}
+
 /**
  * Build a STRUCTURED expected result for a scenario. Replaces the old
- * "expectedResult = scenario.objective" (which produced generic, intent-only
- * results). We split ONE outcome into:
- *   • observable — a concrete, user-visible result a manual tester can check,
- *                  shaped by the coverage type (success vs rejection vs error);
- *   • business   — the meaning/state it proves (the scenario objective);
- *   • technical  — the automation anchor (a post-condition selector/page) when
- *                  the App Profile gives us one.
+ * one-generic-sentence-per-coverage-type output (the audit's Priority-1 defect)
+ * with a business-observable ASSERTION CHECKLIST a QA Lead would accept without
+ * rewriting. One outcome, three projections:
+ *   • observable  — the "✓ "-prefixed checklist a manual tester reads (built by
+ *                   joining `assertions`);
+ *   • assertions  — the canonical list each line came from (one testable claim);
+ *   • business    — the meaning/state it proves (the scenario objective);
+ *   • technical   — the automation anchor (a post-condition selector/page) when
+ *                   the App Profile gives us one.
  *
- * Deterministic and fail-open. The LLM later sharpens `observable` wording only.
- * No new interpretation engine — this is a data-shape change, per the plan.
+ * The coverage TYPE (structured) chooses the assertion FAMILY; the scenario's
+ * own declared objective only refines which negative/boundary outcome applies
+ * (security vs authorization vs duplicate vs validation; accept vs reject). We
+ * NEVER invent behaviour — every assertion is grounded in the entity, the
+ * resolved form's fields, and the profile's pages, all already in hand.
+ * Deterministic and fail-open. The LLM later sharpens wording only.
  */
 function buildExpected(
   scenario: PlannedScenarioWithProvenance,
   form: FormLike | undefined,
   ap: ProfileLike | undefined,
   stepFlow: ScenarioStepFlow | null = null,
+  entity: string = 'record',
 ): StructuredExpected {
   const ct = scenario.coverageType;
-  // Flow-shaped scenarios need a flow-shaped OBSERVABLE — the generic positive
-  // "the action succeeds…" is wrong for a cancel (nothing should persist) or a
-  // search (a record must be FOUND). Keyed off the SAME declared flow the steps
-  // used, so the title, the steps and the expected result all agree.
-  if (stepFlow === 'cancel') {
-    const page = form?.page || ap?.baseUrl;
-    return {
-      observable:
-        'No record is created: the form is discarded and the user is returned to the list. ' +
-        'The entered values are not persisted and the record does not appear in the list afterwards.',
-      business: scenario.objective,
-      technical: page ? { page } : undefined,
-    };
-  }
-  if (stepFlow === 'search') {
-    const page = ap?.baseUrl || form?.page;
-    return {
-      observable:
-        'The newly created record is returned in the search results — found by its identifier and by name — ' +
-        'confirming it was persisted and is immediately discoverable (no reindex delay).',
-      business: scenario.objective,
-      technical: page ? { page } : undefined,
-    };
-  }
+  const listName = deriveListName(ap, entity);
+  const fieldsPhrase = enteredFieldsPhrase(form);
+  const idLabel = identifierFieldLabel(form);
+  const target = targetFieldLabel(scenario, form);
+  const text = `${scenario.title} ${scenario.objective} ${scenario.riskArea}`.toLowerCase();
+
   // A post-condition anchor for automation: a "success" landmark (e.g. a logout
   // control) for positive flows, else the form's page. Never shown to manual QA.
   const successEl = (ap?.keyElements || []).find(e =>
@@ -584,35 +672,142 @@ function buildExpected(
       ? { page }
       : undefined;
 
-  let observable: string;
-  switch (ct) {
-    case 'negative':
-      observable =
-        'The action is rejected, a clear, specific error message is shown, and no state change or navigation occurs.';
-      break;
-    case 'edge_cases':
-      observable =
-        'The application handles the edge input gracefully — it either accepts it correctly or shows a clear validation message, without errors or data corruption.';
-      break;
-    case 'boundary':
-      observable =
-        'Values at and within the limit are accepted; values beyond the limit are rejected with a clear boundary/validation message.';
-      break;
-    case 'security':
-      observable =
-        'The malicious input is safely rejected or neutralised — it is not executed or reflected back, and the user sees a safe, generic error (no sensitive detail).';
-      break;
-    case 'role_based':
-      observable =
-        'Access is denied for the unauthorized role and the user is shown an appropriate "not permitted" / access-denied message.';
-      break;
-    default: // positive, integration, performance, …
-      observable = successEl?.label
-        ? `The action succeeds and the user reaches the expected next state (e.g. the "${successEl.label}" area is visible).`
-        : 'The action succeeds and the user reaches the expected next state, with confirmation shown.';
+  // Assemble the datum from an assertion list: `observable` is the checklist the
+  // string consumers read; `assertions` is the machine-readable source list.
+  const finalize = (assertions: string[]): StructuredExpected => ({
+    observable: assertions.map(a => `✓ ${a}`).join('\n'),
+    assertions,
+    business: scenario.objective,
+    technical,
+  });
+
+  // ── Flow-shaped scenarios (declared step-flow) come FIRST — a cancel proves
+  // nothing persisted; a search proves the record is found. Same declared flow
+  // the steps used, so title, steps and expected all agree. ──
+  if (stepFlow === 'cancel') {
+    return finalize([
+      `No ${entity} is created — the entered data is discarded.`,
+      `The user is returned to the ${listName} without saving.`,
+      `The new ${entity} does not appear in the ${listName} afterwards, confirming nothing was saved.`,
+      `Re-opening the form shows empty fields.`,
+    ]);
+  }
+  if (stepFlow === 'search') {
+    return finalize([
+      `The newly created ${entity} is returned in the search results.`,
+      `It is found by its identifier${idLabel ? ` (${idLabel})` : ''} and by name.`,
+      `The result appears immediately after creation, without needing to wait or search again.`,
+      `The returned record shows the exact values that were saved.`,
+    ]);
   }
 
-  return { observable, business: scenario.objective, technical };
+  // ── NEGATIVE family — refined by the scenario's own declared outcome. ──
+  if (ct === 'negative') {
+    const isSecurity = /\b(sql|xss|injection|script|payload|malicious|cross-site)\b/.test(text);
+    const isAuthz = /\b(unauthori|authoris|authoriz|permission|\brole\b|forbidden|redirected to login|unauthenticated|direct (url|api|endpoint)|access)\b/.test(text);
+    const isDuplicate = /\b(duplicate|unique|already exist|double[- ]?submit|not unique)\b/.test(text);
+
+    if (isSecurity) {
+      return finalize([
+        `The input is rejected, or the ${entity} is created showing the text exactly as typed — the payload is treated as plain text, not run.`,
+        `No pop-up, alert box, or injected element appears on any ${entity} screen or list.`,
+        `Wherever the value is shown, it displays as the literal characters that were entered.`,
+        `A clear, generic error message is shown, with no internal or technical detail exposed to the user.`,
+      ]);
+    }
+    if (isAuthz) {
+      return finalize([
+        `The operation is denied — no ${entity} is created or changed.`,
+        `The user sees an access-denied / not-authorised message (or is sent to the login page).`,
+        `The ${listName} shows no new or changed ${entity} afterwards.`,
+      ]);
+    }
+    if (isDuplicate) {
+      return finalize([
+        `The duplicate is rejected — a second ${entity} record is NOT created.`,
+        `A clear "already exists" uniqueness error is shown${idLabel ? `, identifying the conflicting ${idLabel}` : ''}.`,
+        `The original existing ${entity} is left unchanged.`,
+        `The total ${entity} count does not increase.`,
+      ]);
+    }
+    // General validation rejection.
+    return finalize([
+      `The ${entity} is NOT created — no record is saved.`,
+      target
+        ? `A clear, specific validation error is shown for the ${target} field.`
+        : `A clear, specific validation error message is displayed.`,
+      `The form stays on screen with the entered values retained for correction.`,
+      `No new ${entity} appears in the ${listName}.`,
+    ]);
+  }
+
+  // ── BOUNDARY family — accept vs reject taken from the scenario's own text. ──
+  if (ct === 'boundary') {
+    const isReject = /\b(over|exceed|beyond|too long|longer than|above|rejected|reject)\b/.test(text);
+    if (isReject) {
+      return finalize([
+        target ? `The over-limit ${target} value is rejected.` : `The over-limit value is rejected.`,
+        `A clear length/validation message is shown, stating the allowed maximum.`,
+        `No ${entity} record is created.`,
+        `The entered data is retained so the user can correct it.`,
+      ]);
+    }
+    return finalize([
+      target ? `The boundary ${target} value is accepted.` : `The boundary value is accepted.`,
+      `The ${entity} is created successfully with the boundary value.`,
+      `The value is stored exactly as entered — no truncation, trimming, or modification.`,
+      `The saved ${entity} displays and is retrievable with the exact value intact.`,
+    ]);
+  }
+
+  // ── EDGE family — graceful handling, outcome may be accept OR reject. ──
+  if (ct === 'edge_cases') {
+    return finalize([
+      `The application handles the input without crashing or showing an error page, and stays responsive.`,
+      target
+        ? `The ${target} value is either accepted and shown correctly, or rejected with a clear validation message.`
+        : `The input is either accepted and shown correctly, or rejected with a clear validation message.`,
+      `Any ${entity} that is saved appears in the ${listName} showing the values that were entered.`,
+    ]);
+  }
+
+  // ── SECURITY / ROLE_BASED coverage types (when not already negative). ──
+  if (ct === 'security') {
+    return finalize([
+      `The input is rejected, or the value is shown exactly as typed — it is treated as plain text, not run.`,
+      `No pop-up, alert box, or injected element appears on any ${entity} screen.`,
+      `A clear, generic error message is shown, with no internal or technical detail exposed to the user.`,
+    ]);
+  }
+  if (ct === 'role_based') {
+    return finalize([
+      `The operation is denied for this user role — no ${entity} is created or changed.`,
+      `An access-denied / "not permitted" message is shown.`,
+      `The ${listName} shows no new or changed ${entity} afterwards.`,
+    ]);
+  }
+
+  // ── POSITIVE / default family — a create-and-confirm outcome. When a form was
+  // resolved we assert the full create workflow; ungrounded skeletons get a
+  // lighter positive confirmation (they are Needs-Review anyway). ──
+  if (form) {
+    return finalize([
+      `The ${entity} record is created successfully.`,
+      `A success confirmation message is displayed.`,
+      fieldsPhrase
+        ? `The saved ${entity} shows the entered ${fieldsPhrase} values exactly as entered.`
+        : `The saved ${entity} shows the entered values exactly as entered.`,
+      `The new ${entity} appears in the ${listName}.`,
+      `The new ${entity} is still shown in the ${listName} after the page is refreshed.`,
+    ]);
+  }
+  return finalize([
+    `The ${entity} action completes successfully and a confirmation message is displayed.`,
+    successEl?.label
+      ? `The "${successEl.label}" area becomes visible on screen.`
+      : `The result of the action is visible on screen.`,
+    `The user is taken to the next screen without an error.`,
+  ]);
 }
 
 /* ------------------------------------------------------------------ */
@@ -648,6 +843,10 @@ export function buildDraftTestCases(
   // scenario is resolved against title terms ∪ its own terms, so a form is only
   // grounded when it matches THIS feature's vocabulary.
   const titleTerms = toTerms(input?.title || '');
+  // The business entity the whole requirement is about (e.g. "Employee"). Derived
+  // ONCE from the requirement title and reused for every scenario's expected-result
+  // assertions so they read in the product's own vocabulary, not "the record".
+  const entity = deriveEntity(input);
 
   // The builder is a PURE TRANSFORM. It emits exactly one draft per planned
   // scenario and NEVER decides whether a scenario should exist — that decision
@@ -767,7 +966,7 @@ export function buildDraftTestCases(
     const sourceEvidence = scenario.provenance.whyExists;
     if (usedRealSelector) groundedCount += 1;
 
-    const expected = buildExpected(scenario, form, ap, stepFlow);
+    const expected = buildExpected(scenario, form, ap, stepFlow, entity);
 
     // ── Scenario ↔ Automation Ready ── a case is automation-ready ONLY when a
     // real feature form was resolved AND it yielded a real selector. If no form

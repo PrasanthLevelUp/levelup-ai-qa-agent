@@ -13,6 +13,7 @@ import type {
   IntegrityCheckResult,
   ScenarioForIntegrity,
 } from './types';
+import { validateExpectedResult } from '../expected-result-validator';
 
 // ---------------------------------------------------------------------------
 // Lexicons (deterministic keyword sets)
@@ -589,6 +590,46 @@ export function checkFieldValidity(s: ScenarioForIntegrity): IntegrityCheckResul
   return result({ id: 'field_validity', label, weight, score: foreign.size > 0 ? 0 : 1, messages });
 }
 
+// ---------------------------------------------------------------------------
+// 10. Expected-result provability
+//     Sprint "Expected Result Excellence" (Part 2). Every assertion in the
+//     Expected Result must be PROVABLE by a black-box QA engineer: Observable
+//     (a tester can SEE it), Grounded (derivable from requirement/planner/
+//     profile — no invented side-effects), and Black-box verifiable (no server-
+//     side/database/transaction internals). This catches the "rich, but not
+//     provable" defect deterministically. Delegates to the Expected Result
+//     Validator; the grounding corpus here is the scenario view we have (title,
+//     objective, real field labels).
+// ---------------------------------------------------------------------------
+export function checkExpectedResultProvable(s: ScenarioForIntegrity): IntegrityCheckResult {
+  const label = 'Expected result provable';
+  const weight = 4; // A non-provable expected result cannot be executed as-is.
+  const messages: string[] = [];
+
+  const assertions = s.expected?.assertions ?? [];
+  // No assertion list to judge (e.g. a hand-built or legacy expected) ⇒ cannot
+  // judge ⇒ pass. The check only fires on the structured assertion list.
+  if (assertions.length === 0) {
+    return result({ id: 'expected_result_provable', label, weight, score: 1, messages });
+  }
+
+  const scenarioText = `${s.title ?? ''} ${s.objective ?? ''}`;
+  const profileText = (s.applicationFields ?? []).join(' ');
+  const verdict = validateExpectedResult(assertions, { scenarioText, profileText });
+
+  if (!verdict.passed) {
+    for (const v of verdict.violations) messages.push(v);
+  }
+
+  return result({
+    id: 'expected_result_provable',
+    label,
+    weight,
+    score: verdict.passed ? 1 : 0,
+    messages,
+  });
+}
+
 /** All checks, in report order. */
 export const ALL_CHECKS = [
   checkPersonaConsistency,
@@ -600,4 +641,5 @@ export const ALL_CHECKS = [
   checkBusinessFlow,
   checkGroundingCompleteness,
   checkFieldValidity,
+  checkExpectedResultProvable,
 ];
