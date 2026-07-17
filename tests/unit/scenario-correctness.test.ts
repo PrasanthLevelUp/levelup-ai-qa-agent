@@ -142,7 +142,14 @@ describe('Rule 1 — no foreign fields leak in (Add Employee vs login-only profi
       expect(d.needsReview).toBe(true);
       expect(Array.isArray(d.reviewReasons)).toBe(true);
       expect(d.reviewReasons.length).toBeGreaterThan(0);
-      expect(d.reviewReasons.join(' ')).toMatch(/no form|matches the|ungrounded/i);
+      // The reason is EITHER "no matching form / ungrounded skeleton" (the form
+      // scenarios, since this login-only profile has no Add-Employee form) OR the
+      // Feature Grounding Engine's honest HOLD for non-form authorization
+      // scenarios (direct-URL / unauthorized). Both are valid "Needs Review"
+      // reasons — the guarantee is that an un-automatable case always carries one.
+      expect(d.reviewReasons.join(' ')).toMatch(
+        /no form|matches the|ungrounded|non-form .* scenario|Intent-aware Step Generator/i,
+      );
     }
   });
 });

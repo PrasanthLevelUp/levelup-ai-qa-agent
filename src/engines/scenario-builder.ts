@@ -550,6 +550,72 @@ function dataPhraseFor(scenario: DataIntentScenario, field: FieldLike): string {
 }
 
 /* ------------------------------------------------------------------ */
+/*  FEATURE GROUNDING ENGINE — scenario grounding intent               */
+/* ------------------------------------------------------------------ */
+
+/**
+ * The GROUNDING INTENT of a scenario — WHAT the scenario interacts with, which
+ * decides whether it should be grounded on the feature's form or held.
+ *
+ *   • form_entry    — fills the feature form (create / validation / boundary /
+ *                     duplicate / injection-payload scenarios).
+ *   • file_upload   — exercises the form's file control.
+ *   • search        — create-then-find on the list/search surface.
+ *   • navigation    — cancel / navigate-away flows.
+ *   • authorization — authorization / authentication / session / direct-URL
+ *                     concerns. These do NOT fill the feature form; their real
+ *                     steps ("request the URL while logged out", "attempt as a
+ *                     user without the role") are OWNED by the forthcoming
+ *                     Intent-aware Step Generator. Until then they are HELD as
+ *                     Needs Review rather than given fabricated form-fill steps —
+ *                     the product rule "never generate confident-but-incorrect
+ *                     artifacts".
+ *
+ * Classification is by STABLE STRUCTURED SIGNALS the planner already emits — the
+ * canonical scenario `id`, the `riskArea`, and the KB-declared `stepFlow` — NOT
+ * by scraping the free-text title. Structured signals are stable as titles are
+ * reworded, and they scale to new modules without a keyword list per feature.
+ */
+export type ScenarioGroundingIntent =
+  | 'form_entry'
+  | 'file_upload'
+  | 'search'
+  | 'navigation'
+  | 'authorization';
+
+interface GroundingIntentScenario {
+  id?: string;
+  riskArea?: string;
+  stepFlow?: ScenarioStepFlow;
+}
+
+/**
+ * Classify a scenario's grounding intent from its structured attributes. Pure
+ * and deterministic. The only intent that is HELD (not grounded on the form) is
+ * `authorization`; every other intent grounds on the resolved feature form.
+ */
+export function classifyGroundingIntent(s: GroundingIntentScenario): ScenarioGroundingIntent {
+  const risk = lc(s.riskArea);
+  const id = lc(s.id);
+  // Authorization / authentication / session / direct-endpoint — the planner
+  // labels all of these riskArea "Authorization"; the canonical ids disambiguate.
+  // None of them fill the feature form, so all are held for the Intent engine.
+  if (
+    risk.includes('authorization') ||
+    /authz|unauthenticated|unauthorized|direct-endpoint|(^|[-_])session([-_]|$)/.test(id)
+  ) {
+    return 'authorization';
+  }
+  if (risk.includes('file handling') || /upload/.test(id)) return 'file_upload';
+  if (s.stepFlow === 'search' || risk.includes('search')) return 'search';
+  if (s.stepFlow === 'cancel' || risk === 'navigation') return 'navigation';
+  return 'form_entry';
+}
+
+/** Intents that are HELD (not grounded on the feature form) this sprint. */
+const HELD_INTENTS: ReadonlySet<ScenarioGroundingIntent> = new Set<ScenarioGroundingIntent>(['authorization']);
+
+/* ------------------------------------------------------------------ */
 /*  Expected-result assertion helpers                                  */
 /*  ---------------------------------------------------------------    */
 /*  These turn the data we ALREADY have — the requirement title, the   */
@@ -848,6 +914,40 @@ export function buildDraftTestCases(
   // assertions so they read in the product's own vocabulary, not "the record".
   const entity = deriveEntity(input);
 
+  // ── FEATURE GROUNDING ENGINE — resolve the feature form ONCE ──
+  // Every scenario in a requirement belongs to the SAME feature, so the feature's
+  // form is resolved a SINGLE time from the feature's vocabulary (requirement
+  // title ∪ the union of every FORM-interacting scenario's terms) and reused for
+  // every scenario that interacts with it.
+  //
+  // This replaces the old per-scenario `pickForm`, whose narrow per-scenario
+  // vocabulary made the SAME feature resolve DIFFERENT forms — or none —
+  // scenario by scenario: a scenario sharing no word with the captured field
+  // labels (e.g. "SQL-injection input", "Duplicate entry") scored 0 and fell to a
+  // placeholder, while a file/search scenario could match a foreign search-filter
+  // form and inherit its junk labels. Feature-level resolution fixes both: the
+  // form that best matches the whole feature is chosen once, and the anti-leak
+  // guarantee is preserved — `pickForm` still returns undefined when NOTHING
+  // matches, so an unrelated form is never grounded on.
+  //
+  // CRITICAL — the vocabulary is drawn ONLY from the scenarios that actually
+  // FILL the feature form (form-entry / file / search / navigation intents), and
+  // NEVER from the HELD (authorization/authentication/session) scenarios. Those
+  // held scenarios describe a DIFFERENT surface — their prose says things like
+  // "unauthenticated user is redirected to LOGIN" — so pooling their terms would
+  // vote the word "login"/"session" into the feature vocab and drag the feature
+  // onto a foreign login form (the exact trust defect). A non-form scenario must
+  // never influence which form the form scenarios ground on.
+  const groundedScenarioTerms = plan.scenarios
+    .filter((s) => !HELD_INTENTS.has(classifyGroundingIntent({
+      id: s.id,
+      riskArea: s.riskArea,
+      stepFlow: getScenarioStepFlow(s) ?? undefined,
+    })))
+    .flatMap((s) => toTerms(`${s.title} ${s.objective ?? ''} ${s.riskArea ?? ''}`));
+  const featureVocab = Array.from(new Set([...titleTerms, ...groundedScenarioTerms]));
+  const featureForm = pickForm(ap?.forms, featureVocab);
+
   // The builder is a PURE TRANSFORM. It emits exactly one draft per planned
   // scenario and NEVER decides whether a scenario should exist — that decision
   // was already made (and justified with provenance) by the Scenario Planner,
@@ -855,9 +955,24 @@ export function buildDraftTestCases(
   // enriches each immutable planned scenario into a concrete, grounded draft.
   plan.scenarios.forEach((scenario, index) => {
     const scenarioTerms = toTerms(`${scenario.title} ${scenario.objective} ${scenario.riskArea}`);
-    const featureTerms = Array.from(new Set([...titleTerms, ...scenarioTerms]));
-    const form = pickForm(ap?.forms, featureTerms);
+    // The feature form is resolved once (above) and shared by all scenarios.
+    const form = featureForm;
     const dataset = pickDataset(knowledge?.testData, scenarioTerms);
+
+    // ── Grounding intent ── decides whether this scenario fills the feature form
+    // or is HELD (authorization/authentication/session — non-form concerns whose
+    // real steps belong to the Intent-aware Step Generator). Held scenarios are
+    // NOT given fabricated form-fill steps even though a feature form exists.
+    const groundingIntent = classifyGroundingIntent({
+      id: scenario.id,
+      riskArea: scenario.riskArea,
+      stepFlow: getScenarioStepFlow(scenario) ?? undefined,
+    });
+    const isHeld = HELD_INTENTS.has(groundingIntent);
+    // The form used FOR STEP BUILDING only. Held scenarios build no form steps
+    // (stepForm undefined) but still pass the real `form` to buildExpected so
+    // their expected result stays business-observable (e.g. "access denied").
+    const stepForm = isHeld ? undefined : form;
 
     // ── Steps ── business-readable action text ONLY. Technical grounding
     // (selectors / page) is captured separately in `grounding[]`, aligned to
@@ -868,76 +983,86 @@ export function buildDraftTestCases(
     // leak into the text a human QA reads.
     const steps: string[] = [];
     const grounding: StepGrounding[] = [];
-    const navTarget = loginUrl || form?.page || baseUrl;
-    if (navTarget) {
-      // QA Standard P9 (machine-readable verbs): use "Open ... page", never
-      // "Navigate to" — so the deterministic baseline itself already satisfies
-      // the QA Standard validator and is a clean fallback.
-      steps.push(`Open the ${form?.page ? 'page under test' : 'application'}`);
-      grounding.push({ stepIndex: steps.length, page: navTarget });
+    let usedRealSelector = false;
+    // The KB-declared manual step-flow (null ⇒ generic create). Only meaningful
+    // when a real feature form is used for steps; held/no-form ⇒ skeleton.
+    const stepFlow: ScenarioStepFlow | null = stepForm ? getScenarioStepFlow(scenario) : null;
+
+    if (stepForm) {
+      const navTarget = loginUrl || stepForm.page || baseUrl;
+      if (navTarget) {
+        // QA Standard P9 (machine-readable verbs): use "Open ... page", never
+        // "Navigate to" — so the deterministic baseline itself already satisfies
+        // the QA Standard validator and is a clean fallback.
+        steps.push(`Open the ${stepForm.page ? 'page under test' : 'application'}`);
+        grounding.push({ stepIndex: steps.length, page: navTarget });
+      }
+
+      const fields = (stepForm.fields || []).slice(0, 8);
+      for (const f of fields) {
+        if (f.selector) usedRealSelector = true;
+        const fieldLabel = f.label || f.name || 'field';
+        // File controls are UPLOADED, not typed into — use the verb a manual
+        // tester actually performs so the step is executable as written.
+        const isFileField = lc(f.type) === 'file' || /photo|image|upload|file|attach|document|resume|avatar/.test(lc(`${f.name} ${f.label}`));
+        if (isFileField) {
+          steps.push(`Upload ${dataPhraseFor(scenario, f)} for the ${fieldLabel}`);
+        } else {
+          steps.push(`Enter ${dataPhraseFor(scenario, f)} in the ${fieldLabel} field`);
+        }
+        grounding.push({ stepIndex: steps.length, selector: f.selector, page: stepForm.page, control: fieldLabel });
+      }
+
+      // ── Action tail — SHAPED BY THE SCENARIO'S DECLARED STEP-FLOW ──
+      // The create prefix above (open + fill every field) is common to every flow.
+      // The tail is where a scenario's INTENT diverges, and that intent comes from
+      // the KB via `getScenarioStepFlow` — the Builder DISPATCHES on the declared
+      // flow, it NEVER infers intent from the title/id itself (a wrong guess would
+      // ship steps that contradict the title, the exact defect this fixes). When a
+      // scenario declares no flow, the tail is the unchanged plain-create submit.
+      const submitLabel = stepForm.submitLabel || 'Submit';
+      const pushSubmit = () => {
+        if (stepForm.submitSelector) {
+          usedRealSelector = true;
+          steps.push(`Click the ${submitLabel} button`);
+          grounding.push({ stepIndex: steps.length, selector: stepForm.submitSelector, page: stepForm.page, control: submitLabel });
+        } else {
+          // QA Standard P5 (business language): "Click the Submit button", never a
+          // bare "Submit the form" — keep a consistent, parseable action verb.
+          steps.push(`Click the ${submitLabel} button`);
+          grounding.push({ stepIndex: steps.length, page: stepForm.page, control: submitLabel });
+        }
+      };
+      if (stepFlow === 'cancel') {
+        // CANCEL: discard instead of submit. Click Cancel (NOT Submit); the
+        // structured `expected` then asserts nothing was persisted. We do NOT
+        // fabricate a Cancel selector — grounding stays page-level so the case
+        // never claims a locator the App Profile does not expose.
+        steps.push('Click the Cancel button');
+        grounding.push({ stepIndex: steps.length, page: stepForm.page, control: 'Cancel' });
+        steps.push('Return to the list and confirm the record was NOT created (the entered data was discarded)');
+        grounding.push({ stepIndex: steps.length, page: baseUrl || stepForm.page });
+      } else if (stepFlow === 'search') {
+        // SEARCH: create the record, THEN find it. Submit, go to the list/search
+        // surface, search for the just-created record, and verify it appears — a
+        // create-then-find workflow, not a bare create.
+        pushSubmit();
+        steps.push('Open the records list / search page');
+        grounding.push({ stepIndex: steps.length, page: baseUrl || stepForm.page });
+        steps.push('Search for the newly created record (by its identifier and by name)');
+        grounding.push({ stepIndex: steps.length, page: baseUrl || stepForm.page });
+        steps.push('Confirm the newly created record appears in the search results');
+        grounding.push({ stepIndex: steps.length, page: baseUrl || stepForm.page });
+      } else {
+        pushSubmit();
+      }
     }
 
-    let usedRealSelector = false;
-    const fields = (form?.fields || []).slice(0, 8);
-    for (const f of fields) {
-      if (f.selector) usedRealSelector = true;
-      const fieldLabel = f.label || f.name || 'field';
-      steps.push(`Enter ${dataPhraseFor(scenario, f)} in the ${fieldLabel} field`);
-      grounding.push({ stepIndex: steps.length, selector: f.selector, page: form?.page, control: fieldLabel });
-    }
-    // The KB-declared manual step-flow (null ⇒ generic create). Only meaningful
-    // when a real feature form was resolved; with no form we emit a skeleton.
-    const stepFlow: ScenarioStepFlow | null = form ? getScenarioStepFlow(scenario) : null;
-    // ── Action tail — SHAPED BY THE SCENARIO'S DECLARED STEP-FLOW ──
-    // The create prefix above (open + fill every field) is common to every flow.
-    // The tail is where a scenario's INTENT diverges, and that intent comes from
-    // the KB via `getScenarioStepFlow` — the Builder DISPATCHES on the declared
-    // flow, it NEVER infers intent from the title/id itself (a wrong guess would
-    // ship steps that contradict the title, the exact defect this fixes). When a
-    // scenario declares no flow, the tail is the unchanged plain-create submit.
-    const submitLabel = form?.submitLabel || 'Submit';
-    const pushSubmit = () => {
-      if (form?.submitSelector) {
-        usedRealSelector = true;
-        steps.push(`Click the ${submitLabel} button`);
-        grounding.push({ stepIndex: steps.length, selector: form.submitSelector, page: form?.page, control: submitLabel });
-      } else if (form) {
-        // QA Standard P5 (business language): "Click the Submit button", never a
-        // bare "Submit the form" — keep a consistent, parseable action verb.
-        steps.push('Click the Submit button');
-        grounding.push({ stepIndex: steps.length, page: form?.page, control: 'Submit' });
-      }
-    };
-    if (form && stepFlow === 'cancel') {
-      // CANCEL: discard instead of submit. Click Cancel (NOT Submit); the
-      // structured `expected` then asserts nothing was persisted. We do NOT
-      // fabricate a Cancel selector — grounding stays page-level so the case
-      // never claims a locator the App Profile does not expose.
-      steps.push('Click the Cancel button');
-      grounding.push({ stepIndex: steps.length, page: form.page, control: 'Cancel' });
-      steps.push('Return to the list and confirm the record was NOT created (the entered data was discarded)');
-      grounding.push({ stepIndex: steps.length, page: baseUrl || form.page });
-    } else if (form && stepFlow === 'search') {
-      // SEARCH: create the record, THEN find it. Submit, go to the list/search
-      // surface, search for the just-created record, and verify it appears — a
-      // create-then-find workflow, not a bare create.
-      pushSubmit();
-      steps.push('Open the records list / search page');
-      grounding.push({ stepIndex: steps.length, page: baseUrl || form.page });
-      steps.push('Search for the newly created record (by its identifier and by name)');
-      grounding.push({ stepIndex: steps.length, page: baseUrl || form.page });
-      steps.push('Confirm the newly created record appears in the search results');
-      grounding.push({ stepIndex: steps.length, page: baseUrl || form.page });
-    } else {
-      pushSubmit();
-    }
-    if (!form) {
-      // No form matched THIS feature (or no App Profile at all). Emit an honest,
-      // ungrounded skeleton from the objective rather than fabricating field
-      // steps against a foreign form. The caller marks this "Needs Review".
-      steps.push(`Exercise the "${scenario.title}" scenario against the application`);
-    }
     if (!steps.length) {
+      // Held (authorization/access) scenarios and scenarios with no matching
+      // feature form both emit an honest, ungrounded skeleton rather than
+      // fabricating field steps. The caller marks the case "Needs Review" and
+      // records the precise reason (held-for-intent-engine vs no-form-matched).
       steps.push(`Exercise the "${scenario.title}" scenario against the application`);
     }
     // NOTE: no generic "Observe and verify the outcome" step. Verification lives
@@ -969,13 +1094,23 @@ export function buildDraftTestCases(
     const expected = buildExpected(scenario, form, ap, stepFlow, entity);
 
     // ── Scenario ↔ Automation Ready ── a case is automation-ready ONLY when a
-    // real feature form was resolved AND it yielded a real selector. If no form
-    // matched this feature, the steps are an honest skeleton — mark "Needs
-    // Review" and force automationReady false rather than lie with a YES.
+    // real feature form was resolved AND it yielded a real selector. Held
+    // (authorization/access) scenarios and scenarios with no matching feature
+    // form emit an honest skeleton — mark "Needs Review" and force
+    // automationReady false rather than lie with a YES.
     const featureFormResolved = !!form;
     const applicationFields = (form?.fields || []).map(f => f.label || f.name || 'field');
     const reviewReasons: string[] = [];
-    if (!featureFormResolved) {
+    if (isHeld) {
+      // Deliberately held: the feature form may well be resolved, but this is a
+      // non-form concern (authorization / authentication / session / direct-URL)
+      // whose real steps belong to the Intent-aware Step Generator. We keep it as
+      // Needs Review instead of fabricating Add-form steps — the product rule
+      // "never generate confident-but-incorrect artifacts".
+      reviewReasons.push(
+        `This is a non-form ${groundingIntent} scenario — its steps (e.g. requesting the URL without a session, or acting without the required role) are not form interactions. Held as Needs Review pending the Intent-aware Step Generator rather than fabricating form-fill steps.`,
+      );
+    } else if (!featureFormResolved) {
       reviewReasons.push(
         `No form in the App Profile matches the "${input?.title || scenario.title}" feature — the steps are an ungrounded skeleton. Confirm the real fields and selectors against the live UI before automating.`,
       );
@@ -1013,8 +1148,10 @@ export function buildDraftTestCases(
     }
 
     const needsReview = reviewReasons.length > 0;
+    // Held scenarios never fill the form, so `usedRealSelector` is already false
+    // for them; `!isHeld` makes that invariant explicit and future-proof.
     const automationReady =
-      featureFormResolved && usedRealSelector && correctnessFailures.length === 0;
+      !isHeld && featureFormResolved && usedRealSelector && correctnessFailures.length === 0;
 
     drafts.push({
       schemaVersion: 2,
