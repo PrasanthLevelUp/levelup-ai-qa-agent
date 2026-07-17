@@ -208,6 +208,11 @@ describe('Feature Grounding Engine — feature-level resolution', () => {
 
 describe('Feature Grounding Engine — honest hold (the critical guarantee)', () => {
   it('HOLDS every authorization scenario as Needs Review — 0 wrongly converted to form-fill', () => {
+    // SPRINT 2 (Intent-aware Step Generator) UPDATED THIS CONTRACT: held
+    // non-form scenarios no longer emit the skeleton placeholder — they now emit
+    // a REAL deterministic intent step flow. The critical guarantees are
+    // unchanged: they are still Needs Review, still NOT Automation Ready, and
+    // still NEVER fabricate feature-form-fill steps.
     const drafts = build();
     const authz = (drafts as any[]).filter((d) => AUTHZ_IDS.has(d.scenarioId));
     // The planner emits these three authorization concerns for the feature.
@@ -216,15 +221,19 @@ describe('Feature Grounding Engine — honest hold (the critical guarantee)', ()
       // Held: marked Needs Review, NOT automation ready...
       expect(d.needsReview).toBe(true);
       expect(d.automationReady).toBe(false);
-      // ...with a precise reason mentioning the Intent-aware Step Generator...
-      expect(d.reviewReasons.join(' ')).toMatch(/Intent-aware Step Generator/);
+      // ...with a precise reason describing a deterministic non-form intent flow
+      // that depends on an environment-specific account/precondition...
+      expect(d.reviewReasons.join(' ')).toMatch(/non-form intent|environment-specific/i);
       // ...and NO fabricated Add-form fill steps (the "confident-but-incorrect"
-      // failure mode). It emits only the honest skeleton.
+      // failure mode)...
       const text = (d.steps as string[]).join(' ');
       expect(text).not.toContain('First Name');
       expect(text).not.toContain('Last Name');
       expect(text).not.toContain('Profile Photo');
-      expect(isPlaceholder(d)).toBe(true);
+      // ...and NO skeleton placeholder anymore — the steps are deterministic and
+      // assert an access-control outcome.
+      expect(isPlaceholder(d)).toBe(false);
+      expect(text).toMatch(/access is denied|redirected to the login|server-side authorization|session/i);
     }
   });
 
