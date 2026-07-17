@@ -1,0 +1,63 @@
+# COMPREHENSIVE TEST DATA DEMO — Sprint 3
+
+All intents below are from ONE requirement (User Registration with username max 20 chars).
+
+---
+
+## 1. POSITIVE (realistic, executable values)
+
+Title: "Create a record with valid data"
+Coverage: positive
+
+Steps:
+- Open the page under test
+- Enter "Sample Username" in the Username field
+- Enter "emma.smith@example.com" in the Email field
+- Enter "9876543210" in the Phone field
+- Enter "34" in the Age field
+- Enter "Sample Notes" in the Notes field    ← UNKNOWN FIELD fallback: "Sample <Label>"
+- Click the Register button
+
+## 2. BOUNDARY (username 20-char limit grounded in requirement)
+Title: "The username must not exceed 20 characters"
+Coverage: boundary
+Steps (first 3):
+- Open the page under test
+- Enter a Username of 21 characters (1 over the 20-character maximum) in the Username field
+- Enter a Email of 21 characters (1 over the 20-character maximum) in the Email field
+- Enter a Phone of 21 characters (1 over the 20-character maximum) in the Phone field
+
+## 3. DUPLICATE
+Title: "Duplicate / unique-constraint violation is handled"
+- Open the page under test
+- Enter a Username that already exists (a duplicate of an existing record) in the Username field
+- Enter a Email that already exists (a duplicate of an existing record) in the Email field
+- Enter a Phone that already exists (a duplicate of an existing record) in the Phone field
+
+## 4. SQL INJECTION
+Title: "SQL-injection input is rejected safely"
+- Open the page under test
+- Enter the SQL-injection string "' OR 1=1 --" in the Username field
+- Enter the SQL-injection string "' OR 1=1 --" in the Email field
+- Enter the SQL-injection string "' OR 1=1 --" in the Phone field
+
+## 5. XSS
+Title: "XSS / script payload is escaped, not executed"
+- Open the page under test
+- Enter the XSS payload "<script>alert(1)</script>" in the Username field
+- Enter the XSS payload "<script>alert(1)</script>" in the Email field
+- Enter the XSS payload "<script>alert(1)</script>" in the Phone field
+
+## 6. WHITESPACE
+Title: "Whitespace-only required fields are rejected"
+- Open the page under test
+- Enter a whitespace-only Username (e.g. "   ") in the Username field
+- Enter a whitespace-only Email (e.g. "   ") in the Email field
+- Enter a whitespace-only Phone (e.g. "   ") in the Phone field
+
+## 7. UNICODE
+Title: "Non-ASCII or special characters in the username are rejected"
+- Open the page under test
+- Enter a unicode Username (e.g. "தமிழ்", "李雷", "😊") in the Username field
+- Enter a unicode Email (e.g. "தமிழ்", "李雷", "😊") in the Email field
+- Enter a unicode Phone (e.g. "தமிழ்", "李雷", "😊") in the Phone field

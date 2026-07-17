@@ -1,0 +1,111 @@
+ID,Title,Coverage,Steps,Expected
+"N/A","Create a record with valid data","positive","Open the page under test | Enter ""Sample Username"" in the Username field | Enter ""emma.smith@example.com"" in the Email field | Enter ""9876543210"" in the Phone field | Enter ""34"" in the Age field | Enter ""Sample Notes"" in the Notes field | Click the Register button","✓ The User record is created successfully.
+✓ A success confirmation message is displayed.
+✓ The saved User shows the entered Username, Email, Phone, Age and Notes values exactly as entered.
+✓ The new User appears in the User list.
+✓ The new User is still shown in the User list after the page is refreshed."
+"N/A","Duplicate / unique-constraint violation is handled","negative","Open the page under test | Enter a Username that already exists (a duplicate of an existing record) in the Username field | Enter a Email that already exists (a duplicate of an existing record) in the Email field | Enter a Phone that already exists (a duplicate of an existing record) in the Phone field | Enter a Age that already exists (a duplicate of an existing record) in the Age field | Enter a Notes that already exists (a duplicate of an existing record) in the Notes field | Click the Register button","✓ The duplicate is rejected — a second User record is NOT created.
+✓ A clear ""already exists"" uniqueness error is shown.
+✓ The original existing User is left unchanged.
+✓ The total User count does not increase."
+"N/A","Direct URL / API access is authorization-checked","negative","Request the User Registration URL directly (bypassing the normal in-app navigation) | Use a session that is NOT authorized for this operation | Verify the direct request is rejected or redirected by a server-side authorization check (not merely hidden in the UI) | Verify the User resource is inaccessible and no User record is created","✓ The operation is denied — no User is created or changed.
+✓ The user sees an access-denied / not-authorised message (or is sent to the login page).
+✓ The User list shows no new or changed User afterwards."
+"N/A","Cancel discards input and returns without saving","positive","Open the page under test | Enter ""Sample Username"" in the Username field | Enter ""emma.smith@example.com"" in the Email field | Enter ""9876543210"" in the Phone field | Enter ""28"" in the Age field | Enter ""Sample Notes"" in the Notes field | Click the Cancel button | Return to the list and confirm the record was NOT created (the entered data was discarded)","✓ No User is created — the entered data is discarded.
+✓ The user is returned to the User list without saving.
+✓ The new User does not appear in the User list afterwards, confirming nothing was saved.
+✓ Re-opening the form shows empty fields."
+"N/A","Partial-name search returns the record","positive","Open the page under test | Enter ""Sample Username"" in the Username field | Enter ""emma.smith@example.com"" in the Email field | Enter ""9876543210"" in the Phone field | Enter ""51"" in the Age field | Enter ""Sample Notes"" in the Notes field | Click the Register button | Open the records list / search page | Search for the newly created record (by its identifier and by name) | Confirm the newly created record appears in the search results","✓ The newly created User is returned in the search results.
+✓ It is found by its identifier and by name.
+✓ The result appears immediately after creation, without needing to wait or search again.
+✓ The returned record shows the exact values that were saved."
+"N/A","Search is case-insensitive","positive","Open the page under test | Enter ""Sample Username"" in the Username field | Enter ""priya.kumar@example.com"" in the Email field | Enter ""7011234567"" in the Phone field | Enter ""28"" in the Age field | Enter ""Sample Notes"" in the Notes field | Click the Register button | Open the records list / search page | Search for the newly created record (by its identifier and by name) | Confirm the newly created record appears in the search results","✓ The newly created User is returned in the search results.
+✓ It is found by its identifier and by name.
+✓ The result appears immediately after creation, without needing to wait or search again.
+✓ The returned record shows the exact values that were saved."
+"N/A","Missing required fields are rejected","negative","Open the page under test | Enter a blank Username (leave it empty) in the Username field | Enter a blank Email (leave it empty) in the Email field | Enter a blank Phone (leave it empty) in the Phone field | Enter a blank Age (leave it empty) in the Age field | Enter a blank Notes (leave it empty) in the Notes field | Click the Register button","✓ The User is NOT created — no record is saved.
+✓ A clear, specific validation error message is displayed.
+✓ The form stays on screen with the entered values retained for correction.
+✓ No new User appears in the User list."
+"N/A","Invalid field formats are rejected","negative","Open the page under test | Enter an invalid Username in the Username field | Enter an invalid email address (e.g. ""not-an-email"") in the Email field | Enter an invalid phone number (e.g. ""123"") in the Phone field | Enter an out-of-range number (e.g. ""-1"") in the Age field | Enter an invalid Notes in the Notes field | Click the Register button","✓ The User is NOT created — no record is saved.
+✓ A clear, specific validation error is shown for the Email field.
+✓ The form stays on screen with the entered values retained for correction.
+✓ No new User appears in the User list."
+"N/A","Re-submitting the same form does not create a duplicate","negative","Open the page under test | Enter a Username that already exists (a duplicate of an existing record) in the Username field | Enter a Email that already exists (a duplicate of an existing record) in the Email field | Enter a Phone that already exists (a duplicate of an existing record) in the Phone field | Enter a Age that already exists (a duplicate of an existing record) in the Age field | Enter a Notes that already exists (a duplicate of an existing record) in the Notes field | Click the Register button","✓ The duplicate is rejected — a second User record is NOT created.
+✓ A clear ""already exists"" uniqueness error is shown.
+✓ The original existing User is left unchanged.
+✓ The total User count does not increase."
+"N/A","Field length / value boundaries","boundary","Open the page under test | Enter a Username containing numbers (e.g. ""John123"") in the Username field | Enter a Email containing numbers (e.g. ""John123"") in the Email field | Enter a Phone containing numbers (e.g. ""John123"") in the Phone field | Enter a Age containing numbers (e.g. ""John123"") in the Age field | Enter a Notes containing numbers (e.g. ""John123"") in the Notes field | Click the Register button","✓ The over-limit value is rejected.
+✓ A clear length/validation message is shown, stating the allowed maximum.
+✓ No User record is created.
+✓ The entered data is retained so the user can correct it."
+"N/A","Operate on a non-existent / already-deleted record","negative","Open the page under test | Enter a blank Username (leave it empty) in the Username field | Enter a blank Email (leave it empty) in the Email field | Enter a blank Phone (leave it empty) in the Phone field | Enter a blank Age (leave it empty) in the Age field | Enter a blank Notes (leave it empty) in the Notes field | Click the Register button","✓ The User is NOT created — no record is saved.
+✓ A clear, specific validation error is shown for the Age field.
+✓ The form stays on screen with the entered values retained for correction.
+✓ No new User appears in the User list."
+"N/A","Whitespace-only required fields are rejected","negative","Open the page under test | Enter a whitespace-only Username (e.g. ""   "") in the Username field | Enter a whitespace-only Email (e.g. ""   "") in the Email field | Enter a whitespace-only Phone (e.g. ""   "") in the Phone field | Enter a whitespace-only Age (e.g. ""   "") in the Age field | Enter a whitespace-only Notes (e.g. ""   "") in the Notes field | Click the Register button","✓ The User is NOT created — no record is saved.
+✓ A clear, specific validation error message is displayed.
+✓ The form stays on screen with the entered values retained for correction.
+✓ No new User appears in the User list."
+"N/A","Unauthorized user cannot perform the operation","negative","Attempt to open the User Registration page | Use a user account that is NOT authorized to perform this operation | Verify access is denied (the operation is blocked with a forbidden / access-denied response) | Verify no User record is created or modified","✓ The operation is denied — no User is created or changed.
+✓ The user sees an access-denied / not-authorised message (or is sent to the login page).
+✓ The User list shows no new or changed User afterwards."
+"N/A","SQL-injection input is rejected safely","negative","Open the page under test | Enter the SQL-injection string ""' OR 1=1 --"" in the Username field | Enter the SQL-injection string ""' OR 1=1 --"" in the Email field | Enter the SQL-injection string ""' OR 1=1 --"" in the Phone field | Enter the SQL-injection string ""' OR 1=1 --"" in the Age field | Enter the SQL-injection string ""' OR 1=1 --"" in the Notes field | Click the Register button","✓ The input is rejected, or the User is created showing the text exactly as typed — the payload is treated as plain text, not run.
+✓ No pop-up, alert box, or injected element appears on any User screen or list.
+✓ Wherever the value is shown, it displays as the literal characters that were entered.
+✓ A clear, generic error message is shown, with no internal or technical detail exposed to the user."
+"N/A","XSS / script payload is escaped, not executed","negative","Open the page under test | Enter the XSS payload ""<script>alert(1)</script>"" in the Username field | Enter the XSS payload ""<script>alert(1)</script>"" in the Email field | Enter the XSS payload ""<script>alert(1)</script>"" in the Phone field | Enter the XSS payload ""<script>alert(1)</script>"" in the Age field | Enter the XSS payload ""<script>alert(1)</script>"" in the Notes field | Click the Register button","✓ The input is rejected, or the User is created showing the text exactly as typed — the payload is treated as plain text, not run.
+✓ No pop-up, alert box, or injected element appears on any User screen or list.
+✓ Wherever the value is shown, it displays as the literal characters that were entered.
+✓ A clear, generic error message is shown, with no internal or technical detail exposed to the user."
+"N/A","Username Max 20 Characters containing only whitespace is rejected","negative","Open the page under test | Enter a whitespace-only Username (e.g. ""   "") in the Username field | Enter a whitespace-only Email (e.g. ""   "") in the Email field | Enter a whitespace-only Phone (e.g. ""   "") in the Phone field | Enter a whitespace-only Age (e.g. ""   "") in the Age field | Enter a whitespace-only Notes (e.g. ""   "") in the Notes field | Click the Register button","✓ The User is NOT created — no record is saved.
+✓ A clear, specific validation error is shown for the Username field.
+✓ The form stays on screen with the entered values retained for correction.
+✓ No new User appears in the User list."
+"N/A","Email containing only whitespace is rejected","negative","Open the page under test | Enter a whitespace-only Username (e.g. ""   "") in the Username field | Enter a whitespace-only Email (e.g. ""   "") in the Email field | Enter a whitespace-only Phone (e.g. ""   "") in the Phone field | Enter a whitespace-only Age (e.g. ""   "") in the Age field | Enter a whitespace-only Notes (e.g. ""   "") in the Notes field | Click the Register button","✓ The User is NOT created — no record is saved.
+✓ A clear, specific validation error is shown for the Email field.
+✓ The form stays on screen with the entered values retained for correction.
+✓ No new User appears in the User list."
+"N/A","Phone containing only whitespace is rejected","negative","Open the page under test | Enter a whitespace-only Username (e.g. ""   "") in the Username field | Enter a whitespace-only Email (e.g. ""   "") in the Email field | Enter a whitespace-only Phone (e.g. ""   "") in the Phone field | Enter a whitespace-only Age (e.g. ""   "") in the Age field | Enter a whitespace-only Notes (e.g. ""   "") in the Notes field | Click the Register button","✓ The User is NOT created — no record is saved.
+✓ A clear, specific validation error is shown for the Phone field.
+✓ The form stays on screen with the entered values retained for correction.
+✓ No new User appears in the User list."
+"N/A","Age containing only whitespace is rejected","negative","Open the page under test | Enter a whitespace-only Username (e.g. ""   "") in the Username field | Enter a whitespace-only Email (e.g. ""   "") in the Email field | Enter a whitespace-only Phone (e.g. ""   "") in the Phone field | Enter a whitespace-only Age (e.g. ""   "") in the Age field | Enter a whitespace-only Notes (e.g. ""   "") in the Notes field | Click the Register button","✓ The User is NOT created — no record is saved.
+✓ A clear, specific validation error is shown for the Age field.
+✓ The form stays on screen with the entered values retained for correction.
+✓ No new User appears in the User list."
+"N/A","All required fields blank is rejected","negative","Open the page under test | Enter a blank Username (leave it empty) in the Username field | Enter a blank Email (leave it empty) in the Email field | Enter a blank Phone (leave it empty) in the Phone field | Enter a blank Age (leave it empty) in the Age field | Enter a blank Notes (leave it empty) in the Notes field | Click the Register button","✓ The User is NOT created — no record is saved.
+✓ A clear, specific validation error message is displayed.
+✓ The form stays on screen with the entered values retained for correction.
+✓ No new User appears in the User list."
+"N/A","Valid details, when the visitor submits the form, then…","positive","Open the page under test | Enter ""Sample Username"" in the Username field | Enter ""priya.kumar@example.com"" in the Email field | Enter ""7011234567"" in the Phone field | Enter ""51"" in the Age field | Enter ""Sample Notes"" in the Notes field | Click the Register button","✓ The User record is created successfully.
+✓ A success confirmation message is displayed.
+✓ The saved User shows the entered Username, Email, Phone, Age and Notes values exactly as entered.
+✓ The new User appears in the User list.
+✓ The new User is still shown in the User list after the page is refreshed."
+"N/A","The username must not exceed 20 characters","boundary","Open the page under test | Enter a Username of 21 characters (1 over the 20-character maximum) in the Username field | Enter a Email of 21 characters (1 over the 20-character maximum) in the Email field | Enter a Phone of 21 characters (1 over the 20-character maximum) in the Phone field | Enter a Age of 21 characters (1 over the 20-character maximum) in the Age field | Enter a Notes of 21 characters (1 over the 20-character maximum) in the Notes field | Click the Register button","✓ The over-limit Username value is rejected.
+✓ A clear length/validation message is shown, stating the allowed maximum.
+✓ No User record is created.
+✓ The entered data is retained so the user can correct it."
+"N/A","Duplicate usernames and emails are rejected","negative","Open the page under test | Enter a Username that already exists (a duplicate of an existing record) in the Username field | Enter a Email that already exists (a duplicate of an existing record) in the Email field | Enter a Phone that already exists (a duplicate of an existing record) in the Phone field | Enter a Age that already exists (a duplicate of an existing record) in the Age field | Enter a Notes that already exists (a duplicate of an existing record) in the Notes field | Click the Register button","✓ The duplicate is rejected — a second User record is NOT created.
+✓ A clear ""already exists"" uniqueness error is shown.
+✓ The original existing User is left unchanged.
+✓ The total User count does not increase."
+"N/A","SQL injection and XSS payloads in any field are…","security","Open the page under test | Enter the XSS payload ""<script>alert(1)</script>"" in the Username field | Enter the XSS payload ""<script>alert(1)</script>"" in the Email field | Enter the XSS payload ""<script>alert(1)</script>"" in the Phone field | Enter the XSS payload ""<script>alert(1)</script>"" in the Age field | Enter the XSS payload ""<script>alert(1)</script>"" in the Notes field | Click the Register button","✓ The input is rejected, or the value is shown exactly as typed — it is treated as plain text, not run.
+✓ No pop-up, alert box, or injected element appears on any User screen.
+✓ A clear, generic error message is shown, with no internal or technical detail exposed to the user."
+"N/A","Whitespace-only usernames are rejected","negative","Open the page under test | Enter a whitespace-only Username (e.g. ""   "") in the Username field | Enter a whitespace-only Email (e.g. ""   "") in the Email field | Enter a whitespace-only Phone (e.g. ""   "") in the Phone field | Enter a whitespace-only Age (e.g. ""   "") in the Age field | Enter a whitespace-only Notes (e.g. ""   "") in the Notes field | Click the Register button","✓ The User is NOT created — no record is saved.
+✓ A clear, specific validation error is shown for the Username field.
+✓ The form stays on screen with the entered values retained for correction.
+✓ No new User appears in the User list."
+"N/A","Non-ASCII or special characters in the username are rejected","boundary","Open the page under test | Enter a unicode Username (e.g. ""தமிழ்"", ""李雷"", ""😊"") in the Username field | Enter a unicode Email (e.g. ""தமிழ்"", ""李雷"", ""😊"") in the Email field | Enter a unicode Phone (e.g. ""தமிழ்"", ""李雷"", ""😊"") in the Phone field | Enter a unicode Age (e.g. ""தமிழ்"", ""李雷"", ""😊"") in the Age field | Enter a unicode Notes (e.g. ""தமிழ்"", ""李雷"", ""😊"") in the Notes field | Click the Register button","✓ The over-limit Username value is rejected.
+✓ A clear length/validation message is shown, stating the allowed maximum.
+✓ No User record is created.
+✓ The entered data is retained so the user can correct it."
+"N/A","A visitor registers by entering username (max 20 characters),…","boundary","Open the page under test | Enter a Username of 21 characters (1 over the 20-character maximum) in the Username field | Enter a Email of 21 characters (1 over the 20-character maximum) in the Email field | Enter a Phone of 21 characters (1 over the 20-character maximum) in the Phone field | Enter a Age of 21 characters (1 over the 20-character maximum) in the Age field | Enter a Notes of 21 characters (1 over the 20-character maximum) in the Notes field | Click the Register button","✓ The boundary Username value is accepted.
+✓ The User is created successfully with the boundary value.
+✓ The value is stored exactly as entered — no truncation, trimming, or modification.
+✓ The saved User displays and is retrievable with the exact value intact."
+"N/A","The system validates format, checks for duplicate usernames and…","security","Open the page under test | Enter the XSS payload ""<script>alert(1)</script>"" in the Username field | Enter the XSS payload ""<script>alert(1)</script>"" in the Email field | Enter the XSS payload ""<script>alert(1)</script>"" in the Phone field | Enter the XSS payload ""<script>alert(1)</script>"" in the Age field | Enter the XSS payload ""<script>alert(1)</script>"" in the Notes field | Click the Register button","✓ The input is rejected, or the value is shown exactly as typed — it is treated as plain text, not run.
+✓ No pop-up, alert box, or injected element appears on any User screen.
+✓ A clear, generic error message is shown, with no internal or technical detail exposed to the user."
