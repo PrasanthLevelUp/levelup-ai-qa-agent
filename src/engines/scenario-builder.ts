@@ -612,8 +612,137 @@ export function classifyGroundingIntent(s: GroundingIntentScenario): ScenarioGro
   return 'form_entry';
 }
 
-/** Intents that are HELD (not grounded on the feature form) this sprint. */
+/**
+ * Intents that are NOT grounded on the feature form. `classifyGroundingIntent`
+ * collapses the four non-form concerns (authorization / authentication / session
+ * / direct-URL) into the single coarse `authorization` intent for the purpose of
+ * "does this scenario fill the feature form?" (they all answer NO). The finer
+ * distinction — which of the four it is — is made by `classifyHeldIntent` below,
+ * used ONLY to pick the correct deterministic step flow.
+ */
 const HELD_INTENTS: ReadonlySet<ScenarioGroundingIntent> = new Set<ScenarioGroundingIntent>(['authorization']);
+
+/* ------------------------------------------------------------------ */
+/*  SPRINT 2 — Intent-aware Step Generator                             */
+/*  ---------------------------------------------------------------    */
+/*  The four non-form intents do NOT fill the feature form, so Sprint 1 */
+/*  correctly refused to fabricate form-fill steps and HELD them as a   */
+/*  skeleton placeholder ("Exercise the <title> scenario …"). This      */
+/*  sprint replaces that placeholder with the REAL, deterministic step  */
+/*  flow each intent actually requires — still WITHOUT inventing        */
+/*  business facts (no "Login as HR Admin" unless the profile says so)  */
+/*  and still WITHOUT fabricating form selectors. The steps are         */
+/*  business-readable and manually executable; because they ground on   */
+/*  no real form selector they stay Needs Review (not Automation Ready) */
+/*  — an honest, review-flagged state, NOT a placeholder.               */
+/* ------------------------------------------------------------------ */
+
+/** The distinct non-form step flows the Intent-aware Step Generator emits. */
+export type HeldStepIntent = 'authorization' | 'authentication' | 'session' | 'direct_url';
+
+interface HeldIntentScenario {
+  id?: string;
+  riskArea?: string;
+  title?: string;
+}
+
+/**
+ * Sub-classify a HELD (non-form) scenario into its specific step flow. Pure and
+ * deterministic. Signal priority mirrors `classifyGroundingIntent`: canonical
+ * `id` and `riskArea` (structured, stable) are consulted first; the free-text
+ * `title` is only a LAST fallback. Order of checks is most-specific-first because
+ * the ids overlap (a direct-endpoint id ALSO carries "authz"; an unauthenticated
+ * id ALSO implies authorization), so the broad `authorization` bucket is the
+ * final default.
+ */
+export function classifyHeldIntent(s: HeldIntentScenario): HeldStepIntent {
+  const structured = `${lc(s.id)} ${lc(s.riskArea)}`; // priority 1–2: id + riskArea
+  const title = lc(s.title); // last fallback
+  const has = (re: RegExp) => re.test(structured) || re.test(title);
+  if (/direct-endpoint|direct-url/.test(structured) || /\bdirect\b/.test(title)) return 'direct_url';
+  if (has(/session|timeout|expire/)) return 'session';
+  if (has(/unauthenticated|not logged in|redirected to login|authenticat/)) return 'authentication';
+  return 'authorization';
+}
+
+/** Context the deterministic step builders ground their prose in — all drawn
+ * from real requirement/profile data, never invented. */
+interface HeldStepContext {
+  featureLabel: string; // e.g. "Create Employee" — the requirement title (or entity)
+  entity: string; // e.g. "Employee" — derived from the requirement title
+  submitLabel: string; // e.g. "Save" — the resolved feature form's submit label
+}
+
+/**
+ * AUTHORIZATION — a user WITHOUT the required permission must be blocked. No form
+ * filling; we never name a specific role (e.g. "HR Admin") the requirement did
+ * not state — the truthful phrasing is "a user account without the required
+ * permission".
+ */
+function buildAuthorizationSteps(c: HeldStepContext): string[] {
+  return [
+    `Attempt to open the ${c.featureLabel} page`,
+    'Use a user account that does NOT have the required permission',
+    'Verify access is denied (the operation is blocked with a forbidden / access-denied response)',
+    `Verify no ${c.entity} record is created or modified`,
+  ];
+}
+
+/**
+ * AUTHENTICATION — an unauthenticated user (no active session) must be sent to
+ * login before reaching the feature. No form filling.
+ */
+function buildAuthenticationSteps(c: HeldStepContext): string[] {
+  return [
+    `Open the ${c.featureLabel} page while not authenticated (no active session)`,
+    'Verify the request is redirected to the login page before the form is reachable',
+    `Verify the ${c.featureLabel} form is not shown until the user authenticates`,
+  ];
+}
+
+/**
+ * SESSION — a session expiring mid-operation must be handled gracefully with no
+ * partial write. This is the one non-form flow that DOES touch the feature (open
+ * it, then attempt to submit after expiry) — but it asserts session handling, so
+ * it is not a plain form-fill case.
+ */
+function buildSessionSteps(c: HeldStepContext): string[] {
+  return [
+    `Log in as a valid user and open the ${c.featureLabel} page`,
+    'Allow the session to expire (or invalidate the session) before completing the operation',
+    `Attempt to ${c.submitLabel} the ${c.entity}`,
+    `Verify the expired session is handled gracefully — the user is prompted to re-authenticate and no partial ${c.entity} record is saved`,
+  ];
+}
+
+/**
+ * DIRECT-URL — the create endpoint must be authorization-checked server-side, not
+ * merely hidden in the UI. The user requests the URL directly, bypassing UI
+ * navigation. No form filling.
+ */
+function buildDirectAccessSteps(c: HeldStepContext): string[] {
+  return [
+    `Request the ${c.featureLabel} URL directly (bypassing the normal in-app navigation)`,
+    'Use a session that does NOT have the required permission',
+    'Verify the direct request is rejected or redirected by a server-side authorization check (not merely hidden in the UI)',
+    `Verify the ${c.entity} resource is inaccessible and no ${c.entity} record is created`,
+  ];
+}
+
+/** Dispatch to the correct deterministic step flow for a held intent. */
+function buildHeldIntentSteps(intent: HeldStepIntent, c: HeldStepContext): string[] {
+  switch (intent) {
+    case 'authentication':
+      return buildAuthenticationSteps(c);
+    case 'session':
+      return buildSessionSteps(c);
+    case 'direct_url':
+      return buildDirectAccessSteps(c);
+    case 'authorization':
+    default:
+      return buildAuthorizationSteps(c);
+  }
+}
 
 /* ------------------------------------------------------------------ */
 /*  Expected-result assertion helpers                                  */
@@ -969,6 +1098,13 @@ export function buildDraftTestCases(
       stepFlow: getScenarioStepFlow(scenario) ?? undefined,
     });
     const isHeld = HELD_INTENTS.has(groundingIntent);
+    // For a held (non-form) scenario, resolve WHICH non-form flow it is so the
+    // Intent-aware Step Generator can emit the correct deterministic steps
+    // (authorization / authentication / session / direct-URL). Null for form
+    // scenarios, which build their steps from the feature form instead.
+    const heldIntent: HeldStepIntent | null = isHeld
+      ? classifyHeldIntent({ id: scenario.id, riskArea: scenario.riskArea, title: scenario.title })
+      : null;
     // The form used FOR STEP BUILDING only. Held scenarios build no form steps
     // (stepForm undefined) but still pass the real `form` to buildExpected so
     // their expected result stays business-observable (e.g. "access denied").
@@ -1058,11 +1194,31 @@ export function buildDraftTestCases(
       }
     }
 
+    // ── Intent-aware Step Generator (held, non-form intents) ──
+    // A held scenario fills no form (stepForm undefined above), so it produced no
+    // steps in the block above. Instead of the old skeleton placeholder, emit the
+    // REAL deterministic step flow for its specific intent (authorization /
+    // authentication / session / direct-URL). These steps invent no business
+    // facts and fabricate no selectors — grounding stays page-level, so the case
+    // stays Needs Review (not Automation Ready) with a truthful reason below.
+    if (isHeld && heldIntent && !steps.length) {
+      const heldSteps = buildHeldIntentSteps(heldIntent, {
+        featureLabel: (input?.title || entity || 'feature').trim(),
+        entity,
+        submitLabel: form?.submitLabel || 'Save',
+      });
+      const heldPage = form?.page || baseUrl;
+      for (const st of heldSteps) {
+        steps.push(st);
+        grounding.push({ stepIndex: steps.length, page: heldPage });
+      }
+    }
+
     if (!steps.length) {
-      // Held (authorization/access) scenarios and scenarios with no matching
-      // feature form both emit an honest, ungrounded skeleton rather than
-      // fabricating field steps. The caller marks the case "Needs Review" and
-      // records the precise reason (held-for-intent-engine vs no-form-matched).
+      // Only reached by scenarios with NO matching feature form (not held, not
+      // grounded): emit an honest, ungrounded skeleton rather than fabricating
+      // field steps. The caller marks the case "Needs Review" with the precise
+      // no-form-matched reason.
       steps.push(`Exercise the "${scenario.title}" scenario against the application`);
     }
     // NOTE: no generic "Observe and verify the outcome" step. Verification lives
@@ -1102,13 +1258,17 @@ export function buildDraftTestCases(
     const applicationFields = (form?.fields || []).map(f => f.label || f.name || 'field');
     const reviewReasons: string[] = [];
     if (isHeld) {
-      // Deliberately held: the feature form may well be resolved, but this is a
-      // non-form concern (authorization / authentication / session / direct-URL)
-      // whose real steps belong to the Intent-aware Step Generator. We keep it as
-      // Needs Review instead of fabricating Add-form steps — the product rule
-      // "never generate confident-but-incorrect artifacts".
+      // Non-form concern (authorization / authentication / session / direct-URL).
+      // The Intent-aware Step Generator has now emitted a REAL deterministic step
+      // flow (no fabricated form-fill, no invented role). It still grounds on no
+      // form selector and assumes an environment-specific precondition — a user
+      // account lacking the permission, or an expired session — so it stays Needs
+      // Review (not Automation Ready): confirm that account / access control
+      // against the target environment before automating. This is honest, not a
+      // placeholder — the product rule "never generate confident-but-incorrect
+      // artifacts".
       reviewReasons.push(
-        `This is a non-form ${groundingIntent} scenario — its steps (e.g. requesting the URL without a session, or acting without the required role) are not form interactions. Held as Needs Review pending the Intent-aware Step Generator rather than fabricating form-fill steps.`,
+        `Deterministic ${heldIntent ?? groundingIntent} step flow (non-form intent): the steps assert an access-control / session outcome rather than filling the feature form, so they ground on no selector and depend on an environment-specific account or precondition. Confirm the required account and expected access control against the target environment before automating.`,
       );
     } else if (!featureFormResolved) {
       reviewReasons.push(
