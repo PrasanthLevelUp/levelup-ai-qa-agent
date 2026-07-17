@@ -475,15 +475,43 @@ function pickForm(forms: FormLike[] | undefined, terms: string[]): FormLike | un
   return bestScore > 0 ? best : undefined;
 }
 
-/** Pick the most relevant dataset for a scenario (term match, else first). */
+/** Pick the most relevant dataset for a scenario when terms naturally match.
+ * 
+ *  PX-1A: Returns undefined when no match — datasets assist, they don't dominate.
+ *  Only scenarios whose terms overlap with a dataset name/keys use that dataset;
+ *  everything else (SQL, XSS, whitespace, boundary) uses deterministic inline data.
+ * 
+ *  Matching strategy (LEXICAL, not semantic):
+ *  - Dataset name matches score 2× higher than key matches
+ *  - Requires at least 1 term overlap to select a dataset
+ *  - When multiple datasets tie, picks the first in upload order (deterministic)
+ *  - When no dataset matches, returns undefined → inline values are generated
+ * 
+ *  INTENTIONALLY OUT OF SCOPE (future improvement):
+ *  - Semantic matching (e.g. "Employee_Master" ≈ "Add Employee" without lexical overlap)
+ *  - Domain-aware matching (e.g. HR domain → prefer HR-related datasets)
+ *  - Multi-word compound matching (e.g. "new employee" as a phrase)
+ * 
+ *  If customer uploads datasets with meaningless names (Dataset_A, Regression_Set_01),
+ *  the engine correctly returns undefined and uses inline values. This is the right
+ *  behavior — better to generate deterministic inline data than to randomly guess.
+ */
 function pickDataset(datasets: DatasetLike[] | undefined, terms: string[]): DatasetLike | undefined {
   if (!datasets?.length) return undefined;
-  let best = datasets[0];
-  let bestScore = -1;
+  let best: DatasetLike | undefined = undefined;
+  let bestScore = 0; // Require at least 1 matching term (was -1, which auto-picked datasets[0])
   for (const d of datasets) {
-    const text = [lc(d.name), ...(d.sampleKeys || []).map(lc)].join(' ');
+    const datasetName = lc(d.name);
+    const keys = (d.sampleKeys || []).map(lc).join(' ');
     let score = 0;
-    for (const t of terms) if (t && text.includes(t)) score += 1;
+    // Name matches score higher (2 points) than key matches (1 point) — this ensures
+    // "duplicate_employee" beats "new_employee" when the scenario contains "duplicate".
+    for (const t of terms) {
+      if (t && datasetName.includes(t)) score += 2;
+      else if (t && keys.includes(t)) score += 1;
+    }
+    // Deterministic tie-breaking: only update on strict `>`, so first dataset wins ties.
+    // This ensures stable, predictable behavior when multiple datasets score equally.
     if (score > bestScore) { best = d; bestScore = score; }
   }
   return best;
@@ -1248,7 +1276,14 @@ export function buildDraftTestCases(
   // the single source of truth for scenario existence. The builder only
   // enriches each immutable planned scenario into a concrete, grounded draft.
   plan.scenarios.forEach((scenario, index) => {
-    const scenarioTerms = toTerms(`${scenario.title} ${scenario.objective} ${scenario.riskArea}`);
+    // PX-1A: Positive scenarios inherit requirement context for dataset matching
+    // (e.g. "Add New Employee" → "new_employee" dataset). Security/validation
+    // scenarios (SQL, XSS, whitespace, boundary) use ONLY their own terms, so they
+    // naturally won't match any dataset and fall to deterministic inline values.
+    const isPositiveCreate = scenario.coverageType === 'positive' && 
+      /create|add|new|register|submit/i.test(scenario.title);
+    const requirementContext = isPositiveCreate ? (input?.title ?? '') : '';
+    const scenarioTerms = toTerms(`${requirementContext} ${scenario.title} ${scenario.objective} ${scenario.riskArea}`);
     // The feature form is resolved once (above) and shared by all scenarios.
     const form = featureForm;
     const dataset = pickDataset(knowledge?.testData, scenarioTerms);
@@ -1399,9 +1434,10 @@ export function buildDraftTestCases(
       : `The application and any data required for "${scenario.title}" are available.`;
 
     // ── Test data reference ── real dataset + sample keys when present.
+    // PX-1A: Make dataset usage transparent so users understand where values come from.
     const testData = dataset?.name
-      ? `${dataset.name}${dataset.sampleKeys?.length ? ` (keys: ${dataset.sampleKeys.slice(0, 5).join(', ')})` : ''}`
-      : 'Use data appropriate to the scenario (no dedicated dataset found).';
+      ? `✓ Dataset: ${dataset.name}${dataset.sampleKeys?.length ? ` (keys: ${dataset.sampleKeys.slice(0, 5).join(', ')})` : ''}`
+      : 'Generated inline values (no matching dataset).';
 
     // ── Provenance ── carried through VERBATIM from the planner. The builder
     // does not decide (or second-guess) why a scenario exists; it only relays
