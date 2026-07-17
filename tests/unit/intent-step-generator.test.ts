@@ -98,7 +98,7 @@ describe('Intent-aware Step Generator — deterministic non-form flows', () => {
     expect(d).toBeDefined();
     expect(isPlaceholder(d)).toBe(false);
     const text = (d.steps as string[]).join(' ');
-    expect(text).toMatch(/required permission/i);
+    expect(text).toMatch(/not authorized to perform this operation/i);
     expect(text).toMatch(/access is denied/i);
     NO_FORM_FILL(text);
     // Never claims a specific role the requirement did not state.

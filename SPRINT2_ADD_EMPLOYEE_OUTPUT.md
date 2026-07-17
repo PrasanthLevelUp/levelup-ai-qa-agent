@@ -18,7 +18,7 @@ Legend: 🟢 Automation Ready · 🟡 Needs Review · intent shown per scenario.
 - id: `crud-neg-direct-endpoint-authz` · intent: **held:direct_url** · placeholder: no
 - steps:
   1. Request the Create Employee URL directly (bypassing the normal in-app navigation)
-  2. Use a session that does NOT have the required permission
+  2. Use a session that is NOT authorized for this operation
   3. Verify the direct request is rejected or redirected by a server-side authorization check (not merely hidden in the UI)
   4. Verify the Employee resource is inaccessible and no Employee record is created
 - ⚠️ review: Deterministic direct_url step flow (non-form intent): the steps assert an access-control / session outcome rather than filling the feature form, so they ground on no selector and depend on an environment-specific account or precondition. Confirm the required account and expected access control against the target environment before automating.
@@ -185,7 +185,7 @@ Legend: 🟢 Automation Ready · 🟡 Needs Review · intent shown per scenario.
 - id: `crud-neg-unauthorized` · intent: **held:authorization** · placeholder: no
 - steps:
   1. Attempt to open the Create Employee page
-  2. Use a user account that does NOT have the required permission
+  2. Use a user account that is NOT authorized to perform this operation
   3. Verify access is denied (the operation is blocked with a forbidden / access-denied response)
   4. Verify no Employee record is created or modified
 - ⚠️ review: Deterministic authorization step flow (non-form intent): the steps assert an access-control / session outcome rather than filling the feature form, so they ground on no selector and depend on an environment-specific account or precondition. Confirm the required account and expected access control against the target environment before automating.

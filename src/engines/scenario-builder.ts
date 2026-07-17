@@ -674,15 +674,19 @@ interface HeldStepContext {
 }
 
 /**
- * AUTHORIZATION — a user WITHOUT the required permission must be blocked. No form
- * filling; we never name a specific role (e.g. "HR Admin") the requirement did
- * not state — the truthful phrasing is "a user account without the required
- * permission".
+ * AUTHORIZATION — a user who is NOT authorized for the operation must be blocked.
+ * No form filling; we never name a specific role (e.g. "HR Admin") the requirement
+ * did not state, and we do NOT presuppose a discrete permission/RBAC object (this
+ * canonical scenario is ungated, so it appears even on requirements with no
+ * authorization language). The wording is grounded in the scenario's own identity
+ * — id `crud-neg-unauthorized`, title "Unauthorized user cannot perform the
+ * operation" — hence "a user account that is not authorized to perform this
+ * operation" rather than "without the required permission".
  */
 function buildAuthorizationSteps(c: HeldStepContext): string[] {
   return [
     `Attempt to open the ${c.featureLabel} page`,
-    'Use a user account that does NOT have the required permission',
+    'Use a user account that is NOT authorized to perform this operation',
     'Verify access is denied (the operation is blocked with a forbidden / access-denied response)',
     `Verify no ${c.entity} record is created or modified`,
   ];
@@ -723,7 +727,7 @@ function buildSessionSteps(c: HeldStepContext): string[] {
 function buildDirectAccessSteps(c: HeldStepContext): string[] {
   return [
     `Request the ${c.featureLabel} URL directly (bypassing the normal in-app navigation)`,
-    'Use a session that does NOT have the required permission',
+    'Use a session that is NOT authorized for this operation',
     'Verify the direct request is rejected or redirected by a server-side authorization check (not merely hidden in the UI)',
     `Verify the ${c.entity} resource is inaccessible and no ${c.entity} record is created`,
   ];
