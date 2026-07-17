@@ -475,46 +475,108 @@ function pickForm(forms: FormLike[] | undefined, terms: string[]): FormLike | un
   return bestScore > 0 ? best : undefined;
 }
 
-/** Pick the most relevant dataset for a scenario when terms naturally match.
- * 
- *  PX-1A: Returns undefined when no match — datasets assist, they don't dominate.
- *  Only scenarios whose terms overlap with a dataset name/keys use that dataset;
- *  everything else (SQL, XSS, whitespace, boundary) uses deterministic inline data.
- * 
- *  Matching strategy (LEXICAL, not semantic):
- *  - Dataset name matches score 2× higher than key matches
- *  - Requires at least 1 term overlap to select a dataset
- *  - When multiple datasets tie, picks the first in upload order (deterministic)
- *  - When no dataset matches, returns undefined → inline values are generated
- * 
+/** The lexical signals a dataset is matched against, in priority order. */
+interface DatasetMatchSignals {
+  /** Form field labels/names — matched against the dataset's KEYS. The most
+   *  reliable signal: the actual data structure, not a human-chosen label. */
+  fieldTerms: string[];
+  /** Scenario title/objective terms — a secondary signal. */
+  scenarioTerms: string[];
+  /** Requirement title terms — used ONLY as a tie-breaker, never to select alone. */
+  requirementTerms: string[];
+}
+
+/** Pick the most relevant dataset for a scenario when the DATA STRUCTURE fits.
+ *
+ *  PX-1A: Returns undefined when nothing fits — datasets assist, they don't dominate.
+ *  Only scenarios that naturally consume a full valid record (positive creates,
+ *  duplicate checks) ever reach here; everything else (SQL, XSS, whitespace,
+ *  boundary) uses deterministic inline data.
+ *
+ *  Matching strategy (LEXICAL, not semantic) — trust the DATA before the LABEL:
+ *
+ *      Dataset KEYS        (weight 3)   ← primary   — the actual data structure
+ *      Dataset NAME        (weight 1)   ← secondary — a human-chosen label
+ *      Requirement context (tie-break)  ← tertiary  — never selects on its own
+ *      (no fit) → undefined → inline values
+ *
+ *  A dataset's KEYS are the strongest signal because names are inconsistent
+ *  ("Regression_Set" can still hold employee keys), whereas keys describe what
+ *  the data actually IS. The requirement title only breaks ties between datasets
+ *  that already fit structurally — it can never, on its own, pull in a dataset.
+ *  Ties beyond that resolve by upload order (deterministic, never random).
+ *
  *  INTENTIONALLY OUT OF SCOPE (future improvement):
  *  - Semantic matching (e.g. "Employee_Master" ≈ "Add Employee" without lexical overlap)
  *  - Domain-aware matching (e.g. HR domain → prefer HR-related datasets)
  *  - Multi-word compound matching (e.g. "new employee" as a phrase)
- * 
- *  If customer uploads datasets with meaningless names (Dataset_A, Regression_Set_01),
- *  the engine correctly returns undefined and uses inline values. This is the right
- *  behavior — better to generate deterministic inline data than to randomly guess.
+ *
+ *  If a customer uploads datasets with meaningless names (Dataset_A, Regression_Set_01)
+ *  whose keys don't fit the form either, the engine returns undefined and uses inline
+ *  values — better to generate deterministic inline data than to randomly guess.
  */
-function pickDataset(datasets: DatasetLike[] | undefined, terms: string[]): DatasetLike | undefined {
+function pickDataset(
+  datasets: DatasetLike[] | undefined,
+  signals: DatasetMatchSignals,
+): DatasetLike | undefined {
   if (!datasets?.length) return undefined;
-  let best: DatasetLike | undefined = undefined;
-  let bestScore = 0; // Require at least 1 matching term (was -1, which auto-picked datasets[0])
-  for (const d of datasets) {
-    const datasetName = lc(d.name);
-    const keys = (d.sampleKeys || []).map(lc).join(' ');
-    let score = 0;
-    // Name matches score higher (2 points) than key matches (1 point) — this ensures
-    // "duplicate_employee" beats "new_employee" when the scenario contains "duplicate".
-    for (const t of terms) {
-      if (t && datasetName.includes(t)) score += 2;
-      else if (t && keys.includes(t)) score += 1;
+
+  const KEY_WEIGHT = 3;  // a dataset KEY match — the most reliable signal
+  const NAME_WEIGHT = 1; // a dataset NAME match — a weaker, human-chosen label
+
+  // Match on WHOLE TOKENS, not substrings — otherwise a common word like "data"
+  // in a scenario title would spuriously match a dataset named "Dataset_A".
+  const scorePool = (keyTokens: Set<string>, nameTokens: Set<string>, pool: string[]): number => {
+    let s = 0;
+    for (const t of pool) {
+      if (!t) continue;
+      if (keyTokens.has(t)) s += KEY_WEIGHT;
+      else if (nameTokens.has(t)) s += NAME_WEIGHT;
     }
-    // Deterministic tie-breaking: only update on strict `>`, so first dataset wins ties.
-    // This ensures stable, predictable behavior when multiple datasets score equally.
-    if (score > bestScore) { best = d; bestScore = score; }
+    return s;
+  };
+
+  const scored = datasets.map((d, order) => {
+    const nameTokens = new Set(toTerms(d.name ?? ''));
+    const keyTokens = new Set((d.sampleKeys || []).flatMap(k => toTerms(k)));
+    // PRIMARY: does the data structure fit the form fields + this scenario?
+    const primary = scorePool(keyTokens, nameTokens, [...signals.fieldTerms, ...signals.scenarioTerms]);
+    // TIE-BREAKER: requirement context — never contributes to `primary`, so it
+    // can only choose BETWEEN datasets that already fit structurally.
+    const tiebreak = scorePool(keyTokens, nameTokens, signals.requirementTerms);
+    return { d, primary, tiebreak, order };
+  });
+
+  // A dataset is eligible ONLY if it has a real structural/scenario fit.
+  const eligible = scored.filter(s => s.primary > 0);
+  if (!eligible.length) return undefined;
+
+  eligible.sort((a, b) =>
+    b.primary - a.primary ||   // best structural fit wins
+    b.tiebreak - a.tiebreak || // requirement context breaks ties
+    a.order - b.order,         // deterministic: earliest upload wins
+  );
+  return eligible[0].d;
+}
+
+/** PX-1A: Would a QA naturally use an uploaded dataset for THIS scenario?
+ *
+ *  Only scenarios that fill the form with a full, valid record consume datasets:
+ *  positive creates and the duplicate check (which needs an existing record).
+ *  Security (SQL/XSS), boundary, whitespace and field-validation scenarios always
+ *  use GENERATED payloads — an uploaded dataset would be the wrong instinct there,
+ *  so they never even attempt a match (they fall straight to inline values). */
+function scenarioConsumesDataset(scenario: { title?: string; riskArea?: string; coverageType?: string }): boolean {
+  const t = lc(`${scenario.title ?? ''} ${scenario.riskArea ?? ''}`);
+  // Never for security / boundary / whitespace / payload-validation scenarios.
+  if (/sql|xss|injection|script|whitespace|boundary|unicode|numeric|leading.zero|special.char|max length|too long|min length|single.char/i.test(t)) {
+    return false;
   }
-  return best;
+  // Positive creates fill the form with a valid record.
+  if (scenario.coverageType === 'positive') return true;
+  // The duplicate check needs an existing record to re-submit.
+  if (/duplicate|re-submit|resubmit/i.test(t)) return true;
+  return false;
 }
 
 /**
@@ -1276,17 +1338,23 @@ export function buildDraftTestCases(
   // the single source of truth for scenario existence. The builder only
   // enriches each immutable planned scenario into a concrete, grounded draft.
   plan.scenarios.forEach((scenario, index) => {
-    // PX-1A: Positive scenarios inherit requirement context for dataset matching
-    // (e.g. "Add New Employee" → "new_employee" dataset). Security/validation
-    // scenarios (SQL, XSS, whitespace, boundary) use ONLY their own terms, so they
-    // naturally won't match any dataset and fall to deterministic inline values.
-    const isPositiveCreate = scenario.coverageType === 'positive' && 
-      /create|add|new|register|submit/i.test(scenario.title);
-    const requirementContext = isPositiveCreate ? (input?.title ?? '') : '';
-    const scenarioTerms = toTerms(`${requirementContext} ${scenario.title} ${scenario.objective} ${scenario.riskArea}`);
     // The feature form is resolved once (above) and shared by all scenarios.
     const form = featureForm;
-    const dataset = pickDataset(knowledge?.testData, scenarioTerms);
+
+    // PX-1A: Datasets assist, they don't dominate. Only scenarios that naturally
+    // consume a full valid record (positive creates, duplicate checks) attempt a
+    // match; security / boundary / whitespace / validation scenarios always fall to
+    // generated inline values. When they DO match, the DATA STRUCTURE leads:
+    //   Dataset KEYS (primary) → Dataset NAME (secondary) → Requirement context (tie-break).
+    const dataset = scenarioConsumesDataset(scenario)
+      ? pickDataset(knowledge?.testData, {
+          // Form field labels/names → matched against dataset KEYS (the structural fit).
+          fieldTerms: (form?.fields ?? []).flatMap(f => toTerms(`${f.label ?? ''} ${f.name ?? ''}`)),
+          scenarioTerms: toTerms(`${scenario.title} ${scenario.objective} ${scenario.riskArea}`),
+          // Requirement title is a TIE-BREAKER only — never selects a dataset alone.
+          requirementTerms: toTerms(input?.title ?? ''),
+        })
+      : undefined;
 
     // ── Grounding intent ── decides whether this scenario fills the feature form
     // or is HELD (authorization/authentication/session — non-form concerns whose
@@ -1437,7 +1505,7 @@ export function buildDraftTestCases(
     // PX-1A: Make dataset usage transparent so users understand where values come from.
     const testData = dataset?.name
       ? `✓ Dataset: ${dataset.name}${dataset.sampleKeys?.length ? ` (keys: ${dataset.sampleKeys.slice(0, 5).join(', ')})` : ''}`
-      : 'Generated inline values (no matching dataset).';
+      : 'Generated sample values';
 
     // ── Provenance ── carried through VERBATIM from the planner. The builder
     // does not decide (or second-guess) why a scenario exists; it only relays
