@@ -253,6 +253,34 @@ export interface ScenarioAssertionTemplate {
 }
 
 /**
+ * The MANUAL-BUILDER step-flow discriminator (Scenario ↔ Steps).
+ * ---------------------------------------------------------------------------
+ * The single structured field that tells the deterministic Scenario Builder
+ * what SHAPE a scenario's manual steps must take when the generic "open → fill
+ * every field → submit" template is WRONG for the scenario's intent. Authored
+ * in the Knowledge Base next to the scenario (the KB is the authority on what a
+ * "cancel" or a "search" scenario fundamentally DOES); the Builder READS it and
+ * dispatches — it NEVER infers the flow from the title/id itself.
+ *
+ * Deliberately SEPARATE from `actionTemplate` (below): that field is the
+ * script-gen action grammar (frozen verbs, ratchet-guarded, consumed only by the
+ * Scenario Graph → Playwright). `stepFlow` is the business-readable MANUAL step
+ * shape a human QA reads in the Test Case Lab CSV. They are different surfaces
+ * (automation vs manual) and evolve independently, so this is not the same
+ * concern re-litigated — and it is intentionally NOT gated by the auth
+ * action-template ratchet, which governs `actionTemplate` only.
+ *
+ * Closed set, extended one proven strategy at a time (currently the two the Add
+ * Employee audit demanded). A scenario WITHOUT `stepFlow` keeps the existing
+ * generic template unchanged — this is purely additive.
+ *   • `search` — create the record, then go to the list/search, query for it,
+ *                and verify it appears (a create-then-find workflow).
+ *   • `cancel` — enter data, then Cancel instead of Submit, and verify nothing
+ *                was persisted (a discard workflow).
+ */
+export type ScenarioStepFlow = 'search' | 'cancel';
+
+/**
  * A single baseline scenario the category implies. This is the deterministic
  * "obligation" — the LLM later expands it into concrete, grounded test cases.
  */
@@ -304,6 +332,15 @@ export interface PlannedScenario {
    * that function) so uncurated categories keep working unchanged.
    */
   semantics?: ScenarioSemantics;
+  /**
+   * The MANUAL step-flow SHAPE for this scenario (see {@link ScenarioStepFlow}).
+   * Set it ONLY when the generic "open → fill every field → submit" template is
+   * WRONG for the scenario's intent — e.g. a cancel scenario must click Cancel
+   * (not Submit), a search scenario must create then find. When omitted, the
+   * Builder keeps its generic template, so this is purely additive. The Builder
+   * reads this via `getScenarioStepFlow`; it NEVER infers the flow itself.
+   */
+  stepFlow?: ScenarioStepFlow;
   /**
    * The canonical, ORDERED action sequence for this scenario (Open → Fill →
    * Click → Verify …). Authored here because the Knowledge Base — not a step
@@ -653,11 +690,11 @@ export const QA_KNOWLEDGE_BASE: Record<Exclude<QACategory, 'generic'>, PlannedSc
     { id: 'crud-neg-unauthenticated-redirect', title: 'Unauthenticated user is redirected to login', objective: 'An unauthenticated user (not logged in) is redirected to login before reaching the create form, rather than being shown the form.', coverageType: 'negative', priority: 'P2', riskArea: 'Authorization', conditionalOnKeywords: ['authorized', 'authorised', 'admin', 'permission', 'role', 'login', 'authenticated'] },
     // Form navigation a senior QA always checks on a create/edit form: the exit
     // path must not silently persist. Gated on form/save language.
-    { id: 'crud-pos-cancel-discards', title: 'Cancel discards input and returns without saving', objective: 'Cancel discards the entered input and returns to the list without saving — no partial record is created (cancel without saving).', coverageType: 'positive', priority: 'P2', riskArea: 'Navigation', conditionalOnKeywords: ['form', 'save', 'submit', 'cancel', 'create', 'add', 'new'] },
+    { id: 'crud-pos-cancel-discards', title: 'Cancel discards input and returns without saving', objective: 'Cancel discards the entered input and returns to the list without saving — no partial record is created (cancel without saving).', coverageType: 'positive', priority: 'P2', riskArea: 'Navigation', stepFlow: 'cancel', conditionalOnKeywords: ['form', 'save', 'submit', 'cancel', 'create', 'add', 'new'] },
     // Post-write workflow: a created record must be persisted AND discoverable.
-    { id: 'crud-pos-searchable', title: 'Created record is immediately searchable', objective: 'After a successful create the new record is findable straight away — searchable by ID and by name — with no reindex delay.', coverageType: 'positive', priority: 'P1', riskArea: 'Data retrieval / workflow', conditionalOnKeywords: ['search', 'searchable', 'find', 'lookup', 'list', 'directory'] },
-    { id: 'crud-pos-search-partial', title: 'Partial-name search returns the record', objective: 'A partial name search (a partial match on the name) returns the newly created record, not just an exact full-string match.', coverageType: 'positive', priority: 'P2', riskArea: 'Search correctness', conditionalOnKeywords: ['search', 'searchable', 'find', 'lookup', 'name'] },
-    { id: 'crud-pos-search-case-insensitive', title: 'Search is case-insensitive', objective: 'Search is case insensitive — a differently-cased query (upper/lower) still returns the created record.', coverageType: 'positive', priority: 'P2', riskArea: 'Search correctness', conditionalOnKeywords: ['search', 'searchable', 'find', 'lookup', 'name'] },
+    { id: 'crud-pos-searchable', title: 'Created record is immediately searchable', objective: 'After a successful create the new record is findable straight away — searchable by ID and by name — with no reindex delay.', coverageType: 'positive', priority: 'P1', riskArea: 'Data retrieval / workflow', stepFlow: 'search', conditionalOnKeywords: ['search', 'searchable', 'find', 'lookup', 'list', 'directory'] },
+    { id: 'crud-pos-search-partial', title: 'Partial-name search returns the record', objective: 'A partial name search (a partial match on the name) returns the newly created record, not just an exact full-string match.', coverageType: 'positive', priority: 'P2', riskArea: 'Search correctness', stepFlow: 'search', conditionalOnKeywords: ['search', 'searchable', 'find', 'lookup', 'name'] },
+    { id: 'crud-pos-search-case-insensitive', title: 'Search is case-insensitive', objective: 'Search is case insensitive — a differently-cased query (upper/lower) still returns the created record.', coverageType: 'positive', priority: 'P2', riskArea: 'Search correctness', stepFlow: 'search', conditionalOnKeywords: ['search', 'searchable', 'find', 'lookup', 'name'] },
     { id: 'crud-pos-propagate-views', title: 'New record propagates to dependent views', objective: 'The newly created record propagates to dependent views — it appears in the directory / list immediately, keeping downstream views consistent.', coverageType: 'positive', priority: 'P2', riskArea: 'Integration / consistency', conditionalOnKeywords: ['list', 'directory', 'search', 'searchable', 'appears'] },
     // ── File / attachment upload surface — gated so it only appears for features
     // that actually take an upload (photo, avatar, document, attachment, file). ──
@@ -864,6 +901,20 @@ export function getScenarioActionTemplate(scenario: PlannedScenario): ScenarioAc
     return scenario.actionTemplate;
   }
   return null;
+}
+
+/**
+ * Resolve a scenario's MANUAL step-flow shape — the KB's answer to "does this
+ * scenario's manual steps need a shape OTHER than the generic fill-and-submit?".
+ *
+ * Like {@link getScenarioActionTemplate}, this is a pure KB lookup — NOT
+ * inference. The authored `stepFlow` wins; otherwise `null`, and the Builder
+ * keeps its generic template. Returning `null` (never a guessed flow) is the
+ * whole point: the Builder must consume the KB's declared intent, never re-infer
+ * it from the title — a wrong flow would ship steps that contradict the title.
+ */
+export function getScenarioStepFlow(scenario: PlannedScenario): ScenarioStepFlow | null {
+  return scenario.stepFlow ?? null;
 }
 
 /**

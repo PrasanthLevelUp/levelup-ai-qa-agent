@@ -307,3 +307,99 @@ describe('Step Validator — checkFieldValidity', () => {
     expect(r.score).toBe(1);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Rule 4 — Scenario ↔ Step-Flow  (Builder consumes KB-declared intent)
+// ---------------------------------------------------------------------------
+// Locks the Builder semantic-loss defect: three CRUD scenarios (cancel, two
+// searches) used to emit the IDENTICAL generic "open → fill → submit" steps,
+// contradicting their own titles. The KB now declares a structured `stepFlow`
+// and the Builder DISPATCHES on it (never infers from the title). These tests
+// assert the two shipped flows — cancel and search — produce steps + expected
+// results that match intent, and that undeclared scenarios stay generic.
+
+describe('Rule 4 — Builder shapes steps from the KB-declared step-flow', () => {
+  const plan = planScenarios(ADD_EMPLOYEE_REQ, COVERAGE, 'crud');
+  const { drafts } = buildDraftTestCases(plan, employeeKnowledge(), ADD_EMPLOYEE_REQ);
+
+  const byId = (id: string) => drafts.find((d: any) => d.scenarioId === id);
+  const expectedOf = (d: any): string =>
+    (d.expectedResult || d?.expected?.observable || '').toLowerCase();
+
+  describe('CANCEL — crud-pos-cancel-discards', () => {
+    const d: any = byId('crud-pos-cancel-discards');
+
+    it('is generated', () => expect(d).toBeTruthy());
+
+    it('clicks Cancel and NEVER clicks Submit/Save', () => {
+      const text = stepsOf(d);
+      expect(text).toContain('cancel');
+      expect(text).not.toContain('click the save button');
+      expect(text).not.toContain('click the submit button');
+    });
+
+    it('verifies the record was NOT created', () => {
+      const text = stepsOf(d);
+      expect(text).toMatch(/not created|discarded/);
+    });
+
+    it('has a discard-shaped expected result (nothing persisted)', () => {
+      expect(expectedOf(d)).toMatch(/no record is created|not persisted|does not appear/);
+    });
+
+    it('still fills the real employee fields first', () => {
+      const text = stepsOf(d);
+      expect(text).toMatch(/first name|last name|employee id/);
+    });
+  });
+
+  describe('SEARCH — crud-pos-searchable', () => {
+    const d: any = byId('crud-pos-searchable');
+
+    it('is generated', () => expect(d).toBeTruthy());
+
+    it('follows create → navigate → search → verify (submit THEN find)', () => {
+      const steps: string[] = (d.steps || []).map((s: string) => s.toLowerCase());
+      const submitIdx = steps.findIndex((s) => s.includes('save') || s.includes('submit'));
+      const searchIdx = steps.findIndex((s) => s.includes('search'));
+      const verifyIdx = steps.findIndex((s) => s.includes('appears in the search results'));
+      expect(submitIdx).toBeGreaterThanOrEqual(0);
+      expect(searchIdx).toBeGreaterThan(submitIdx);
+      expect(verifyIdx).toBeGreaterThan(searchIdx);
+    });
+
+    it('has a found-in-results expected result', () => {
+      expect(expectedOf(d)).toMatch(/search results|discoverable|found by/);
+    });
+  });
+
+  describe('SEARCH — crud-pos-search-partial shares the search flow', () => {
+    const d: any = byId('crud-pos-search-partial');
+    it('is generated and searches after creating', () => {
+      expect(d).toBeTruthy();
+      const text = stepsOf(d);
+      expect(text).toContain('search');
+      expect(text).toMatch(/save|submit/);
+    });
+  });
+
+  describe('undeclared scenarios keep the generic create flow', () => {
+    // A plain positive create (duplicate-id / valid-create style) that declares
+    // NO stepFlow must be untouched: submit, no search-list, no cancel.
+    const generic = drafts.find(
+      (d: any) =>
+        d.coverageType === 'positive' &&
+        !['crud-pos-cancel-discards', 'crud-pos-searchable', 'crud-pos-search-partial', 'crud-pos-search-case-insensitive'].includes(
+          d.scenarioId,
+        ) &&
+        (d.steps || []).some((s: string) => /save|submit/i.test(s)),
+    );
+
+    it('exists and does not gain cancel/search tail steps', () => {
+      expect(generic).toBeTruthy();
+      const text = stepsOf(generic);
+      expect(text).not.toContain('click the cancel button');
+      expect(text).not.toContain('appears in the search results');
+    });
+  });
+});

@@ -41,7 +41,12 @@
  *     echo.
  */
 
-import type { QACategory, ScenarioSemantics } from './qa-knowledge-engine';
+import {
+  getScenarioStepFlow,
+  type QACategory,
+  type ScenarioSemantics,
+  type ScenarioStepFlow,
+} from './qa-knowledge-engine';
 // Resolution no longer happens here — it runs ONCE at Scenario Graph build time
 // and the record is carried down onto the case. We only need the record TYPE and
 // the shared masking primitive (single source of truth) for the prompt boundary.
@@ -539,8 +544,33 @@ function buildExpected(
   scenario: PlannedScenarioWithProvenance,
   form: FormLike | undefined,
   ap: ProfileLike | undefined,
+  stepFlow: ScenarioStepFlow | null = null,
 ): StructuredExpected {
   const ct = scenario.coverageType;
+  // Flow-shaped scenarios need a flow-shaped OBSERVABLE — the generic positive
+  // "the action succeeds…" is wrong for a cancel (nothing should persist) or a
+  // search (a record must be FOUND). Keyed off the SAME declared flow the steps
+  // used, so the title, the steps and the expected result all agree.
+  if (stepFlow === 'cancel') {
+    const page = form?.page || ap?.baseUrl;
+    return {
+      observable:
+        'No record is created: the form is discarded and the user is returned to the list. ' +
+        'The entered values are not persisted and the record does not appear in the list afterwards.',
+      business: scenario.objective,
+      technical: page ? { page } : undefined,
+    };
+  }
+  if (stepFlow === 'search') {
+    const page = ap?.baseUrl || form?.page;
+    return {
+      observable:
+        'The newly created record is returned in the search results — found by its identifier and by name — ' +
+        'confirming it was persisted and is immediately discoverable (no reindex delay).',
+      business: scenario.objective,
+      technical: page ? { page } : undefined,
+    };
+  }
   // A post-condition anchor for automation: a "success" landmark (e.g. a logout
   // control) for positive flows, else the form's page. Never shown to manual QA.
   const successEl = (ap?.keyElements || []).find(e =>
@@ -656,16 +686,51 @@ export function buildDraftTestCases(
       steps.push(`Enter ${dataPhraseFor(scenario, f)} in the ${fieldLabel} field`);
       grounding.push({ stepIndex: steps.length, selector: f.selector, page: form?.page, control: fieldLabel });
     }
-    if (form?.submitSelector) {
-      usedRealSelector = true;
-      const submitLabel = form.submitLabel || 'Submit';
-      steps.push(`Click the ${submitLabel} button`);
-      grounding.push({ stepIndex: steps.length, selector: form.submitSelector, page: form?.page, control: submitLabel });
-    } else if (form) {
-      // QA Standard P5 (business language): "Click the Submit button", never a
-      // bare "Submit the form" — keep a consistent, parseable action verb.
-      steps.push('Click the Submit button');
-      grounding.push({ stepIndex: steps.length, page: form?.page, control: 'Submit' });
+    // The KB-declared manual step-flow (null ⇒ generic create). Only meaningful
+    // when a real feature form was resolved; with no form we emit a skeleton.
+    const stepFlow: ScenarioStepFlow | null = form ? getScenarioStepFlow(scenario) : null;
+    // ── Action tail — SHAPED BY THE SCENARIO'S DECLARED STEP-FLOW ──
+    // The create prefix above (open + fill every field) is common to every flow.
+    // The tail is where a scenario's INTENT diverges, and that intent comes from
+    // the KB via `getScenarioStepFlow` — the Builder DISPATCHES on the declared
+    // flow, it NEVER infers intent from the title/id itself (a wrong guess would
+    // ship steps that contradict the title, the exact defect this fixes). When a
+    // scenario declares no flow, the tail is the unchanged plain-create submit.
+    const submitLabel = form?.submitLabel || 'Submit';
+    const pushSubmit = () => {
+      if (form?.submitSelector) {
+        usedRealSelector = true;
+        steps.push(`Click the ${submitLabel} button`);
+        grounding.push({ stepIndex: steps.length, selector: form.submitSelector, page: form?.page, control: submitLabel });
+      } else if (form) {
+        // QA Standard P5 (business language): "Click the Submit button", never a
+        // bare "Submit the form" — keep a consistent, parseable action verb.
+        steps.push('Click the Submit button');
+        grounding.push({ stepIndex: steps.length, page: form?.page, control: 'Submit' });
+      }
+    };
+    if (form && stepFlow === 'cancel') {
+      // CANCEL: discard instead of submit. Click Cancel (NOT Submit); the
+      // structured `expected` then asserts nothing was persisted. We do NOT
+      // fabricate a Cancel selector — grounding stays page-level so the case
+      // never claims a locator the App Profile does not expose.
+      steps.push('Click the Cancel button');
+      grounding.push({ stepIndex: steps.length, page: form.page, control: 'Cancel' });
+      steps.push('Return to the list and confirm the record was NOT created (the entered data was discarded)');
+      grounding.push({ stepIndex: steps.length, page: baseUrl || form.page });
+    } else if (form && stepFlow === 'search') {
+      // SEARCH: create the record, THEN find it. Submit, go to the list/search
+      // surface, search for the just-created record, and verify it appears — a
+      // create-then-find workflow, not a bare create.
+      pushSubmit();
+      steps.push('Open the records list / search page');
+      grounding.push({ stepIndex: steps.length, page: baseUrl || form.page });
+      steps.push('Search for the newly created record (by its identifier and by name)');
+      grounding.push({ stepIndex: steps.length, page: baseUrl || form.page });
+      steps.push('Confirm the newly created record appears in the search results');
+      grounding.push({ stepIndex: steps.length, page: baseUrl || form.page });
+    } else {
+      pushSubmit();
     }
     if (!form) {
       // No form matched THIS feature (or no App Profile at all). Emit an honest,
@@ -702,7 +767,7 @@ export function buildDraftTestCases(
     const sourceEvidence = scenario.provenance.whyExists;
     if (usedRealSelector) groundedCount += 1;
 
-    const expected = buildExpected(scenario, form, ap);
+    const expected = buildExpected(scenario, form, ap, stepFlow);
 
     // ── Scenario ↔ Automation Ready ── a case is automation-ready ONLY when a
     // real feature form was resolved AND it yielded a real selector. If no form
