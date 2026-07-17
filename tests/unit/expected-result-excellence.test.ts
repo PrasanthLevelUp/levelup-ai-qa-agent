@@ -32,6 +32,7 @@
 
 import { planScenarios } from '../../src/engines/scenario-planner';
 import { buildDraftTestCases } from '../../src/engines/scenario-builder';
+import { validateExpectedResult } from '../../src/engines/expected-result-validator';
 import type { CoverageType } from '../../src/engines/test-coverage-engine';
 
 // ---------------------------------------------------------------------------
@@ -150,18 +151,18 @@ describe('Contract 2 — positive create names the entity, the fields, and the l
     expect(observableOf(d)).toContain('Employee');
   });
 
-  it('asserts the entered fields are saved exactly (First Name, Last Name, Employee ID)', () => {
+  it('asserts the entered fields are shown exactly as entered (First Name, Last Name, Employee ID)', () => {
     const obs = observableOf(d);
     expect(obs).toContain('First Name');
     expect(obs).toContain('Last Name');
     expect(obs).toContain('Employee ID');
-    expect(obs.toLowerCase()).toMatch(/saved exactly|stored exactly/);
+    expect(obs.toLowerCase()).toMatch(/exactly as entered|saved exactly|stored exactly/);
   });
 
-  it('asserts the record becomes visible in the list and persists', () => {
+  it('asserts the record becomes visible in the list and survives a refresh (observable proxy for persistence)', () => {
     const obs = observableOf(d).toLowerCase();
     expect(obs).toMatch(/appears in the employees list/);
-    expect(obs).toMatch(/persists|durably/);
+    expect(obs).toMatch(/after the page is refreshed/);
   });
 
   it('reads with positive polarity (success, no rejection language)', () => {
@@ -191,18 +192,21 @@ describe('Contract 3 — different scenario types produce different assertion li
     expect(obs).toMatch(/retained/);
   });
 
-  it('AUTHORIZATION — access denied, nothing created, server-side enforced', () => {
+  it('AUTHORIZATION — operation denied, nothing created/changed, denied message shown (all observable)', () => {
     const obs = observableOf(byId('crud-neg-unauthorized')).toLowerCase();
-    expect(obs).toMatch(/access is denied|not permitted/);
-    expect(obs).toMatch(/no employee record is created|not created/);
-    expect(obs).toMatch(/server-side/);
+    expect(obs).toMatch(/operation is denied|access-denied|not-authorised|not authorised/);
+    expect(obs).toMatch(/no employee is created or changed|no new or changed employee/);
+    // The non-provable "enforced server-side" claim must be GONE.
+    expect(obs).not.toMatch(/server-side|server side/);
   });
 
-  it('INJECTION — payload neutralised/escaped, no script runs, no detail leaks', () => {
+  it('INJECTION — literal text shown, no pop-up appears, generic error (all observable, no internals)', () => {
     const obs = observableOf(byId('crud-neg-injection-xss')).toLowerCase();
-    expect(obs).toMatch(/neutralised|escaped/);
-    expect(obs).toMatch(/no script runs/);
-    expect(obs).toMatch(/no stack trace|no sensitive detail|generic error/);
+    expect(obs).toMatch(/plain text|literal characters|exactly as typed/);
+    expect(obs).toMatch(/no pop-up|no popup|alert box|injected element/);
+    expect(obs).toMatch(/generic error/);
+    // Non-provable internals must be GONE.
+    expect(obs).not.toMatch(/neutralised|escaped|executed|interpreted|corruption/);
   });
 
   it('BOUNDARY-ACCEPT vs BOUNDARY-REJECT are opposite assertions', () => {
@@ -263,5 +267,60 @@ describe('Contract 5 — polarity is clean so the integrity gate never downgrade
     const obs = observableOf(byId('crud-pos-create')).toLowerCase();
     expect(obs).toMatch(/success|successfully/);
     expect(obs).not.toMatch(/\bfailure\b|\berror\b/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Contract 6 — THE PROVABILITY GATE. Every assertion of every scenario must be
+// Observable + Grounded + Black-box (the founder's "rich, but not provable"
+// defect). Validated with the FULL context (requirement + scenario + profile).
+// ---------------------------------------------------------------------------
+
+describe('Contract 6 — every assertion of every scenario is Observable + Grounded + Black-box', () => {
+  const requirementText = `${ADD_EMPLOYEE_REQ.title} ${ADD_EMPLOYEE_REQ.description} ${ADD_EMPLOYEE_REQ.acceptanceCriteria} ${ADD_EMPLOYEE_REQ.businessFlow}`;
+  const profileText = [
+    'Employee',
+    'Employees',
+    'Employees list',
+    'First Name',
+    'Last Name',
+    'Employee ID',
+    ...EMPLOYEE_PROFILE.pages.map((p) => `${p.title} ${p.pageType}`),
+  ].join(' ');
+
+  it('NO assertion in the entire Add Employee suite violates any of the three conditions', () => {
+    const failures: string[] = [];
+    for (const d of drafts) {
+      const scenarioText = `${d.title || ''} ${d.objective || ''}`;
+      const verdict = validateExpectedResult(assertionsOf(d), {
+        requirementText,
+        scenarioText,
+        profileText,
+      });
+      if (!verdict.passed) {
+        failures.push(`${d.scenarioId}: ${verdict.violations.join(' | ')}`);
+      }
+    }
+    expect(failures).toEqual([]);
+  });
+
+  it('the OLD non-provable phrasings would have been REJECTED (gate is real, not vacuous)', () => {
+    const bad = validateExpectedResult(
+      [
+        'The block is enforced server-side, not merely hidden in the UI.',
+        'The Employee record persists after a page refresh (it is durably saved).',
+        'The malicious input is safely neutralised — escaped as literal text, never executed.',
+        'The database is updated and the transaction is committed.',
+        'A confirmation email is sent to the HR admin.',
+      ],
+      { requirementText, profileText },
+    );
+    expect(bad.passed).toBe(false);
+    // each of the five is caught
+    expect(bad.assertions.filter((a) => !a.passed).length).toBe(5);
+    // server-side => not black-box; durably => not observable; email => not grounded
+    expect(bad.violations.join(' ')).toMatch(/black-box/);
+    expect(bad.violations.join(' ')).toMatch(/observable/);
+    expect(bad.violations.join(' ')).toMatch(/grounded/);
   });
 });

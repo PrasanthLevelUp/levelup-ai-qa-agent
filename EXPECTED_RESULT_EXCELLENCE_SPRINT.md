@@ -130,5 +130,57 @@ Each branch returns a **checklist** via a single `finalize()` helper. The Expect
 - No new engine, prompt, planner field, renderer, or exporter. One function reshaped; one optional `assertions` field added to the expected object.
 - Add Employee only. Checkout / Banking / CRM / HRMS untouched.
 
+---
+
+# Part 2 — The Provability Gate ("rich, but not provable")
+
+Making Expected Results *rich* surfaced a new, equally dangerous failure mode the founder named exactly: **rich, but not provable.** An assertion can read well yet be impossible for a black-box QA engineer to verify. Re-reading Part 1's output, several assertions were exactly that:
+
+| Non-provable assertion (Part 1) | Why it fails |
+|---|---|
+| "The block is enforced **server-side**, not merely hidden in the UI." | **Not black-box** — you cannot see server internals from the UI. |
+| "The record **persists** after a page refresh (it is **durably saved**)." | **Not observable** — "durably saved" is a storage-internal claim. |
+| "…stored/**escaped** as literal text, **never executed or interpreted**." | **Not observable** — describes engine internals, not a visible outcome. |
+| "…created with the payload safely escaped — **no data corruption**." | **Not observable** — "no data corruption" is unverifiable black-box. |
+| "The result appears immediately, with **no reindex delay**." | **Not observable** — "reindex" is a backend mechanism. |
+
+### The rule (now mechanical)
+Every assertion must satisfy **three conditions**, checked deterministically:
+
+1. **Observable** — a tester can SEE it (a message, a list row, a field value, a redirect), not an invisible internal effect.
+2. **Grounded** — derivable from the Requirement, Planner scenario, or App Profile ONLY — no invented side-effects (emails, audit trails, re-indexing, notifications the inputs never mention).
+3. **Black-box verifiable** — a QA engineer could verify it without reading code (no server-side / database / transaction / CSRF / cache internals).
+
+### The change (deterministic, no AI)
+- **New module `src/engines/expected-result-validator.ts`** — pure, lexicon-based. `validateAssertion()` scores one assertion; `validateExpectedResult()` scores the list. Never throws, never mutates, same input → same verdict. It rejects code-level terms (fails Black-box), invisible internal-state terms (fails Observable), and ungrounded side-effect concepts (fails Grounded).
+- **`buildExpected()` assertions rewritten** to assert the **observable proxy** instead of the internal:
+  - authorization: dropped "enforced server-side" → *"The operation is denied — no Employee is created or changed"* + *"an access-denied message is shown"* + *"the Employees list shows no new or changed Employee."*
+  - injection: dropped "neutralised / escaped / never executed / no data corruption" → *"the text is shown exactly as typed, as plain text"* + *"no pop-up, alert box, or injected element appears"* + *"a clear, generic error with no internal detail."*
+  - positive create: dropped "durably saved" → *"the new Employee is still shown in the Employees list after the page is refreshed."*
+  - search: dropped "no reindex delay" → *"appears immediately after creation, without needing to wait or search again."*
+- **Permanent gate** — the validator is wired in as the **10th Scenario Integrity check** (`expected_result_provable`) and added to `AUTOMATION_GATING_CHECKS`. A case whose Expected Result is not provable is **downgraded to Needs Review**, never Automation Ready — exactly like a wrong field or contradictory expected result. This is the mechanical "definition of done" for review-free test cases.
+
+### Before / After (provable rewrites)
+
+**Authorization (`crud-neg-direct-endpoint-authz`)**
+- ❌ Before: "…The block is enforced server-side, not merely hidden in the UI."
+- ✅ After: 1) The operation is denied — no Employee is created or changed. 2) The user sees an access-denied / not-authorised message (or is sent to the login page). 3) The Employees list shows no new or changed Employee afterwards.
+
+**Injection (`crud-neg-injection-xss`)**
+- ❌ Before: "…safely neutralised — escaped as literal text, never executed… no data corruption."
+- ✅ After: 1) The input is rejected, or the Employee is created showing the text exactly as typed — treated as plain text, not run. 2) No pop-up, alert box, or injected element appears on any Employee screen or list. 3) Wherever the value is shown, it displays as the literal characters entered. 4) A clear, generic error message, with no internal or technical detail exposed.
+
+**Positive create (`crud-pos-create`), final assertion**
+- ❌ Before: "The Employee record persists after a page refresh (it is durably saved)."
+- ✅ After: "The new Employee is still shown in the Employees list after the page is refreshed."
+
+### Verification (Part 2)
+- **`tsc --noEmit`** clean.
+- Full 39-scenario Add Employee suite re-audited through the validator with full context (requirement + scenario + profile): **all 39 scenarios / 159 assertions pass Observable + Grounded + Black-box** — 0 failures.
+- **154 regression tests still green**; the new gating check downgrades nothing (verified across Employee, checkout, graph, renderer, dedup, canonical, qa-standard suites).
+- **New tests:** `tests/unit/expected-result-validator.test.ts` (validator: rejects server-side/DB/transaction/CSRF/cache, rejects durably/escaped/executed/corruption/reindex, rejects ungrounded email/audit, allows a side-effect when the requirement mentions it, passes clean assertions, deterministic) + Contract 6 in `expected-result-excellence.test.ts` (every assertion of every scenario is provable, and the OLD phrasings are proven to be rejected — the gate is real, not vacuous).
+
+---
+
 ## Next candidate defect (not this sprint)
 Test **Data** is still generic ("Use data appropriate to the scenario…"). That is the highest-value remaining gap — scenario-specific data derived from the same planner/profile data, one defect at a time.

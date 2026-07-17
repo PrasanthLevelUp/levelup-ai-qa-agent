@@ -81,6 +81,10 @@ export const AUTOMATION_GATING_CHECKS = new Set<IntegrityCheckId>([
   'step_completeness',
   'test_data_suitability',
   'expected_result_consistency',
+  // A "rich but not provable" expected result (server-side/DB internals,
+  // invented side-effects, invisible state) is NOT executable as-is — it gates
+  // automation readiness exactly like a wrong field or contradictory expected.
+  'expected_result_provable',
 ]);
 
 /**
@@ -682,17 +686,17 @@ function buildExpected(
   // the steps used, so title, steps and expected all agree. ──
   if (stepFlow === 'cancel') {
     return finalize([
-      `No ${entity} record is created — the entered data is discarded.`,
+      `No ${entity} is created — the entered data is discarded.`,
       `The user is returned to the ${listName} without saving.`,
-      `The entered values are not persisted and do not show up in the ${listName} afterwards.`,
-      `Re-opening the form shows empty fields, confirming nothing was retained.`,
+      `The new ${entity} does not appear in the ${listName} afterwards, confirming nothing was saved.`,
+      `Re-opening the form shows empty fields.`,
     ]);
   }
   if (stepFlow === 'search') {
     return finalize([
       `The newly created ${entity} is returned in the search results.`,
       `It is found by its identifier${idLabel ? ` (${idLabel})` : ''} and by name.`,
-      `The result appears immediately, with no reindex delay.`,
+      `The result appears immediately after creation, without needing to wait or search again.`,
       `The returned record shows the exact values that were saved.`,
     ]);
   }
@@ -705,18 +709,17 @@ function buildExpected(
 
     if (isSecurity) {
       return finalize([
-        `The malicious input is rejected or safely neutralised — stored/escaped as literal text, never executed or interpreted.`,
-        `No script runs and no injected markup is reflected back in the UI or any ${entity} view.`,
-        `The ${entity} is either not created, or created with the payload safely escaped — no data corruption.`,
-        `A safe, generic error is shown — no stack trace, SQL, or sensitive detail leaks.`,
+        `The input is rejected, or the ${entity} is created showing the text exactly as typed — the payload is treated as plain text, not run.`,
+        `No pop-up, alert box, or injected element appears on any ${entity} screen or list.`,
+        `Wherever the value is shown, it displays as the literal characters that were entered.`,
+        `A clear, generic error message is shown, with no internal or technical detail exposed to the user.`,
       ]);
     }
     if (isAuthz) {
       return finalize([
-        `Access is denied — the ${entity} operation is not permitted for this user.`,
-        `No ${entity} record is created or modified.`,
-        `The user sees an access-denied / not-authorised message (or is redirected to login).`,
-        `The block is enforced server-side, not merely hidden in the UI.`,
+        `The operation is denied — no ${entity} is created or changed.`,
+        `The user sees an access-denied / not-authorised message (or is sent to the login page).`,
+        `The ${listName} shows no new or changed ${entity} afterwards.`,
       ]);
     }
     if (isDuplicate) {
@@ -734,7 +737,7 @@ function buildExpected(
         ? `A clear, specific validation error is shown for the ${target} field.`
         : `A clear, specific validation error message is displayed.`,
       `The form stays on screen with the entered values retained for correction.`,
-      `No partial or malformed ${entity} record is persisted.`,
+      `No new ${entity} appears in the ${listName}.`,
     ]);
   }
 
@@ -760,27 +763,27 @@ function buildExpected(
   // ── EDGE family — graceful handling, outcome may be accept OR reject. ──
   if (ct === 'edge_cases') {
     return finalize([
-      `The application handles the edge input gracefully — no crash, stack trace, or corrupted data.`,
+      `The application handles the input without crashing or showing an error page, and stays responsive.`,
       target
-        ? `The ${target} is either accepted and stored correctly, or rejected with a clear validation message.`
-        : `The input is either accepted and stored correctly, or rejected with a clear validation message.`,
-      `Any saved ${entity} data stays consistent and retrievable.`,
+        ? `The ${target} value is either accepted and shown correctly, or rejected with a clear validation message.`
+        : `The input is either accepted and shown correctly, or rejected with a clear validation message.`,
+      `Any ${entity} that is saved appears in the ${listName} showing the values that were entered.`,
     ]);
   }
 
   // ── SECURITY / ROLE_BASED coverage types (when not already negative). ──
   if (ct === 'security') {
     return finalize([
-      `The malicious input is rejected or safely neutralised — never executed or reflected back.`,
-      `No ${entity} data is corrupted and no injected script runs.`,
-      `A safe, generic error is shown — no sensitive detail leaks.`,
+      `The input is rejected, or the value is shown exactly as typed — it is treated as plain text, not run.`,
+      `No pop-up, alert box, or injected element appears on any ${entity} screen.`,
+      `A clear, generic error message is shown, with no internal or technical detail exposed to the user.`,
     ]);
   }
   if (ct === 'role_based') {
     return finalize([
-      `Access is denied for the unauthorised role.`,
-      `No ${entity} record is created or modified.`,
-      `An appropriate "not permitted" / access-denied message is shown.`,
+      `The operation is denied for this user role — no ${entity} is created or changed.`,
+      `An access-denied / "not permitted" message is shown.`,
+      `The ${listName} shows no new or changed ${entity} afterwards.`,
     ]);
   }
 
@@ -792,17 +795,18 @@ function buildExpected(
       `The ${entity} record is created successfully.`,
       `A success confirmation message is displayed.`,
       fieldsPhrase
-        ? `The entered ${fieldsPhrase} values are saved exactly as entered.`
-        : `The entered values are saved exactly as entered.`,
+        ? `The saved ${entity} shows the entered ${fieldsPhrase} values exactly as entered.`
+        : `The saved ${entity} shows the entered values exactly as entered.`,
       `The new ${entity} appears in the ${listName}.`,
-      `After saving, the user is taken to the ${entity} details or the updated ${listName}.`,
-      `The ${entity} record persists after a page refresh (it is durably saved).`,
+      `The new ${entity} is still shown in the ${listName} after the page is refreshed.`,
     ]);
   }
   return finalize([
     `The ${entity} action completes successfully and a confirmation message is displayed.`,
-    `The user reaches the expected next state.`,
-    successEl?.label ? `The "${successEl.label}" area becomes visible.` : `The result of the action is visible to the user.`,
+    successEl?.label
+      ? `The "${successEl.label}" area becomes visible on screen.`
+      : `The result of the action is visible on screen.`,
+    `The user is taken to the next screen without an error.`,
   ]);
 }
 
