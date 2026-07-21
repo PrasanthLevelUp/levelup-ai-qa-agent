@@ -209,7 +209,8 @@ export function createTestCoverageRouter(): Router {
         apiDocs, releaseNotes, module: mod, coverageTypes,
         knowledgeItemIds,
         useRepoIntelligence, repoId,
-        includeCoverageGaps,
+        deepCoverage,          // Sprint 5.2 — Deep Coverage toggle (generate more real cases)
+        includeCoverageGaps,   // @deprecated legacy alias for deepCoverage
         requirementId,
         force,
         useAppProfile,   // optional: explicitly disable (false) the application-profile grounding
@@ -495,8 +496,13 @@ export function createTestCoverageRouter(): Router {
         applicationProfile: appProfileUsed ? true : false,
         testData: testDataUsed.length,
       });
+      // Sprint 5.2 — Deep Coverage. Prefer the new `deepCoverage` flag; fall back
+      // to the legacy `includeCoverageGaps` alias when older clients send it.
+      const deepCoverageOn = deepCoverage !== undefined
+        ? deepCoverage === true
+        : includeCoverageGaps === true;
       const result = await getEngine().generateFullCoverage(input, selectedTypes, knowledge, {
-        includeCoverageGaps: includeCoverageGaps !== false,
+        deepCoverage: deepCoverageOn,
         deduplicate: deduplicate !== false, // default on — semantic near-duplicate removal
         aiCoverageExpansion: aiCoverageExpansion === true, // default off — respect the user's coverage-type selection
       });
@@ -553,7 +559,14 @@ export function createTestCoverageRouter(): Router {
         knowledgeItemTitles: knowledgeItemsUsed.map((ki: any) => ki.title),
         useRepoIntelligence: !!repoContextUsed,
         repoId: repoContextUsed ? repoId : undefined,
-        includeCoverageGaps: includeCoverageGaps !== false, // default true
+        // Sprint 5.2 — Deep Coverage toggle state (Standard vs Deep). Kept under
+        // the legacy key too so older History rows keep rendering.
+        deepCoverage: deepCoverageOn,
+        includeCoverageGaps: deepCoverageOn,
+        // Sprint 5.1 — Requirement Coverage KPI (X/Y + per-step checklist). The
+        // headline trust metric, persisted so History can render "no requirement
+        // left uncovered" without re-running generation.
+        requirementCoverage: result.requirementCoverage,
         // Generation mode: 'strict' (requirement-only) or 'expanded' (+ suggestions).
         mode: result.mode,
         // Persist the coverage gaps inside the analysis JSONB so they survive to
