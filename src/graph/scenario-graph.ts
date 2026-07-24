@@ -267,6 +267,18 @@ export interface ScenarioAction {
   target: string;
   value?: string;
   optional?: boolean;
+  /**
+   * OPTIONAL human-readable projection of this step — the exact sentence a
+   * MANUAL tester reads (e.g. `In the Sort dropdown, select "Name (A to Z)"`).
+   * It is the SAME canonical object's business face: automation reads
+   * `action`/`target`/`value`; a manual renderer prefers `description` when
+   * present and otherwise derives a sentence deterministically from
+   * verb + humanized target + value. Additive and OPTIONAL — a step without it
+   * renders exactly as before, so no existing output changes. Authored in the
+   * KB (`ScenarioActionTemplate.description`) and copied verbatim by the builder;
+   * it is a rendering hint, never used for grounding or execution.
+   */
+  description?: string;
 }
 
 /* ------------------------------------------------------------------ */
@@ -361,6 +373,22 @@ export interface ScenarioAssertion {
   expected?: string | number | boolean;
   optional?: boolean;
   afterAction?: string;
+  /**
+   * OPTIONAL business-observable projection of this check — the exact sentence a
+   * MANUAL tester reads in the Expected Result (e.g. `The product list re-orders
+   * into ascending alphabetical order by name (A → Z).`). It is the SAME
+   * canonical object's business face: automation reads `type`/`target`/`expected`
+   * and emits `expect(...)`; a manual renderer prefers `observable` when present
+   * and otherwise derives a sentence deterministically from the type/target.
+   *
+   * This is ALSO how the model expresses a business outcome the FROZEN machine
+   * vocabulary cannot (there is no `ordered` AssertionType): the machine `type`
+   * carries the closest checkable property (e.g. `visible` — the list rendered)
+   * while `observable` states the full business truth for the human. Additive and
+   * OPTIONAL — an assertion without it renders exactly as before. Authored in the
+   * KB (`ScenarioAssertionTemplate.observable`) and copied verbatim by the builder.
+   */
+  observable?: string;
 }
 
 /**

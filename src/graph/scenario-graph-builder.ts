@@ -198,6 +198,10 @@ export function materializeActionTemplate(
     };
     if (step.value !== undefined) action.value = step.value;
     if (step.optional !== undefined) action.optional = step.optional;
+    // The human-readable projection is COPIED VERBATIM (like value/optional) —
+    // the builder never invents or paraphrases it. It is a rendering hint the
+    // manual renderer prefers; automation ignores it.
+    if (step.description !== undefined) action.description = step.description;
     return action;
   });
 }
@@ -288,6 +292,10 @@ export function materializeAssertionTemplate(
     // scenario) is the KB's responsibility, enforced by the qa-knowledge
     // assertions invariant test.
     if (check.afterAction !== undefined) assertion.afterAction = check.afterAction;
+    // The business-observable projection is COPIED VERBATIM (like expected/
+    // afterAction) — the builder never invents or paraphrases it. It is a
+    // rendering hint the manual renderer prefers; automation ignores it.
+    if (check.observable !== undefined) assertion.observable = check.observable;
     return assertion;
   });
 }

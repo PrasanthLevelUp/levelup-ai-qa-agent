@@ -28,8 +28,34 @@ import {
   type ResolvedDatasetRecord,
   maskResolvedDataset,
 } from '../engines/dataset-resolver';
+import { renderManualFromCanonical, type ResolvedValues } from './canonical-manual-renderer';
 
 const norm = (s?: string) => (s || '').trim().toLowerCase();
+
+/**
+ * The MANUAL renderer's entry point over a node: when the node carries
+ * KB-authored canonical `actions`, its manual columns (Steps / Expected Result /
+ * Test Data) are RENDERED from that one canonical source — the same source
+ * Script Gen consumes — so manual and automation can never drift. When the node
+ * has no authored actions (every capability not yet authored), this returns
+ * `null` and the caller keeps the legacy prose verbatim. This single guard is
+ * what makes the migration capability-by-capability and byte-for-byte safe.
+ *
+ * The dataset values passed to the renderer are the REAL resolved values (the
+ * node's internal source of truth). Masking still happens separately at the
+ * projection boundary for the `resolvedDataset` field; the visible Test Data
+ * line the renderer produces only ever echoes values the KB action authored
+ * (literals, or a `@dataset.*` field the project itself supplied).
+ */
+function renderManualIfCanonical(node: ScenarioNode): {
+  steps: string[];
+  expectedResult: string;
+  testData: string;
+} | null {
+  if (!node.actions || node.actions.length === 0) return null;
+  const resolved: ResolvedValues = node.execution?.resolvedDataset?.values as ResolvedValues;
+  return renderManualFromCanonical(node.actions, node.assertions ?? [], resolved);
+}
 
 /**
  * Build the human-readable Test Case Lab "Test Data" line that makes Sprint 2C
@@ -107,16 +133,24 @@ export function toTestCaseLab(graph: ScenarioGraph): TestCaseLabProjection {
     priority: n.priority,
     riskArea: n.riskArea,
   }));
-  const testCases: TestCaseLabCase[] = graph.nodes.map((n, i) => ({
+  const testCases: TestCaseLabCase[] = graph.nodes.map((n, i) => {
+    // ── Canonical Rendering (Phase 1) ──────────────────────────────────────
+    // When the node carries KB-authored canonical actions, RENDER its manual
+    // columns from that one source (the same the Script emitter reads) so manual
+    // and automation stay in lockstep. Otherwise `manual` is null and we keep the
+    // legacy prose verbatim — zero change for any not-yet-authored capability.
+    const manual = renderManualIfCanonical(n);
+    return {
     scenarioId: n.id,
     title: n.title,
     objective: n.objective,
     preconditions: n.preconditions,
-    steps: n.steps.slice(),
-    expectedResult: n.expectedResult,
+    steps: manual ? manual.steps : n.steps.slice(),
+    expectedResult: manual ? manual.expectedResult : n.expectedResult,
     // Enrich the visible Test Data line with the resolved role/dataset/record
     // (values masked). Falls back to the node's raw testData when unresolved.
-    testData: composeResolvedTestData(n),
+    // A canonical render owns its own Test Data line (from the authored actions).
+    testData: manual ? manual.testData : composeResolvedTestData(n),
     selectors: n.selectors.slice(),
     priority: n.priority,
     severity: n.severity,
@@ -132,7 +166,8 @@ export function toTestCaseLab(graph: ScenarioGraph): TestCaseLabProjection {
     ...(n.execution?.resolvedDataset
       ? { resolvedDataset: maskResolvedDataset(n.execution.resolvedDataset) }
       : {}),
-  }));
+    };
+  });
   return { scenarios, testCases };
 }
 

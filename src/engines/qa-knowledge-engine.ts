@@ -179,6 +179,15 @@ export interface ScenarioActionTemplate {
   value?: string;
   /** When true the step may be skipped if its target is absent in the app. */
   optional?: boolean;
+  /**
+   * OPTIONAL human-readable sentence a MANUAL tester reads for this step (e.g.
+   * `In the Sort dropdown, select "Name (A to Z)"`). Copied verbatim onto the
+   * canonical {@link ScenarioAction.description}. When omitted, the manual
+   * renderer derives a sentence from verb + humanized target + value, so this is
+   * only authored when the derived phrasing would be weaker than a hand-written
+   * one. Never used for grounding or automation — a pure rendering hint.
+   */
+  description?: string;
 }
 
 /**
@@ -250,6 +259,18 @@ export interface ScenarioAssertionTemplate {
    * match a real action id in the same scenario (no dangling references).
    */
   afterAction?: string;
+  /**
+   * OPTIONAL business-observable sentence a MANUAL tester reads in the Expected
+   * Result (e.g. `The product list re-orders into ascending alphabetical order
+   * by name (A → Z).`). Copied verbatim onto the canonical
+   * {@link ScenarioAssertion.observable}. Author it when the outcome is richer
+   * than the machine `type`/`target` can express — most importantly for business
+   * facts the FROZEN vocabulary has no primitive for (ordering, "cart
+   * unchanged"): the `type` carries the closest checkable property while
+   * `observable` states the full truth for the human. When omitted, the manual
+   * renderer derives a sentence from the type/target. A pure rendering hint.
+   */
+  observable?: string;
 }
 
 /**
@@ -709,7 +730,29 @@ export const QA_KNOWLEDGE_BASE: Record<Exclude<QACategory, 'generic'>, PlannedSc
     { id: 'search-edge-empty-query', title: 'Empty / whitespace-only query', objective: 'An empty or whitespace query is handled per spec (all results, prompt, or blocked).', coverageType: 'edge_cases', priority: 'P2', riskArea: 'Input handling' },
     { id: 'search-edge-special-chars', title: 'Special characters / injection-like input', objective: 'Special characters and injection-like strings are handled safely and do not break search.', coverageType: 'edge_cases', priority: 'P2', riskArea: 'Robustness' },
     { id: 'search-pos-filters', title: 'Filters / facets narrow results', objective: 'Applying and combining filters narrows results correctly and clearing restores them.', coverageType: 'positive', priority: 'P1', riskArea: 'Filtering correctness', conditionalOnKeywords: ['filter', 'facet', 'refine'] },
-    { id: 'search-pos-sort', title: 'Sorting orders results correctly', objective: 'Each sort option orders the results as specified and is stable.', coverageType: 'positive', priority: 'P2', riskArea: 'Sort correctness', conditionalOnKeywords: ['sort', 'order by', 'ascending', 'descending'] },
+    // ── SORTING (first fully-authored capability — Canonical Rendering sprint) ──
+    // The single canonical journey a SORT scenario describes. Authored with
+    // semantics + actionTemplate + assertionTemplate so BOTH renderers work from
+    // ONE source: Script Gen emits selectOption/expect; the manual renderer emits
+    // human Steps/Expected. No form is picked, no CRUD template fires — the
+    // Builder no longer guesses because the KB now tells it exactly what "sort"
+    // means. `@dataset.sort_option` lets a project dataset drive WHICH option is
+    // exercised; the literal fallback keeps it self-contained. The ordering and
+    // cart/product invariants ride on `observable` because the FROZEN assertion
+    // vocabulary has no `ordered` primitive — the machine `type` checks the
+    // closest property, `observable` states the full business truth for the human.
+    { id: 'search-pos-sort', title: 'Sorting orders the product list correctly', objective: 'Selecting a sort option re-orders the product list as specified while the selection is retained and the cart and product details are unaffected.', coverageType: 'positive', priority: 'P1', riskArea: 'Sort correctness', conditionalOnKeywords: ['sort', 'order by', 'ascending', 'descending'],
+      semantics: { variableUnderTest: 'sort option', preconditions: 'a product list showing multiple products in its default order', variation: 'a single sort option (e.g. Name A → Z) is selected from the sort control', expectedBehavior: 'the product list re-orders per the selected option; the selected option stays selected; product details and the cart are unchanged', requiredDataRole: '' },
+      actionTemplate: [
+        { action: 'navigate', target: 'product_list', description: 'Open the product list page' },
+        { action: 'select', target: 'sort_dropdown', value: 'Name (A to Z)', description: 'In the Sort dropdown, select the "Name (A to Z)" option' },
+      ],
+      assertionTemplate: [
+        { type: 'visible', target: 'product_list', afterAction: 'search-pos-sort.select.sort_dropdown', observable: 'The product list re-orders into ascending alphabetical order by name (A → Z), matching the selected option.' },
+        { type: 'value', target: 'sort_dropdown', expected: 'Name (A to Z)', afterAction: 'search-pos-sort.select.sort_dropdown', observable: 'The Sort dropdown still shows "Name (A to Z)" — the selected sort option is retained after the list re-orders.' },
+        { type: 'visible', target: 'product_item', optional: true, afterAction: 'search-pos-sort.select.sort_dropdown', observable: 'Each product\u2019s name, image and price are unchanged — only the display order changed, not the products themselves.' },
+        { type: 'visible', target: 'cart', optional: true, afterAction: 'search-pos-sort.select.sort_dropdown', observable: 'The shopping cart contents and item count are preserved — sorting the list does not modify the cart.' },
+      ] },
     { id: 'search-pos-pagination', title: 'Pagination navigates result pages', objective: 'Page navigation shows the correct slice with no duplicates or gaps.', coverageType: 'positive', priority: 'P2', riskArea: 'Pagination', conditionalOnKeywords: ['page', 'pagination', 'load more', 'infinite'] },
     { id: 'search-perf-large', title: 'Search performance on large datasets', objective: 'Query returns within the acceptable time on a realistically large dataset.', coverageType: 'performance', priority: 'P2', riskArea: 'Performance at scale' },
   ],

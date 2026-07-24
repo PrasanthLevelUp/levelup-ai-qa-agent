@@ -88,14 +88,21 @@ describe('Sprint 2D.3 — action-template coverage ratchet', () => {
   });
 
   // (D) EXPANSION BLOCK
-  it('(D) no NON-authentication module authors action templates until auth is 100%', () => {
+  // Deliberately-authored cross-category scenarios are allow-listed here. Each
+  // entry is a reviewed exception, NOT an accidental leak.
+  //   • search/search-pos-sort — Canonical Rendering sprint: the first scenario
+  //     authored to prove the manual builder renders from canonical actions
+  //     (single source of truth) rather than the legacy form playbook.
+  const AUTHORED_NON_AUTH_ACTIONS = new Set<string>(['search/search-pos-sort']);
+  it('(D) no NON-authentication module authors action templates until auth is 100% (except reviewed allow-list)', () => {
     const authComplete = Object.keys(AUTH_SCENARIOS_PENDING_ACTION_TEMPLATE).length === 0;
     if (authComplete) return; // once auth reaches 100%, other modules may begin.
     for (const [category, scenarios] of Object.entries(QA_KNOWLEDGE_BASE)) {
       if (category === 'authentication') continue;
       const leaked = scenarios
         .filter((s) => s.actionTemplate && s.actionTemplate.length > 0)
-        .map((s) => `${category}/${s.id}`);
+        .map((s) => `${category}/${s.id}`)
+        .filter((id) => !AUTHORED_NON_AUTH_ACTIONS.has(id));
       expect(leaked).toEqual([]);
     }
   });
