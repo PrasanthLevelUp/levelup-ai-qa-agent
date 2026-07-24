@@ -268,6 +268,13 @@ export interface ScenarioAction {
   value?: string;
   optional?: boolean;
 }
+// NOTE — the canonical action is deliberately PRESENTATION-NEUTRAL and
+// LANGUAGE-NEUTRAL: it carries only machine meaning (`action`/`target`/`value`).
+// Human wording ("In the Sort dropdown, select …") is NOT stored here — it is
+// OWNED by each renderer (manual/BDD/Playwright/…), which derives its own
+// sentence from verb + humanized target + value. This keeps one canonical model
+// feeding many renderers without embedding English (or any locale) into the
+// business model.
 
 /* ------------------------------------------------------------------ */
 /*  Assertions                                                         */
@@ -295,6 +302,15 @@ export interface ScenarioAction {
  *   • `value`      — the target input has form value `expected`.
  *   • `count`      — the target matches `expected` (a number) of elements.
  *   • `attribute`  — the target has attribute `expected`, encoded `name=value`.
+ *   • `ordered`    — the target COLLECTION is ordered. A genuine business-meaning
+ *                    primitive (not presentation): the elements matched by
+ *                    `target`/`collection` appear in `direction` order, optionally
+ *                    by the `orderBy` dimension. This is the check a "sort" feature
+ *                    is actually about. It was added deliberately (per architecture
+ *                    review) instead of smuggling ordering intent into a prose field,
+ *                    so EVERY renderer — manual, automation, RTM, future AI — reads
+ *                    ordering as first-class meaning. Script Gen maps it to a
+ *                    sequence check; the manual renderer states it in words.
  */
 export type AssertionType =
   | 'url'
@@ -307,7 +323,11 @@ export type AssertionType =
   | 'text'
   | 'value'
   | 'count'
-  | 'attribute';
+  | 'attribute'
+  | 'ordered';
+
+/** Ordering direction for an `ordered` assertion. */
+export type OrderDirection = 'ascending' | 'descending';
 
 /**
  * A single canonical executable assertion — the exact, minimal, FROZEN contract
@@ -361,7 +381,28 @@ export interface ScenarioAssertion {
   expected?: string | number | boolean;
   optional?: boolean;
   afterAction?: string;
+  /**
+   * SEMANTIC ordering fields — populated ONLY for `type: 'ordered'`. They carry
+   * business meaning, not presentation, so every renderer reads ordering as
+   * first-class intent (manual → prose, automation → sequence check, RTM →
+   * "ordering requirement satisfied", future AI → knows this is an ordering check):
+   *   • `collection` — the semantic collection under order (e.g. `products`).
+   *                    Falls back to `target` when omitted.
+   *   • `direction`  — `ascending` | `descending`.
+   *   • `orderBy`    — optional semantic dimension the order is by (e.g. `name`,
+   *                    `price`). Absent when the collection has a single natural
+   *                    ordering. NEVER a locale-specific label — it is a key.
+   * All three are absent for every non-`ordered` assertion, so existing checks are
+   * byte-for-byte unchanged.
+   */
+  collection?: string;
+  direction?: OrderDirection;
+  orderBy?: string;
 }
+// NOTE — as with ScenarioAction, the canonical assertion holds NO human wording.
+// The old `observable` prose field was removed: ordering (the one thing the frozen
+// vocabulary could not express) is now the first-class `ordered` type with the
+// semantic fields above, and all Expected-Result wording is derived by renderers.
 
 /**
  * Execution-scoped facts attached to a {@link ScenarioNode}. Distinct from

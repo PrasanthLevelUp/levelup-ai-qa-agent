@@ -288,6 +288,12 @@ export function materializeAssertionTemplate(
     // scenario) is the KB's responsibility, enforced by the qa-knowledge
     // assertions invariant test.
     if (check.afterAction !== undefined) assertion.afterAction = check.afterAction;
+    // Semantic ordering fields are COPIED VERBATIM (like target/expected) for an
+    // `ordered` check — business meaning, never presentation. The builder never
+    // invents or paraphrases them; every renderer derives its own wording.
+    if (check.collection !== undefined) assertion.collection = check.collection;
+    if (check.direction !== undefined) assertion.direction = check.direction;
+    if (check.orderBy !== undefined) assertion.orderBy = check.orderBy;
     return assertion;
   });
 }

@@ -4564,6 +4564,27 @@ ${gotoB}${sessionLogin('pageB')}
           stmts = [`await expect(${loc}).toHaveAttribute('${escapeStr(name)}', '${escapeStr(val)}');`];
           break;
         }
+        case 'ordered': {
+          // First-class ORDERING verification (mirrors the manual renderer's
+          // ordering sentence from the SAME semantic fields). Collect the visible
+          // text of the ordered collection and assert the sequence is sorted in
+          // the required direction — a real check, never a silent drop.
+          //   NOTE (scoped follow-up): the comparison is lexical (localeCompare),
+          //   correct for textual dimensions like `name`. Non-lexical dimensions
+          //   (e.g. numeric `price`) need a numeric comparator — no such scenario
+          //   is authored yet, so this is intentionally deferred, not wrong today.
+          const coll = a.collection ?? a.target;
+          const collLoc = coll ? locatorFor(coll) : loc;
+          const suffix = a.order;
+          const cmp = a.direction === 'descending'
+            ? '(x, y) => y.localeCompare(x)'
+            : '(x, y) => x.localeCompare(y)';
+          stmts = [
+            `const _ordered${suffix} = (await ${collLoc}.allTextContents()).map((t) => t.trim());`,
+            `expect(_ordered${suffix}).toEqual([..._ordered${suffix}].sort(${cmp}));`,
+          ];
+          break;
+        }
         default:
           continue;
       }

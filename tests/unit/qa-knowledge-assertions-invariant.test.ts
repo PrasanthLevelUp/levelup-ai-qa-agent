@@ -15,7 +15,7 @@
  *       assertion template. No scenario may prove "nothing"; a template-less auth
  *       scenario is a regression that fails here loudly.
  *
- *   (B) FROZEN grammar — every authored `type` is one of the 11 frozen
+ *   (B) FROZEN grammar — every authored `type` is one of the 12 frozen
  *       AssertionType values. New types are a contract change, not a quiet edit.
  *
  *   (C) CANONICAL targets — every authored target is an app-neutral semantic key
@@ -47,6 +47,7 @@ import {
 const FROZEN_TYPES = new Set([
   'url', 'visible', 'hidden', 'enabled', 'disabled',
   'checked', 'unchecked', 'text', 'value', 'count', 'attribute',
+  'ordered',
 ]);
 
 // A canonical target is a lowercase snake/word key — never a CSS/XPath locator.
@@ -72,7 +73,7 @@ describe('Sprint 2D.4 — assertion-template coverage ratchet', () => {
   });
 
   // (B) FROZEN grammar
-  it('(B) every authored assertion type is one of the 11 frozen AssertionType values', () => {
+  it('(B) every authored assertion type is one of the 12 frozen AssertionType values', () => {
     for (const s of auth) {
       for (const a of s.assertionTemplate ?? []) {
         expect(FROZEN_TYPES.has(a.type)).toBe(true);
@@ -189,12 +190,19 @@ describe('Sprint 2D.4 — assertion-template coverage ratchet', () => {
   });
 
   // (E) EXPANSION BLOCK — assertions land module-by-module, authentication first.
-  it('(E) no NON-authentication module authors assertion templates yet', () => {
+  // Deliberately-authored cross-category scenarios are allow-listed here. Each
+  // entry is a reviewed exception, NOT an accidental leak.
+  //   • search/search-pos-sort — Canonical Rendering sprint: the first scenario
+  //     authored to prove the manual builder renders from canonical actions/
+  //     assertions (single source of truth) rather than the legacy form playbook.
+  const AUTHORED_NON_AUTH_ASSERTIONS = new Set<string>(['search/search-pos-sort']);
+  it('(E) no NON-authentication module authors assertion templates yet (except reviewed allow-list)', () => {
     for (const [category, scenarios] of Object.entries(QA_KNOWLEDGE_BASE)) {
       if (category === 'authentication') continue;
       const leaked = scenarios
         .filter((s) => s.assertionTemplate && s.assertionTemplate.length > 0)
-        .map((s) => `${category}/${s.id}`);
+        .map((s) => `${category}/${s.id}`)
+        .filter((id) => !AUTHORED_NON_AUTH_ASSERTIONS.has(id));
       expect(leaked).toEqual([]);
     }
   });

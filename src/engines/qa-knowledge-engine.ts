@@ -180,6 +180,10 @@ export interface ScenarioActionTemplate {
   /** When true the step may be skipped if its target is absent in the app. */
   optional?: boolean;
 }
+// The action template is presentation-neutral: it authors only machine meaning.
+// A manual tester's sentence is derived by the renderer from verb + humanized
+// target + value, never authored here — so one KB entry feeds every renderer
+// (manual, BDD, automation, …) in any language.
 
 /**
  * The FROZEN, closed set of assertion types a KB assertion template entry may
@@ -202,7 +206,11 @@ export type AssertionType =
   | 'text'
   | 'value'
   | 'count'
-  | 'attribute';
+  | 'attribute'
+  | 'ordered';
+
+/** Ordering direction for an `ordered` assertion (mirrors the graph type). */
+export type OrderDirection = 'ascending' | 'descending';
 
 /**
  * One authored entry of a scenario's canonical VERIFICATION set — the KB's
@@ -250,6 +258,19 @@ export interface ScenarioAssertionTemplate {
    * match a real action id in the same scenario (no dangling references).
    */
   afterAction?: string;
+  /**
+   * SEMANTIC ordering fields — authored ONLY for `type: 'ordered'`. They carry
+   * business meaning (not presentation) and are copied verbatim onto the canonical
+   * {@link ScenarioAssertion}:
+   *   • `collection` — the collection under order (e.g. `products`); falls back to
+   *                    `target` when omitted.
+   *   • `direction`  — `ascending` | `descending`.
+   *   • `orderBy`    — optional dimension the order is by (e.g. `name`, `price`).
+   * Every renderer derives its own wording from these keys — no prose is stored.
+   */
+  collection?: string;
+  direction?: OrderDirection;
+  orderBy?: string;
 }
 
 /**
@@ -709,7 +730,32 @@ export const QA_KNOWLEDGE_BASE: Record<Exclude<QACategory, 'generic'>, PlannedSc
     { id: 'search-edge-empty-query', title: 'Empty / whitespace-only query', objective: 'An empty or whitespace query is handled per spec (all results, prompt, or blocked).', coverageType: 'edge_cases', priority: 'P2', riskArea: 'Input handling' },
     { id: 'search-edge-special-chars', title: 'Special characters / injection-like input', objective: 'Special characters and injection-like strings are handled safely and do not break search.', coverageType: 'edge_cases', priority: 'P2', riskArea: 'Robustness' },
     { id: 'search-pos-filters', title: 'Filters / facets narrow results', objective: 'Applying and combining filters narrows results correctly and clearing restores them.', coverageType: 'positive', priority: 'P1', riskArea: 'Filtering correctness', conditionalOnKeywords: ['filter', 'facet', 'refine'] },
-    { id: 'search-pos-sort', title: 'Sorting orders results correctly', objective: 'Each sort option orders the results as specified and is stable.', coverageType: 'positive', priority: 'P2', riskArea: 'Sort correctness', conditionalOnKeywords: ['sort', 'order by', 'ascending', 'descending'] },
+    // ── SORTING (first fully-authored capability — Canonical Rendering sprint) ──
+    // The single canonical journey a SORT scenario describes. Authored with
+    // semantics + actionTemplate + assertionTemplate so BOTH renderers work from
+    // ONE source: Script Gen emits selectOption/expect; the manual renderer emits
+    // human Steps/Expected. No form is picked, no CRUD template fires — the
+    // Builder no longer guesses because the KB now tells it exactly what "sort"
+    // means. Everything here is PRESENTATION-NEUTRAL: no prose is stored. The
+    // ordering invariant is the first-class `ordered` assertion type (semantic
+    // fields collection/direction/orderBy); each renderer derives its own wording.
+    { id: 'search-pos-sort', title: 'Sorting orders the product list correctly', objective: 'Selecting a sort option re-orders the product list as specified while the selection is retained and the cart and product details are unaffected.', coverageType: 'positive', priority: 'P1', riskArea: 'Sort correctness', conditionalOnKeywords: ['sort', 'order by', 'ascending', 'descending'],
+      semantics: { variableUnderTest: 'sort option', preconditions: 'a product list showing multiple products in its default order', variation: 'a single sort option (e.g. Name A → Z) is selected from the sort control', expectedBehavior: 'the product list re-orders per the selected option; the selected option stays selected; product details and the cart are unchanged', requiredDataRole: '' },
+      actionTemplate: [
+        { action: 'navigate', target: 'product_list' },
+        { action: 'select', target: 'sort_dropdown', value: 'Name (A to Z)' },
+      ],
+      assertionTemplate: [
+        // The check a "sort" feature is actually about — first-class ordering meaning,
+        // not prose. Renderers turn this into words / a sequence check / an RTM row.
+        { type: 'ordered', target: 'product_list', collection: 'products', direction: 'ascending', orderBy: 'name', afterAction: 'search-pos-sort.select.sort_dropdown' },
+        // Selection retained after the list re-orders.
+        { type: 'value', target: 'sort_dropdown', expected: 'Name (A to Z)', afterAction: 'search-pos-sort.select.sort_dropdown' },
+        // Products themselves unchanged (only order changed) — control some apps omit.
+        { type: 'visible', target: 'product_item', optional: true, afterAction: 'search-pos-sort.select.sort_dropdown' },
+        // Cart preserved — sorting must not mutate the cart.
+        { type: 'visible', target: 'cart', optional: true, afterAction: 'search-pos-sort.select.sort_dropdown' },
+      ] },
     { id: 'search-pos-pagination', title: 'Pagination navigates result pages', objective: 'Page navigation shows the correct slice with no duplicates or gaps.', coverageType: 'positive', priority: 'P2', riskArea: 'Pagination', conditionalOnKeywords: ['page', 'pagination', 'load more', 'infinite'] },
     { id: 'search-perf-large', title: 'Search performance on large datasets', objective: 'Query returns within the acceptable time on a realistically large dataset.', coverageType: 'performance', priority: 'P2', riskArea: 'Performance at scale' },
   ],
