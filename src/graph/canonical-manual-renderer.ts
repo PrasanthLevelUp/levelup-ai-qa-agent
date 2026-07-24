@@ -68,9 +68,11 @@ function renderValuePhrase(value: string | undefined, resolved: ResolvedValues):
 /* ------------------------------------------------------------------ */
 
 /**
- * Derive a manual step sentence from a canonical action when the KB authored no
- * `description`. Deterministic verb → phrasing map; QA-standard action verbs
- * ("Open …", "Enter …", "Click …", "Select …", "Upload …").
+ * Derive a manual step sentence from a canonical action. This renderer OWNS the
+ * wording — the canonical model carries no prose. Deterministic verb → phrasing
+ * map; QA-standard action verbs ("Open …", "Enter …", "Click …", "Select …",
+ * "Upload …"). A different renderer (BDD, German, executive) would map the same
+ * verbs to its own wording without touching the model.
  */
 function deriveStep(action: ScenarioAction, resolved: ResolvedValues): string {
   const el = humanizeTarget(action.target);
@@ -102,10 +104,10 @@ function deriveStep(action: ScenarioAction, resolved: ResolvedValues): string {
 }
 
 /**
- * Render the canonical action list into ordered manual Steps. Prefers the
- * KB-authored `description` (the exact sentence the author wrote); otherwise
- * derives one deterministically. Actions are rendered in `order` (defensive
- * sort — identity lives in `id`, sequence in `order`).
+ * Render the canonical action list into ordered manual Steps. All wording is
+ * derived here from the semantic action (the model stores no prose). Actions are
+ * rendered in `order` (defensive sort — identity lives in `id`, sequence in
+ * `order`).
  */
 export function renderManualSteps(
   actions: readonly ScenarioAction[],
@@ -113,9 +115,7 @@ export function renderManualSteps(
 ): string[] {
   return [...actions]
     .sort((a, b) => a.order - b.order)
-    .map((a) => (a.description && a.description.trim().length > 0
-      ? a.description.trim()
-      : deriveStep(a, resolved)));
+    .map((a) => deriveStep(a, resolved));
 }
 
 /* ------------------------------------------------------------------ */
@@ -123,10 +123,12 @@ export function renderManualSteps(
 /* ------------------------------------------------------------------ */
 
 /**
- * Derive an Expected-Result sentence from a canonical assertion when the KB
- * authored no `observable`. Covers the frozen assertion vocabulary; the
- * business-rich outcomes the vocabulary can't express (ordering, "cart
- * unchanged") are always authored with `observable`, so they never fall here.
+ * Derive an Expected-Result sentence from a canonical assertion. This renderer
+ * OWNS the wording — the canonical model carries no prose. Covers the full
+ * assertion vocabulary INCLUDING the first-class `ordered` primitive, whose
+ * semantic fields (`collection`/`direction`/`orderBy`) are turned into a human
+ * ordering sentence here (a BDD/automation/RTM renderer turns the SAME fields
+ * into its own form).
  */
 function deriveAssertion(a: ScenarioAssertion): string {
   const el = a.target ? humanizeTarget(a.target) : 'the page';
@@ -154,18 +156,31 @@ function deriveAssertion(a: ScenarioAssertion): string {
       return exp !== undefined ? `The ${el} count is ${String(exp)}.` : `The ${el} count matches.`;
     case 'attribute':
       return exp !== undefined ? `The ${el} has ${String(exp)}.` : `The ${el} has the expected attribute.`;
+    case 'ordered':
+      return deriveOrdered(a);
     default:
       return `The ${el} meets the expected condition.`;
   }
 }
 
-/** One expected-result line per assertion. Prefers authored `observable`. */
+/**
+ * Human ordering sentence from the semantic `ordered` fields. `collection` names
+ * what is ordered (falls back to `target`), `direction` gives ascending/
+ * descending, and the optional `orderBy` gives the dimension. Nothing here is
+ * stored in the model — it is derived, so other renderers phrase it their way.
+ */
+function deriveOrdered(a: ScenarioAssertion): string {
+  const collection = humanizeTarget(a.collection ?? a.target ?? 'items');
+  const direction = a.direction === 'descending' ? 'descending' : 'ascending';
+  const by = a.orderBy ? ` by ${humanizeTarget(a.orderBy)}` : '';
+  return `The ${collection} are displayed in ${direction} order${by}.`;
+}
+
+/** One expected-result line per assertion, all wording derived here. */
 export function renderManualExpectedLines(assertions: readonly ScenarioAssertion[]): string[] {
   return [...assertions]
     .sort((a, b) => a.order - b.order)
-    .map((a) => (a.observable && a.observable.trim().length > 0
-      ? a.observable.trim()
-      : deriveAssertion(a)));
+    .map((a) => deriveAssertion(a));
 }
 
 /**

@@ -267,19 +267,14 @@ export interface ScenarioAction {
   target: string;
   value?: string;
   optional?: boolean;
-  /**
-   * OPTIONAL human-readable projection of this step — the exact sentence a
-   * MANUAL tester reads (e.g. `In the Sort dropdown, select "Name (A to Z)"`).
-   * It is the SAME canonical object's business face: automation reads
-   * `action`/`target`/`value`; a manual renderer prefers `description` when
-   * present and otherwise derives a sentence deterministically from
-   * verb + humanized target + value. Additive and OPTIONAL — a step without it
-   * renders exactly as before, so no existing output changes. Authored in the
-   * KB (`ScenarioActionTemplate.description`) and copied verbatim by the builder;
-   * it is a rendering hint, never used for grounding or execution.
-   */
-  description?: string;
 }
+// NOTE — the canonical action is deliberately PRESENTATION-NEUTRAL and
+// LANGUAGE-NEUTRAL: it carries only machine meaning (`action`/`target`/`value`).
+// Human wording ("In the Sort dropdown, select …") is NOT stored here — it is
+// OWNED by each renderer (manual/BDD/Playwright/…), which derives its own
+// sentence from verb + humanized target + value. This keeps one canonical model
+// feeding many renderers without embedding English (or any locale) into the
+// business model.
 
 /* ------------------------------------------------------------------ */
 /*  Assertions                                                         */
@@ -307,6 +302,15 @@ export interface ScenarioAction {
  *   • `value`      — the target input has form value `expected`.
  *   • `count`      — the target matches `expected` (a number) of elements.
  *   • `attribute`  — the target has attribute `expected`, encoded `name=value`.
+ *   • `ordered`    — the target COLLECTION is ordered. A genuine business-meaning
+ *                    primitive (not presentation): the elements matched by
+ *                    `target`/`collection` appear in `direction` order, optionally
+ *                    by the `orderBy` dimension. This is the check a "sort" feature
+ *                    is actually about. It was added deliberately (per architecture
+ *                    review) instead of smuggling ordering intent into a prose field,
+ *                    so EVERY renderer — manual, automation, RTM, future AI — reads
+ *                    ordering as first-class meaning. Script Gen maps it to a
+ *                    sequence check; the manual renderer states it in words.
  */
 export type AssertionType =
   | 'url'
@@ -319,7 +323,11 @@ export type AssertionType =
   | 'text'
   | 'value'
   | 'count'
-  | 'attribute';
+  | 'attribute'
+  | 'ordered';
+
+/** Ordering direction for an `ordered` assertion. */
+export type OrderDirection = 'ascending' | 'descending';
 
 /**
  * A single canonical executable assertion — the exact, minimal, FROZEN contract
@@ -374,22 +382,27 @@ export interface ScenarioAssertion {
   optional?: boolean;
   afterAction?: string;
   /**
-   * OPTIONAL business-observable projection of this check — the exact sentence a
-   * MANUAL tester reads in the Expected Result (e.g. `The product list re-orders
-   * into ascending alphabetical order by name (A → Z).`). It is the SAME
-   * canonical object's business face: automation reads `type`/`target`/`expected`
-   * and emits `expect(...)`; a manual renderer prefers `observable` when present
-   * and otherwise derives a sentence deterministically from the type/target.
-   *
-   * This is ALSO how the model expresses a business outcome the FROZEN machine
-   * vocabulary cannot (there is no `ordered` AssertionType): the machine `type`
-   * carries the closest checkable property (e.g. `visible` — the list rendered)
-   * while `observable` states the full business truth for the human. Additive and
-   * OPTIONAL — an assertion without it renders exactly as before. Authored in the
-   * KB (`ScenarioAssertionTemplate.observable`) and copied verbatim by the builder.
+   * SEMANTIC ordering fields — populated ONLY for `type: 'ordered'`. They carry
+   * business meaning, not presentation, so every renderer reads ordering as
+   * first-class intent (manual → prose, automation → sequence check, RTM →
+   * "ordering requirement satisfied", future AI → knows this is an ordering check):
+   *   • `collection` — the semantic collection under order (e.g. `products`).
+   *                    Falls back to `target` when omitted.
+   *   • `direction`  — `ascending` | `descending`.
+   *   • `orderBy`    — optional semantic dimension the order is by (e.g. `name`,
+   *                    `price`). Absent when the collection has a single natural
+   *                    ordering. NEVER a locale-specific label — it is a key.
+   * All three are absent for every non-`ordered` assertion, so existing checks are
+   * byte-for-byte unchanged.
    */
-  observable?: string;
+  collection?: string;
+  direction?: OrderDirection;
+  orderBy?: string;
 }
+// NOTE — as with ScenarioAction, the canonical assertion holds NO human wording.
+// The old `observable` prose field was removed: ordering (the one thing the frozen
+// vocabulary could not express) is now the first-class `ordered` type with the
+// semantic fields above, and all Expected-Result wording is derived by renderers.
 
 /**
  * Execution-scoped facts attached to a {@link ScenarioNode}. Distinct from

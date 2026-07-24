@@ -15,7 +15,7 @@
  *       assertion template. No scenario may prove "nothing"; a template-less auth
  *       scenario is a regression that fails here loudly.
  *
- *   (B) FROZEN grammar — every authored `type` is one of the 11 frozen
+ *   (B) FROZEN grammar — every authored `type` is one of the 12 frozen
  *       AssertionType values. New types are a contract change, not a quiet edit.
  *
  *   (C) CANONICAL targets — every authored target is an app-neutral semantic key
@@ -47,6 +47,7 @@ import {
 const FROZEN_TYPES = new Set([
   'url', 'visible', 'hidden', 'enabled', 'disabled',
   'checked', 'unchecked', 'text', 'value', 'count', 'attribute',
+  'ordered',
 ]);
 
 // A canonical target is a lowercase snake/word key — never a CSS/XPath locator.
@@ -72,7 +73,7 @@ describe('Sprint 2D.4 — assertion-template coverage ratchet', () => {
   });
 
   // (B) FROZEN grammar
-  it('(B) every authored assertion type is one of the 11 frozen AssertionType values', () => {
+  it('(B) every authored assertion type is one of the 12 frozen AssertionType values', () => {
     for (const s of auth) {
       for (const a of s.assertionTemplate ?? []) {
         expect(FROZEN_TYPES.has(a.type)).toBe(true);
